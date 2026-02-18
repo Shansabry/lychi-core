@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use std::process::Command;
 use std::time::Instant;
 
-use crate::command::{CommandHandler, CommandResult, CompletionItem};
+use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, RiskLevel};
 use crate::error::LychiError;
 
 pub struct SystemCommand;
@@ -88,8 +88,8 @@ fn whoami() -> String {
 }
 
 #[async_trait]
-impl CommandHandler for SystemCommand {
-    fn prefix(&self) -> &str {
+impl ActionHandler for SystemCommand {
+    fn id(&self) -> &str {
         "system"
     }
 
@@ -97,12 +97,16 @@ impl CommandHandler for SystemCommand {
         "System power controls (shutdown, reboot, suspend, lock, logout)"
     }
 
-    async fn execute(&self, args: &str) -> Result<CommandResult, LychiError> {
+    fn default_risk(&self) -> RiskLevel {
+        RiskLevel::Medium
+    }
+
+    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
         let action_name = args.trim().to_lowercase();
         let start = Instant::now();
 
         if action_name.is_empty() {
-            return Ok(CommandResult {
+            return Ok(ActionResult {
                 success: false,
                 output: None,
                 error: Some(
@@ -111,6 +115,8 @@ impl CommandHandler for SystemCommand {
                 duration_ms: 0,
                 routed_by: None,
                 open_url: None,
+                needs_confirmation: None,
+                risk_level: None,
             });
         }
 
@@ -121,25 +127,29 @@ impl CommandHandler for SystemCommand {
                 let result = (a.run)();
                 let duration_ms = start.elapsed().as_millis() as u64;
                 match result {
-                    Ok(()) => Ok(CommandResult {
+                    Ok(()) => Ok(ActionResult {
                         success: true,
                         output: Some(format!("{} initiated", a.description)),
                         error: None,
                         duration_ms,
                         routed_by: None,
                         open_url: None,
+                        needs_confirmation: None,
+                        risk_level: None,
                     }),
-                    Err(e) => Ok(CommandResult {
+                    Err(e) => Ok(ActionResult {
                         success: false,
                         output: None,
                         error: Some(e),
                         duration_ms,
                         routed_by: None,
                         open_url: None,
+                        needs_confirmation: None,
+                        risk_level: None,
                     }),
                 }
             }
-            None => Ok(CommandResult {
+            None => Ok(ActionResult {
                 success: false,
                 output: None,
                 error: Some(format!(
@@ -149,6 +159,8 @@ impl CommandHandler for SystemCommand {
                 duration_ms: start.elapsed().as_millis() as u64,
                 routed_by: None,
                 open_url: None,
+                needs_confirmation: None,
+                risk_level: None,
             }),
         }
     }

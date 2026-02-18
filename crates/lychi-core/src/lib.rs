@@ -1,8 +1,11 @@
-pub mod ai;
-pub mod command;
+pub mod action_registry;
 pub mod config;
 pub mod error;
+pub mod executor;
 pub mod history;
 pub mod intent;
+#[cfg(feature = "mpris")]
 pub mod mpris;
 pub mod paths;
+pub mod providers;
+pub mod rules;

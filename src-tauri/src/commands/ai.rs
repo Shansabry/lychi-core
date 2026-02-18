@@ -32,12 +32,12 @@ pub async fn set_api_key(provider: String, key: String) -> Result<(), LychiError
 #[tauri::command]
 pub async fn get_ai_status(state: State<'_, AppState>) -> Result<AiStatus, LychiError> {
     let config = state.config.read().await;
-    let registry = state.registry.read().await;
+    let executor = state.executor.read().await;
     Ok(AiStatus {
         mode: config.ai.mode.clone(),
         provider: config.ai.provider.clone(),
         model: config.ai.model.clone(),
-        has_ai_router: registry.has_ai(),
+        has_ai_router: executor.has_ai(),
     })
 }
 
@@ -61,10 +61,10 @@ pub async fn check_ai_health(state: State<'_, AppState>) -> Result<bool, LychiEr
             Err(e) => tracing::warn!("No API key for {}: {e}", config.ai.provider),
         }
         if let Ok(key) = key {
-            let provider: lychi_core::ai::byo::BYOProvider = config.ai.provider.parse()?;
+            let provider: lychi_core::providers::byo::BYOProvider = config.ai.provider.parse()?;
             let client =
-                lychi_core::ai::byo::BYOClient::new(provider, config.ai.model.clone(), key);
-            use lychi_core::ai::provider::AiProvider;
+                lychi_core::providers::byo::BYOClient::new(provider, config.ai.model.clone(), key);
+            use lychi_core::providers::AiProvider;
             return Ok(client.health_check().await);
         }
     }

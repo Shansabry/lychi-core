@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::command::{CommandHandler, CommandResult, CompletionItem};
+use crate::action_registry::{ActionHandler, ActionResult, CompletionItem};
 use crate::error::LychiError;
 
 pub struct CalcHandler;
@@ -34,8 +34,8 @@ impl CalcHandler {
 }
 
 #[async_trait]
-impl CommandHandler for CalcHandler {
-    fn prefix(&self) -> &str {
+impl ActionHandler for CalcHandler {
+    fn id(&self) -> &str {
         "calc"
     }
 
@@ -43,35 +43,41 @@ impl CommandHandler for CalcHandler {
         "Evaluate a math expression"
     }
 
-    async fn execute(&self, args: &str) -> Result<CommandResult, LychiError> {
+    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
         let expr = args.trim();
         if expr.is_empty() {
-            return Ok(CommandResult {
+            return Ok(ActionResult {
                 success: false,
                 output: None,
                 error: Some("Usage: calc <expression> or =<expression>".to_string()),
                 duration_ms: 0,
                 routed_by: None,
                 open_url: None,
+                needs_confirmation: None,
+                risk_level: None,
             });
         }
 
         match Self::evaluate(expr) {
-            Some(result) => Ok(CommandResult {
+            Some(result) => Ok(ActionResult {
                 success: true,
                 output: Some(Self::format_result(result)),
                 error: None,
                 duration_ms: 0,
                 routed_by: None,
                 open_url: None,
+                needs_confirmation: None,
+                risk_level: None,
             }),
-            None => Ok(CommandResult {
+            None => Ok(ActionResult {
                 success: false,
                 output: None,
                 error: Some(format!("Invalid expression: {expr}")),
                 duration_ms: 0,
                 routed_by: None,
                 open_url: None,
+                needs_confirmation: None,
+                risk_level: None,
             }),
         }
     }

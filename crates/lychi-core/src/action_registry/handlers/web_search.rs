@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::command::{CommandHandler, CommandResult};
+use crate::action_registry::{ActionHandler, ActionResult};
 use crate::error::LychiError;
 
 const DEFAULT_SEARCH_URL: &str = "https://www.google.com/search?q=";
@@ -28,8 +28,8 @@ impl WebSearch {
 }
 
 #[async_trait]
-impl CommandHandler for WebSearch {
-    fn prefix(&self) -> &str {
+impl ActionHandler for WebSearch {
+    fn id(&self) -> &str {
         "web"
     }
 
@@ -37,28 +37,32 @@ impl CommandHandler for WebSearch {
         "Search the web in your default browser"
     }
 
-    async fn execute(&self, args: &str) -> Result<CommandResult, LychiError> {
+    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
         let query = args.trim();
         if query.is_empty() {
-            return Ok(CommandResult {
+            return Ok(ActionResult {
                 success: false,
                 output: None,
                 error: Some("Usage: web <search query>".to_string()),
                 duration_ms: 0,
                 routed_by: None,
                 open_url: None,
+                needs_confirmation: None,
+                risk_level: None,
             });
         }
 
         let url = format!("{}{}", self.search_url, urlencoding::encode(query));
 
-        Ok(CommandResult {
+        Ok(ActionResult {
             success: true,
             output: Some(format!("Searching: {query}")),
             error: None,
             duration_ms: 0,
             routed_by: None,
             open_url: Some(url),
+            needs_confirmation: None,
+            risk_level: None,
         })
     }
 }

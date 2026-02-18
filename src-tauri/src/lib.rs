@@ -1,4 +1,7 @@
 mod commands;
+#[cfg(unix)]
+mod ipc_server;
+mod platform;
 mod state;
 mod window;
 
@@ -14,7 +17,7 @@ pub fn run() {
         )
         .init();
 
-    glib::set_application_name("Lychi");
+    platform::init_app();
 
     let app_state = AppState::new();
     let hotkey = {
@@ -67,58 +70,9 @@ pub fn run() {
         .setup(move |app| {
             let handle = app.handle().clone();
 
-            // Ulauncher approach: transparent full-screen layer-shell window,
-            // content positioned via CSS. Layer shell surfaces never appear
-            // in the taskbar on any Wayland compositor.
-            #[cfg(target_os = "linux")]
+            // Platform-specific window setup (layer-shell, skip-taskbar, etc.)
             if let Some(win) = app.get_webview_window("main") {
-                if let Ok(gtk_win) = win.gtk_window() {
-                    use gtk::prelude::{GtkWindowExt, MonitorExt, WidgetExt};
-
-                    // Gracefully handle missing screen/monitor instead of panicking
-                    let setup_ok = (|| -> Option<()> {
-                        let screen = WidgetExt::screen(&gtk_win)?;
-                        let display = screen.display();
-                        let monitor = display.primary_monitor().or_else(|| display.monitor(0))?;
-                        let geom = monitor.geometry();
-
-                        // Ensure the window is transparent
-                        if let Some(visual) = screen.rgba_visual() {
-                            gtk_win.set_visual(Some(&visual));
-                        }
-                        gtk_win.set_app_paintable(true);
-
-                        // Use layer shell if available (Wayland) — hides from taskbar
-                        if gtk_layer_shell::is_supported() {
-                            use gtk_layer_shell::LayerShell;
-                            gtk_win.hide(); // Must unmap before init_layer_shell
-                            gtk_win.init_layer_shell();
-                            gtk_win.set_layer(gtk_layer_shell::Layer::Overlay);
-                            gtk_win.set_keyboard_mode(gtk_layer_shell::KeyboardMode::OnDemand);
-                            // Anchor to all edges = fullscreen on the layer
-                            gtk_win.set_anchor(gtk_layer_shell::Edge::Top, true);
-                            gtk_win.set_anchor(gtk_layer_shell::Edge::Bottom, true);
-                            gtk_win.set_anchor(gtk_layer_shell::Edge::Left, true);
-                            gtk_win.set_anchor(gtk_layer_shell::Edge::Right, true);
-                            gtk_win.set_namespace("lychi");
-                            tracing::info!("Layer shell initialized (Wayland)");
-                        } else {
-                            // X11 fallback — use regular window with skip-taskbar hints
-                            gtk_win.set_size_request(geom.width(), geom.height());
-                            gtk_win.set_skip_taskbar_hint(true);
-                            gtk_win.set_skip_pager_hint(true);
-                            tracing::info!("Using X11 skip-taskbar hints");
-                        }
-                        Some(())
-                    })();
-
-                    if setup_ok.is_none() {
-                        tracing::error!(
-                            "No GDK screen or monitor available — skipping window hints"
-                        );
-                    }
-                }
-                // Now show the window (visible: false in config, so we show after hints are set)
+                platform::init_window(&win);
                 let _ = win.show();
             }
 
@@ -165,15 +119,19 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // Spawn IPC server
-            let ipc_handle = handle.clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = ipc_server::run(ipc_handle).await {
-                    tracing::error!("IPC server error: {e}");
-                }
-            });
+            // Spawn IPC server (Unix domain sockets — Linux/macOS only)
+            #[cfg(unix)]
+            {
+                let ipc_handle = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = ipc_server::run(ipc_handle).await {
+                        tracing::error!("IPC server error: {e}");
+                    }
+                });
+            }
 
             // Spawn MPRIS listener (pushes track changes from all players to frontend)
+            #[cfg(feature = "mpris")]
             {
                 let media_handle = handle;
                 let mpris_state = app.state::<AppState>().mpris.clone();
@@ -226,72 +184,28 @@ pub fn run() {
 
     app.run(|_app, event| {
         if let tauri::RunEvent::Exit = event {
-            let path = window::socket_path();
-            if path.exists() {
-                let _ = std::fs::remove_file(&path);
+            // Clean up Unix domain socket
+            #[cfg(unix)]
+            {
+                let path = platform::ipc_path();
+                if path.exists() {
+                    let _ = std::fs::remove_file(&path);
+                }
             }
 
             // Drop the MPRIS manager cleanly so D-Bus subscriptions
             // are released before the process exits. This prevents
             // crashes in media players (e.g. Spotify) caused by
             // abrupt D-Bus peer disconnection.
-            let state = _app.state::<AppState>();
-            let mpris = state.mpris.clone();
-            tauri::async_runtime::block_on(async {
-                let mut guard = mpris.write().await;
-                guard.take();
-            });
-        }
-    });
-}
-
-mod ipc_server {
-    use crate::window;
-    use tauri::Manager;
-    use tokio::io::AsyncBufReadExt;
-    use tokio::net::UnixListener;
-
-    pub async fn run(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-        let path = window::socket_path();
-
-        // Clean up stale socket
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-        }
-
-        // Ensure parent directory exists
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let listener = UnixListener::bind(&path)?;
-        tracing::info!("IPC server listening on {}", path.display());
-
-        loop {
-            match listener.accept().await {
-                Ok((stream, _addr)) => {
-                    let handle = handle.clone();
-                    tokio::spawn(async move {
-                        let reader = tokio::io::BufReader::new(stream);
-                        let mut lines = reader.lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            match line.trim() {
-                                "toggle" => {
-                                    if let Some(w) = handle.get_webview_window("main") {
-                                        window::toggle_window(&w);
-                                    }
-                                }
-                                other => {
-                                    tracing::warn!("Unknown IPC command: {other}");
-                                }
-                            }
-                        }
-                    });
-                }
-                Err(e) => {
-                    tracing::error!("IPC accept error: {e}");
-                }
+            #[cfg(feature = "mpris")]
+            {
+                let state = _app.state::<AppState>();
+                let mpris = state.mpris.clone();
+                tauri::async_runtime::block_on(async {
+                    let mut guard = mpris.write().await;
+                    guard.take();
+                });
             }
         }
-    }
+    });
 }

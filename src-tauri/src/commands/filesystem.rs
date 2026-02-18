@@ -1,4 +1,4 @@
-use lychi_core::command::CompletionItem;
+use lychi_core::action_registry::CompletionItem;
 use lychi_core::error::LychiError;
 use std::path::PathBuf;
 

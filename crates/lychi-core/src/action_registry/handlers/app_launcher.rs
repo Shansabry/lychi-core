@@ -8,8 +8,8 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use crate::command::icons::resolve_icon;
-use crate::command::{CommandHandler, CommandResult, CompletionItem};
+use crate::action_registry::handlers::icons::resolve_icon;
+use crate::action_registry::{ActionHandler, ActionResult, CompletionItem};
 use crate::error::LychiError;
 
 #[derive(Debug)]
@@ -44,6 +44,8 @@ impl AppLauncher {
     fn discover_entries() -> HashMap<String, DesktopEntry> {
         let mut entries = HashMap::new();
 
+        // TODO: cross-platform — Linux-specific XDG paths. macOS needs NSWorkspace/Launch Services,
+        // Windows needs Start Menu + shell:AppsFolder enumeration.
         let dirs = [
             PathBuf::from("/usr/share/applications"),
             PathBuf::from("/usr/local/share/applications"),
@@ -164,8 +166,8 @@ impl AppLauncher {
 }
 
 #[async_trait]
-impl CommandHandler for AppLauncher {
-    fn prefix(&self) -> &str {
+impl ActionHandler for AppLauncher {
+    fn id(&self) -> &str {
         "open"
     }
 
@@ -173,16 +175,18 @@ impl CommandHandler for AppLauncher {
         "Launch a desktop application"
     }
 
-    async fn execute(&self, args: &str) -> Result<CommandResult, LychiError> {
+    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
         let query = args.trim();
         if query.is_empty() {
-            return Ok(CommandResult {
+            return Ok(ActionResult {
                 success: false,
                 output: None,
                 error: Some("Usage: open <application name>".to_string()),
                 duration_ms: 0,
                 routed_by: None,
                 open_url: None,
+                needs_confirmation: None,
+                risk_level: None,
             });
         }
 
@@ -211,13 +215,15 @@ impl CommandHandler for AppLauncher {
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        Ok(CommandResult {
+        Ok(ActionResult {
             success: true,
             output: Some(format!("Launched {}", entry.name)),
             error: None,
             duration_ms,
             routed_by: None,
             open_url: None,
+            needs_confirmation: None,
+            risk_level: None,
         })
     }
 

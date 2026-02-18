@@ -3,6 +3,10 @@ name = "lychi-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["mpris"]
+mpris = ["dep:zbus", "dep:futures-util", "dep:futures-core"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -18,9 +22,9 @@ dirs = "6"
 nucleo-matcher = "0.3"
 meval = "0.2.0"
 reqwest = { version = "0.12", features = ["json"] }
-zbus = { version = "5", features = ["tokio"] }
-futures-util = "0.3.32"
-futures-core = "0.3.32"
+zbus = { version = "5", features = ["tokio"], optional = true }
+futures-util = { version = "0.3.32", optional = true }
+futures-core = { version = "0.3.32", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

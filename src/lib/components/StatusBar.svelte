@@ -48,15 +48,17 @@ async function togglePlayPause() {
 <div class="status-bar">
 	<div class="status-info">
 		{#if routing}
-			<span class="routing-text"><span class="wave"><i></i><i></i><i></i><i></i></span> Routing...</span>
+			<span class="routing-text"><span class="traveler"><span class="dot"></span></span> Routing...</span>
 		{:else if executing}
-			<span class="executing-text"><span class="wave"><i></i><i></i><i></i><i></i></span> Running...</span>
+			<span class="executing-text"><span class="traveler"><span class="dot"></span></span> Running...</span>
 		{:else if result}
 			{#if result.routed_by === "ai"}
 				<span class="ai-indicator"><Sparkles size={11} strokeWidth={2} /></span>
 			{/if}
 			<span class="duration">{result.duration_ms}ms</span>
-			{#if result.success}
+			{#if result.needs_confirmation}
+				<span class="status confirm">CONFIRM</span>
+			{:else if result.success}
 				<span class="status success">OK</span>
 			{:else}
 				<span class="status error">ERR</span>
@@ -257,31 +259,29 @@ async function togglePlayPause() {
 		color: var(--fg-muted);
 	}
 
-	.wave {
+	.traveler {
+		position: relative;
 		display: inline-flex;
 		align-items: center;
-		gap: 1.5px;
+		width: 14px;
 		height: 11px;
 		flex-shrink: 0;
 	}
 
-	.wave i {
-		display: block;
-		width: 2px;
-		height: 3px;
-		border-radius: 1px;
+	.dot {
+		position: absolute;
+		top: 50%;
+		width: 5px;
+		height: 5px;
+		border-radius: 50%;
 		background: currentColor;
-		animation: wave 0.8s ease-in-out infinite;
+		transform: translate(0, -50%);
+		animation: travel 1.2s ease-in-out infinite;
 	}
 
-	.wave i:nth-child(1) { animation-delay: 0s; }
-	.wave i:nth-child(2) { animation-delay: 0.1s; }
-	.wave i:nth-child(3) { animation-delay: 0.2s; }
-	.wave i:nth-child(4) { animation-delay: 0.3s; }
-
-	@keyframes wave {
-		0%, 100% { height: 3px; }
-		50% { height: 10px; }
+	@keyframes travel {
+		0%, 100% { left: 0; }
+		50% { left: calc(100% - 5px); }
 	}
 
 	.duration {
@@ -301,8 +301,12 @@ async function togglePlayPause() {
 		color: var(--error);
 	}
 
+	.confirm {
+		color: #ffaa00;
+	}
+
 	.ai-indicator {
-		color: var(--accent);
+		color: var(--ai);
 		display: flex;
 		align-items: center;
 	}

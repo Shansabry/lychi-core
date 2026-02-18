@@ -11,26 +11,51 @@
 
 ```
 core/
-├── Cargo.toml                     # Workspace root (3 crates)
+├── Cargo.toml                     # Workspace root
 ├── crates/lychi-core/             # Core library — ALL business logic
 │   └── src/
-│       ├── command/               # CommandHandler trait + implementations
-│       │   ├── mod.rs             # Trait, CommandInput, CommandResult
-│       │   ├── registry.rs        # CommandRegistry (dispatch)
-│       │   ├── parser.rs          # Parse "open firefox" → (prefix, args)
-│       │   ├── app_launcher.rs    # "open" — XDG .desktop discovery
-│       │   ├── web_search.rs      # "web" — browser search
-│       │   ├── youtube.rs         # "yt" — YouTube search
-│       │   └── shell_exec.rs      # "run" — sh -lc execution
-│       ├── history/               # JSON file persistence, dedup
+│       ├── action_registry/       # BRICK: Action Registry
+│       │   ├── mod.rs             # ActionHandler trait, ActionResult, RiskLevel, CompletionItem
+│       │   ├── registry.rs        # ActionRegistry (register, lookup, list)
+│       │   └── handlers/          # All handler implementations
+│       │       ├── app_launcher.rs
+│       │       ├── calc.rs
+│       │       ├── file_open.rs
+│       │       ├── icons.rs
+│       │       ├── project_open.rs
+│       │       ├── shell_exec.rs
+│       │       ├── spotify.rs
+│       │       ├── system.rs
+│       │       ├── url_open.rs
+│       │       ├── web_search.rs
+│       │       └── youtube.rs
+│       ├── rules/                 # BRICK: Rules Engine
+│       │   ├── mod.rs             # RulesEngine, ValidationDecision, ValidationRequest
+│       │   └── shell.rs           # ShellRules (denylist, dangerous/moderate patterns)
+│       ├── intent/                # BRICK: Intent Resolver
+│       │   ├── mod.rs             # IntentResolver (pattern + AI routing)
+│       │   ├── patterns.rs        # Deterministic pattern matching
+│       │   ├── ai_router.rs       # AiRouter wrapper
+│       │   └── prompt.rs          # System prompt + response parsing
+│       ├── executor/              # BRICK: Execution Manager
+│       │   └── mod.rs             # Executor (resolve → validate → execute)
+│       ├── providers/             # BRICK: AI Providers
+│       │   ├── mod.rs             # AiProvider trait, AiRoute, AgentPlan
+│       │   └── byo.rs             # BYOClient (OpenAI/Anthropic/Groq)
 │       ├── config/                # TOML config with serde defaults
+│       ├── history/               # JSON file persistence, dedup
 │       ├── error.rs               # LychiError (thiserror)
+│       ├── mpris.rs               # MPRIS D-Bus media control (feature-gated)
 │       └── paths.rs               # XDG directory resolution
 ├── src-tauri/                     # Tauri app — THIN bridge layer
 │   └── src/
 │       ├── lib.rs                 # Tauri Builder setup
 │       ├── main.rs                # Entry point
-│       ├── state.rs               # AppState + handler registration
+│       ├── state.rs               # AppState + Executor setup
+│       ├── ipc_server.rs          # Unix socket IPC listener
+│       ├── platform/              # Platform abstraction layer
+│       │   ├── mod.rs             # cfg-gated re-exports
+│       │   └── linux.rs           # Linux: GTK/GDK, layer-shell, XDG
 │       └── commands/              # #[tauri::command] wrappers
 ├── cli/                           # CLI binary for `lychi --toggle`
 ├── src/                           # Svelte 5 frontend
@@ -43,6 +68,8 @@ core/
 ├── svelte.config.js               # adapter-static, SPA fallback
 └── vite.config.ts
 ```
+
+See `docs/architecture.md` for the full LEGO-brick architecture diagram and dependency rules.
 
 ## Architecture Rules
 
@@ -58,13 +85,14 @@ core/
 - `src-tauri` commands are thin wrappers (5-10 lines max). Extract state, call core, return.
 - All business logic lives in `lychi-core`. No exceptions.
 
-### Adding a New Command
+### Adding a New Action Handler
 
-1. Create `crates/lychi-core/src/command/my_command.rs`
-2. Implement the `CommandHandler` trait
-3. Add `pub mod my_command;` to `command/mod.rs`
-4. Register in `src-tauri/src/state.rs`: `registry.register(Box::new(MyCommand::new()))`
+1. Create `crates/lychi-core/src/action_registry/handlers/my_action.rs`
+2. Implement the `ActionHandler` trait (with `id()`, `description()`, `execute()`, optionally `default_risk()` and `completions()`)
+3. Add `pub mod my_action;` to `action_registry/handlers/mod.rs`
+4. Register in `src-tauri/src/state.rs`: `registry.register(Box::new(MyAction::new()))`
 5. No frontend changes needed — dispatch is automatic via the registry
+6. Rules Engine auto-validates based on `default_risk()` (Low = auto-execute, Medium/High = confirm)
 
 ### Adding an Integration (e.g., Slack)
 
@@ -92,7 +120,7 @@ core/
 
 - Crates: `kebab-case` (`lychi-core`)
 - Modules: `snake_case` (`app_launcher.rs`)
-- Types/Traits: `PascalCase` (`CommandHandler`, `AppState`)
+- Types/Traits: `PascalCase` (`ActionHandler`, `AppState`)
 - Functions/Methods: `snake_case` (`execute_command`)
 - Constants: `SCREAMING_SNAKE_CASE` (`DEFAULT_SEARCH_URL`)
 
@@ -207,9 +235,12 @@ cargo update                 # Update Cargo.lock
 
 ## Key Design Decisions
 
-1. **3 crates, not more** — enough separation, minimal overhead for solo dev
-2. **Trait objects for commands** — `Box<dyn CommandHandler>` in a HashMap registry
-3. **Feature flags for integrations** — compile-time inclusion without crate explosion
-4. **Flat files for MVP** — JSON history, TOML config. SQLite in Phase 2+
-5. **SvelteKit SPA** — SSR disabled, adapter-static, single page app
-6. **No CSS framework** — minimal custom CSS, premium feel
+1. **LEGO-brick architecture** — each module (action_registry, rules, intent, executor, providers) is a self-contained brick with clean interfaces, no cross-module shortcuts, and plug-and-play replaceability
+2. **Trait objects for actions** — `Box<dyn ActionHandler>` in a HashMap registry
+3. **Rules Engine gates every execution** — denylist, risk levels, confirmation flow. AI suggests, never executes directly
+4. **Executor is the single orchestrator** — resolve → validate → execute pipeline. Tauri bridge calls only the Executor
+5. **Feature flags for integrations** — compile-time inclusion without crate explosion (e.g. `mpris` feature for D-Bus media control)
+6. **Platform abstraction** — all platform-specific code (GTK, GDK, layer-shell, XDG sockets) lives in `src-tauri/src/platform/linux.rs`. Adding macOS/Windows means creating one new file per platform — zero changes to callers
+7. **Flat files for MVP** — JSON history, TOML config. SQLite in Phase 2+
+8. **SvelteKit SPA** — SSR disabled, adapter-static, single page app
+9. **No CSS framework** — minimal custom CSS, premium feel

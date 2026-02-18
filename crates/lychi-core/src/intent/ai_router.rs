@@ -1,9 +1,7 @@
 use std::time::Duration;
 
 use crate::error::LychiError;
-
-use super::agent::AiResponse;
-use super::provider::{AiProvider, AiRoute};
+use crate::providers::{AiProvider, AiResponse, AiRoute};
 
 /// Wraps an active AI provider with timeout and error handling.
 pub struct AiRouter {
@@ -25,13 +23,11 @@ impl AiRouter {
     pub async fn try_route(
         &self,
         input: &str,
-        known_commands: &[&str],
+        known_actions: &[&str],
     ) -> Result<Option<AiRoute>, LychiError> {
-        match self.try_route_or_plan(input, known_commands).await? {
+        match self.try_route_or_plan(input, known_actions).await? {
             Some(AiResponse::SingleRoute(route)) => Ok(Some(route)),
             Some(AiResponse::Plan(_)) => {
-                // Got a plan but caller only wants a route — treat as single-shot failure
-                // so the caller falls back to heuristics
                 tracing::debug!("AI returned plan but single route expected, falling back");
                 Ok(None)
             }
@@ -44,18 +40,23 @@ impl AiRouter {
     pub async fn try_route_or_plan(
         &self,
         input: &str,
-        known_commands: &[&str],
+        known_actions: &[&str],
     ) -> Result<Option<AiResponse>, LychiError> {
         match tokio::time::timeout(
             self.timeout,
-            self.provider.route_or_plan(input, known_commands),
+            self.provider.route_or_plan(input, known_actions),
         )
         .await
         {
             Ok(Ok(response)) => {
                 match &response {
                     AiResponse::SingleRoute(route) => {
-                        tracing::info!("AI routed '{}' → {} {}", input, route.command, route.args);
+                        tracing::info!(
+                            "AI routed '{}' → {} {}",
+                            input,
+                            route.action_id,
+                            route.args
+                        );
                     }
                     AiResponse::Plan(plan) => {
                         tracing::info!("AI planned '{}' → {} steps", input, plan.steps.len());

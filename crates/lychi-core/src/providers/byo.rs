@@ -6,9 +6,8 @@ use std::str::FromStr;
 
 use crate::error::LychiError;
 
-use super::agent::AiResponse;
-use super::prompt;
-use super::provider::{AiProvider, AiRoute};
+use super::{AiProvider, AiResponse, AiRoute};
+use crate::intent::prompt;
 
 /// Supported BYO API providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,7 +31,6 @@ impl FromStr for BYOProvider {
 }
 
 impl BYOProvider {
-
     fn endpoint(&self) -> &'static str {
         match self {
             Self::OpenAI => "https://api.openai.com/v1/chat/completions",
@@ -151,10 +149,9 @@ impl AiProvider for BYOClient {
     async fn route_intent(
         &self,
         input: &str,
-        known_commands: &[&str],
+        known_actions: &[&str],
     ) -> Result<AiRoute, LychiError> {
-        // route_intent returns only single routes; multi-step plans are treated as errors
-        match self.route_or_plan(input, known_commands).await? {
+        match self.route_or_plan(input, known_actions).await? {
             AiResponse::SingleRoute(route) => Ok(route),
             AiResponse::Plan(_) => Err(LychiError::Ai(
                 "AI returned a plan but single route was expected".to_string(),
@@ -165,9 +162,9 @@ impl AiProvider for BYOClient {
     async fn route_or_plan(
         &self,
         input: &str,
-        known_commands: &[&str],
+        known_actions: &[&str],
     ) -> Result<AiResponse, LychiError> {
-        let sys_prompt = prompt::system_prompt(known_commands);
+        let sys_prompt = prompt::system_prompt(known_actions);
 
         let response = match self.provider {
             BYOProvider::OpenAI | BYOProvider::Groq => {
@@ -177,15 +174,12 @@ impl AiProvider for BYOClient {
         };
 
         tracing::debug!("AI response: {response}");
-        prompt::parse_ai_response(&response, known_commands, input)
+        prompt::parse_ai_response(&response, known_actions, input)
     }
 
     async fn health_check(&self) -> bool {
         let result = match self.provider {
             BYOProvider::Anthropic => {
-                // Anthropic has no /models endpoint — send a minimal messages request
-                // with an impossibly low max_tokens. A valid key returns 400 (bad request),
-                // an invalid key returns 401 (unauthorized).
                 let res = self
                     .http
                     .post("https://api.anthropic.com/v1/messages")
@@ -198,8 +192,6 @@ impl AiProvider for BYOClient {
                 match res {
                     Ok(r) => {
                         let status = r.status().as_u16();
-                        // 200 = working, 400 = valid key but bad request, both mean key is valid
-                        // 401/403 = invalid key
                         status != 401 && status != 403
                     }
                     Err(_) => false,

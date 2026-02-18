@@ -9,6 +9,10 @@ export interface CommandResult {
 	routed_by?: string | null;
 	/** If set, the frontend should open this URI via GDK for proper Wayland focus. */
 	open_url?: string | null;
+	/** If set, the action needs user confirmation before executing. */
+	needs_confirmation?: string | null;
+	/** Risk level of the action (low, medium, high). */
+	risk_level?: RiskLevel | null;
 }
 
 export interface CompletionItem {
@@ -21,11 +25,11 @@ function isTauri(): boolean {
 	return "__TAURI_INTERNALS__" in window;
 }
 
-export async function executeCommand(input: string): Promise<CommandResult> {
+export async function executeCommand(input: string, confirmed?: boolean): Promise<CommandResult> {
 	if (!isTauri()) {
 		return { success: false, output: null, error: "Not running in Tauri", duration_ms: 0 };
 	}
-	return invoke<CommandResult>("execute_command", { input });
+	return invoke<CommandResult>("execute_command", { input, confirmed: confirmed ?? null });
 }
 
 export async function getHistory(): Promise<string[]> {
@@ -209,13 +213,13 @@ export async function checkAiHealth(): Promise<boolean> {
 
 // --- Agent Plans ---
 
-export type Risk = "safe" | "moderate" | "dangerous";
+export type RiskLevel = "low" | "medium" | "high";
 
 export interface AgentStep {
-	command: string;
+	action_id: string;
 	args: string;
 	label: string;
-	risk: Risk;
+	risk: RiskLevel;
 }
 
 export interface AgentPlan {

@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use std::sync::RwLock;
 use std::time::Instant;
 
-use crate::command::{CommandHandler, CommandResult};
+use crate::action_registry::{ActionHandler, ActionResult, RiskLevel};
 use crate::error::LychiError;
 
 /// Captured environment from the user's interactive login shell.
@@ -68,9 +68,10 @@ impl ShellExec {
         // Check if we have a cached env for this shell
         if let Ok(guard) = SHELL_ENV.read()
             && let Some((cached_shell, env)) = guard.as_ref()
-                && cached_shell == &self.shell {
-                    return env.clone();
-                }
+            && cached_shell == &self.shell
+        {
+            return env.clone();
+        }
 
         // Capture and cache
         let env = capture_shell_env(&self.shell);
@@ -82,8 +83,8 @@ impl ShellExec {
 }
 
 #[async_trait]
-impl CommandHandler for ShellExec {
-    fn prefix(&self) -> &str {
+impl ActionHandler for ShellExec {
+    fn id(&self) -> &str {
         "run"
     }
 
@@ -91,16 +92,22 @@ impl CommandHandler for ShellExec {
         "Execute a shell command"
     }
 
-    async fn execute(&self, args: &str) -> Result<CommandResult, LychiError> {
+    fn default_risk(&self) -> RiskLevel {
+        RiskLevel::Medium
+    }
+
+    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
         let cmd = args.trim();
         if cmd.is_empty() {
-            return Ok(CommandResult {
+            return Ok(ActionResult {
                 success: false,
                 output: None,
                 error: Some("Usage: run <shell command>".to_string()),
                 duration_ms: 0,
                 routed_by: None,
                 open_url: None,
+                needs_confirmation: None,
+                risk_level: None,
             });
         }
 
@@ -149,13 +156,15 @@ impl CommandHandler for ShellExec {
             )
         };
 
-        Ok(CommandResult {
+        Ok(ActionResult {
             success,
             output: out,
             error: err,
             duration_ms,
             routed_by: None,
             open_url: None,
+            needs_confirmation: None,
+            risk_level: None,
         })
     }
 }

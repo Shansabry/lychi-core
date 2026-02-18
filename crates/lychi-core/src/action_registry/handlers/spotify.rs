@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 
-use crate::command::{CommandHandler, CommandResult};
+use crate::action_registry::{ActionHandler, ActionResult, CompletionItem};
 use crate::error::LychiError;
 use crate::mpris::{MprisManager, TrackInfo};
 
@@ -18,19 +18,21 @@ enum Target {
 }
 
 /// Shared implementation for media transport commands.
-async fn execute_media(target: Target, args: &str) -> Result<CommandResult, LychiError> {
+async fn execute_media(target: Target, args: &str) -> Result<ActionResult, LychiError> {
     let action = args.trim().to_lowercase();
     let start = Instant::now();
 
     // No args → signal frontend to open media player panel
     if action.is_empty() {
-        return Ok(CommandResult {
+        return Ok(ActionResult {
             success: true,
             output: Some("__media_panel__".to_string()),
             error: None,
             duration_ms: start.elapsed().as_millis() as u64,
             routed_by: None,
             open_url: None,
+            needs_confirmation: None,
+            risk_level: None,
         });
     }
 
@@ -39,13 +41,15 @@ async fn execute_media(target: Target, args: &str) -> Result<CommandResult, Lych
     // Handle "pause all" / "stop all" — pauses every running player
     if action == "pause all" || action == "stop all" {
         let count = manager.control_all("pause").await?;
-        return Ok(CommandResult {
+        return Ok(ActionResult {
             success: true,
             output: Some(format!("Paused {count} player(s)")),
             error: None,
             duration_ms: start.elapsed().as_millis() as u64,
             routed_by: None,
             open_url: None,
+            needs_confirmation: None,
+            risk_level: None,
         });
     }
 
@@ -58,7 +62,7 @@ async fn execute_media(target: Target, args: &str) -> Result<CommandResult, Lych
         "prev" | "previous" | "back" => "prev",
         "toggle" => "play_pause",
         other => {
-            return Ok(CommandResult {
+            return Ok(ActionResult {
                 success: false,
                 output: None,
                 error: Some(format!(
@@ -67,6 +71,8 @@ async fn execute_media(target: Target, args: &str) -> Result<CommandResult, Lych
                 duration_ms: 0,
                 routed_by: None,
                 open_url: None,
+                needs_confirmation: None,
+                risk_level: None,
             });
         }
     };
@@ -76,23 +82,27 @@ async fn execute_media(target: Target, args: &str) -> Result<CommandResult, Lych
     let player = find_target(&players, target);
 
     match player {
-        None => Ok(CommandResult {
+        None => Ok(ActionResult {
             success: false,
             output: None,
             error: Some("No media players running".to_string()),
             duration_ms: start.elapsed().as_millis() as u64,
             routed_by: None,
             open_url: None,
+            needs_confirmation: None,
+            risk_level: None,
         }),
         Some(p) => {
             manager.control(&p.bus_name, mpris_action).await?;
-            Ok(CommandResult {
+            Ok(ActionResult {
                 success: true,
                 output: Some(format!("{}: {action}", p.player_name)),
                 error: None,
                 duration_ms: start.elapsed().as_millis() as u64,
                 routed_by: None,
                 open_url: None,
+                needs_confirmation: None,
+                risk_level: None,
             })
         }
     }
@@ -131,6 +141,23 @@ fn find_target(players: &[TrackInfo], target: Target) -> Option<&TrackInfo> {
     }
 }
 
+const MEDIA_SUBCOMMANDS: &[&str] = &[
+    "play", "pause", "next", "prev", "toggle", "pause all",
+];
+
+fn media_completions(partial: &str) -> Vec<CompletionItem> {
+    let lower = partial.to_lowercase();
+    MEDIA_SUBCOMMANDS
+        .iter()
+        .filter(|s| s.contains(&lower) || lower.is_empty())
+        .map(|s| CompletionItem {
+            label: s.to_string(),
+            icon_path: None,
+            score: if s.starts_with(&lower) { 100 } else { 50 },
+        })
+        .collect()
+}
+
 // --- Spotify handler ---
 
 pub struct SpotifyHandler;
@@ -148,8 +175,8 @@ impl SpotifyHandler {
 }
 
 #[async_trait]
-impl CommandHandler for SpotifyHandler {
-    fn prefix(&self) -> &str {
+impl ActionHandler for SpotifyHandler {
+    fn id(&self) -> &str {
         "spotify"
     }
 
@@ -157,8 +184,12 @@ impl CommandHandler for SpotifyHandler {
         "Spotify controls — play, pause, next, prev"
     }
 
-    async fn execute(&self, args: &str) -> Result<CommandResult, LychiError> {
+    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
         execute_media(Target::Spotify, args).await
+    }
+
+    async fn completions(&self, partial: &str) -> Vec<CompletionItem> {
+        media_completions(partial)
     }
 }
 
@@ -179,8 +210,8 @@ impl YtHandler {
 }
 
 #[async_trait]
-impl CommandHandler for YtHandler {
-    fn prefix(&self) -> &str {
+impl ActionHandler for YtHandler {
+    fn id(&self) -> &str {
         "yt"
     }
 
@@ -188,8 +219,12 @@ impl CommandHandler for YtHandler {
         "YouTube/browser media controls — play, pause, next, prev"
     }
 
-    async fn execute(&self, args: &str) -> Result<CommandResult, LychiError> {
+    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
         execute_media(Target::Browser, args).await
+    }
+
+    async fn completions(&self, partial: &str) -> Vec<CompletionItem> {
+        media_completions(partial)
     }
 }
 
@@ -210,8 +245,8 @@ impl MediaHandler {
 }
 
 #[async_trait]
-impl CommandHandler for MediaHandler {
-    fn prefix(&self) -> &str {
+impl ActionHandler for MediaHandler {
+    fn id(&self) -> &str {
         "media"
     }
 
@@ -219,7 +254,11 @@ impl CommandHandler for MediaHandler {
         "Media controls (any player) — play, pause, next, prev"
     }
 
-    async fn execute(&self, args: &str) -> Result<CommandResult, LychiError> {
+    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
         execute_media(Target::Any, args).await
+    }
+
+    async fn completions(&self, partial: &str) -> Vec<CompletionItem> {
+        media_completions(partial)
     }
 }

@@ -1,0 +1,12 @@
+pub mod app_launcher;
+pub mod calc;
+pub mod file_open;
+pub mod icons;
+pub mod project_open;
+pub mod shell_exec;
+#[cfg(feature = "mpris")]
+pub mod spotify;
+pub mod system;
+pub mod url_open;
+pub mod web_search;
+pub mod youtube;

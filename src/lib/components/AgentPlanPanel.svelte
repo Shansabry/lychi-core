@@ -80,21 +80,21 @@ function statusIcon(status: StepStatus): string {
 
 	<div class="steps">
 		{#each plan.steps as step, i}
-			<div class="step" class:running={stepStatuses[i] === "running"} class:done={stepStatuses[i] === "done"} class:failed={stepStatuses[i] === "failed"} class:dangerous={step.risk === "dangerous"}>
+			<div class="step" class:running={stepStatuses[i] === "running"} class:done={stepStatuses[i] === "done"} class:failed={stepStatuses[i] === "failed"} class:dangerous={step.risk === "high"}>
 				<div class="step-line">
 					<span class="step-status" class:running={stepStatuses[i] === "running"} class:done={stepStatuses[i] === "done"} class:failed={stepStatuses[i] === "failed"}>
 						{statusIcon(stepStatuses[i])}
 					</span>
-					<span class="step-prefix">{step.command}</span>
+					<span class="step-prefix">{step.action_id}</span>
 					<span class="step-args">{step.args}</span>
 					{#if stepResults[i]?.duration_ms}
 						<span class="step-duration">{stepResults[i]?.duration_ms}ms</span>
 					{/if}
 				</div>
-				<div class="step-label" class:dangerous={step.risk === "dangerous"}>
+				<div class="step-label" class:dangerous={step.risk === "high"}>
 					{step.label}
-					{#if step.risk === "dangerous"}
-						<span class="risk-badge">⚠ dangerous</span>
+					{#if step.risk === "high"}
+						<span class="risk-badge">⚠ high risk</span>
 					{/if}
 				</div>
 				{#if stepResults[i]?.error}

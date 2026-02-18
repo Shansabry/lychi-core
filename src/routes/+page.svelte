@@ -282,8 +282,16 @@ async function handleSubmit() {
 				handleCompletionSelect(selected.label);
 				return;
 			}
-			// App completions — launch via open prefix
-			await runCommand(`open ${selected.label}`);
+			// Check if input has an explicit prefix (e.g. "spotify ", "system ", "media ")
+			// If so, append the selected completion to the prefix
+			const spaceIdx = trimmed.indexOf(" ");
+			if (spaceIdx !== -1) {
+				const prefix = trimmed.slice(0, spaceIdx);
+				await runCommand(`${prefix} ${selected.label}`);
+			} else {
+				// No prefix — these are app completions, launch via open
+				await runCommand(`open ${selected.label}`);
+			}
 			return;
 		}
 	}
@@ -319,6 +327,10 @@ async function runCommand(command: string) {
 	try {
 		lastCommand = command;
 		lastResult = await executeCommand(command);
+		// If confirmation is needed, show the confirm panel and wait for user decision
+		if (lastResult.needs_confirmation) {
+			return;
+		}
 		historyEntries = [...historyEntries, command];
 		inputValue = "";
 		// If the backend wants us to open a URI, use GDK (proper Wayland focus transfer)
@@ -343,6 +355,30 @@ async function runCommand(command: string) {
 	} finally {
 		isExecuting = false;
 	}
+}
+
+async function handleConfirm() {
+	if (isExecuting || !lastResult?.needs_confirmation) return;
+	isExecuting = true;
+	try {
+		lastResult = await executeCommand(lastCommand, true);
+		historyEntries = [...historyEntries, lastCommand];
+		inputValue = "";
+		if (lastResult.open_url) {
+			await hideWindow();
+			await openUri(lastResult.open_url);
+		} else if (lastResult.success && !lastResult.output) {
+			await hideWindow();
+		}
+	} catch (err) {
+		lastResult = { success: false, output: null, error: String(err), duration_ms: 0 };
+	} finally {
+		isExecuting = false;
+	}
+}
+
+function handleConfirmDismiss() {
+	lastResult = null;
 }
 
 function handleCompletionSelect(label: string) {
@@ -447,6 +483,10 @@ async function handleDismiss() {
 		mediaOpen = false;
 		return;
 	}
+	if (lastResult?.needs_confirmation) {
+		lastResult = null;
+		return;
+	}
 	if (pendingPlan) {
 		pendingPlan = null;
 		return;
@@ -510,7 +550,8 @@ async function handleDismiss() {
 			{#if historyOpen}
 				<HistoryPanel entries={historyEntries} onselect={handleHistorySelect} />
 			{:else if lastResult}
-				<ResultPanel result={lastResult} command={lastCommand} />
+				<ResultPanel result={lastResult} command={lastCommand}
+				onconfirm={handleConfirm} ondismiss={handleConfirmDismiss} />
 			{/if}
 		{/if}
 		<StatusBar

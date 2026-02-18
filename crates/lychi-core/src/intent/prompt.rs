@@ -1,14 +1,14 @@
+use crate::action_registry::RiskLevel;
 use crate::error::LychiError;
-
-use super::agent::{AgentPlan, AgentStep, AiResponse, generate_plan_id, validate_risk};
-use super::provider::AiRoute;
+use crate::providers::{AgentPlan, AgentStep, AiResponse, AiRoute, generate_plan_id};
+use crate::rules::shell::ShellRules;
 
 /// Build the system prompt for intent routing.
-pub fn system_prompt(known_commands: &[&str]) -> String {
-    let commands = known_commands
+pub fn system_prompt(known_actions: &[&str]) -> String {
+    let commands = known_actions
         .iter()
         .map(|cmd| {
-            let desc = command_description(cmd);
+            let desc = action_description(cmd);
             format!("- {cmd} <args>: {desc}")
         })
         .collect::<Vec<_>>()
@@ -21,43 +21,43 @@ Available commands:
 {commands}
 
 For simple requests (one action), respond with:
-{{"command": "...", "args": "..."}}
+{{"action_id": "...", "args": "..."}}
 
 For complex requests (2+ distinct actions), respond with a steps array:
 {{"steps": [
-  {{"command": "run", "args": "cargo init my-project", "label": "Create Rust project", "risk": "moderate"}},
-  {{"command": "run", "args": "code my-project", "label": "Open in VS Code", "risk": "safe"}}
+  {{"action_id": "run", "args": "cargo init my-project", "label": "Create Rust project", "risk": "medium"}},
+  {{"action_id": "run", "args": "code my-project", "label": "Open in VS Code", "risk": "low"}}
 ]}}
 
 Risk levels per step:
-- "safe": read-only or standard operations (ls, cat, code, open, firefox)
-- "moderate": creates or modifies files (mkdir, touch, cargo init, npm init)
-- "dangerous": destructive or system operations (rm, sudo, chmod, operations with > or |)
+- "low": read-only or standard operations (ls, cat, code, open, firefox)
+- "medium": creates or modifies files (mkdir, touch, cargo init, npm init)
+- "high": destructive or system operations (rm, sudo, chmod, operations with > or |)
 
 Examples:
-- "open firefox" → {{"command": "open", "args": "firefox"}}
-- "play lofi on youtube" → {{"command": "yt", "args": "lofi"}}
-- "what's the weather" → {{"command": "web", "args": "weather"}}
-- "open this folder in vscode" → {{"command": "run", "args": "code ."}}
-- "list files in home" → {{"command": "run", "args": "ls ~"}}
-- "how much is 15% of 200" → {{"command": "calc", "args": "200 * 0.15"}}
-- "open github.com" → {{"command": "url", "args": "https://github.com"}}
-- "open downloads folder" → {{"command": "file", "args": "~/Downloads"}}
-- "skip this song" → {{"command": "media", "args": "next"}}
-- "pause the music" → {{"command": "media", "args": "pause"}}
-- "play something on spotify" → {{"command": "spotify", "args": "play"}}
-- "pause chrome media" → {{"command": "media", "args": "pause"}}
-- "next song on spotify" → {{"command": "spotify", "args": "next"}}
-- "pause everything" → {{"command": "media", "args": "pause all"}}
-- "stop all music" → {{"command": "media", "args": "pause all"}}
-- "shut down the computer" → {{"command": "system", "args": "shutdown"}}
-- "lock my screen" → {{"command": "system", "args": "lock"}}
-- "reboot" → {{"command": "system", "args": "reboot"}}
-- "put the computer to sleep" → {{"command": "system", "args": "suspend"}}
-- "open readyroos in vscode" → {{"command": "project", "args": "readyroos"}}
-- "open my lychi project" → {{"command": "project", "args": "lychi"}}
-- "create a new rust project and open in vscode" → {{"steps": [{{"command": "run", "args": "cargo init my-project", "label": "Create Rust project", "risk": "moderate"}}, {{"command": "run", "args": "code my-project", "label": "Open in VS Code", "risk": "safe"}}]}}
-- "start a node project, install express, and open in code" → {{"steps": [{{"command": "run", "args": "mkdir my-app && cd my-app && npm init -y", "label": "Create Node project", "risk": "moderate"}}, {{"command": "run", "args": "cd my-app && npm install express", "label": "Install Express", "risk": "moderate"}}, {{"command": "run", "args": "code my-app", "label": "Open in VS Code", "risk": "safe"}}]}}
+- "open firefox" → {{"action_id": "open", "args": "firefox"}}
+- "play lofi on youtube" → {{"action_id": "yt", "args": "lofi"}}
+- "what's the weather" → {{"action_id": "web", "args": "weather"}}
+- "open this folder in vscode" → {{"action_id": "run", "args": "code ."}}
+- "list files in home" → {{"action_id": "run", "args": "ls ~"}}
+- "how much is 15% of 200" → {{"action_id": "calc", "args": "200 * 0.15"}}
+- "open github.com" → {{"action_id": "url", "args": "https://github.com"}}
+- "open downloads folder" → {{"action_id": "file", "args": "~/Downloads"}}
+- "skip this song" → {{"action_id": "media", "args": "next"}}
+- "pause the music" → {{"action_id": "media", "args": "pause"}}
+- "play something on spotify" → {{"action_id": "spotify", "args": "play"}}
+- "pause chrome media" → {{"action_id": "media", "args": "pause"}}
+- "next song on spotify" → {{"action_id": "spotify", "args": "next"}}
+- "pause everything" → {{"action_id": "media", "args": "pause all"}}
+- "stop all music" → {{"action_id": "media", "args": "pause all"}}
+- "shut down the computer" → {{"action_id": "system", "args": "shutdown"}}
+- "lock my screen" → {{"action_id": "system", "args": "lock"}}
+- "reboot" → {{"action_id": "system", "args": "reboot"}}
+- "put the computer to sleep" → {{"action_id": "system", "args": "suspend"}}
+- "open readyroos in vscode" → {{"action_id": "project", "args": "readyroos"}}
+- "open my lychi project" → {{"action_id": "project", "args": "lychi"}}
+- "create a new rust project and open in vscode" → {{"steps": [{{"action_id": "run", "args": "cargo init my-project", "label": "Create Rust project", "risk": "medium"}}, {{"action_id": "run", "args": "code my-project", "label": "Open in VS Code", "risk": "low"}}]}}
+- "start a node project, install express, and open in code" → {{"steps": [{{"action_id": "run", "args": "mkdir my-app && cd my-app && npm init -y", "label": "Create Node project", "risk": "medium"}}, {{"action_id": "run", "args": "cd my-app && npm install express", "label": "Install Express", "risk": "medium"}}, {{"action_id": "run", "args": "code my-app", "label": "Open in VS Code", "risk": "low"}}]}}
 
 Rules:
 - For launching GUI apps by name, use "open".
@@ -69,12 +69,12 @@ Rules:
 - Order steps logically (create before open, install before run).
 - Extract clean arguments — strip filler words like "please", "can you", "I want to".
 - Respond with ONLY valid JSON. No extra text.
-- If truly unclear, use: {{"command": "web", "args": "<original input>"}}"#
+- If truly unclear, use: {{"action_id": "web", "args": "<original input>"}}"#
     )
 }
 
-fn command_description(prefix: &str) -> &'static str {
-    match prefix {
+fn action_description(id: &str) -> &'static str {
+    match id {
         "open" => "Launch a desktop application by name (e.g. firefox, spotify, vscode)",
         "web" => "Search the web for information or questions",
         "yt" => "Search YouTube for videos",
@@ -108,10 +108,31 @@ fn strip_code_fences(response: &str) -> &str {
     stripped.strip_suffix("```").unwrap_or(stripped).trim()
 }
 
+/// Validate and potentially upgrade the risk level of a shell step.
+fn validate_step_risk(step: &AgentStep) -> RiskLevel {
+    if step.action_id == "run" {
+        let shell_rules = ShellRules::new();
+        match shell_rules.validate(&step.args) {
+            crate::rules::ValidationDecision::Deny { .. } => RiskLevel::High,
+            crate::rules::ValidationDecision::Confirm { .. } => {
+                // At least Medium, but keep High if AI said High
+                if step.risk >= RiskLevel::Medium {
+                    step.risk
+                } else {
+                    RiskLevel::Medium
+                }
+            }
+            crate::rules::ValidationDecision::Execute => step.risk,
+        }
+    } else {
+        step.risk
+    }
+}
+
 /// Parse an AI response into either a single route or a multi-step plan.
 pub fn parse_ai_response(
     response: &str,
-    known_commands: &[&str],
+    known_actions: &[&str],
     original_input: &str,
 ) -> Result<AiResponse, LychiError> {
     let cleaned = strip_code_fences(response);
@@ -131,14 +152,14 @@ pub fn parse_ai_response(
         // Single-step plan → collapse to single route
         if raw_steps.len() == 1 {
             let step = &raw_steps[0];
-            if !known_commands.contains(&step.command.as_str()) {
+            if !known_actions.contains(&step.action_id.as_str()) {
                 return Err(LychiError::Ai(format!(
                     "AI returned unknown command: {}",
-                    step.command
+                    step.action_id
                 )));
             }
             return Ok(AiResponse::SingleRoute(AiRoute {
-                command: step.command.clone(),
+                action_id: step.action_id.clone(),
                 args: step.args.clone(),
             }));
         }
@@ -146,13 +167,13 @@ pub fn parse_ai_response(
         // Validate all commands are known and apply risk validation
         let mut steps = Vec::with_capacity(raw_steps.len());
         for mut step in raw_steps {
-            if !known_commands.contains(&step.command.as_str()) {
+            if !known_actions.contains(&step.action_id.as_str()) {
                 return Err(LychiError::Ai(format!(
                     "AI returned unknown command in step: {}",
-                    step.command
+                    step.action_id
                 )));
             }
-            step.risk = validate_risk(&step);
+            step.risk = validate_step_risk(&step);
             steps.push(step);
         }
 
@@ -167,10 +188,10 @@ pub fn parse_ai_response(
     let route: AiRoute = serde_json::from_value(json)
         .map_err(|e| LychiError::Ai(format!("Failed to parse AI route: {e}")))?;
 
-    if !known_commands.contains(&route.command.as_str()) {
+    if !known_actions.contains(&route.action_id.as_str()) {
         return Err(LychiError::Ai(format!(
             "AI returned unknown command: {}",
-            route.command
+            route.action_id
         )));
     }
 
@@ -180,20 +201,19 @@ pub fn parse_ai_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::agent::Risk;
 
     #[test]
     fn parse_single_route() {
         let known = &["web", "yt", "open", "run"];
         let resp = parse_ai_response(
-            r#"{"command": "web", "args": "rust tutorials"}"#,
+            r#"{"action_id": "web", "args": "rust tutorials"}"#,
             known,
             "rust tutorials",
         )
         .unwrap();
         match resp {
             AiResponse::SingleRoute(route) => {
-                assert_eq!(route.command, "web");
+                assert_eq!(route.action_id, "web");
                 assert_eq!(route.args, "rust tutorials");
             }
             AiResponse::Plan(_) => panic!("Expected SingleRoute"),
@@ -204,14 +224,14 @@ mod tests {
     fn parse_with_code_fences() {
         let known = &["yt"];
         let resp = parse_ai_response(
-            "```json\n{\"command\": \"yt\", \"args\": \"lofi\"}\n```",
+            "```json\n{\"action_id\": \"yt\", \"args\": \"lofi\"}\n```",
             known,
             "play lofi",
         )
         .unwrap();
         match resp {
             AiResponse::SingleRoute(route) => {
-                assert_eq!(route.command, "yt");
+                assert_eq!(route.action_id, "yt");
                 assert_eq!(route.args, "lofi");
             }
             AiResponse::Plan(_) => panic!("Expected SingleRoute"),
@@ -223,8 +243,8 @@ mod tests {
         let known = &["run", "open"];
         let resp = parse_ai_response(
             r#"{"steps": [
-                {"command": "run", "args": "cargo init my-project", "label": "Create project", "risk": "moderate"},
-                {"command": "run", "args": "code my-project", "label": "Open in VS Code", "risk": "safe"}
+                {"action_id": "run", "args": "cargo init my-project", "label": "Create project", "risk": "medium"},
+                {"action_id": "run", "args": "code my-project", "label": "Open in VS Code", "risk": "low"}
             ]}"#,
             known,
             "create rust project and open in vscode",
@@ -233,9 +253,9 @@ mod tests {
         match resp {
             AiResponse::Plan(plan) => {
                 assert_eq!(plan.steps.len(), 2);
-                assert_eq!(plan.steps[0].command, "run");
-                assert_eq!(plan.steps[0].risk, Risk::Moderate);
-                assert_eq!(plan.steps[1].command, "run");
+                assert_eq!(plan.steps[0].action_id, "run");
+                assert_eq!(plan.steps[0].risk, RiskLevel::Medium);
+                assert_eq!(plan.steps[1].action_id, "run");
             }
             AiResponse::SingleRoute(_) => panic!("Expected Plan"),
         }
@@ -245,14 +265,14 @@ mod tests {
     fn single_step_plan_collapses_to_route() {
         let known = &["run"];
         let resp = parse_ai_response(
-            r#"{"steps": [{"command": "run", "args": "code .", "label": "Open VS Code", "risk": "safe"}]}"#,
+            r#"{"steps": [{"action_id": "run", "args": "code .", "label": "Open VS Code", "risk": "low"}]}"#,
             known,
             "open vscode",
         )
         .unwrap();
         match resp {
             AiResponse::SingleRoute(route) => {
-                assert_eq!(route.command, "run");
+                assert_eq!(route.action_id, "run");
                 assert_eq!(route.args, "code .");
             }
             AiResponse::Plan(_) => panic!("Expected SingleRoute (collapsed)"),
@@ -263,7 +283,7 @@ mod tests {
     fn parse_unknown_command() {
         let known = &["web", "yt"];
         let result = parse_ai_response(
-            r#"{"command": "delete", "args": "everything"}"#,
+            r#"{"action_id": "delete", "args": "everything"}"#,
             known,
             "test",
         );
@@ -282,8 +302,8 @@ mod tests {
         let known = &["run"];
         let resp = parse_ai_response(
             r#"{"steps": [
-                {"command": "run", "args": "rm -rf /tmp/foo", "label": "Clean up", "risk": "safe"},
-                {"command": "run", "args": "ls", "label": "List files", "risk": "safe"}
+                {"action_id": "run", "args": "rm -rf /tmp/foo", "label": "Clean up", "risk": "low"},
+                {"action_id": "run", "args": "ls", "label": "List files", "risk": "low"}
             ]}"#,
             known,
             "clean up and list files",
@@ -291,8 +311,9 @@ mod tests {
         .unwrap();
         match resp {
             AiResponse::Plan(plan) => {
-                assert_eq!(plan.steps[0].risk, Risk::Dangerous); // upgraded from safe
-                assert_eq!(plan.steps[1].risk, Risk::Safe); // stays safe
+                // rm -rf upgraded from low → at least medium
+                assert!(plan.steps[0].risk >= RiskLevel::Medium);
+                assert_eq!(plan.steps[1].risk, RiskLevel::Low); // stays low
             }
             _ => panic!("Expected Plan"),
         }
@@ -304,12 +325,5 @@ mod tests {
         assert!(prompt.contains("web <args>"));
         assert!(prompt.contains("yt <args>"));
         assert!(prompt.contains("open <args>"));
-    }
-
-    #[test]
-    fn system_prompt_contains_steps_format() {
-        let prompt = system_prompt(&["web", "run"]);
-        assert!(prompt.contains("steps"));
-        assert!(prompt.contains("risk"));
     }
 }

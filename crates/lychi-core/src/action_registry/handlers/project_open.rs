@@ -8,7 +8,7 @@ use std::process::Command;
 use std::sync::RwLock;
 use std::time::Instant;
 
-use crate::command::{CommandHandler, CommandResult, CompletionItem};
+use crate::action_registry::{ActionHandler, ActionResult, CompletionItem};
 use crate::error::LychiError;
 
 #[derive(Debug)]
@@ -97,21 +97,22 @@ impl ProjectOpen {
         // Check cache
         if let Ok(guard) = PROJECT_CACHE.read()
             && let Some((cached_dirs, entries)) = guard.as_ref()
-                && cached_dirs == &self.directories {
-                    // Clone the entries since we can't return a reference to the guard
-                    return entries
-                        .iter()
-                        .map(|(k, v)| {
-                            (
-                                k.clone(),
-                                ProjectEntry {
-                                    name: v.name.clone(),
-                                    path: v.path.clone(),
-                                },
-                            )
-                        })
-                        .collect();
-                }
+            && cached_dirs == &self.directories
+        {
+            // Clone the entries since we can't return a reference to the guard
+            return entries
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        ProjectEntry {
+                            name: v.name.clone(),
+                            path: v.path.clone(),
+                        },
+                    )
+                })
+                .collect();
+        }
 
         // Discover and cache
         let entries = Self::discover_projects(&self.directories);
@@ -174,8 +175,8 @@ pub fn invalidate_project_cache() {
 }
 
 #[async_trait]
-impl CommandHandler for ProjectOpen {
-    fn prefix(&self) -> &str {
+impl ActionHandler for ProjectOpen {
+    fn id(&self) -> &str {
         "project"
     }
 
@@ -183,16 +184,18 @@ impl CommandHandler for ProjectOpen {
         "Open a project folder in the code editor"
     }
 
-    async fn execute(&self, args: &str) -> Result<CommandResult, LychiError> {
+    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
         let query = args.trim();
         if query.is_empty() {
-            return Ok(CommandResult {
+            return Ok(ActionResult {
                 success: false,
                 output: None,
                 error: Some("Usage: project <name>".to_string()),
                 duration_ms: 0,
                 routed_by: None,
                 open_url: None,
+                needs_confirmation: None,
+                risk_level: None,
             });
         }
 
@@ -212,13 +215,15 @@ impl CommandHandler for ProjectOpen {
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        Ok(CommandResult {
+        Ok(ActionResult {
             success: true,
             output: Some(format!("Opened {} in editor", entry.name)),
             error: None,
             duration_ms,
             routed_by: None,
             open_url: None,
+            needs_confirmation: None,
+            risk_level: None,
         })
     }
 

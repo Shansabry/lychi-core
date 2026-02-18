@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use std::path::PathBuf;
 
-use crate::command::{CommandHandler, CommandResult};
+use crate::action_registry::{ActionHandler, ActionResult};
 use crate::error::LychiError;
 
 pub struct FileOpen;
@@ -30,8 +30,8 @@ impl FileOpen {
 }
 
 #[async_trait]
-impl CommandHandler for FileOpen {
-    fn prefix(&self) -> &str {
+impl ActionHandler for FileOpen {
+    fn id(&self) -> &str {
         "file"
     }
 
@@ -39,42 +39,48 @@ impl CommandHandler for FileOpen {
         "Open a file or folder in the default application"
     }
 
-    async fn execute(&self, args: &str) -> Result<CommandResult, LychiError> {
+    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
         let path_str = args.trim();
         if path_str.is_empty() {
-            return Ok(CommandResult {
+            return Ok(ActionResult {
                 success: false,
                 output: None,
                 error: Some("Usage: file <path> or type a path starting with / or ~/".to_string()),
                 duration_ms: 0,
                 routed_by: None,
                 open_url: None,
+                needs_confirmation: None,
+                risk_level: None,
             });
         }
 
         let expanded = Self::expand_path(path_str);
 
         if !expanded.exists() {
-            return Ok(CommandResult {
+            return Ok(ActionResult {
                 success: false,
                 output: None,
                 error: Some(format!("Path not found: {}", expanded.display())),
                 duration_ms: 0,
                 routed_by: None,
                 open_url: None,
+                needs_confirmation: None,
+                risk_level: None,
             });
         }
 
         // Convert to file:// URI for GDK-based opening on the frontend
         let file_uri = format!("file://{}", expanded.display());
 
-        Ok(CommandResult {
+        Ok(ActionResult {
             success: true,
             output: Some(format!("Opened {}", expanded.display())),
             error: None,
             duration_ms: 0,
             routed_by: None,
             open_url: Some(file_uri),
+            needs_confirmation: None,
+            risk_level: None,
         })
     }
 }

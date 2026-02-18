@@ -18,7 +18,7 @@ pub fn resolve_icon(icon: &str) -> Option<String> {
         return None;
     }
 
-    // Icon name — search standard locations + Flatpak/Snap/local
+    // TODO: cross-platform — Linux-specific XDG icon paths. macOS/Windows use different icon systems.
     let icon_roots = [
         PathBuf::from("/usr/share/icons"),
         PathBuf::from("/usr/share/pixmaps"),
