@@ -11,5 +11,7 @@ pub mod shell_exec;
 pub mod spotify;
 pub mod system;
 pub mod url_open;
+pub mod weather;
+pub mod weather_ask;
 pub mod web_search;
 pub mod youtube;

@@ -138,8 +138,8 @@ impl ActionHandler for SystemCommand {
                         open_url: None,
                         needs_confirmation: None,
                         risk_level: None,
-                output_type: None,
-                executed_args: None,
+                        output_type: None,
+                        executed_args: None,
                     }),
                     Err(e) => Ok(ActionResult {
                         success: false,
@@ -150,8 +150,8 @@ impl ActionHandler for SystemCommand {
                         open_url: None,
                         needs_confirmation: None,
                         risk_level: None,
-                output_type: None,
-                executed_args: None,
+                        output_type: None,
+                        executed_args: None,
                     }),
                 }
             }

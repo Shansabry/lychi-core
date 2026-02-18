@@ -9,6 +9,7 @@ pub struct Config {
     pub history: HistoryConfig,
     pub ai: AiConfig,
     pub projects: ProjectsConfig,
+    pub weather: WeatherConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +109,24 @@ impl Default for AiConfig {
             provider: "anthropic".to_string(),
             model: "claude-sonnet-4-5-20250929".to_string(),
             ollama_url: "http://localhost:11434".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WeatherConfig {
+    /// Temperature unit: "celsius" or "fahrenheit"
+    pub unit: String,
+    /// Default location when no args provided
+    pub default_location: String,
+}
+
+impl Default for WeatherConfig {
+    fn default() -> Self {
+        Self {
+            unit: "celsius".to_string(),
+            default_location: String::new(),
         }
     }
 }

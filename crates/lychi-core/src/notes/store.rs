@@ -125,10 +125,7 @@ mod tests {
     fn temp_path() -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        env::temp_dir().join(format!(
-            "lychi-test-notes-{}-{id}.json",
-            std::process::id()
-        ))
+        env::temp_dir().join(format!("lychi-test-notes-{}-{id}.json", std::process::id()))
     }
 
     #[test]

@@ -33,8 +33,8 @@ async fn execute_media(target: Target, args: &str) -> Result<ActionResult, Lychi
             open_url: None,
             needs_confirmation: None,
             risk_level: None,
-                output_type: None,
-                executed_args: None,
+            output_type: None,
+            executed_args: None,
         });
     }
 
@@ -52,8 +52,8 @@ async fn execute_media(target: Target, args: &str) -> Result<ActionResult, Lychi
             open_url: None,
             needs_confirmation: None,
             risk_level: None,
-                output_type: None,
-                executed_args: None,
+            output_type: None,
+            executed_args: None,
         });
     }
 
@@ -97,8 +97,8 @@ async fn execute_media(target: Target, args: &str) -> Result<ActionResult, Lychi
             open_url: None,
             needs_confirmation: None,
             risk_level: None,
-                output_type: None,
-                executed_args: None,
+            output_type: None,
+            executed_args: None,
         }),
         Some(p) => {
             manager.control(&p.bus_name, mpris_action).await?;
@@ -151,9 +151,7 @@ fn find_target(players: &[TrackInfo], target: Target) -> Option<&TrackInfo> {
     }
 }
 
-const MEDIA_SUBCOMMANDS: &[&str] = &[
-    "play", "pause", "next", "prev", "toggle", "pause all",
-];
+const MEDIA_SUBCOMMANDS: &[&str] = &["play", "pause", "next", "prev", "toggle", "pause all"];
 
 fn media_completions(partial: &str) -> Vec<CompletionItem> {
     let lower = partial.to_lowercase();

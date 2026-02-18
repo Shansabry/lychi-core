@@ -37,7 +37,14 @@ Risk levels per step:
 Examples:
 - "open firefox" → {{"action_id": "open", "args": "firefox"}}
 - "play lofi on youtube" → {{"action_id": "yt", "args": "lofi"}}
-- "what's the weather" → {{"action_id": "ask", "args": "what's the weather"}}
+- "what's the weather" → {{"action_id": "weather", "args": ""}}
+- "weather in paris" → {{"action_id": "weather", "args": "paris"}}
+- "is it raining in tokyo" → {{"action_id": "weather", "args": "tokyo"}}
+- "temperature in new york" → {{"action_id": "weather", "args": "new york"}}
+- "will it rain today" → {{"action_id": "weather-ask", "args": "will it rain today"}}
+- "do I need an umbrella" → {{"action_id": "weather-ask", "args": "do I need an umbrella"}}
+- "is it cold outside" → {{"action_id": "weather-ask", "args": "is it cold outside"}}
+- "should I wear a jacket tomorrow" → {{"action_id": "weather-ask", "args": "should I wear a jacket tomorrow"}}
 - "open this folder in vscode" → {{"action_id": "run", "args": "code ."}}
 - "browse downloads" → {{"action_id": "browse", "args": "~/Downloads"}}
 - "show my documents folder" → {{"action_id": "browse", "args": "~/Documents"}}
@@ -81,7 +88,9 @@ Rules:
 - For browsing a whole directory (no search/filter), use "browse". For searching specific files by name/type, use "run" with ls or find.
 - For running CLI tools or apps with specific arguments/paths, use "run".
 - For direct questions (what, who, how, why, explain, define), use "ask".
-- For general searches or non-question lookups (e.g. "weather", "news", "reddit"), use "web".
+- For viewing weather data/forecast (e.g. "weather in london", "temperature in paris"), use "weather".
+- For conversational weather questions (e.g. "will it rain today", "do I need an umbrella", "is it cold outside"), use "weather-ask".
+- For general searches or non-question lookups (e.g. "news", "reddit"), use "web".
 - Only use steps array when 2+ distinct operations are needed.
 - Labels should be short (3-5 words).
 - Order steps logically (create before open, install before run).
@@ -124,6 +133,12 @@ fn action_description(id: &str) -> &'static str {
         }
         "todo" => {
             "Todo list. 'todo add <text>' to add, 'todo list' to view all, 'todo done <id>' to check off, 'todo delete <id>' to remove, 'todo summary' for a full overview of note + todos. Use for task management, reminders, or when asking what's on their plate"
+        }
+        "weather" => {
+            "Get current weather for a location (e.g. 'london', 'tokyo'). Use when the user wants to VIEW weather data or forecast"
+        }
+        "weather-ask" => {
+            "Answer conversational weather questions using real weather data (e.g. 'will it rain', 'do I need a jacket', 'is it cold today'). Use for weather QUESTIONS, not for viewing weather data"
         }
         _ => "Unknown command",
     }

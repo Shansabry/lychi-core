@@ -86,8 +86,8 @@ impl ActionHandler for NotesHandler {
             open_url: None,
             needs_confirmation: None,
             risk_level: None,
-                output_type: None,
-                executed_args: None,
+            output_type: None,
+            executed_args: None,
         })
     }
 }
@@ -136,9 +136,7 @@ impl ActionHandler for TodoHandler {
             });
         }
 
-        let (cmd, rest) = trimmed
-            .split_once(' ')
-            .unwrap_or((trimmed, ""));
+        let (cmd, rest) = trimmed.split_once(' ').unwrap_or((trimmed, ""));
         let rest = rest.trim();
 
         match cmd.to_lowercase().as_str() {
@@ -153,8 +151,8 @@ impl ActionHandler for TodoHandler {
                         open_url: None,
                         needs_confirmation: None,
                         risk_level: None,
-                output_type: None,
-                executed_args: None,
+                        output_type: None,
+                        executed_args: None,
                     });
                 }
                 let mut store = self.store.write().await;
@@ -168,8 +166,8 @@ impl ActionHandler for TodoHandler {
                     open_url: None,
                     needs_confirmation: None,
                     risk_level: None,
-                output_type: None,
-                executed_args: None,
+                    output_type: None,
+                    executed_args: None,
                 })
             }
             "list" | "ls" => {
@@ -185,8 +183,8 @@ impl ActionHandler for TodoHandler {
                         open_url: None,
                         needs_confirmation: None,
                         risk_level: None,
-                output_type: None,
-                executed_args: None,
+                        output_type: None,
+                        executed_args: None,
                     });
                 }
                 let lines: Vec<String> = todos
@@ -272,8 +270,8 @@ impl ActionHandler for TodoHandler {
                         open_url: None,
                         needs_confirmation: None,
                         risk_level: None,
-                output_type: None,
-                executed_args: None,
+                        output_type: None,
+                        executed_args: None,
                     });
                 }
                 let mut store = self.store.write().await;
@@ -287,8 +285,8 @@ impl ActionHandler for TodoHandler {
                     open_url: None,
                     needs_confirmation: None,
                     risk_level: None,
-                output_type: None,
-                executed_args: None,
+                    output_type: None,
+                    executed_args: None,
                 })
             }
             "delete" | "del" | "rm" | "remove" => {
@@ -302,8 +300,8 @@ impl ActionHandler for TodoHandler {
                         open_url: None,
                         needs_confirmation: None,
                         risk_level: None,
-                output_type: None,
-                executed_args: None,
+                        output_type: None,
+                        executed_args: None,
                     });
                 }
                 let mut store = self.store.write().await;
@@ -317,8 +315,8 @@ impl ActionHandler for TodoHandler {
                     open_url: None,
                     needs_confirmation: None,
                     risk_level: None,
-                output_type: None,
-                executed_args: None,
+                    output_type: None,
+                    executed_args: None,
                 })
             }
             // If the first word isn't a subcommand, treat the entire args as "add"
@@ -334,8 +332,8 @@ impl ActionHandler for TodoHandler {
                     open_url: None,
                     needs_confirmation: None,
                     risk_level: None,
-                output_type: None,
-                executed_args: None,
+                    output_type: None,
+                    executed_args: None,
                 })
             }
         }

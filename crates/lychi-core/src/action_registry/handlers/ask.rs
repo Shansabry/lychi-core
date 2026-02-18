@@ -72,9 +72,11 @@ impl ActionHandler for AskHandler {
 
         let start = Instant::now();
 
-        let answer =
-            tokio::time::timeout(ASK_TIMEOUT, provider.answer_question(ASK_SYSTEM_PROMPT, query))
-                .await;
+        let answer = tokio::time::timeout(
+            ASK_TIMEOUT,
+            provider.answer_question(ASK_SYSTEM_PROMPT, query),
+        )
+        .await;
         let duration = start.elapsed().as_millis() as u64;
 
         match answer {
@@ -101,12 +103,14 @@ impl ActionHandler for AskHandler {
                     open_url: Some(search_url),
                     needs_confirmation: None,
                     risk_level: None,
-                output_type: Some(OutputType::Text),
-                executed_args: None,
+                    output_type: Some(OutputType::Text),
+                    executed_args: None,
                 })
             }
             Err(_) => {
-                tracing::warn!("Ask AI timed out after {ASK_TIMEOUT:?}, falling back to web search");
+                tracing::warn!(
+                    "Ask AI timed out after {ASK_TIMEOUT:?}, falling back to web search"
+                );
                 Ok(ActionResult {
                     success: true,
                     output: Some(format!("AI timed out — searching: {query}")),
@@ -116,8 +120,8 @@ impl ActionHandler for AskHandler {
                     open_url: Some(search_url),
                     needs_confirmation: None,
                     risk_level: None,
-                output_type: Some(OutputType::Text),
-                executed_args: None,
+                    output_type: Some(OutputType::Text),
+                    executed_args: None,
                 })
             }
         }

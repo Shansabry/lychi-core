@@ -4,29 +4,31 @@ use tokio::sync::RwLock;
 use lychi_core::action_registry::handlers::app_launcher::AppLauncher;
 use lychi_core::action_registry::handlers::ask::AskHandler;
 use lychi_core::action_registry::handlers::browse::BrowseHandler;
-use lychi_core::action_registry::handlers::notes::{NotesHandler, TodoHandler};
 use lychi_core::action_registry::handlers::calc::CalcHandler;
 use lychi_core::action_registry::handlers::file_open::FileOpen;
+use lychi_core::action_registry::handlers::notes::{NotesHandler, TodoHandler};
 use lychi_core::action_registry::handlers::project_open::ProjectOpen;
 use lychi_core::action_registry::handlers::shell_exec::ShellExec;
 #[cfg(feature = "mpris")]
 use lychi_core::action_registry::handlers::spotify::{MediaHandler, SpotifyHandler};
 use lychi_core::action_registry::handlers::system::SystemCommand;
 use lychi_core::action_registry::handlers::url_open::UrlOpen;
+use lychi_core::action_registry::handlers::weather::WeatherHandler;
+use lychi_core::action_registry::handlers::weather_ask::WeatherAskHandler;
 use lychi_core::action_registry::handlers::web_search::WebSearch;
 use lychi_core::action_registry::handlers::youtube::YouTube;
 use lychi_core::action_registry::registry::ActionRegistry;
 use lychi_core::config::Config;
 use lychi_core::executor::Executor;
 use lychi_core::history::HistoryStore;
-use lychi_core::notes::store::NotesStore;
 use lychi_core::intent::IntentResolver;
 use lychi_core::intent::ai_router::AiRouter;
 #[cfg(feature = "mpris")]
 use lychi_core::mpris::MprisManager;
+use lychi_core::notes::store::NotesStore;
 use lychi_core::paths;
-use lychi_core::providers::{AgentPlan, AiProvider};
 use lychi_core::providers::byo::{BYOClient, BYOProvider};
+use lychi_core::providers::{AgentPlan, AiProvider};
 use lychi_core::rules::RulesEngine;
 
 pub struct AppState {
@@ -80,6 +82,11 @@ impl AppState {
         registry.register(Box::new(NotesHandler::new(notes.clone())));
         registry.register(Box::new(TodoHandler::new(notes.clone())));
         registry.register(Box::new(BrowseHandler::new()));
+        let weather_handler = Arc::new(WeatherHandler::new(
+            config.weather.unit.clone(),
+            config.weather.default_location.clone(),
+        ));
+        registry.register(Box::new(weather_handler.clone()));
 
         // Initialize AI provider if configured (shared between router and ask handler)
         let ai_provider: Option<Arc<dyn AiProvider>> = if config.ai.mode == "byo" {
@@ -100,6 +107,10 @@ impl AppState {
         registry.register(Box::new(AskHandler::new(
             ai_provider.clone(),
             config.commands.default_search_engine.clone(),
+        )));
+        registry.register(Box::new(WeatherAskHandler::new(
+            weather_handler,
+            ai_provider.clone(),
         )));
 
         let ai_router = ai_provider.map(AiRouter::new_shared);

@@ -757,6 +757,28 @@ function handleKeydown(e: KeyboardEvent) {
 					</div>
 				</div>
 
+				<div class="about-credits">
+					<span class="about-credits-title">Credits</span>
+					<div class="about-links">
+						<div class="about-link-row">
+							<span class="about-link-label">Weather data</span>
+							<span class="about-link-value">MET Norway (CC BY 4.0)</span>
+						</div>
+						<div class="about-link-row">
+							<span class="about-link-label">Geocoding</span>
+							<span class="about-link-value">OpenStreetMap contributors (ODbL)</span>
+						</div>
+						<div class="about-link-row">
+							<span class="about-link-label">Geolocation</span>
+							<span class="about-link-value">freeipapi.com</span>
+						</div>
+						<div class="about-link-row">
+							<span class="about-link-label">Icons</span>
+							<span class="about-link-value">Lucide (ISC)</span>
+						</div>
+					</div>
+				</div>
+
 				<p class="about-copy">&copy; {new Date().getFullYear()} Lychi. All rights reserved.</p>
 			</div>
 		{/if}
@@ -1336,6 +1358,22 @@ function handleKeydown(e: KeyboardEvent) {
 	.about-link-value {
 		font-size: 12px;
 		color: var(--fg);
+	}
+
+	.about-credits {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		padding-top: 4px;
+		border-top: 1px solid var(--border);
+	}
+
+	.about-credits-title {
+		font-size: 12px;
+		font-weight: 600;
+		color: var(--fg-muted);
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
 	}
 
 	.about-copy {

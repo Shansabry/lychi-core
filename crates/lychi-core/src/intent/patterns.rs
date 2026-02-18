@@ -9,7 +9,7 @@
 /// Known handler prefixes.
 const KNOWN_PREFIXES: &[&str] = &[
     "ask", "browse", "open", "web", "yt", "run", "calc", "file", "url", "spotify", "project",
-    "system", "note", "notes", "todo", "todos",
+    "system", "note", "notes", "todo", "todos", "weather",
 ];
 
 /// Common TLDs for URL detection.

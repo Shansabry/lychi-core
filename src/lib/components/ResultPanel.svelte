@@ -1,6 +1,7 @@
 <script lang="ts">
 import AnsiToHtml from "ansi-to-html";
 import type { CommandResult } from "$lib/ipc";
+import WeatherCard from "./WeatherCard.svelte";
 
 let {
 	result,
@@ -96,13 +97,18 @@ function extractLsDirectory(cmd: string): string | null {
 
 /** Escape a string for use in an HTML attribute. */
 function escapeAttr(s: string): string {
-	return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+	return s
+		.replace(/&/g, "&amp;")
+		.replace(/"/g, "&quot;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;");
 }
 
 // Permission pattern for ls -l lines: drwxr-xr-x, -rw-r--r--, lrwxrwxrwx, etc.
-const PERM_RE = /^[d\-lbcps][rwxsStT\-]{9}/;
+const PERM_RE = /^[d\-lbcps][rwxsStT-]{9}/;
 // Match the time portion (HH:MM or year) to find where the filename starts
-const LS_LONG_RE = /^[d\-lbcps][rwxsStT\-]{9}[\s.+]+\S+\s+\S+\s+\S+\s+[\d,]+\s+\w+\s+\d+\s+[\d:]+\s+/;
+const LS_LONG_RE =
+	/^[d\-lbcps][rwxsStT-]{9}[\s.+]+\S+\s+\S+\s+\S+\s+[\d,]+\s+\w+\s+\d+\s+[\d:]+\s+/;
 
 /** Wrap filenames in ls output with clickable spans. Works on already-HTML-escaped text. */
 function linkifyLsOutput(html: string, directory: string): string {
@@ -128,13 +134,17 @@ function linkifyLsOutput(html: string, directory: string): string {
 			}
 
 			if (!filename) return line;
-			const filepath = directory.endsWith("/") ? `${directory}${filename}` : `${directory}/${filename}`;
+			const filepath = directory.endsWith("/")
+				? `${directory}${filename}`
+				: `${directory}/${filename}`;
 			return `<span class="clickable-file" data-filepath="${escapeAttr(filepath)}">${line}</span>`;
 		})
 		.join("\n");
 }
 
-let lsDirectory = $derived(isTerminal && result.executed_args ? extractLsDirectory(result.executed_args) : null);
+let lsDirectory = $derived(
+	isTerminal && result.executed_args ? extractLsDirectory(result.executed_args) : null,
+);
 let processedHtml = $derived(
 	outputHtml && lsDirectory ? linkifyLsOutput(outputHtml, lsDirectory) : outputHtml,
 );
@@ -215,6 +225,8 @@ function handleKeydown(e: KeyboardEvent) {
 				<pre class="output terminal" onclick={lsDirectory ? handleTerminalClick : undefined}>{@html processedHtml}</pre>
 			{:else if outputType === "text"}
 				<div class="output text">{result.output}</div>
+			{:else if outputType === "weather"}
+				<WeatherCard data={JSON.parse(result.output)} />
 			{:else}
 				<div class="output status">{result.output}</div>
 			{/if}
@@ -225,7 +237,7 @@ function handleKeydown(e: KeyboardEvent) {
 		{#if hasInlineUrl}
 			<div class="inline-url-actions">
 				<button class="btn btn-browser" onmousedown={(e) => e.preventDefault()} onclick={onopenurl}>
-					Search in browser <span class="kbd">Ctrl+O</span>
+					Browse <span class="kbd">Ctrl+O</span>
 				</button>
 			</div>
 		{/if}

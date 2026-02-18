@@ -26,6 +26,8 @@ pub enum OutputType {
     Text,
     /// Short status message (e.g. "Launched Firefox") — compact, muted.
     Status,
+    /// Structured weather card — JSON data rendered as a rich card.
+    Weather,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

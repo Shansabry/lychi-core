@@ -218,7 +218,7 @@ export async function checkAiHealth(): Promise<boolean> {
 // --- Agent Plans ---
 
 export type RiskLevel = "low" | "medium" | "high";
-export type OutputType = "terminal" | "text" | "status";
+export type OutputType = "terminal" | "text" | "status" | "weather";
 
 export interface AgentStep {
 	action_id: string;

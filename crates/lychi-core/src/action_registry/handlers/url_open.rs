@@ -64,8 +64,8 @@ impl ActionHandler for UrlOpen {
             open_url: Some(url),
             needs_confirmation: None,
             risk_level: None,
-                output_type: None,
-                executed_args: None,
+            output_type: None,
+            executed_args: None,
         })
     }
 }
