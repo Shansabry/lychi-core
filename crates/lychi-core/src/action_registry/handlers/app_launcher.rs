@@ -4,6 +4,7 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -210,6 +211,7 @@ impl ActionHandler for AppLauncher {
 
         Command::new(cmd)
             .args(cmd_args.iter())
+            .process_group(0)
             .spawn()
             .map_err(|e| {
                 LychiError::ExecutionFailed(format!("Failed to launch {}: {e}", entry.name))

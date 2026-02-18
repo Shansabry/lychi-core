@@ -1,21 +1,41 @@
 use tauri::State;
 
 use lychi_core::error::LychiError;
-use lychi_core::notes::TodoItem;
+use lychi_core::notes::{NoteItem, TodoItem};
 
 use crate::state::AppState;
 
+// ---- Notes ----
+
 #[tauri::command]
-pub async fn get_note(state: State<'_, AppState>) -> Result<String, LychiError> {
+pub async fn get_notes(state: State<'_, AppState>) -> Result<Vec<NoteItem>, LychiError> {
     let notes = state.notes.read().await;
-    Ok(notes.get_note().to_string())
+    Ok(notes.get_notes().to_vec())
 }
 
 #[tauri::command]
-pub async fn set_note(text: String, state: State<'_, AppState>) -> Result<(), LychiError> {
+pub async fn add_note(text: String, state: State<'_, AppState>) -> Result<NoteItem, LychiError> {
     let mut notes = state.notes.write().await;
-    notes.set_note(&text)
+    notes.add_note(&text)
 }
+
+#[tauri::command]
+pub async fn update_note(
+    id: String,
+    text: String,
+    state: State<'_, AppState>,
+) -> Result<(), LychiError> {
+    let mut notes = state.notes.write().await;
+    notes.update_note(&id, &text)
+}
+
+#[tauri::command]
+pub async fn delete_note(id: String, state: State<'_, AppState>) -> Result<(), LychiError> {
+    let mut notes = state.notes.write().await;
+    notes.delete_note(&id)
+}
+
+// ---- Todos ----
 
 #[tauri::command]
 pub async fn get_todos(state: State<'_, AppState>) -> Result<Vec<TodoItem>, LychiError> {

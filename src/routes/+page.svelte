@@ -48,6 +48,7 @@ let pendingPlan: AgentPlan | null = $state(null);
 let planPanelRef: AgentPlanPanel | undefined = $state(undefined);
 let mediaOpen = $state(false);
 let notesOpen = $state(false);
+let pendingNoteText: string | null = $state(null);
 let mediaPlayers: TrackInfo[] = $state([]);
 let mediaPollTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -363,6 +364,13 @@ async function runCommand(command: string) {
 			settingsOpen = false;
 			mediaOpen = false;
 			lastResult = null;
+		} else if (lastResult.output?.startsWith("__notes_limit__:")) {
+			pendingNoteText = lastResult.output.slice("__notes_limit__:".length);
+			notesOpen = true;
+			historyOpen = false;
+			settingsOpen = false;
+			mediaOpen = false;
+			lastResult = null;
 		} else if (lastResult.output?.startsWith("__browse_panel__:")) {
 			const dir = lastResult.output.slice("__browse_panel__:".length);
 			inputValue = `@${dir}`;
@@ -579,7 +587,7 @@ async function handleDismiss() {
 		{:else if mediaOpen}
 			<MediaPanel ondismiss={() => { mediaOpen = false; }} players={mediaPlayers} />
 		{:else if notesOpen}
-			<NotesPanel ondismiss={() => { notesOpen = false; }} />
+			<NotesPanel ondismiss={() => { notesOpen = false; pendingNoteText = null; }} {pendingNoteText} onpendingcleared={() => { pendingNoteText = null; }} />
 		{:else if pendingPlan}
 			<AgentPlanPanel
 				bind:this={planPanelRef}

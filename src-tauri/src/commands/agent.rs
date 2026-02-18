@@ -69,6 +69,11 @@ pub async fn execute_agent_plan(
                 executed_args: None,
             });
 
+        // Notify frontend when notes/todos are mutated by a plan step
+        if result.success && (step.action_id == "note" || step.action_id == "todo") {
+            let _ = app.emit("lychi://notes-changed", ());
+        }
+
         let failed = !result.success;
 
         let _ = app.emit(

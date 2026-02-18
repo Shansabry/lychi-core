@@ -306,20 +306,37 @@ export async function mediaRefresh(): Promise<void> {
 
 // --- Notes & Todos ---
 
+export interface NoteItem {
+	id: string;
+	text: string;
+	created_at: number;
+	updated_at: number;
+}
+
 export interface TodoItem {
 	id: string;
 	text: string;
 	done: boolean;
 }
 
-export async function getNote(): Promise<string> {
-	if (!isTauri()) return "";
-	return invoke<string>("get_note");
+export async function getNotes(): Promise<NoteItem[]> {
+	if (!isTauri()) return [];
+	return invoke<NoteItem[]>("get_notes");
 }
 
-export async function setNote(text: string): Promise<void> {
+export async function addNote(text: string): Promise<NoteItem> {
+	if (!isTauri()) return { id: "", text, created_at: 0, updated_at: 0 };
+	return invoke<NoteItem>("add_note", { text });
+}
+
+export async function updateNote(id: string, text: string): Promise<void> {
 	if (!isTauri()) return;
-	return invoke("set_note", { text });
+	return invoke("update_note", { id, text });
+}
+
+export async function deleteNote(id: string): Promise<void> {
+	if (!isTauri()) return;
+	return invoke("delete_note", { id });
 }
 
 export async function getTodos(): Promise<TodoItem[]> {

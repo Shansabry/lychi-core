@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 
 use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType};
 use crate::error::LychiError;
-use crate::notes::store::NotesStore;
+use crate::notes::store::{NotesStore, MAX_NOTES};
 
 // ---- Notes handler ----
 
@@ -18,6 +18,16 @@ impl NotesHandler {
     pub fn new(store: Arc<RwLock<NotesStore>>) -> Self {
         Self { store }
     }
+
+    /// Format a note's first line as its title (truncated to 40 chars).
+    fn note_title(text: &str) -> &str {
+        let first_line = text.lines().next().unwrap_or(text);
+        if first_line.len() > 40 {
+            &first_line[..40]
+        } else {
+            first_line
+        }
+    }
 }
 
 #[async_trait]
@@ -27,7 +37,7 @@ impl ActionHandler for NotesHandler {
     }
 
     fn description(&self) -> &str {
-        "Quick note — set or view a sticky note. Usage: note <text> to set, note to view"
+        "Notes — add, list, or delete notes (max 5). Usage: note <text> to add, note read to list, note delete <id> to remove"
     }
 
     async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
@@ -50,18 +60,32 @@ impl ActionHandler for NotesHandler {
             });
         }
 
-        // "read" → return current note content
-        if text.eq_ignore_ascii_case("read") {
+        // "read" / "list" → list all notes
+        if text.eq_ignore_ascii_case("read") || text.eq_ignore_ascii_case("list") {
             let store = self.store.read().await;
-            let current = store.get_note();
-            let output = if current.is_empty() {
-                "No note saved".to_string()
-            } else {
-                current.to_string()
-            };
+            let notes = store.get_notes();
+            if notes.is_empty() {
+                return Ok(ActionResult {
+                    success: true,
+                    output: Some("No notes saved".to_string()),
+                    error: None,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    routed_by: None,
+                    open_url: None,
+                    needs_confirmation: None,
+                    risk_level: None,
+                    output_type: Some(OutputType::Text),
+                    executed_args: None,
+                });
+            }
+            let lines: Vec<String> = notes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| format!("{}. {} ({})", i + 1, Self::note_title(&n.text), n.id))
+                .collect();
             return Ok(ActionResult {
                 success: true,
-                output: Some(output),
+                output: Some(format!("Notes ({}/{}):\n{}", notes.len(), MAX_NOTES, lines.join("\n"))),
                 error: None,
                 duration_ms: start.elapsed().as_millis() as u64,
                 routed_by: None,
@@ -73,22 +97,66 @@ impl ActionHandler for NotesHandler {
             });
         }
 
-        // Set the note
-        let mut store = self.store.write().await;
-        store.set_note(text)?;
+        // "delete <id>" → delete a note
+        if let Some(rest) = text
+            .strip_prefix("delete ")
+            .or_else(|| text.strip_prefix("del "))
+            .or_else(|| text.strip_prefix("rm "))
+        {
+            let id = rest.trim();
+            let mut store = self.store.write().await;
+            store.delete_note(id)?;
+            return Ok(ActionResult {
+                success: true,
+                output: Some(format!("Note deleted: {id}")),
+                error: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+                routed_by: None,
+                open_url: None,
+                needs_confirmation: None,
+                risk_level: None,
+                output_type: None,
+                executed_args: None,
+            });
+        }
 
-        Ok(ActionResult {
-            success: true,
-            output: Some(format!("Note saved ({} chars)", text.len())),
-            error: None,
-            duration_ms: start.elapsed().as_millis() as u64,
-            routed_by: None,
-            open_url: None,
-            needs_confirmation: None,
-            risk_level: None,
-            output_type: None,
-            executed_args: None,
-        })
+        // Add a new note
+        let mut store = self.store.write().await;
+        match store.add_note(text) {
+            Ok(item) => Ok(ActionResult {
+                success: true,
+                output: Some(format!(
+                    "Note saved ({} chars, {}/{})",
+                    item.text.len(),
+                    store.notes_count(),
+                    MAX_NOTES
+                )),
+                error: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+                routed_by: None,
+                open_url: None,
+                needs_confirmation: None,
+                risk_level: None,
+                output_type: None,
+                executed_args: None,
+            }),
+            Err(e) if e.to_string().contains("limit reached") => {
+                // Return sentinel so frontend opens NotesPanel with pending note
+                Ok(ActionResult {
+                    success: true,
+                    output: Some(format!("__notes_limit__:{text}")),
+                    error: None,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    routed_by: None,
+                    open_url: None,
+                    needs_confirmation: None,
+                    risk_level: None,
+                    output_type: None,
+                    executed_args: None,
+                })
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -209,15 +277,18 @@ impl ActionHandler for TodoHandler {
             }
             "summary" => {
                 let store = self.store.read().await;
-                let note = store.get_note();
+                let notes = store.get_notes();
                 let todos = store.get_todos();
 
                 let mut lines = Vec::new();
 
-                // Note section
-                if !note.is_empty() {
-                    lines.push("📋 Note:".to_string());
-                    lines.push(note.to_string());
+                // Notes section
+                if !notes.is_empty() {
+                    lines.push(format!("Notes ({}/{}):", notes.len(), MAX_NOTES));
+                    for (i, n) in notes.iter().enumerate() {
+                        let title = n.text.lines().next().unwrap_or(&n.text);
+                        lines.push(format!("  {}. {}", i + 1, title));
+                    }
                     lines.push(String::new());
                 }
 
@@ -226,9 +297,9 @@ impl ActionHandler for TodoHandler {
                 let done: Vec<_> = todos.iter().filter(|t| t.done).collect();
 
                 if !pending.is_empty() {
-                    lines.push(format!("☐ Pending ({}):", pending.len()));
+                    lines.push(format!("Pending ({}):", pending.len()));
                     for t in &pending {
-                        lines.push(format!("  • {}", t.text));
+                        lines.push(format!("  - {}", t.text));
                     }
                 }
 
@@ -236,14 +307,14 @@ impl ActionHandler for TodoHandler {
                     if !pending.is_empty() {
                         lines.push(String::new());
                     }
-                    lines.push(format!("☑ Done ({}):", done.len()));
+                    lines.push(format!("Done ({}):", done.len()));
                     for t in &done {
-                        lines.push(format!("  • {}", t.text));
+                        lines.push(format!("  - {}", t.text));
                     }
                 }
 
                 if lines.is_empty() {
-                    lines.push("Nothing here — note is empty and no todos.".to_string());
+                    lines.push("Nothing here — no notes and no todos.".to_string());
                 }
 
                 Ok(ActionResult {
