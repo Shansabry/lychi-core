@@ -4,7 +4,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem};
+use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType};
 use crate::error::LychiError;
 use crate::notes::store::NotesStore;
 
@@ -45,6 +45,8 @@ impl ActionHandler for NotesHandler {
                 open_url: None,
                 needs_confirmation: None,
                 risk_level: None,
+                output_type: None,
+                executed_args: None,
             });
         }
 
@@ -66,6 +68,8 @@ impl ActionHandler for NotesHandler {
                 open_url: None,
                 needs_confirmation: None,
                 risk_level: None,
+                output_type: Some(OutputType::Text),
+                executed_args: None,
             });
         }
 
@@ -82,6 +86,8 @@ impl ActionHandler for NotesHandler {
             open_url: None,
             needs_confirmation: None,
             risk_level: None,
+                output_type: None,
+                executed_args: None,
         })
     }
 }
@@ -125,6 +131,8 @@ impl ActionHandler for TodoHandler {
                 open_url: None,
                 needs_confirmation: None,
                 risk_level: None,
+                output_type: None,
+                executed_args: None,
             });
         }
 
@@ -145,6 +153,8 @@ impl ActionHandler for TodoHandler {
                         open_url: None,
                         needs_confirmation: None,
                         risk_level: None,
+                output_type: None,
+                executed_args: None,
                     });
                 }
                 let mut store = self.store.write().await;
@@ -158,6 +168,8 @@ impl ActionHandler for TodoHandler {
                     open_url: None,
                     needs_confirmation: None,
                     risk_level: None,
+                output_type: None,
+                executed_args: None,
                 })
             }
             "list" | "ls" => {
@@ -173,6 +185,8 @@ impl ActionHandler for TodoHandler {
                         open_url: None,
                         needs_confirmation: None,
                         risk_level: None,
+                output_type: None,
+                executed_args: None,
                     });
                 }
                 let lines: Vec<String> = todos
@@ -191,6 +205,8 @@ impl ActionHandler for TodoHandler {
                     open_url: None,
                     needs_confirmation: None,
                     risk_level: None,
+                    output_type: Some(OutputType::Text),
+                    executed_args: None,
                 })
             }
             "summary" => {
@@ -241,6 +257,8 @@ impl ActionHandler for TodoHandler {
                     open_url: None,
                     needs_confirmation: None,
                     risk_level: None,
+                    output_type: Some(OutputType::Text),
+                    executed_args: None,
                 })
             }
             "done" | "check" | "toggle" => {
@@ -254,6 +272,8 @@ impl ActionHandler for TodoHandler {
                         open_url: None,
                         needs_confirmation: None,
                         risk_level: None,
+                output_type: None,
+                executed_args: None,
                     });
                 }
                 let mut store = self.store.write().await;
@@ -267,6 +287,8 @@ impl ActionHandler for TodoHandler {
                     open_url: None,
                     needs_confirmation: None,
                     risk_level: None,
+                output_type: None,
+                executed_args: None,
                 })
             }
             "delete" | "del" | "rm" | "remove" => {
@@ -280,6 +302,8 @@ impl ActionHandler for TodoHandler {
                         open_url: None,
                         needs_confirmation: None,
                         risk_level: None,
+                output_type: None,
+                executed_args: None,
                     });
                 }
                 let mut store = self.store.write().await;
@@ -293,6 +317,8 @@ impl ActionHandler for TodoHandler {
                     open_url: None,
                     needs_confirmation: None,
                     risk_level: None,
+                output_type: None,
+                executed_args: None,
                 })
             }
             // If the first word isn't a subcommand, treat the entire args as "add"
@@ -308,6 +334,8 @@ impl ActionHandler for TodoHandler {
                     open_url: None,
                     needs_confirmation: None,
                     risk_level: None,
+                output_type: None,
+                executed_args: None,
                 })
             }
         }

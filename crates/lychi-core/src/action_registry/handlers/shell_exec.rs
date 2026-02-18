@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use std::sync::RwLock;
 use std::time::Instant;
 
-use crate::action_registry::{ActionHandler, ActionResult, RiskLevel};
+use crate::action_registry::{ActionHandler, ActionResult, OutputType, RiskLevel};
 use crate::error::LychiError;
 
 /// Captured environment from the user's interactive login shell.
@@ -108,6 +108,8 @@ impl ActionHandler for ShellExec {
                 open_url: None,
                 needs_confirmation: None,
                 risk_level: None,
+                output_type: None,
+                executed_args: None,
             });
         }
 
@@ -165,6 +167,8 @@ impl ActionHandler for ShellExec {
             open_url: None,
             needs_confirmation: None,
             risk_level: None,
+            output_type: Some(OutputType::Terminal),
+            executed_args: None,
         })
     }
 }

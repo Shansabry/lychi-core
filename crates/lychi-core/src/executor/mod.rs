@@ -59,6 +59,8 @@ impl Executor {
                 open_url: None,
                 needs_confirmation: None,
                 risk_level: Some(RiskLevel::High),
+                output_type: None,
+                executed_args: None,
             }),
             ValidationDecision::Confirm { reason } if !confirmed => Ok(ActionResult {
                 success: false,
@@ -69,12 +71,18 @@ impl Executor {
                 open_url: None,
                 needs_confirmation: Some(reason),
                 risk_level: Some(handler.default_risk()),
+                output_type: None,
+                executed_args: None,
             }),
             // Execute (or Confirm with confirmed=true)
             _ => {
                 let mut result = handler.execute(&intent.args).await?;
                 if intent.routing == RoutingMethod::Ai {
                     result.routed_by = Some("ai".to_string());
+                }
+                // Pass actual executed args to frontend (useful for ls output linkification etc.)
+                if intent.action_id == "run" {
+                    result.executed_args = Some(intent.args.clone());
                 }
 
                 // If the "open" handler failed and we have a web fallback, try it

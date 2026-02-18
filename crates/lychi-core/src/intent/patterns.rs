@@ -8,8 +8,8 @@
 
 /// Known handler prefixes.
 const KNOWN_PREFIXES: &[&str] = &[
-    "open", "web", "yt", "run", "calc", "file", "url", "spotify", "project", "system", "note",
-    "notes", "todo", "todos",
+    "ask", "browse", "open", "web", "yt", "run", "calc", "file", "url", "spotify", "project",
+    "system", "note", "notes", "todo", "todos",
 ];
 
 /// Common TLDs for URL detection.
@@ -133,6 +133,8 @@ fn try_explicit_prefix(input: &str) -> Option<Route> {
 
         // Map the prefix string to a static str
         let handler = match lower.as_str() {
+            "ask" => "ask",
+            "browse" => "browse",
             "open" => "open",
             "web" => "web",
             "yt" => "yt",

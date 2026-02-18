@@ -13,6 +13,10 @@ export interface CommandResult {
 	needs_confirmation?: string | null;
 	/** Risk level of the action (low, medium, high). */
 	risk_level?: RiskLevel | null;
+	/** How the frontend should render the output. */
+	output_type?: OutputType | null;
+	/** The actual args executed (set by executor for shell commands). */
+	executed_args?: string | null;
 }
 
 export interface CompletionItem {
@@ -214,6 +218,7 @@ export async function checkAiHealth(): Promise<boolean> {
 // --- Agent Plans ---
 
 export type RiskLevel = "low" | "medium" | "high";
+export type OutputType = "terminal" | "text" | "status";
 
 export interface AgentStep {
 	action_id: string;

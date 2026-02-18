@@ -33,6 +33,8 @@ async fn execute_media(target: Target, args: &str) -> Result<ActionResult, Lychi
             open_url: None,
             needs_confirmation: None,
             risk_level: None,
+                output_type: None,
+                executed_args: None,
         });
     }
 
@@ -50,6 +52,8 @@ async fn execute_media(target: Target, args: &str) -> Result<ActionResult, Lychi
             open_url: None,
             needs_confirmation: None,
             risk_level: None,
+                output_type: None,
+                executed_args: None,
         });
     }
 
@@ -73,6 +77,8 @@ async fn execute_media(target: Target, args: &str) -> Result<ActionResult, Lychi
                 open_url: None,
                 needs_confirmation: None,
                 risk_level: None,
+                output_type: None,
+                executed_args: None,
             });
         }
     };
@@ -91,6 +97,8 @@ async fn execute_media(target: Target, args: &str) -> Result<ActionResult, Lychi
             open_url: None,
             needs_confirmation: None,
             risk_level: None,
+                output_type: None,
+                executed_args: None,
         }),
         Some(p) => {
             manager.control(&p.bus_name, mpris_action).await?;
@@ -103,6 +111,8 @@ async fn execute_media(target: Target, args: &str) -> Result<ActionResult, Lychi
                 open_url: None,
                 needs_confirmation: None,
                 risk_level: None,
+                output_type: None,
+                executed_args: None,
             })
         }
     }

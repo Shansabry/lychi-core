@@ -55,6 +55,8 @@ impl ActionHandler for CalcHandler {
                 open_url: None,
                 needs_confirmation: None,
                 risk_level: None,
+                output_type: None,
+                executed_args: None,
             });
         }
 
@@ -68,6 +70,8 @@ impl ActionHandler for CalcHandler {
                 open_url: None,
                 needs_confirmation: None,
                 risk_level: None,
+                output_type: None,
+                executed_args: None,
             }),
             None => Ok(ActionResult {
                 success: false,
@@ -78,6 +82,8 @@ impl ActionHandler for CalcHandler {
                 open_url: None,
                 needs_confirmation: None,
                 risk_level: None,
+                output_type: None,
+                executed_args: None,
             }),
         }
     }

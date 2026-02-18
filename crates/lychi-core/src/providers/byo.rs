@@ -223,4 +223,17 @@ impl AiProvider for BYOClient {
             BYOProvider::Groq => "groq",
         }
     }
+
+    async fn answer_question(
+        &self,
+        system_prompt: &str,
+        question: &str,
+    ) -> Result<String, LychiError> {
+        match self.provider {
+            BYOProvider::OpenAI | BYOProvider::Groq => {
+                self.call_openai_compatible(system_prompt, question).await
+            }
+            BYOProvider::Anthropic => self.call_anthropic(system_prompt, question).await,
+        }
+    }
 }

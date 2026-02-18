@@ -49,6 +49,8 @@ impl ActionHandler for WebSearch {
                 open_url: None,
                 needs_confirmation: None,
                 risk_level: None,
+                output_type: None,
+                executed_args: None,
             });
         }
 
@@ -63,6 +65,8 @@ impl ActionHandler for WebSearch {
             open_url: Some(url),
             needs_confirmation: None,
             risk_level: None,
+                output_type: None,
+                executed_args: None,
         })
     }
 }

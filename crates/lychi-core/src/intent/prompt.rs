@@ -37,9 +37,12 @@ Risk levels per step:
 Examples:
 - "open firefox" → {{"action_id": "open", "args": "firefox"}}
 - "play lofi on youtube" → {{"action_id": "yt", "args": "lofi"}}
-- "what's the weather" → {{"action_id": "web", "args": "weather"}}
+- "what's the weather" → {{"action_id": "ask", "args": "what's the weather"}}
 - "open this folder in vscode" → {{"action_id": "run", "args": "code ."}}
-- "list files in home" → {{"action_id": "run", "args": "ls ~"}}
+- "browse downloads" → {{"action_id": "browse", "args": "~/Downloads"}}
+- "show my documents folder" → {{"action_id": "browse", "args": "~/Documents"}}
+- "find agent agnes files in downloads" → {{"action_id": "run", "args": "ls ~/Downloads/*gent*gnes*"}}
+- "list pdf files in documents" → {{"action_id": "run", "args": "ls ~/Documents/*.pdf"}}
 - "how much is 15% of 200" → {{"action_id": "calc", "args": "200 * 0.15"}}
 - "open github.com" → {{"action_id": "url", "args": "https://github.com"}}
 - "open downloads folder" → {{"action_id": "file", "args": "~/Downloads"}}
@@ -63,6 +66,10 @@ Examples:
 - "jot down: call dentist tomorrow" → {{"action_id": "note", "args": "call dentist tomorrow"}}
 - "what did I write down" → {{"action_id": "note", "args": "read"}}
 - "read my note" → {{"action_id": "note", "args": "read"}}
+- "what is the capital of France" → {{"action_id": "ask", "args": "what is the capital of France"}}
+- "who invented the telephone" → {{"action_id": "ask", "args": "who invented the telephone"}}
+- "explain quantum computing" → {{"action_id": "ask", "args": "explain quantum computing"}}
+- "how does photosynthesis work" → {{"action_id": "ask", "args": "how does photosynthesis work"}}
 - "open readyroos in vscode" → {{"action_id": "project", "args": "readyroos"}}
 - "open my lychi project" → {{"action_id": "project", "args": "lychi"}}
 - "create a new rust project and open in vscode" → {{"steps": [{{"action_id": "run", "args": "cargo init my-project", "label": "Create Rust project", "risk": "medium"}}, {{"action_id": "run", "args": "code my-project", "label": "Open in VS Code", "risk": "low"}}]}}
@@ -71,24 +78,33 @@ Examples:
 Rules:
 - For launching GUI apps by name, use "open".
 - For opening a project by name in an editor/IDE, use "project".
+- For browsing a whole directory (no search/filter), use "browse". For searching specific files by name/type, use "run" with ls or find.
 - For running CLI tools or apps with specific arguments/paths, use "run".
-- For questions or lookups, use "web".
+- For direct questions (what, who, how, why, explain, define), use "ask".
+- For general searches or non-question lookups (e.g. "weather", "news", "reddit"), use "web".
 - Only use steps array when 2+ distinct operations are needed.
 - Labels should be short (3-5 words).
 - Order steps logically (create before open, install before run).
 - Extract clean arguments — strip filler words like "please", "can you", "I want to".
 - Respond with ONLY valid JSON. No extra text.
-- If truly unclear, use: {{"action_id": "web", "args": "<original input>"}}"#
+- If truly unclear and it looks like a question, use: {{"action_id": "ask", "args": "<original input>"}}
+- If truly unclear and it doesn't look like a question, use: {{"action_id": "web", "args": "<original input>"}}"#
     )
 }
 
 fn action_description(id: &str) -> &'static str {
     match id {
+        "ask" => {
+            "Ask a question and get an AI-powered inline answer. Use for direct questions (what, who, how, why, explain, define). Prefer over 'web' when the user is asking a question"
+        }
         "open" => "Launch a desktop application by name (e.g. firefox, spotify, vscode)",
-        "web" => "Search the web for information or questions",
+        "web" => "Search the web for general lookups or non-question searches",
         "yt" => "Search YouTube for videos",
         "run" => "Execute a shell command (e.g. 'code .', 'ls ~', 'htop')",
         "calc" => "Evaluate a math expression (e.g. '2+2', 'sqrt(144)')",
+        "browse" => {
+            "Browse a directory interactively. ONLY use when the user wants to open/browse a whole folder without filtering (e.g. 'browse downloads', 'show my documents folder'). If the user mentions specific filenames or search terms, use 'run' with ls/find instead"
+        }
         "file" => "Open a file or directory in the default app (e.g. '~/Downloads')",
         "url" => "Open a URL in the browser (e.g. 'https://github.com')",
         "spotify" => {

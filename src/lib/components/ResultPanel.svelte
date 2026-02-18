@@ -7,12 +7,20 @@ let {
 	command = "",
 	onconfirm,
 	ondismiss,
+	onopenurl,
+	onopenfile,
 }: {
 	result: CommandResult;
 	command?: string;
 	onconfirm?: () => void;
 	ondismiss?: () => void;
+	onopenurl?: () => void;
+	onopenfile?: (path: string) => void;
 } = $props();
+
+let hasInlineUrl = $derived(!!result.output && !!result.open_url);
+let outputType = $derived(result.output_type ?? "status");
+let isTerminal = $derived(outputType === "terminal");
 
 const darkColors = [
 	"#5c6370",
@@ -72,10 +80,76 @@ let converter = $derived(
 	}),
 );
 
-let outputHtml = $derived(result.output ? converter.toHtml(result.output) : "");
+// Only convert ANSI for terminal output and errors
+let outputHtml = $derived(isTerminal && result.output ? converter.toHtml(result.output) : "");
 let errorHtml = $derived(result.error ? converter.toHtml(result.error) : "");
 
+// --- Clickable filenames in ls output ---
+
+/** Extract target directory from an ls-like command. Returns null for non-ls commands. */
+function extractLsDirectory(cmd: string): string | null {
+	const m = cmd.trim().match(/^ls\s*((?:-\w+\s+)*)(.+)?$/);
+	if (!m) return null;
+	const dir = m[2]?.trim();
+	return dir || "~";
+}
+
+/** Escape a string for use in an HTML attribute. */
+function escapeAttr(s: string): string {
+	return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Permission pattern for ls -l lines: drwxr-xr-x, -rw-r--r--, lrwxrwxrwx, etc.
+const PERM_RE = /^[d\-lbcps][rwxsStT\-]{9}/;
+// Match the time portion (HH:MM or year) to find where the filename starts
+const LS_LONG_RE = /^[d\-lbcps][rwxsStT\-]{9}[\s.+]+\S+\s+\S+\s+\S+\s+[\d,]+\s+\w+\s+\d+\s+[\d:]+\s+/;
+
+/** Wrap filenames in ls output with clickable spans. Works on already-HTML-escaped text. */
+function linkifyLsOutput(html: string, directory: string): string {
+	return html
+		.split("\n")
+		.map((line) => {
+			// Strip HTML tags to inspect the raw text content
+			const raw = line.replace(/<[^>]*>/g, "").trim();
+			if (!raw || raw.startsWith("total ")) return line;
+
+			let filename: string;
+			if (PERM_RE.test(raw)) {
+				// Long format: extract filename after the date/time columns
+				const match = raw.match(LS_LONG_RE);
+				if (!match) return line;
+				filename = raw.slice(match[0].length);
+				// Handle symlinks: "name -> target"
+				const arrow = filename.indexOf(" -> ");
+				if (arrow !== -1) filename = filename.slice(0, arrow);
+			} else {
+				// Plain ls output: each line is a filename
+				filename = raw;
+			}
+
+			if (!filename) return line;
+			const filepath = directory.endsWith("/") ? `${directory}${filename}` : `${directory}/${filename}`;
+			return `<span class="clickable-file" data-filepath="${escapeAttr(filepath)}">${line}</span>`;
+		})
+		.join("\n");
+}
+
+let lsDirectory = $derived(isTerminal && result.executed_args ? extractLsDirectory(result.executed_args) : null);
+let processedHtml = $derived(
+	outputHtml && lsDirectory ? linkifyLsOutput(outputHtml, lsDirectory) : outputHtml,
+);
+
 let isHighRisk = $derived(result.risk_level === "high");
+
+function handleTerminalClick(e: MouseEvent) {
+	const target = (e.target as HTMLElement).closest(".clickable-file");
+	if (!target || !onopenfile) return;
+	const filepath = target.getAttribute("data-filepath");
+	if (filepath) {
+		e.preventDefault();
+		onopenfile(filepath);
+	}
+}
 
 function autofocus(node: HTMLElement) {
 	requestAnimationFrame(() => node.focus());
@@ -90,6 +164,10 @@ function handleKeydown(e: KeyboardEvent) {
 		e.preventDefault();
 		e.stopPropagation();
 		ondismiss();
+	} else if (e.key === "o" && e.ctrlKey && onopenurl && hasInlineUrl) {
+		e.preventDefault();
+		e.stopPropagation();
+		onopenurl();
 	}
 }
 </script>
@@ -123,17 +201,33 @@ function handleKeydown(e: KeyboardEvent) {
 		</div>
 	</div>
 {:else if result.output || result.error}
-	<div class="result-panel">
-		{#if command}
+	<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+	<div class="result-panel" class:has-url={hasInlineUrl} onkeydown={hasInlineUrl ? handleKeydown : undefined}
+		tabindex={hasInlineUrl ? -1 : undefined} role={hasInlineUrl ? "region" : undefined} use:autofocus>
+		{#if command && isTerminal}
 			<div class="command-header">
 				<span class="prompt">$</span> {command}
 			</div>
 		{/if}
 		{#if result.output}
-			<pre class="output">{@html outputHtml}</pre>
+			{#if isTerminal}
+				<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions a11y_no_noninteractive_element_interactions -->
+				<pre class="output terminal" onclick={lsDirectory ? handleTerminalClick : undefined}>{@html processedHtml}</pre>
+			{:else if outputType === "text"}
+				<div class="output text">{result.output}</div>
+			{:else}
+				<div class="output status">{result.output}</div>
+			{/if}
 		{/if}
 		{#if result.error}
-			<pre class="error">{@html errorHtml}</pre>
+			<pre class="output-error">{@html errorHtml}</pre>
+		{/if}
+		{#if hasInlineUrl}
+			<div class="inline-url-actions">
+				<button class="btn btn-browser" onmousedown={(e) => e.preventDefault()} onclick={onopenurl}>
+					Search in browser <span class="kbd">Ctrl+O</span>
+				</button>
+			</div>
 		{/if}
 	</div>
 {/if}
@@ -161,6 +255,7 @@ function handleKeydown(e: KeyboardEvent) {
 		margin-right: 6px;
 	}
 
+	/* Terminal output — monospace with ANSI colors */
 	pre {
 		font-family: var(--font-mono);
 		font-size: 13px;
@@ -169,11 +264,40 @@ function handleKeydown(e: KeyboardEvent) {
 		line-height: 1.5;
 	}
 
-	.output {
+	.output.terminal {
 		color: var(--fg);
 	}
 
-	.error {
+	.output.terminal :global(.clickable-file) {
+		cursor: pointer;
+		border-radius: 2px;
+		display: inline-block;
+		width: 100%;
+	}
+
+	.output.terminal :global(.clickable-file:hover) {
+		background: var(--bg);
+		text-decoration: underline;
+	}
+
+	/* Text output — clean readable sans-serif (AI answers, notes) */
+	.output.text {
+		font-family: var(--font-sans, system-ui, -apple-system, sans-serif);
+		font-size: 13px;
+		line-height: 1.6;
+		color: var(--fg);
+		white-space: pre-wrap;
+		word-break: break-word;
+	}
+
+	/* Status output — compact muted (short messages) */
+	.output.status {
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--fg-muted);
+	}
+
+	.output-error {
 		color: var(--error);
 	}
 
@@ -284,5 +408,37 @@ function handleKeydown(e: KeyboardEvent) {
 	.kbd {
 		font-size: 9px;
 		opacity: 0.6;
+	}
+
+	/* Inline URL action bar (e.g. "ask" handler results) */
+	.result-panel.has-url {
+		outline: none;
+	}
+
+	.inline-url-actions {
+		display: flex;
+		justify-content: flex-end;
+		padding-top: 8px;
+		margin-top: 8px;
+		border-top: 1px solid var(--border);
+	}
+
+	.btn-browser {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		padding: 5px 14px;
+		border-radius: 4px;
+		border: 1px solid var(--accent);
+		cursor: pointer;
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		transition: all 100ms ease;
+		background: var(--accent);
+		color: var(--bg);
+	}
+
+	.btn-browser:hover {
+		opacity: 0.85;
 	}
 </style>

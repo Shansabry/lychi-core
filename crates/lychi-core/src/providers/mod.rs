@@ -72,4 +72,16 @@ pub trait AiProvider: Send + Sync {
 
     /// Human-readable provider name (e.g. "anthropic", "openai", "ollama").
     fn name(&self) -> &str;
+
+    /// Send a direct question to the AI with a custom system prompt.
+    /// Used by the "ask" handler for QA rather than intent routing.
+    async fn answer_question(
+        &self,
+        _system_prompt: &str,
+        _question: &str,
+    ) -> Result<String, LychiError> {
+        Err(LychiError::Ai(
+            "answer_question not supported by this provider".to_string(),
+        ))
+    }
 }

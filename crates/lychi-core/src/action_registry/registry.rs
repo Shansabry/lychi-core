@@ -81,6 +81,8 @@ mod tests {
                 open_url: None,
                 needs_confirmation: None,
                 risk_level: None,
+                output_type: None,
+                executed_args: None,
             })
         }
     }

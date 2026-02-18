@@ -51,6 +51,8 @@ impl ActionHandler for FileOpen {
                 open_url: None,
                 needs_confirmation: None,
                 risk_level: None,
+                output_type: None,
+                executed_args: None,
             });
         }
 
@@ -66,6 +68,8 @@ impl ActionHandler for FileOpen {
                 open_url: None,
                 needs_confirmation: None,
                 risk_level: None,
+                output_type: None,
+                executed_args: None,
             });
         }
 
@@ -81,6 +85,8 @@ impl ActionHandler for FileOpen {
             open_url: Some(file_uri),
             needs_confirmation: None,
             risk_level: None,
+                output_type: None,
+                executed_args: None,
         })
     }
 }

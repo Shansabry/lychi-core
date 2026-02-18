@@ -289,7 +289,7 @@ async function handleSubmit() {
 				completionIndex = -1;
 				return;
 			}
-			// @ mode — insert path, don't execute
+			// @ mode — drill into directory or open file
 			if (atMode) {
 				handleCompletionSelect(selected.label);
 				return;
@@ -347,7 +347,8 @@ async function runCommand(command: string) {
 		historyEntries = [...historyEntries, command];
 		inputValue = "";
 		// If the backend wants us to open a URI, use GDK (proper Wayland focus transfer)
-		if (lastResult.open_url) {
+		// But if output is also present (e.g. "ask" handler), show inline result instead
+		if (lastResult.open_url && !lastResult.output) {
 			await hideWindow();
 			await openUri(lastResult.open_url);
 		} else if (lastResult.output === "__media_panel__") {
@@ -362,6 +363,13 @@ async function runCommand(command: string) {
 			settingsOpen = false;
 			mediaOpen = false;
 			lastResult = null;
+		} else if (lastResult.output?.startsWith("__browse_panel__:")) {
+			const dir = lastResult.output.slice("__browse_panel__:".length);
+			inputValue = `@${dir}`;
+			atMode = true;
+			atStart = 0;
+			lastResult = null;
+			handleInput(inputValue);
 		} else if (lastResult.success && !lastResult.output) {
 			await hideWindow();
 		}
@@ -384,7 +392,7 @@ async function handleConfirm() {
 		lastResult = await executeCommand(lastCommand, true);
 		historyEntries = [...historyEntries, lastCommand];
 		inputValue = "";
-		if (lastResult.open_url) {
+		if (lastResult.open_url && !lastResult.output) {
 			await hideWindow();
 			await openUri(lastResult.open_url);
 		} else if (lastResult.success && !lastResult.output) {
@@ -403,26 +411,26 @@ function handleConfirmDismiss() {
 
 function handleCompletionSelect(label: string) {
 	if (atMode) {
-		// Insert the resolved path, replacing @partial in the input
-		const before = inputValue.slice(0, atStart);
-		const afterAt = inputValue.slice(atStart);
-		const spaceIdx = afterAt.indexOf(" ", 1); // skip the @ itself
-		const after = spaceIdx === -1 ? "" : afterAt.slice(spaceIdx);
 		// If it's a directory (ends with /), keep @ mode active for drilling down
 		if (label.endsWith("/")) {
+			const before = inputValue.slice(0, atStart);
+			const afterAt = inputValue.slice(atStart);
+			const spaceIdx = afterAt.indexOf(" ", 1); // skip the @ itself
+			const after = spaceIdx === -1 ? "" : afterAt.slice(spaceIdx);
 			inputValue = `${before}@${label}${after}`;
 			// Re-trigger completions for the directory contents
 			handleInput(inputValue);
+			requestAnimationFrame(() => {
+				document.querySelector<HTMLInputElement>(".input-container input")?.focus();
+			});
 		} else {
-			inputValue = before + label + after;
+			// It's a file — open it directly
 			atMode = false;
 			atStart = -1;
 			completions = [];
 			completionIndex = -1;
+			runCommand(`file ${label}`);
 		}
-		requestAnimationFrame(() => {
-			document.querySelector<HTMLInputElement>(".input-container input")?.focus();
-		});
 		return;
 	}
 	runCommand(`open ${label}`);
@@ -594,7 +602,14 @@ async function handleDismiss() {
 				<HistoryPanel entries={historyEntries} onselect={handleHistorySelect} />
 			{:else if lastResult}
 				<ResultPanel result={lastResult} command={lastCommand}
-				onconfirm={handleConfirm} ondismiss={handleConfirmDismiss} />
+				onconfirm={handleConfirm} ondismiss={handleConfirmDismiss}
+				onopenurl={async () => {
+					if (lastResult?.open_url) {
+						await hideWindow();
+						await openUri(lastResult.open_url);
+					}
+				}}
+				onopenfile={(path) => runCommand(`file ${path}`)} />
 			{/if}
 		{/if}
 		<StatusBar

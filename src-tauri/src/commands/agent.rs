@@ -65,6 +65,8 @@ pub async fn execute_agent_plan(
                 open_url: None,
                 needs_confirmation: None,
                 risk_level: None,
+                output_type: None,
+                executed_args: None,
             });
 
         let failed = !result.success;

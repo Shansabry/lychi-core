@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::LychiError;
@@ -5,12 +6,19 @@ use crate::providers::{AiProvider, AiResponse, AiRoute};
 
 /// Wraps an active AI provider with timeout and error handling.
 pub struct AiRouter {
-    provider: Box<dyn AiProvider>,
+    provider: Arc<dyn AiProvider>,
     timeout: Duration,
 }
 
 impl AiRouter {
     pub fn new(provider: Box<dyn AiProvider>) -> Self {
+        Self {
+            provider: Arc::from(provider),
+            timeout: Duration::from_secs(8),
+        }
+    }
+
+    pub fn new_shared(provider: Arc<dyn AiProvider>) -> Self {
         Self {
             provider,
             timeout: Duration::from_secs(8),

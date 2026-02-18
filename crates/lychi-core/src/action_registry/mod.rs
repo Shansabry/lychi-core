@@ -16,6 +16,18 @@ pub enum RiskLevel {
     High,
 }
 
+/// How the frontend should render the output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputType {
+    /// Shell/terminal output — render with ANSI-to-HTML, monospace `<pre>`.
+    Terminal,
+    /// Natural language text (AI answers, notes) — clean readable sans-serif.
+    Text,
+    /// Short status message (e.g. "Launched Firefox") — compact, muted.
+    Status,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionResult {
     pub success: bool,
@@ -34,6 +46,12 @@ pub struct ActionResult {
     /// Risk level of this action (populated by rules engine).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub risk_level: Option<RiskLevel>,
+    /// How the frontend should render the output. None defaults to Status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_type: Option<OutputType>,
+    /// The actual args that were executed (set by executor, not by handlers).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executed_args: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

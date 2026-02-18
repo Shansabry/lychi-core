@@ -2,6 +2,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use lychi_core::action_registry::handlers::app_launcher::AppLauncher;
+use lychi_core::action_registry::handlers::ask::AskHandler;
+use lychi_core::action_registry::handlers::browse::BrowseHandler;
 use lychi_core::action_registry::handlers::notes::{NotesHandler, TodoHandler};
 use lychi_core::action_registry::handlers::calc::CalcHandler;
 use lychi_core::action_registry::handlers::file_open::FileOpen;
@@ -23,7 +25,7 @@ use lychi_core::intent::ai_router::AiRouter;
 #[cfg(feature = "mpris")]
 use lychi_core::mpris::MprisManager;
 use lychi_core::paths;
-use lychi_core::providers::AgentPlan;
+use lychi_core::providers::{AgentPlan, AiProvider};
 use lychi_core::providers::byo::{BYOClient, BYOProvider};
 use lychi_core::rules::RulesEngine;
 
@@ -77,22 +79,30 @@ impl AppState {
         registry.register(Box::new(SystemCommand::new()));
         registry.register(Box::new(NotesHandler::new(notes.clone())));
         registry.register(Box::new(TodoHandler::new(notes.clone())));
+        registry.register(Box::new(BrowseHandler::new()));
 
-        // Initialize AI router if configured
-        let ai_router = if config.ai.mode == "byo" {
-            match Self::init_byo_router(&config.ai.provider, &config.ai.model) {
-                Ok(router) => {
-                    tracing::info!("AI router initialized (BYO: {})", config.ai.provider);
-                    Some(router)
+        // Initialize AI provider if configured (shared between router and ask handler)
+        let ai_provider: Option<Arc<dyn AiProvider>> = if config.ai.mode == "byo" {
+            match Self::init_byo_client(&config.ai.provider, &config.ai.model) {
+                Ok(client) => {
+                    tracing::info!("AI initialized (BYO: {})", config.ai.provider);
+                    Some(client)
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to initialize AI router: {e}");
+                    tracing::warn!("Failed to initialize AI: {e}");
                     None
                 }
             }
         } else {
             None
         };
+
+        registry.register(Box::new(AskHandler::new(
+            ai_provider.clone(),
+            config.commands.default_search_engine.clone(),
+        )));
+
+        let ai_router = ai_provider.map(AiRouter::new_shared);
 
         let resolver = IntentResolver::new(ai_router);
         let rules = RulesEngine::new();
@@ -122,7 +132,7 @@ impl AppState {
         }
     }
 
-    fn init_byo_router(provider_name: &str, model: &str) -> Result<AiRouter, String> {
+    fn init_byo_client(provider_name: &str, model: &str) -> Result<Arc<dyn AiProvider>, String> {
         let provider: BYOProvider = provider_name
             .parse()
             .map_err(|e: lychi_core::error::LychiError| e.to_string())?;
@@ -134,6 +144,6 @@ impl AppState {
             .map_err(|e| format!("No API key stored for {provider_name}: {e}"))?;
 
         let client = BYOClient::new(provider, model.to_string(), api_key);
-        Ok(AiRouter::new(Box::new(client)))
+        Ok(Arc::new(client))
     }
 }
