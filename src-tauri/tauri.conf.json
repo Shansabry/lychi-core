@@ -1,0 +1,56 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-config-schema/schema.json",
+  "productName": "Lychi",
+  "version": "0.1.0",
+  "identifier": "app.lychi.desktop",
+  "build": {
+    "frontendDist": "../build",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "pnpm vite:dev",
+    "beforeBuildCommand": "pnpm vite:build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Lychi",
+        "width": 1920,
+        "height": 1080,
+        "resizable": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "center": true,
+        "transparent": true,
+        "visible": false,
+        "skipTaskbar": true
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "/usr/share/icons/**",
+          "/usr/share/pixmaps/**",
+          "/opt/**",
+          "/var/lib/flatpak/exports/share/icons/**",
+          "/var/lib/flatpak/app/**/icons/**",
+          "/var/lib/snapd/desktop/icons/**",
+          "$HOME/.local/share/icons/**",
+          "$HOME/.local/share/flatpak/exports/share/icons/**",
+          "$HOME/.local/share/flatpak/app/**/icons/**"
+        ]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

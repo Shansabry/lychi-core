@@ -1,0 +1,51 @@
+# Rust
+**/target
+**/*.rs.bk
+Cargo.lock
+
+# Frontend
+**/node_modules
+**/build
+**/.svelte-kit
+**/pnpm-lock.yaml
+**/pnpm-workspace.yaml
+
+# Environment
+.env
+.env.*
+*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tauri generated icons (keep PNGs, ignore platform-specific)
+**/src-tauri/icons/*.ico
+**/src-tauri/icons/*.icns
+**/src-tauri/icons/android/
+**/src-tauri/icons/ios/
+**/src-tauri/icons/Square*.png
+**/src-tauri/icons/StoreLogo.png
+**/src-tauri/icons/AppIcon*.png
+
+# Generated placeholder icon
+core/app-icon.png
+
+# Build outputs
+**/bundle/
+**/*.AppImage
+**/*.deb
+**/*.rpm
+**/*.dmg
+**/*.msi
+
+# Logs
+*.log
+npm-debug.log*
