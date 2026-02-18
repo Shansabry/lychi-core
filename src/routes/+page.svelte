@@ -1,10 +1,11 @@
 <script lang="ts">
 import { onMount } from "svelte";
-import type AgentPlanPanel from "$lib/components/AgentPlanPanel.svelte";
+import AgentPlanPanel from "$lib/components/AgentPlanPanel.svelte";
 import CommandInput from "$lib/components/CommandInput.svelte";
 import CompletionsList from "$lib/components/CompletionsList.svelte";
 import HistoryPanel from "$lib/components/HistoryPanel.svelte";
 import MediaPanel from "$lib/components/MediaPanel.svelte";
+import NotesPanel from "$lib/components/NotesPanel.svelte";
 import ResultPanel from "$lib/components/ResultPanel.svelte";
 import SettingsPanel from "$lib/components/SettingsPanel.svelte";
 import StatusBar from "$lib/components/StatusBar.svelte";
@@ -46,6 +47,7 @@ let blurEnabled = $state(false);
 let pendingPlan: AgentPlan | null = $state(null);
 let planPanelRef: AgentPlanPanel | undefined = $state(undefined);
 let mediaOpen = $state(false);
+let notesOpen = $state(false);
 let mediaPlayers: TrackInfo[] = $state([]);
 let mediaPollTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -171,6 +173,7 @@ onMount(() => {
 			settingsOpen = false;
 			pendingPlan = null;
 			mediaOpen = false;
+			notesOpen = false;
 			completions = [];
 			completionIndex = -1;
 			atMode = false;
@@ -209,7 +212,7 @@ onMount(() => {
 
 		// Hide on blur
 		const unlistenFocus = await win.onFocusChanged(({ payload: focused }) => {
-			if (!focused && hideOnBlur && blurEnabled && !settingsOpen) {
+			if (!focused && hideOnBlur && blurEnabled && !settingsOpen && !notesOpen) {
 				hideWindow();
 			}
 		});
@@ -254,6 +257,15 @@ async function handleSubmit() {
 	if (lower === "spotify" || lower === "media" || lower === "music") {
 		inputValue = "";
 		mediaOpen = true;
+		historyOpen = false;
+		completions = [];
+		completionIndex = -1;
+		return;
+	}
+
+	if (lower === "notes" || lower === "todo" || lower === "todos") {
+		inputValue = "";
+		notesOpen = true;
 		historyOpen = false;
 		completions = [];
 		completionIndex = -1;
@@ -324,6 +336,7 @@ async function runCommand(command: string) {
 	historyOpen = false;
 	settingsOpen = false;
 	mediaOpen = false;
+	notesOpen = false;
 	try {
 		lastCommand = command;
 		lastResult = await executeCommand(command);
@@ -341,6 +354,13 @@ async function runCommand(command: string) {
 			mediaOpen = true;
 			historyOpen = false;
 			settingsOpen = false;
+			notesOpen = false;
+			lastResult = null;
+		} else if (lastResult.output === "__notes_panel__") {
+			notesOpen = true;
+			historyOpen = false;
+			settingsOpen = false;
+			mediaOpen = false;
 			lastResult = null;
 		} else if (lastResult.success && !lastResult.output) {
 			await hideWindow();
@@ -417,6 +437,7 @@ function handleToggleHistory() {
 	historyOpen = !historyOpen;
 	settingsOpen = false;
 	mediaOpen = false;
+	notesOpen = false;
 	if (historyOpen) {
 		completions = [];
 		completionIndex = -1;
@@ -431,6 +452,7 @@ function handleToggleSettings() {
 	if (settingsOpen) {
 		historyOpen = false;
 		mediaOpen = false;
+		notesOpen = false;
 		completions = [];
 		completionIndex = -1;
 	}
@@ -441,6 +463,18 @@ function handleToggleMedia() {
 	if (mediaOpen) {
 		historyOpen = false;
 		settingsOpen = false;
+		notesOpen = false;
+		completions = [];
+		completionIndex = -1;
+	}
+}
+
+function handleToggleNotes() {
+	notesOpen = !notesOpen;
+	if (notesOpen) {
+		historyOpen = false;
+		settingsOpen = false;
+		mediaOpen = false;
 		completions = [];
 		completionIndex = -1;
 	}
@@ -450,6 +484,7 @@ function handleShowResult() {
 	settingsOpen = false;
 	mediaOpen = false;
 	historyOpen = false;
+	notesOpen = false;
 	completions = [];
 	completionIndex = -1;
 }
@@ -458,6 +493,7 @@ function handleShowPlan() {
 	settingsOpen = false;
 	mediaOpen = false;
 	historyOpen = false;
+	notesOpen = false;
 	completions = [];
 	completionIndex = -1;
 }
@@ -481,6 +517,10 @@ async function handleDismiss() {
 	}
 	if (mediaOpen) {
 		mediaOpen = false;
+		return;
+	}
+	if (notesOpen) {
+		notesOpen = false;
 		return;
 	}
 	if (lastResult?.needs_confirmation) {
@@ -518,6 +558,7 @@ async function handleDismiss() {
 			ontogglehistory={handleToggleHistory}
 			ontogglemedia={handleToggleMedia}
 			ontogglesettings={handleToggleSettings}
+			ontogglenotes={handleToggleNotes}
 			disabled={isExecuting || isRouting}
 			routing={isRouting}
 			executing={isExecuting}
@@ -529,6 +570,8 @@ async function handleDismiss() {
 			<SettingsPanel ondismiss={() => { settingsOpen = false; }} />
 		{:else if mediaOpen}
 			<MediaPanel ondismiss={() => { mediaOpen = false; }} players={mediaPlayers} />
+		{:else if notesOpen}
+			<NotesPanel ondismiss={() => { notesOpen = false; }} />
 		{:else if pendingPlan}
 			<AgentPlanPanel
 				bind:this={planPanelRef}
@@ -566,6 +609,8 @@ async function handleDismiss() {
 			ontogglehistory={handleToggleHistory}
 			ontogglesettings={handleToggleSettings}
 			ontogglemedia={handleToggleMedia}
+			ontogglenotes={handleToggleNotes}
+			{notesOpen}
 		onshowresult={handleShowResult}
 		onshowplan={handleShowPlan}
 		hasPlan={!!pendingPlan}

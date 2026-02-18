@@ -4,6 +4,7 @@ pub mod error;
 pub mod executor;
 pub mod history;
 pub mod intent;
+pub mod notes;
 #[cfg(feature = "mpris")]
 pub mod mpris;
 pub mod paths;

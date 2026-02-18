@@ -2,6 +2,7 @@ pub mod app_launcher;
 pub mod calc;
 pub mod file_open;
 pub mod icons;
+pub mod notes;
 pub mod project_open;
 pub mod shell_exec;
 #[cfg(feature = "mpris")]

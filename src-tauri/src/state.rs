@@ -2,6 +2,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use lychi_core::action_registry::handlers::app_launcher::AppLauncher;
+use lychi_core::action_registry::handlers::notes::{NotesHandler, TodoHandler};
 use lychi_core::action_registry::handlers::calc::CalcHandler;
 use lychi_core::action_registry::handlers::file_open::FileOpen;
 use lychi_core::action_registry::handlers::project_open::ProjectOpen;
@@ -16,6 +17,7 @@ use lychi_core::action_registry::registry::ActionRegistry;
 use lychi_core::config::Config;
 use lychi_core::executor::Executor;
 use lychi_core::history::HistoryStore;
+use lychi_core::notes::store::NotesStore;
 use lychi_core::intent::IntentResolver;
 use lychi_core::intent::ai_router::AiRouter;
 #[cfg(feature = "mpris")]
@@ -29,6 +31,7 @@ pub struct AppState {
     pub executor: Arc<RwLock<Executor>>,
     pub history: Arc<RwLock<HistoryStore>>,
     pub config: Arc<RwLock<Config>>,
+    pub notes: Arc<RwLock<NotesStore>>,
     pub pending_plan: Arc<RwLock<Option<AgentPlan>>>,
     #[cfg(feature = "mpris")]
     pub mpris: Arc<RwLock<Option<MprisManager>>>,
@@ -37,6 +40,19 @@ pub struct AppState {
 impl AppState {
     pub fn new() -> Self {
         let config = Config::load_or_default(&paths::config_file());
+
+        // Load notes store early so handlers can share the reference
+        let notes = Arc::new(RwLock::new(
+            NotesStore::load_or_create(&paths::notes_file()).unwrap_or_else(|e| {
+                tracing::error!("Failed to load notes: {e} — starting fresh");
+                NotesStore::load_or_create(&paths::notes_file()).unwrap_or_else(|_| {
+                    NotesStore::load_or_create(
+                        &std::env::temp_dir().join("lychi-notes-fallback.json"),
+                    )
+                    .expect("Failed to create fallback notes store")
+                })
+            }),
+        ));
 
         let mut registry = ActionRegistry::new();
         registry.register(Box::new(AppLauncher::new()));
@@ -59,6 +75,8 @@ impl AppState {
             config.projects.directories.clone(),
         )));
         registry.register(Box::new(SystemCommand::new()));
+        registry.register(Box::new(NotesHandler::new(notes.clone())));
+        registry.register(Box::new(TodoHandler::new(notes.clone())));
 
         // Initialize AI router if configured
         let ai_router = if config.ai.mode == "byo" {
@@ -96,6 +114,7 @@ impl AppState {
         Self {
             executor: Arc::new(RwLock::new(executor)),
             history: Arc::new(RwLock::new(history)),
+            notes,
             config: Arc::new(RwLock::new(config)),
             pending_plan: Arc::new(RwLock::new(None)),
             #[cfg(feature = "mpris")]

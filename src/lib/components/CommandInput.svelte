@@ -11,6 +11,7 @@ let {
 	ontogglehistory,
 	ontogglemedia,
 	ontogglesettings,
+	ontogglenotes,
 	disabled = false,
 	routing = false,
 	executing = false,
@@ -27,6 +28,7 @@ let {
 	ontogglehistory: () => void;
 	ontogglemedia: () => void;
 	ontogglesettings: () => void;
+	ontogglenotes: () => void;
 	disabled: boolean;
 	routing: boolean;
 	executing: boolean;
@@ -199,6 +201,9 @@ function handleKeydown(e: KeyboardEvent) {
 	} else if (e.ctrlKey && e.key === "3") {
 		e.preventDefault();
 		ontogglesettings();
+	} else if (e.ctrlKey && e.key === "4") {
+		e.preventDefault();
+		ontogglenotes();
 	}
 }
 </script>

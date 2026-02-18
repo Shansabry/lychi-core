@@ -28,6 +28,9 @@ pub enum LychiError {
 
     #[error("AI error: {0}")]
     Ai(String),
+
+    #[error("Notes error: {0}")]
+    Notes(String),
 }
 
 impl serde::Serialize for LychiError {

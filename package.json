@@ -17,6 +17,7 @@
     "clippy": "cargo clippy --workspace",
     "test": "cargo test --workspace",
     "test:core": "cargo test -p lychi-core",
+    "clean": "rm -rf .svelte-kit node_modules/.vite",
     "tauri": "tauri"
   },
   "devDependencies": {

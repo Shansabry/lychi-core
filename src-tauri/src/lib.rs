@@ -66,6 +66,12 @@ pub fn run() {
             commands::media::media_seek,
             commands::media::media_refresh,
             commands::open_uri::open_uri,
+            commands::notes::get_note,
+            commands::notes::set_note,
+            commands::notes::get_todos,
+            commands::notes::add_todo,
+            commands::notes::toggle_todo,
+            commands::notes::delete_todo,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

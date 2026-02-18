@@ -92,15 +92,24 @@ core/
 ├── Cargo.toml                     # Workspace root (3 crates)
 ├── crates/lychi-core/             # Core library — all business logic
 │   └── src/
-│       ├── command/               # CommandHandler trait + implementations
+│       ├── action_registry/       # ActionHandler trait + handler implementations
+│       │   └── handlers/          # open, web, yt, run, calc, spotify, media, notes, etc.
+│       ├── intent/                # Intent resolution (pattern matching + AI routing)
+│       ├── rules/                 # Rules engine (risk levels, denylist, shell patterns)
+│       ├── executor/              # Executor pipeline: resolve → validate → execute
+│       ├── providers/             # AI backends (BYO OpenAI/Anthropic/Groq)
 │       ├── history/               # Command history (JSON persistence)
+│       ├── notes/                 # Notes & todo store (JSON persistence)
 │       ├── config/                # App config (TOML with serde defaults)
+│       ├── mpris/                 # MPRIS D-Bus media control (feature-gated)
 │       ├── error.rs               # LychiError (thiserror)
 │       └── paths.rs               # XDG directory resolution
 ├── src-tauri/                     # Tauri app — thin bridge layer
 │   └── src/
 │       ├── lib.rs                 # Tauri Builder setup
 │       ├── state.rs               # AppState + handler registration
+│       ├── ipc_server.rs          # Unix domain socket IPC
+│       ├── platform/              # Platform abstraction (linux.rs — GTK/GDK/layer-shell)
 │       └── commands/              # #[tauri::command] IPC wrappers
 ├── cli/                           # CLI binary for `lychi --toggle`
 ├── src/                           # Svelte 5 frontend
@@ -122,6 +131,14 @@ core/
 | `web` | `web rust lang` | Search the web (opens default browser) |
 | `yt` | `yt lofi beats` | Search YouTube |
 | `run` | `run ls -la` | Execute a shell command |
+| `calc` | `calc 2+2` | Evaluate a math expression |
+| `project` | `project lychi` | Open a project directory in your editor |
+| `spotify` | `spotify next` | Control Spotify (play, pause, next, prev) |
+| `media` | `media pause all` | Control any media player via MPRIS |
+| `note` | `note pick up milk` | Save a quick note |
+| `todo` | `todo add fix bug` | Manage todo list (add, list, done, delete) |
+
+With AI routing enabled, natural language input is parsed into structured commands automatically.
 
 ## Config
 
@@ -139,15 +156,40 @@ shell = "/bin/sh"
 [history]
 max_entries = 500
 deduplicate = true
+
+[ai]
+mode = "disabled"       # "disabled", "byo"
+provider = "openai"     # "openai", "anthropic", "groq"
+model = "gpt-4o-mini"
 ```
+
+## Data Files
+
+| File | Path | Purpose |
+|------|------|---------|
+| Config | `~/.config/lychi/config.toml` | App configuration |
+| History | `~/.local/share/lychi/history.json` | Command history |
+| Notes | `~/.local/share/lychi/notes.json` | Sticky note + todo list |
 
 ## Architecture
 
-- **`lychi-core`** — All business logic. Zero Tauri knowledge. Testable in isolation.
+- **`lychi-core`** — All business logic. Zero Tauri knowledge. Testable in isolation. Organized as LEGO bricks: action_registry, rules, intent, executor, providers.
 - **`src-tauri`** — Thin Tauri shell. Bridges core to frontend via IPC commands (5-10 lines each).
 - **`cli`** — Tiny binary for `lychi --toggle` via Unix domain socket.
 
-Commands are extensible via the `CommandHandler` trait + `CommandRegistry` dispatch pattern. Adding a new command = 1 new file + 1 registration line, no frontend changes needed.
+Commands are extensible via the `ActionHandler` trait + `ActionRegistry` dispatch pattern. Adding a new command = 1 new handler file + 1 registration line in `state.rs`.
+
+## Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl+1` | Toggle history panel |
+| `Ctrl+2` | Toggle media panel |
+| `Ctrl+3` | Toggle settings panel |
+| `Ctrl+4` | Toggle notes panel |
+| `Escape` | Dismiss window / close panel |
+| `Up/Down` | Navigate history |
+| `Tab` / `Right Arrow` | Accept history ghost autofill |
 
 ## All Scripts Reference
 

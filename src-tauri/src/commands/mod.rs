@@ -5,4 +5,5 @@ pub mod execute;
 pub mod filesystem;
 pub mod history;
 pub mod media;
+pub mod notes;
 pub mod open_uri;

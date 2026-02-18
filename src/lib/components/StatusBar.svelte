@@ -1,5 +1,14 @@
 <script lang="ts">
-import { Clock, Music, Pause, Play, Settings, Sparkles, SquareTerminal } from "lucide-svelte";
+import {
+	Clock,
+	Music,
+	Pause,
+	Play,
+	Settings,
+	Sparkles,
+	SquareTerminal,
+	StickyNote,
+} from "lucide-svelte";
 import type { CommandResult, TrackInfo } from "$lib/ipc";
 import { mediaControl } from "$lib/ipc";
 
@@ -15,8 +24,10 @@ let {
 	ontogglehistory,
 	ontogglesettings,
 	ontogglemedia,
+	ontogglenotes,
 	onshowresult,
 	onshowplan,
+	notesOpen = false,
 	hasPlan = false,
 }: {
 	result: CommandResult | null;
@@ -30,13 +41,20 @@ let {
 	ontogglehistory: () => void;
 	ontogglesettings: () => void;
 	ontogglemedia: () => void;
+	ontogglenotes: () => void;
 	onshowresult: () => void;
 	onshowplan: () => void;
+	notesOpen?: boolean;
 	hasPlan?: boolean;
 } = $props();
 
 let resultVisible = $derived(
-	result && (result.output || result.error) && !settingsOpen && !mediaOpen && !historyOpen,
+	result &&
+		(result.output || result.error) &&
+		!settingsOpen &&
+		!mediaOpen &&
+		!historyOpen &&
+		!notesOpen,
 );
 
 async function togglePlayPause() {
@@ -136,6 +154,16 @@ async function togglePlayPause() {
 			tabindex={-1}
 		>
 			<Music size={14} strokeWidth={1.5} />
+		</button>
+		<button
+			class="bar-icon"
+			class:active={notesOpen}
+			onmousedown={(e) => e.preventDefault()}
+			onclick={ontogglenotes}
+			title="Notes (Ctrl+4)"
+			tabindex={-1}
+		>
+			<StickyNote size={14} strokeWidth={1.5} />
 		</button>
 		<button
 			class="bar-icon"

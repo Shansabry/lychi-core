@@ -8,7 +8,8 @@
 
 /// Known handler prefixes.
 const KNOWN_PREFIXES: &[&str] = &[
-    "open", "web", "yt", "run", "calc", "file", "url", "spotify", "project", "system",
+    "open", "web", "yt", "run", "calc", "file", "url", "spotify", "project", "system", "note",
+    "notes", "todo", "todos",
 ];
 
 /// Common TLDs for URL detection.
@@ -142,6 +143,8 @@ fn try_explicit_prefix(input: &str) -> Option<Route> {
             "spotify" => "spotify",
             "project" => "project",
             "system" => "system",
+            "note" | "notes" => "note",
+            "todo" | "todos" => "todo",
             _ => return None,
         };
         Some(Route {

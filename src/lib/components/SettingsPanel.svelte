@@ -34,6 +34,7 @@ import Select from "./Select.svelte";
 let { ondismiss }: { ondismiss: () => void } = $props();
 
 let activeTab: "general" | "ai" | "projects" | "guide" | "about" = $state("general");
+let guideTab: "shortcuts" | "commands" | "triggers" = $state("shortcuts");
 let appVersion = $state("");
 
 let aiConfig: AiConfig = $state({
@@ -354,9 +355,8 @@ function handleKeydown(e: KeyboardEvent) {
 			<BookOpen size={14} strokeWidth={1.5} />
 			<span>Guide</span>
 		</button>
-		<div class="sidebar-spacer"></div>
 		<button
-			class="tab-btn"
+			class="tab-btn about-tab"
 			class:active={activeTab === "about"}
 			onclick={() => (activeTab = "about")}
 		>
@@ -595,8 +595,31 @@ function handleKeydown(e: KeyboardEvent) {
 			{/if}
 		{:else if activeTab === "guide"}
 			<div class="guide" role="region" aria-label="Guide">
-				<div class="guide-section">
-					<h3 class="guide-heading">Shortcuts</h3>
+				<div class="guide-tab-bar">
+					<button
+						class="guide-tab"
+						class:active={guideTab === "shortcuts"}
+						onmousedown={(e) => e.preventDefault()}
+						onclick={() => { guideTab = "shortcuts"; }}
+						tabindex={-1}
+					>Shortcuts</button>
+					<button
+						class="guide-tab"
+						class:active={guideTab === "commands"}
+						onmousedown={(e) => e.preventDefault()}
+						onclick={() => { guideTab = "commands"; }}
+						tabindex={-1}
+					>Commands</button>
+					<button
+						class="guide-tab"
+						class:active={guideTab === "triggers"}
+						onmousedown={(e) => e.preventDefault()}
+						onclick={() => { guideTab = "triggers"; }}
+						tabindex={-1}
+					>Triggers</button>
+				</div>
+
+				{#if guideTab === "shortcuts"}
 					<div class="guide-table">
 						<div class="guide-row">
 							<kbd>{generalConfig.hotkey}</kbd>
@@ -630,11 +653,16 @@ function handleKeydown(e: KeyboardEvent) {
 							<kbd>Ctrl+3</kbd>
 							<span>Toggle settings</span>
 						</div>
+						<div class="guide-row">
+							<kbd>Ctrl+4</kbd>
+							<span>Toggle notes</span>
+						</div>
+						<div class="guide-row">
+							<kbd>@</kbd>
+							<span>File/folder reference</span>
+						</div>
 					</div>
-				</div>
-
-				<div class="guide-section">
-					<h3 class="guide-heading">Commands</h3>
+				{:else if guideTab === "commands"}
 					<div class="guide-table">
 						<div class="guide-row">
 							<code>open &lt;app&gt;</code>
@@ -665,14 +693,27 @@ function handleKeydown(e: KeyboardEvent) {
 							<span>Open project in editor</span>
 						</div>
 						<div class="guide-row">
+							<code>spotify &lt;action&gt;</code>
+							<span>Control Spotify</span>
+						</div>
+						<div class="guide-row">
+							<code>media &lt;action&gt;</code>
+							<span>Control any media player</span>
+						</div>
+						<div class="guide-row">
+							<code>note &lt;text&gt;</code>
+							<span>Save a quick note</span>
+						</div>
+						<div class="guide-row">
+							<code>todo &lt;action&gt;</code>
+							<span>Manage todo list</span>
+						</div>
+						<div class="guide-row">
 							<code>system &lt;action&gt;</code>
 							<span>shutdown / reboot / lock / suspend</span>
 						</div>
 					</div>
-				</div>
-
-				<div class="guide-section">
-					<h3 class="guide-heading">Quick triggers</h3>
+				{:else}
 					<div class="guide-table">
 						<div class="guide-row">
 							<code>=2+2</code>
@@ -691,7 +732,7 @@ function handleKeydown(e: KeyboardEvent) {
 							<span>Open URL</span>
 						</div>
 					</div>
-				</div>
+				{/if}
 			</div>
 		{:else if activeTab === "about"}
 			<div class="about">
@@ -1167,25 +1208,38 @@ function handleKeydown(e: KeyboardEvent) {
 	.guide {
 		display: flex;
 		flex-direction: column;
-		gap: 14px;
 		padding: 2px 0;
 		overflow-y: auto;
 		max-height: calc(50vh - 40px);
 	}
 
-	.guide-section {
+	.guide-tab-bar {
 		display: flex;
-		flex-direction: column;
-		gap: 4px;
+		border-bottom: 1px solid var(--border);
+		margin-bottom: 8px;
 	}
 
-	.guide-heading {
+	.guide-tab {
+		font-family: var(--font-mono);
 		font-size: 11px;
-		font-weight: 600;
-		color: var(--fg-muted);
 		text-transform: uppercase;
 		letter-spacing: 0.5px;
-		margin: 0 0 2px 0;
+		color: var(--fg-muted);
+		background: none;
+		border: none;
+		border-bottom: 2px solid transparent;
+		padding: 6px 10px;
+		cursor: pointer;
+		transition: color 100ms ease, border-color 100ms ease;
+	}
+
+	.guide-tab:hover {
+		color: var(--fg);
+	}
+
+	.guide-tab.active {
+		color: var(--fg);
+		border-bottom-color: var(--accent);
 	}
 
 	.guide-table {
@@ -1221,8 +1275,10 @@ function handleKeydown(e: KeyboardEvent) {
 	}
 
 	/* About tab */
-	.sidebar-spacer {
-		flex: 1;
+	.about-tab {
+		margin-top: 8px;
+		border-top: 1px solid var(--border);
+		padding-top: 8px;
 	}
 
 	.about {

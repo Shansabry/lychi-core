@@ -54,6 +54,15 @@ Examples:
 - "lock my screen" → {{"action_id": "system", "args": "lock"}}
 - "reboot" → {{"action_id": "system", "args": "reboot"}}
 - "put the computer to sleep" → {{"action_id": "system", "args": "suspend"}}
+- "remind me to buy milk" → {{"action_id": "todo", "args": "add buy milk"}}
+- "add to my list: fix the login bug" → {{"action_id": "todo", "args": "add fix the login bug"}}
+- "what's on my plate" → {{"action_id": "todo", "args": "summary"}}
+- "what's left to do" → {{"action_id": "todo", "args": "summary"}}
+- "show my todos" → {{"action_id": "todo", "args": "list"}}
+- "did I forget something" → {{"action_id": "todo", "args": "summary"}}
+- "jot down: call dentist tomorrow" → {{"action_id": "note", "args": "call dentist tomorrow"}}
+- "what did I write down" → {{"action_id": "note", "args": "read"}}
+- "read my note" → {{"action_id": "note", "args": "read"}}
 - "open readyroos in vscode" → {{"action_id": "project", "args": "readyroos"}}
 - "open my lychi project" → {{"action_id": "project", "args": "lychi"}}
 - "create a new rust project and open in vscode" → {{"steps": [{{"action_id": "run", "args": "cargo init my-project", "label": "Create Rust project", "risk": "medium"}}, {{"action_id": "run", "args": "code my-project", "label": "Open in VS Code", "risk": "low"}}]}}
@@ -93,6 +102,12 @@ fn action_description(id: &str) -> &'static str {
         }
         "system" => {
             "System power controls: shutdown, reboot, suspend, hibernate, lock, logout. Use when the user wants to power off, restart, sleep, lock screen, or log out"
+        }
+        "note" => {
+            "Quick sticky note. 'note <text>' to save, 'note read' to view current note. Use when the user wants to jot something down or read their note"
+        }
+        "todo" => {
+            "Todo list. 'todo add <text>' to add, 'todo list' to view all, 'todo done <id>' to check off, 'todo delete <id>' to remove, 'todo summary' for a full overview of note + todos. Use for task management, reminders, or when asking what's on their plate"
         }
         _ => "Unknown command",
     }
