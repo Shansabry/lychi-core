@@ -22,6 +22,17 @@ pub struct ResolvedIntent {
     pub routing: RoutingMethod,
 }
 
+/// Check if input looks like a natural language question.
+/// Used as a no-AI fallback — routes questions to web search instead of app launcher.
+fn looks_like_question(input: &str) -> bool {
+    let lower = input.trim_start().to_lowercase();
+    const QUESTION_WORDS: &[&str] = &[
+        "what ", "who ", "how ", "why ", "when ", "where ", "which ", "is ", "are ", "can ",
+        "does ", "do ", "will ", "should ", "explain ", "define ",
+    ];
+    QUESTION_WORDS.iter().any(|w| lower.starts_with(w)) || lower.ends_with('?')
+}
+
 /// Intent Resolver — converts raw user input into structured intents.
 ///
 /// Combines deterministic pattern matching with optional AI routing.
@@ -55,7 +66,8 @@ impl IntentResolver {
     /// 1. Explicit prefix / trigger character → dispatch immediately
     /// 2. Pattern detection (file path, URL, math) → dispatch
     /// 3. Default "open" + AI available → ask AI
-    /// 4. Fallback: "open" handler
+    /// 4. Question fallback (no AI) → web search
+    /// 5. Fallback: "open" handler
     pub async fn resolve(&self, raw: &str, registry: &ActionRegistry) -> ResolvedIntent {
         let route = patterns::route(raw);
 
@@ -88,6 +100,16 @@ impl IntentResolver {
                     routing: RoutingMethod::Ai,
                 };
             }
+        }
+
+        // AI unavailable or failed — if it looks like a question, fall back to
+        // web search instead of trying to open it as an app name.
+        if looks_like_question(raw) {
+            return ResolvedIntent {
+                action_id: "web".to_string(),
+                args: route.args,
+                routing: RoutingMethod::Pattern,
+            };
         }
 
         // Fallback to "open"

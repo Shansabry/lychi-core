@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 
 use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType};
 use crate::error::LychiError;
-use crate::notes::store::{NotesStore, MAX_NOTES};
+use crate::notes::store::{MAX_NOTES, NotesStore};
 
 // ---- Notes handler ----
 
@@ -85,7 +85,12 @@ impl ActionHandler for NotesHandler {
                 .collect();
             return Ok(ActionResult {
                 success: true,
-                output: Some(format!("Notes ({}/{}):\n{}", notes.len(), MAX_NOTES, lines.join("\n"))),
+                output: Some(format!(
+                    "Notes ({}/{}):\n{}",
+                    notes.len(),
+                    MAX_NOTES,
+                    lines.join("\n")
+                )),
                 error: None,
                 duration_ms: start.elapsed().as_millis() as u64,
                 routed_by: None,

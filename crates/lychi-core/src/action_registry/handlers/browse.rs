@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use crate::action_registry::{ActionHandler, ActionResult};
 use crate::error::LychiError;
 
+#[derive(Default)]
 pub struct BrowseHandler;
 
 impl BrowseHandler {

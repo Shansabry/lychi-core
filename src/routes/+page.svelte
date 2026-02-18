@@ -301,6 +301,10 @@ async function handleSubmit() {
 			if (spaceIdx !== -1) {
 				const prefix = trimmed.slice(0, spaceIdx);
 				await runCommand(`${prefix} ${selected.label}`);
+			} else if (selected.label.toLowerCase() === trimmed.toLowerCase()) {
+				// Completion matches input exactly (e.g. "mem" → sysinfo "mem")
+				// Let the backend router handle it directly
+				await runCommand(trimmed);
 			} else {
 				// No prefix — these are app completions, launch via open
 				await runCommand(`open ${selected.label}`);

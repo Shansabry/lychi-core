@@ -11,6 +11,7 @@ use lychi_core::action_registry::handlers::project_open::ProjectOpen;
 use lychi_core::action_registry::handlers::shell_exec::ShellExec;
 #[cfg(feature = "mpris")]
 use lychi_core::action_registry::handlers::spotify::{MediaHandler, SpotifyHandler};
+use lychi_core::action_registry::handlers::sysinfo::SysInfoHandler;
 use lychi_core::action_registry::handlers::system::SystemCommand;
 use lychi_core::action_registry::handlers::url_open::UrlOpen;
 use lychi_core::action_registry::handlers::weather::WeatherHandler;
@@ -79,6 +80,7 @@ impl AppState {
             config.projects.directories.clone(),
         )));
         registry.register(Box::new(SystemCommand::new()));
+        registry.register(Box::new(SysInfoHandler::new()));
         registry.register(Box::new(NotesHandler::new(notes.clone())));
         registry.register(Box::new(TodoHandler::new(notes.clone())));
         registry.register(Box::new(BrowseHandler::new()));

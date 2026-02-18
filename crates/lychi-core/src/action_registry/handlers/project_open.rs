@@ -3,8 +3,8 @@ use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::RwLock;
 use std::time::Instant;
@@ -212,9 +212,13 @@ impl ActionHandler for ProjectOpen {
 
         let path = &entry.path;
 
-        Command::new("code").arg(path).process_group(0).spawn().map_err(|e| {
-            LychiError::ExecutionFailed(format!("Failed to open {} in editor: {e}", entry.name))
-        })?;
+        Command::new("code")
+            .arg(path)
+            .process_group(0)
+            .spawn()
+            .map_err(|e| {
+                LychiError::ExecutionFailed(format!("Failed to open {} in editor: {e}", entry.name))
+            })?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 

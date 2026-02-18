@@ -1,5 +1,6 @@
 <script lang="ts">
 import { LoaderCircle } from "lucide-svelte";
+import { fuzzyRank } from "$lib/fuzzy";
 
 let {
 	value = $bindable(""),
@@ -49,18 +50,30 @@ let segments = $derived.by(() => {
 	return { before, atPart, after };
 });
 
-// Ghost autofill from history — find the most recent match for current input
-let ghostSuffix = $derived.by(() => {
-	if (!value || executing || routing) return "";
+// Ghost autofill from history — prefix match first, fuzzy fallback
+type Ghost = { kind: "suffix"; suffix: string } | { kind: "fuzzy"; full: string } | null;
+
+let ghost: Ghost = $derived.by(() => {
+	if (!value || executing || routing) return null;
 	const lower = value.toLowerCase();
-	// Search history in reverse (most recent first)
+	// Prefix match wins (most recent first)
 	for (let i = history.length - 1; i >= 0; i--) {
 		if (history[i].toLowerCase().startsWith(lower) && history[i] !== value) {
-			return history[i].slice(value.length);
+			return { kind: "suffix", suffix: history[i].slice(value.length) };
 		}
 	}
-	return "";
+	// Fuzzy fallback — only for meaningful queries
+	if (value.length >= 3) {
+		const matches = fuzzyRank(value, history);
+		if (matches.length > 0 && matches[0].value !== value) {
+			return { kind: "fuzzy", full: matches[0].value };
+		}
+	}
+	return null;
 });
+
+let ghostSuffix = $derived(ghost?.kind === "suffix" ? ghost.suffix : "");
+let ghostFull = $derived(ghost?.kind === "fuzzy" ? ghost.full : "");
 
 let inputEl: HTMLInputElement | undefined = $state();
 
@@ -160,8 +173,13 @@ $effect(() => {
 });
 
 function acceptGhost() {
-	if (ghostSuffix) {
-		value = value + ghostSuffix;
+	if (ghost?.kind === "suffix") {
+		value = value + ghost.suffix;
+		oninputchange(value);
+		return true;
+	}
+	if (ghost?.kind === "fuzzy") {
+		value = ghost.full;
 		oninputchange(value);
 		return true;
 	}
@@ -169,12 +187,12 @@ function acceptGhost() {
 }
 
 function handleKeydown(e: KeyboardEvent) {
-	if (e.key === "Tab" && ghostSuffix) {
+	if (e.key === "Tab" && ghost) {
 		e.preventDefault();
 		acceptGhost();
 	} else if (
 		e.key === "ArrowRight" &&
-		ghostSuffix &&
+		ghost &&
 		inputEl &&
 		inputEl.selectionStart === value.length
 	) {
@@ -230,6 +248,11 @@ function handleKeydown(e: KeyboardEvent) {
 		{#if ghostSuffix}
 			<div class="ghost-overlay" aria-hidden="true">
 				<span class="ghost-typed">{value}</span><span class="ghost-suffix">{ghostSuffix}</span>
+			</div>
+		{/if}
+		{#if ghostFull}
+			<div class="ghost-overlay" aria-hidden="true">
+				<span class="ghost-typed">{value}</span><span class="ghost-fuzzy-hint"> ~{ghostFull}</span>
 			</div>
 		{/if}
 		<input
@@ -375,6 +398,12 @@ function handleKeydown(e: KeyboardEvent) {
 	.ghost-suffix {
 		color: var(--fg-muted);
 		opacity: 0.35;
+	}
+
+	.ghost-fuzzy-hint {
+		color: var(--fg-muted);
+		opacity: 0.25;
+		font-style: italic;
 	}
 
 	input {

@@ -1,9 +1,18 @@
 <script lang="ts">
-import { X, ChevronLeft, Plus } from "lucide-svelte";
-import { onMount } from "svelte";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { ChevronLeft, Plus, X } from "lucide-svelte";
+import { onMount } from "svelte";
 import type { NoteItem, TodoItem } from "$lib/ipc";
-import { getNotes, addNote, updateNote, deleteNote, addTodo, deleteTodo, getTodos, toggleTodo } from "$lib/ipc";
+import {
+	addNote,
+	addTodo,
+	deleteNote,
+	deleteTodo,
+	getNotes,
+	getTodos,
+	toggleTodo,
+	updateNote,
+} from "$lib/ipc";
 
 const MAX_NOTES = 5;
 const MAX_NOTE_CHARS = 500;
@@ -63,7 +72,7 @@ async function loadData() {
 		notes = n;
 		todos = t;
 		// If editing a note that was deleted externally, go back to list
-		if (editingNote && !n.find((x) => x.id === editingNote!.id)) {
+		if (editingNote && !n.find((x) => x.id === editingNote?.id)) {
 			editingNote = null;
 		}
 	} catch (err) {
@@ -75,7 +84,7 @@ async function loadData() {
 
 function noteTitle(text: string): string {
 	const first = text.split("\n")[0] || text;
-	return first.length > 50 ? first.slice(0, 50) + "…" : first;
+	return first.length > 50 ? `${first.slice(0, 50)}…` : first;
 }
 
 function openNote(note: NoteItem) {
@@ -108,7 +117,7 @@ async function saveCurrentNote() {
 		} else if (editingNote) {
 			await updateNote(editingNote.id, editText);
 			notes = notes.map((n) =>
-				n.id === editingNote!.id ? { ...n, text: editText, updated_at: Date.now() } : n
+				n.id === editingNote?.id ? { ...n, text: editText, updated_at: Date.now() } : n,
 			);
 		}
 	} catch (err) {

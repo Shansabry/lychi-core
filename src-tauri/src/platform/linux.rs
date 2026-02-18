@@ -59,14 +59,14 @@ fn find_primary_monitor(display: &gdk::Display) -> Option<gdk::Monitor> {
                 is_primary = true;
             } else if is_primary && trimmed.starts_with("Geometry:") {
                 // "Geometry: 1920,0 1920x1080"
-                if let Some(coords) = trimmed.strip_prefix("Geometry:").map(|s| s.trim()) {
-                    if let Some(pos) = coords.split_whitespace().next() {
-                        let parts: Vec<&str> = pos.split(',').collect();
-                        if parts.len() == 2 {
-                            if let (Ok(x), Ok(y)) = (parts[0].parse(), parts[1].parse()) {
-                                primary_geom = Some((x, y));
-                            }
-                        }
+                if let Some(coords) = trimmed.strip_prefix("Geometry:").map(|s| s.trim())
+                    && let Some(pos) = coords.split_whitespace().next()
+                {
+                    let parts: Vec<&str> = pos.split(',').collect();
+                    if parts.len() == 2
+                        && let (Ok(x), Ok(y)) = (parts[0].parse(), parts[1].parse())
+                    {
+                        primary_geom = Some((x, y));
                     }
                 }
                 break;

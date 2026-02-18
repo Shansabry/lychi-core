@@ -29,6 +29,10 @@ impl Executor {
     /// `Deny` decisions are always enforced regardless of `confirmed`.
     pub async fn run(&self, input: &str, confirmed: bool) -> Result<ActionResult, LychiError> {
         let intent = self.resolver.resolve(input, &self.registry).await;
+        tracing::info!(
+            "Resolved '{}' → action={}, args='{}', routing={:?}",
+            input, intent.action_id, intent.args, intent.routing
+        );
 
         let handler = self
             .registry

@@ -27,9 +27,7 @@ impl WeatherAskHandler {
     }
 
     /// Format weather data into a context string for the AI.
-    fn format_context(
-        data: &super::weather::WeatherData,
-    ) -> String {
+    fn format_context(data: &super::weather::WeatherData) -> String {
         let mut ctx = format!(
             "Location: {}. Current: {}°{}, {}",
             data.location, data.current.temp, data.unit, data.current.condition
@@ -56,10 +54,7 @@ impl WeatherAskHandler {
     }
 
     /// Generate a simple template answer when AI is not available.
-    fn fallback_answer(
-        data: &super::weather::WeatherData,
-        question: &str,
-    ) -> String {
+    fn fallback_answer(data: &super::weather::WeatherData, question: &str) -> String {
         let q = question.to_lowercase();
         let has_rain = data.current.condition.contains("rain")
             || data.forecast.iter().any(|d| d.condition.contains("rain"));
@@ -76,7 +71,11 @@ impl WeatherAskHandler {
                     data.location, data.current.temp, data.unit, data.current.condition
                 )
             }
-        } else if q.contains("cold") || q.contains("warm") || q.contains("hot") || q.contains("jacket") {
+        } else if q.contains("cold")
+            || q.contains("warm")
+            || q.contains("hot")
+            || q.contains("jacket")
+        {
             format!(
                 "It's currently {}°{} in {} with {}.",
                 data.current.temp, data.unit, data.location, data.current.condition

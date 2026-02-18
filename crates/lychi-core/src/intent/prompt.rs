@@ -15,89 +15,29 @@ pub fn system_prompt(known_actions: &[&str]) -> String {
         .join("\n");
 
     format!(
-        r#"You are a command router for a desktop launcher on Linux. Given natural language input, determine the best matching command and extract the arguments.
+        r#"You are a command router for a desktop launcher. Given natural language input, determine the best matching command and extract the arguments.
+
+Most common inputs (weather, system power, media control, sysinfo, todos, notes, direct questions) are already handled before reaching you. You only see ambiguous or complex cases.
 
 Available commands:
 {commands}
 
-For simple requests (one action), respond with:
+Response format:
 {{"action_id": "...", "args": "..."}}
 
-For complex requests (2+ distinct actions), respond with a steps array:
-{{"steps": [
-  {{"action_id": "run", "args": "cargo init my-project", "label": "Create Rust project", "risk": "medium"}},
-  {{"action_id": "run", "args": "code my-project", "label": "Open in VS Code", "risk": "low"}}
-]}}
-
-Risk levels per step:
-- "low": read-only or standard operations (ls, cat, code, open, firefox)
-- "medium": creates or modifies files (mkdir, touch, cargo init, npm init)
-- "high": destructive or system operations (rm, sudo, chmod, operations with > or |)
-
-Examples:
-- "open firefox" → {{"action_id": "open", "args": "firefox"}}
-- "play lofi on youtube" → {{"action_id": "yt", "args": "lofi"}}
-- "what's the weather" → {{"action_id": "weather", "args": ""}}
-- "weather in paris" → {{"action_id": "weather", "args": "paris"}}
-- "is it raining in tokyo" → {{"action_id": "weather", "args": "tokyo"}}
-- "temperature in new york" → {{"action_id": "weather", "args": "new york"}}
-- "will it rain today" → {{"action_id": "weather-ask", "args": "will it rain today"}}
-- "do I need an umbrella" → {{"action_id": "weather-ask", "args": "do I need an umbrella"}}
-- "is it cold outside" → {{"action_id": "weather-ask", "args": "is it cold outside"}}
-- "should I wear a jacket tomorrow" → {{"action_id": "weather-ask", "args": "should I wear a jacket tomorrow"}}
-- "open this folder in vscode" → {{"action_id": "run", "args": "code ."}}
-- "browse downloads" → {{"action_id": "browse", "args": "~/Downloads"}}
-- "show my documents folder" → {{"action_id": "browse", "args": "~/Documents"}}
+Examples (non-obvious argument transformations only):
 - "find agent agnes files in downloads" → {{"action_id": "run", "args": "ls ~/Downloads/*gent*gnes*"}}
-- "list pdf files in documents" → {{"action_id": "run", "args": "ls ~/Documents/*.pdf"}}
 - "how much is 15% of 200" → {{"action_id": "calc", "args": "200 * 0.15"}}
-- "open github.com" → {{"action_id": "url", "args": "https://github.com"}}
-- "open downloads folder" → {{"action_id": "file", "args": "~/Downloads"}}
-- "skip this song" → {{"action_id": "media", "args": "next"}}
-- "pause the music" → {{"action_id": "media", "args": "pause"}}
-- "play something on spotify" → {{"action_id": "spotify", "args": "play"}}
-- "pause chrome media" → {{"action_id": "media", "args": "pause"}}
-- "next song on spotify" → {{"action_id": "spotify", "args": "next"}}
-- "pause everything" → {{"action_id": "media", "args": "pause all"}}
-- "stop all music" → {{"action_id": "media", "args": "pause all"}}
-- "shut down the computer" → {{"action_id": "system", "args": "shutdown"}}
-- "lock my screen" → {{"action_id": "system", "args": "lock"}}
-- "reboot" → {{"action_id": "system", "args": "reboot"}}
-- "put the computer to sleep" → {{"action_id": "system", "args": "suspend"}}
-- "remind me to buy milk" → {{"action_id": "todo", "args": "add buy milk"}}
-- "add to my list: fix the login bug" → {{"action_id": "todo", "args": "add fix the login bug"}}
-- "what's on my plate" → {{"action_id": "todo", "args": "summary"}}
-- "what's left to do" → {{"action_id": "todo", "args": "summary"}}
-- "show my todos" → {{"action_id": "todo", "args": "list"}}
-- "did I forget something" → {{"action_id": "todo", "args": "summary"}}
-- "jot down: call dentist tomorrow" → {{"action_id": "note", "args": "call dentist tomorrow"}}
-- "what did I write down" → {{"action_id": "note", "args": "read"}}
-- "read my note" → {{"action_id": "note", "args": "read"}}
-- "what is the capital of France" → {{"action_id": "ask", "args": "what is the capital of France"}}
-- "who invented the telephone" → {{"action_id": "ask", "args": "who invented the telephone"}}
-- "explain quantum computing" → {{"action_id": "ask", "args": "explain quantum computing"}}
-- "how does photosynthesis work" → {{"action_id": "ask", "args": "how does photosynthesis work"}}
 - "open readyroos in vscode" → {{"action_id": "project", "args": "readyroos"}}
-- "open my lychi project" → {{"action_id": "project", "args": "lychi"}}
-- "create a new rust project and open in vscode" → {{"steps": [{{"action_id": "run", "args": "cargo init my-project", "label": "Create Rust project", "risk": "medium"}}, {{"action_id": "run", "args": "code my-project", "label": "Open in VS Code", "risk": "low"}}]}}
-- "start a node project, install express, and open in code" → {{"steps": [{{"action_id": "run", "args": "mkdir my-app && cd my-app && npm init -y", "label": "Create Node project", "risk": "medium"}}, {{"action_id": "run", "args": "cd my-app && npm install express", "label": "Install Express", "risk": "medium"}}, {{"action_id": "run", "args": "code my-app", "label": "Open in VS Code", "risk": "low"}}]}}
+- "open github.com" → {{"action_id": "url", "args": "https://github.com"}}
 
 Rules:
-- For launching GUI apps by name, use "open".
-- For opening a project by name in an editor/IDE, use "project".
-- For browsing a whole directory (no search/filter), use "browse". For searching specific files by name/type, use "run" with ls or find.
-- For running CLI tools or apps with specific arguments/paths, use "run".
-- For direct questions (what, who, how, why, explain, define), use "ask".
-- For viewing weather data/forecast (e.g. "weather in london", "temperature in paris"), use "weather".
-- For conversational weather questions (e.g. "will it rain today", "do I need an umbrella", "is it cold outside"), use "weather-ask".
-- For general searches or non-question lookups (e.g. "news", "reddit"), use "web".
-- Only use steps array when 2+ distinct operations are needed.
-- Labels should be short (3-5 words).
-- Order steps logically (create before open, install before run).
-- Extract clean arguments — strip filler words like "please", "can you", "I want to".
+- "open" = GUI apps by name. "project" = open a project folder in editor. "browse" = browse a directory. "run" = shell commands.
+- For file searches by name/type, use "run" with ls or find — not "browse".
+- When uncertain between two handlers, prefer the more specific one.
+- Extract clean arguments — strip filler words ("please", "can you", "I want to").
 - Respond with ONLY valid JSON. No extra text.
-- If truly unclear and it looks like a question, use: {{"action_id": "ask", "args": "<original input>"}}
-- If truly unclear and it doesn't look like a question, use: {{"action_id": "web", "args": "<original input>"}}"#
+- Fallback: question → "ask", non-question → "web"."#
     )
 }
 
@@ -117,28 +57,25 @@ fn action_description(id: &str) -> &'static str {
         "file" => "Open a file or directory in the default app (e.g. '~/Downloads')",
         "url" => "Open a URL in the browser (e.g. 'https://github.com')",
         "spotify" => {
-            "Control Spotify specifically (e.g. 'play', 'pause', 'next', 'prev'). Only use when the user explicitly mentions Spotify"
+            "Control Spotify. Args: play, pause, next, prev. Only when user explicitly mentions Spotify"
         }
         "media" => {
-            "Control any/all media players (e.g. 'play', 'pause', 'next', 'prev', 'pause all'). Use for generic media commands or when a non-Spotify player is mentioned (Chrome, Firefox, browser, YouTube, VLC, etc.). 'pause all' pauses every running player"
+            "Control any/all media players. Args: play, pause, next, prev, 'pause all'. Use for generic media commands or non-Spotify players"
         }
         "project" => {
             "Open a project folder by name in the code editor (e.g. 'readyroos', 'lychi'). Use when the user wants to open a project in VSCode/editor by its name"
         }
+        "sysinfo" => {
+            "System info — show IP address, CPU, memory, or disk usage. Subcommands: ip, cpu, mem, disk. Empty args shows a full overview"
+        }
         "system" => {
-            "System power controls: shutdown, reboot, suspend, hibernate, lock, logout. Use when the user wants to power off, restart, sleep, lock screen, or log out"
+            "System power controls. Args: shutdown, reboot, suspend, hibernate, lock, logout"
         }
-        "note" => {
-            "Quick sticky note. 'note <text>' to save, 'note read' to view current note. Use when the user wants to jot something down or read their note"
-        }
-        "todo" => {
-            "Todo list. 'todo add <text>' to add, 'todo list' to view all, 'todo done <id>' to check off, 'todo delete <id>' to remove, 'todo summary' for a full overview of note + todos. Use for task management, reminders, or when asking what's on their plate"
-        }
-        "weather" => {
-            "Get current weather for a location (e.g. 'london', 'tokyo'). Use when the user wants to VIEW weather data or forecast"
-        }
+        "note" => "Quick sticky note. Args: text to save, or 'read' to view current note",
+        "todo" => "Todo list. Args: 'add <text>', 'list', 'done <id>', 'delete <id>', 'summary'",
+        "weather" => "Get current weather/forecast. Args: city name, or empty for default location",
         "weather-ask" => {
-            "Answer conversational weather questions using real weather data (e.g. 'will it rain', 'do I need a jacket', 'is it cold today'). Use for weather QUESTIONS, not for viewing weather data"
+            "Answer conversational weather questions with real data. Args: the full question (e.g. 'will it rain today', 'do I need a jacket')"
         }
         _ => "Unknown command",
     }

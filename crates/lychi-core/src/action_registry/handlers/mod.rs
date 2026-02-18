@@ -9,6 +9,7 @@ pub mod project_open;
 pub mod shell_exec;
 #[cfg(feature = "mpris")]
 pub mod spotify;
+pub mod sysinfo;
 pub mod system;
 pub mod url_open;
 pub mod weather;
