@@ -9,9 +9,36 @@
 
 /// Known handler prefixes.
 const KNOWN_PREFIXES: &[&str] = &[
-    "ask", "browse", "open", "web", "yt", "run", "calc", "file", "url", "spotify", "project",
-    "system", "note", "notes", "todo", "todos", "weather", "sysinfo", "ip", "cpu", "mem", "disk",
-    "temp", "gpu", "battery", "net", "audio", "display", "os", "speedtest",
+    "ask",
+    "browse",
+    "open",
+    "web",
+    "yt",
+    "run",
+    "calc",
+    "file",
+    "url",
+    "spotify",
+    "project",
+    "system",
+    "note",
+    "notes",
+    "todo",
+    "todos",
+    "weather",
+    "sysinfo",
+    "ip",
+    "cpu",
+    "mem",
+    "disk",
+    "temp",
+    "gpu",
+    "battery",
+    "net",
+    "audio",
+    "display",
+    "os",
+    "speedtest",
 ];
 
 /// Common TLDs for URL detection.
@@ -326,19 +353,14 @@ fn try_keyword_route(input: &str) -> Option<Route> {
             explicit: false,
         });
     }
-    if lower.contains("gpu")
-        || lower.contains("graphics card")
-        || lower.contains("video card")
-    {
+    if lower.contains("gpu") || lower.contains("graphics card") || lower.contains("video card") {
         return Some(Route {
             handler: "sysinfo",
             args: "gpu".into(),
             explicit: false,
         });
     }
-    if lower.contains("battery")
-        || lower.contains("charge level")
-        || lower.contains("power level")
+    if lower.contains("battery") || lower.contains("charge level") || lower.contains("power level")
     {
         return Some(Route {
             handler: "sysinfo",

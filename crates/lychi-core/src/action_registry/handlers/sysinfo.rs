@@ -22,7 +22,17 @@ impl Default for SysInfoHandler {
 }
 
 const SUBCOMMANDS: &[&str] = &[
-    "ip", "cpu", "mem", "disk", "temp", "gpu", "battery", "net", "audio", "display", "os",
+    "ip",
+    "cpu",
+    "mem",
+    "disk",
+    "temp",
+    "gpu",
+    "battery",
+    "net",
+    "audio",
+    "display",
+    "os",
     "speedtest",
 ];
 
@@ -146,6 +156,7 @@ impl ActionHandler for SysInfoHandler {
                 label: s.to_string(),
                 icon_path: None,
                 score: if s.starts_with(&lower) { 100 } else { 50 },
+                description: None,
             })
             .collect()
     }
@@ -276,12 +287,12 @@ fn read_gpu() -> String {
     }
 
     // Fallback: lspci for GPU names
-    if sections.is_empty() {
-        if let Ok(lspci) = run_cmd("sh", &["-c", "lspci | grep -iE 'VGA|3D|Display'"]) {
-            let lspci = lspci.trim();
-            if !lspci.is_empty() {
-                sections.push(lspci.to_string());
-            }
+    if sections.is_empty()
+        && let Ok(lspci) = run_cmd("sh", &["-c", "lspci | grep -iE 'VGA|3D|Display'"])
+    {
+        let lspci = lspci.trim();
+        if !lspci.is_empty() {
+            sections.push(lspci.to_string());
         }
     }
 
@@ -311,16 +322,16 @@ fn read_amd_gpu() -> Option<String> {
             lines.push(format!("Temp: {temp:.0}°C"));
         }
         // freq1_input is in Hz
-        if let Ok(freq) = fs::read_to_string(dir.join("freq1_input")) {
-            if let Ok(hz) = freq.trim().parse::<u64>() {
-                lines.push(format!("Clock: {} MHz", hz / 1_000_000));
-            }
+        if let Ok(freq) = fs::read_to_string(dir.join("freq1_input"))
+            && let Ok(hz) = freq.trim().parse::<u64>()
+        {
+            lines.push(format!("Clock: {} MHz", hz / 1_000_000));
         }
         // power1_average is in microwatts
-        if let Ok(power) = fs::read_to_string(dir.join("power1_average")) {
-            if let Ok(uw) = power.trim().parse::<f64>() {
-                lines.push(format!("Power: {:.1} W", uw / 1_000_000.0));
-            }
+        if let Ok(power) = fs::read_to_string(dir.join("power1_average"))
+            && let Ok(uw) = power.trim().parse::<f64>()
+        {
+            lines.push(format!("Power: {:.1} W", uw / 1_000_000.0));
         }
         // GPU utilization via sysfs (amdgpu specific)
         if let Ok(busy) = fs::read_to_string("/sys/class/drm/card1/device/gpu_busy_percent")
@@ -331,24 +342,11 @@ fn read_amd_gpu() -> Option<String> {
         // VRAM
         if let Ok(used) = fs::read_to_string("/sys/class/drm/card1/device/mem_info_vram_used")
             .or_else(|_| fs::read_to_string("/sys/class/drm/card0/device/mem_info_vram_used"))
+            && let Ok(total) = fs::read_to_string("/sys/class/drm/card1/device/mem_info_vram_total")
+                .or_else(|_| fs::read_to_string("/sys/class/drm/card0/device/mem_info_vram_total"))
+            && let (Ok(u), Ok(t)) = (used.trim().parse::<u64>(), total.trim().parse::<u64>())
         {
-            if let Ok(total) =
-                fs::read_to_string("/sys/class/drm/card1/device/mem_info_vram_total")
-                    .or_else(|_| {
-                        fs::read_to_string("/sys/class/drm/card0/device/mem_info_vram_total")
-                    })
-            {
-                if let (Ok(u), Ok(t)) = (
-                    used.trim().parse::<u64>(),
-                    total.trim().parse::<u64>(),
-                ) {
-                    lines.push(format!(
-                        "VRAM: {} / {} MB",
-                        u / 1_048_576,
-                        t / 1_048_576
-                    ));
-                }
-            }
+            lines.push(format!("VRAM: {} / {} MB", u / 1_048_576, t / 1_048_576));
         }
         return Some(lines.join("\n"));
     }
@@ -388,23 +386,19 @@ fn read_battery() -> String {
         if let (Ok(now), Ok(full)) = (
             fs::read_to_string(dir.join("energy_now")),
             fs::read_to_string(dir.join("energy_full")),
-        ) {
-            if let (Ok(n), Ok(f)) = (
-                now.trim().parse::<f64>(),
-                full.trim().parse::<f64>(),
-            ) {
-                lines.push(format!(
-                    "Energy: {:.1} / {:.1} Wh",
-                    n / 1_000_000.0,
-                    f / 1_000_000.0
-                ));
-            }
+        ) && let (Ok(n), Ok(f)) = (now.trim().parse::<f64>(), full.trim().parse::<f64>())
+        {
+            lines.push(format!(
+                "Energy: {:.1} / {:.1} Wh",
+                n / 1_000_000.0,
+                f / 1_000_000.0
+            ));
         }
         // Power draw
-        if let Ok(rate) = fs::read_to_string(dir.join("power_now")) {
-            if let Ok(w) = rate.trim().parse::<f64>() {
-                lines.push(format!("Power: {:.1} W", w / 1_000_000.0));
-            }
+        if let Ok(rate) = fs::read_to_string(dir.join("power_now"))
+            && let Ok(w) = rate.trim().parse::<f64>()
+        {
+            lines.push(format!("Power: {:.1} W", w / 1_000_000.0));
         }
         // Cycle count
         if let Ok(cycles) = fs::read_to_string(dir.join("cycle_count")) {
@@ -545,10 +539,7 @@ fn read_audio() -> String {
         let sink = sink.trim();
         if !sink.is_empty() {
             // Try to get a friendly description
-            if let Ok(info) = run_cmd(
-                "pactl",
-                &["list", "sinks", "short"],
-            ) {
+            if let Ok(info) = run_cmd("pactl", &["list", "sinks", "short"]) {
                 // Find matching sink line for a cleaner name
                 for line in info.lines() {
                     if line.contains(sink) {
@@ -636,10 +627,10 @@ fn read_display() -> String {
                 if let Some(star_pos) = trimmed.find('*') {
                     // Walk backwards from * to find the Hz value
                     let before_star = &trimmed[..star_pos];
-                    if let Some(hz) = before_star.split_whitespace().last() {
-                        if let Some(last_line) = lines.last_mut() {
-                            last_line.push_str(&format!(" @ {hz}Hz"));
-                        }
+                    if let Some(hz) = before_star.split_whitespace().last()
+                        && let Some(last_line) = lines.last_mut()
+                    {
+                        last_line.push_str(&format!(" @ {hz}Hz"));
                     }
                 }
             }

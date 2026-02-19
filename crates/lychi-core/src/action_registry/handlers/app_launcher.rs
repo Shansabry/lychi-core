@@ -254,6 +254,7 @@ impl ActionHandler for AppLauncher {
                     label: entry.name.clone(),
                     icon_path,
                     score: _score,
+                    description: None,
                 }
             })
             .collect()

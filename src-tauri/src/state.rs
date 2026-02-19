@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use tokio::sync::RwLock;
 
 use lychi_core::action_registry::handlers::app_launcher::AppLauncher;
@@ -38,6 +39,7 @@ pub struct AppState {
     pub config: Arc<RwLock<Config>>,
     pub notes: Arc<RwLock<NotesStore>>,
     pub pending_plan: Arc<RwLock<Option<AgentPlan>>>,
+    pub active_file_search: Arc<AtomicU64>,
     #[cfg(feature = "mpris")]
     pub mpris: Arc<RwLock<Option<MprisManager>>>,
 }
@@ -140,6 +142,7 @@ impl AppState {
             notes,
             config: Arc::new(RwLock::new(config)),
             pending_plan: Arc::new(RwLock::new(None)),
+            active_file_search: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "mpris")]
             mpris: Arc::new(RwLock::new(None)),
         }

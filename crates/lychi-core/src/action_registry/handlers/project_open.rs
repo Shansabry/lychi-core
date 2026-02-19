@@ -252,6 +252,7 @@ impl ActionHandler for ProjectOpen {
                 label: entry.name.clone(),
                 icon_path: None,
                 score,
+                description: None,
             })
             .collect()
     }

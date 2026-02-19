@@ -31,7 +31,10 @@ impl Executor {
         let intent = self.resolver.resolve(input, &self.registry).await;
         tracing::info!(
             "Resolved '{}' → action={}, args='{}', routing={:?}",
-            input, intent.action_id, intent.args, intent.routing
+            input,
+            intent.action_id,
+            intent.args,
+            intent.routing
         );
 
         let handler = self

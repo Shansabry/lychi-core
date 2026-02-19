@@ -23,6 +23,7 @@ export interface CompletionItem {
 	label: string;
 	icon_path: string | null;
 	score: number;
+	description?: string | null;
 }
 
 function isTauri(): boolean {
@@ -80,6 +81,46 @@ export interface DirEntry {
 export async function listDirectories(path: string): Promise<DirEntry[]> {
 	if (!isTauri()) return [];
 	return invoke<DirEntry[]>("list_directories", { path });
+}
+
+// --- Recursive file search ---
+
+export interface MountPoint {
+	path: string;
+	label: string;
+}
+
+export interface FileSearchResult {
+	label: string;
+	full_path: string;
+	is_dir: boolean;
+	score: number;
+	description?: string | null;
+}
+
+export interface FileSearchBatch {
+	search_id: number;
+	results: FileSearchResult[];
+	done: boolean;
+}
+
+export async function getMountPoints(): Promise<MountPoint[]> {
+	if (!isTauri()) return [];
+	return invoke<MountPoint[]>("get_mount_points");
+}
+
+export async function startFileSearch(
+	query: string,
+	scope: string,
+	searchId: number,
+): Promise<void> {
+	if (!isTauri()) return;
+	return invoke("start_file_search", { query, scope, searchId });
+}
+
+export async function cancelFileSearch(): Promise<void> {
+	if (!isTauri()) return;
+	return invoke("cancel_file_search");
 }
 
 export async function saveWindowPosition(x: number, y: number): Promise<void> {

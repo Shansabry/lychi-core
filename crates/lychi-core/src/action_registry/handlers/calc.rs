@@ -100,6 +100,7 @@ impl ActionHandler for CalcHandler {
                 label: format!("= {}", Self::format_result(result)),
                 icon_path: None,
                 score: 1000,
+                description: None,
             }]
         } else {
             Vec::new()

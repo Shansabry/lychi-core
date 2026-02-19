@@ -18,6 +18,13 @@ let {
 	executing = false,
 	atMode = false,
 	atStart = -1,
+	searchMode = false,
+	scopeCount = 0,
+	ontabscope = () => {},
+	ontabcomplete = () => {},
+	onshifttabback = () => {},
+	searchGhost = "",
+	browseGhost = "",
 	history = [],
 }: {
 	value: string;
@@ -35,6 +42,13 @@ let {
 	executing: boolean;
 	atMode: boolean;
 	atStart: number;
+	searchMode?: boolean;
+	scopeCount?: number;
+	ontabscope?: () => void;
+	ontabcomplete?: () => void;
+	onshifttabback?: () => void;
+	searchGhost?: string;
+	browseGhost?: string;
 	history: string[];
 } = $props();
 
@@ -51,10 +65,38 @@ let segments = $derived.by(() => {
 });
 
 // Ghost autofill from history — prefix match first, fuzzy fallback
-type Ghost = { kind: "suffix"; suffix: string } | { kind: "fuzzy"; full: string } | null;
+type Ghost =
+	| { kind: "suffix"; suffix: string }
+	| { kind: "fuzzy"; full: string }
+	| { kind: "at-suffix"; suffix: string }
+	| null;
 
 let ghost: Ghost = $derived.by(() => {
 	if (!value || executing || routing) return null;
+	// In browse mode, ghost shows suffix to complete the highlighted path
+	if (atMode && browseGhost && atStart >= 0) {
+		const partial = value.slice(atStart + 1); // text after @
+		const ghostLabel = browseGhost.startsWith("~/") ? browseGhost.slice(2) : browseGhost;
+		if (
+			ghostLabel.toLowerCase().startsWith(partial.toLowerCase()) &&
+			ghostLabel.length > partial.length
+		) {
+			return { kind: "at-suffix", suffix: ghostLabel.slice(partial.length) };
+		}
+		return null;
+	}
+	if (atMode) return null;
+	// In search mode, ghost shows suffix to complete the highlighted path
+	if (searchMode && searchGhost) {
+		const ghostPath = searchGhost.startsWith("~/") ? searchGhost.slice(2) : searchGhost;
+		const currentQuery = value.slice(1); // strip leading /
+		if (ghostPath.toLowerCase().startsWith(currentQuery.toLowerCase())) {
+			const suffix = ghostPath.slice(currentQuery.length);
+			if (suffix) return { kind: "suffix", suffix };
+		}
+		return { kind: "fuzzy", full: searchGhost };
+	}
+	if (searchMode) return null;
 	const lower = value.toLowerCase();
 	// Prefix match wins (most recent first)
 	for (let i = history.length - 1; i >= 0; i--) {
@@ -74,6 +116,7 @@ let ghost: Ghost = $derived.by(() => {
 
 let ghostSuffix = $derived(ghost?.kind === "suffix" ? ghost.suffix : "");
 let ghostFull = $derived(ghost?.kind === "fuzzy" ? ghost.full : "");
+let ghostAtSuffix = $derived(ghost?.kind === "at-suffix" ? ghost.suffix : "");
 
 let inputEl: HTMLInputElement | undefined = $state();
 
@@ -173,6 +216,18 @@ $effect(() => {
 });
 
 function acceptGhost() {
+	if (searchMode && searchGhost) {
+		// Fill highlighted result into input as a /path query
+		const filled = searchGhost.startsWith("~/") ? `/${searchGhost.slice(2)}` : `/${searchGhost}`;
+		value = filled;
+		oninputchange(value);
+		return true;
+	}
+	if (ghost?.kind === "at-suffix") {
+		value = value + ghost.suffix;
+		oninputchange(value);
+		return true;
+	}
 	if (ghost?.kind === "suffix") {
 		value = value + ghost.suffix;
 		oninputchange(value);
@@ -186,8 +241,24 @@ function acceptGhost() {
 	return false;
 }
 
+function isTab(e: KeyboardEvent) {
+	return e.key === "Tab" || e.code === "Tab";
+}
+
 function handleKeydown(e: KeyboardEvent) {
-	if (e.key === "Tab" && ghost) {
+	if (isTab(e) && e.shiftKey) {
+		// Shift+Tab = go back up one folder level (search mode) or reverse
+		e.preventDefault();
+		onshifttabback();
+	} else if (isTab(e) && e.ctrlKey && scopeCount > 1) {
+		// Ctrl+Tab = switch scope
+		e.preventDefault();
+		ontabscope();
+	} else if (isTab(e) && (searchMode || atMode)) {
+		// Tab in search/browse mode = drill into folder or accept ghost
+		e.preventDefault();
+		ontabcomplete();
+	} else if (isTab(e) && ghost) {
 		e.preventDefault();
 		acceptGhost();
 	} else if (
@@ -253,6 +324,11 @@ function handleKeydown(e: KeyboardEvent) {
 		{#if ghostFull}
 			<div class="ghost-overlay" aria-hidden="true">
 				<span class="ghost-typed">{value}</span><span class="ghost-fuzzy-hint"> ~{ghostFull}</span>
+			</div>
+		{/if}
+		{#if ghostAtSuffix}
+			<div class="ghost-overlay" aria-hidden="true">
+				<span class="ghost-typed">{value}</span><span class="ghost-suffix">{ghostAtSuffix}</span>
 			</div>
 		{/if}
 		<input

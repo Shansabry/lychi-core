@@ -9,18 +9,29 @@ import NotesPanel from "$lib/components/NotesPanel.svelte";
 import ResultPanel from "$lib/components/ResultPanel.svelte";
 import SettingsPanel from "$lib/components/SettingsPanel.svelte";
 import StatusBar from "$lib/components/StatusBar.svelte";
-import type { AgentPlan, CommandResult, CompletionItem, StepEvent, TrackInfo } from "$lib/ipc";
+import type {
+	AgentPlan,
+	CommandResult,
+	CompletionItem,
+	FileSearchBatch,
+	MountPoint,
+	StepEvent,
+	TrackInfo,
+} from "$lib/ipc";
 import {
+	cancelFileSearch,
 	executeCommand,
 	getAgentPlan,
 	getCompletions,
 	getHideOnBlur,
 	getHistory,
+	getMountPoints,
 	hideWindow,
 	listPathCompletions,
 	mediaGetStatus,
 	openUri,
 	saveWindowPosition,
+	startFileSearch,
 } from "$lib/ipc";
 
 let inputValue = $state("");
@@ -36,9 +47,39 @@ let completions: CompletionItem[] = $state([]);
 let completionIndex = $state(-1);
 let debounceTimer: ReturnType<typeof setTimeout> | undefined;
 
-// @ file reference mode
+// @ file reference mode (browse — point to a file in a command)
 let atMode = $state(false);
 let atStart = $state(-1);
+let atNoResults = $state(false);
+
+// / file search mode (find and open a file, like Spotlight)
+let searchMode = $state(false);
+let fileSearchId = $state(0);
+let searchDone = $state(false);
+let mountPoints: MountPoint[] = $state([]);
+let scopeIndex = $state(0);
+let activeScope = $derived(mountPoints[scopeIndex]?.path ?? "");
+let searchScopePath = $state(""); // absolute path when drilled into a folder
+
+// Derive breadcrumb path context for / search mode (when drilled into a folder)
+let searchPathContext = $derived.by(() => {
+	if (!searchMode || !searchScopePath) return "";
+	const home = mountPoints[0]?.path ?? "";
+	if (home && searchScopePath.startsWith(home)) {
+		return `~${searchScopePath.slice(home.length)}/`;
+	}
+	return `${searchScopePath}/`;
+});
+
+// Derive breadcrumb path context for @ mode
+let atPathContext = $derived.by(() => {
+	if (!atMode || atStart < 0) return "";
+	const partial = inputValue.slice(atStart + 1);
+	const lastSlash = partial.lastIndexOf("/");
+	if (lastSlash === -1) return "~/";
+	const raw = partial.slice(0, lastSlash + 1);
+	return raw.startsWith("/") ? raw : `~/${raw}`;
+});
 
 let settingsOpen = $state(false);
 let hideOnBlur = $state(true);
@@ -82,10 +123,79 @@ $effect(() => {
 	return () => clearInterval(mediaPollTimer);
 });
 
+// Immediate @ mode completion fetch (no debounce) — used when drilling into dirs
+async function fetchAtCompletions(partial: string) {
+	try {
+		const results = await listPathCompletions(partial);
+		completions = results;
+		completionIndex = results.length > 0 ? 0 : -1;
+		atNoResults = results.length === 0 && partial.length > 0;
+		// Stay in @ mode even when empty — user can backspace to navigate up
+	} catch (err) {
+		console.error("[@completions] error:", err);
+		// Stay in @ mode on error too — don't kick the user out
+		completions = [];
+		completionIndex = -1;
+		atNoResults = true;
+	}
+}
+
 // Called by CommandInput on every keystroke
 function handleInput(val: string) {
 	historyOpen = false;
 	clearTimeout(debounceTimer);
+	atNoResults = false;
+
+	// Detect / file search mode — must be at the start of input
+	if (val.startsWith("/")) {
+		const raw = val.slice(1);
+		if (!raw.includes(" ")) {
+			// Exit @ mode if active
+			atMode = false;
+			atStart = -1;
+
+			searchMode = true;
+			searchDone = false;
+			fileSearchId++;
+			const id = fileSearchId;
+
+			// Parse path: /folder/subfolder/query → scope=folder/subfolder, searchTerm=query
+			const lastSlash = raw.lastIndexOf("/");
+			let searchScope: string;
+			let searchTerm: string;
+			if (lastSlash >= 0) {
+				const folderPart = raw.slice(0, lastSlash); // e.g. "Documents/reports"
+				searchTerm = raw.slice(lastSlash + 1); // e.g. "q1" or ""
+				const baseScope = activeScope || (mountPoints[0]?.path ?? "");
+				searchScope = folderPart ? `${baseScope}/${folderPart}` : baseScope;
+				searchScopePath = searchScope;
+			} else {
+				searchTerm = raw;
+				searchScope = activeScope || (mountPoints[0]?.path ?? "");
+				searchScopePath = "";
+			}
+
+			// Don't clear completions — keep showing old results until new ones arrive
+			if (raw.length > 0 || lastSlash >= 0) {
+				debounceTimer = setTimeout(() => {
+					completions = [];
+					completionIndex = -1;
+					if (searchScope) startFileSearch(searchTerm, searchScope, id);
+				}, 150);
+			} else {
+				completions = [];
+				completionIndex = -1;
+			}
+			return;
+		}
+	}
+
+	// Exiting search mode
+	if (searchMode) {
+		cancelFileSearch();
+		searchScopePath = "";
+		searchMode = false;
+	}
 
 	// Detect @ file reference — find the last @ in the input
 	const atIdx = val.lastIndexOf("@");
@@ -97,27 +207,13 @@ function handleInput(val: string) {
 		if (!partial.includes(" ") && !isEmail) {
 			atMode = true;
 			atStart = atIdx;
-			debounceTimer = setTimeout(async () => {
-				try {
-					const results = await listPathCompletions(partial);
-					completions = results;
-					completionIndex = results.length > 0 ? 0 : -1;
-					// No results and not a path prefix — exit @ mode, fall back to normal
-					if (results.length === 0 && partial.length > 0) {
-						atMode = false;
-						atStart = -1;
-					}
-				} catch (err) {
-					console.error("[@completions] error:", err);
-					atMode = false;
-					atStart = -1;
-				}
-			}, 80);
+			cancelFileSearch();
+			debounceTimer = setTimeout(() => fetchAtCompletions(partial), 30);
 			return;
 		}
 	}
 
-	// Not in @ mode — normal completions
+	// Not in @ or / mode — normal completions
 	atMode = false;
 	atStart = -1;
 
@@ -144,6 +240,11 @@ onMount(() => {
 	// Load config
 	getHideOnBlur().then((v) => {
 		hideOnBlur = v;
+	});
+
+	// Load mount points for @ search scope
+	getMountPoints().then((mounts) => {
+		mountPoints = mounts;
 	});
 
 	// Guard: only attach Tauri listeners if running inside Tauri
@@ -179,6 +280,8 @@ onMount(() => {
 			completionIndex = -1;
 			atMode = false;
 			atStart = -1;
+			searchMode = false;
+			cancelFileSearch();
 			// Re-arm blur after grace period on each summon
 			blurEnabled = false;
 			setTimeout(() => {
@@ -203,6 +306,41 @@ onMount(() => {
 			}
 		});
 		unlisteners.push(unlistenMedia);
+
+		// Listen for streaming file search results
+		const unlistenFileSearch = await win.listen<FileSearchBatch>(
+			"lychi://file-search-results",
+			(e) => {
+				const batch = e.payload;
+				if (batch.search_id !== fileSearchId) return;
+
+				const newItems: CompletionItem[] = batch.results.map((r) => ({
+					label: r.label,
+					icon_path: r.is_dir ? "__folder__" : null,
+					score: r.score,
+					description: r.description ?? null,
+				}));
+
+				completions = [...completions, ...newItems]
+					.sort((a, b) => {
+						const aDir = a.icon_path === "__folder__" ? 1 : 0;
+						const bDir = b.icon_path === "__folder__" ? 1 : 0;
+						if (bDir !== aDir) return bDir - aDir; // folders first
+						return b.score - a.score; // then by score
+					})
+					.slice(0, 20);
+
+				if (completions.length > 0 && completionIndex < 0) {
+					completionIndex = 0;
+				}
+
+				if (batch.done) {
+					searchDone = true;
+					atNoResults = completions.length === 0;
+				}
+			},
+		);
+		unlisteners.push(unlistenFileSearch);
 
 		// Ctrl+Shift+I: disable blur so devtools can open
 		window.addEventListener("keydown", (e) => {
@@ -273,6 +411,11 @@ async function handleSubmit() {
 		return;
 	}
 
+	// In search mode, auto-select first result if none explicitly selected
+	if (searchMode && completions.length > 0 && completionIndex < 0) {
+		completionIndex = 0;
+	}
+
 	// If completions are visible and one is selected, execute based on context
 	if (completions.length > 0 && completionIndex >= 0) {
 		const selected = completions[completionIndex];
@@ -290,8 +433,8 @@ async function handleSubmit() {
 				completionIndex = -1;
 				return;
 			}
-			// @ mode — drill into directory or open file
-			if (atMode) {
+			// @ browse or / search mode — drill into directory or open file
+			if (atMode || searchMode) {
 				handleCompletionSelect(selected.label);
 				return;
 			}
@@ -312,6 +455,9 @@ async function handleSubmit() {
 			return;
 		}
 	}
+
+	// In search mode, don't fall through to command execution
+	if (searchMode) return;
 
 	// Try AI plan first — if it returns a multi-step plan, show preview
 	isRouting = true;
@@ -381,7 +527,7 @@ async function runCommand(command: string) {
 			atMode = true;
 			atStart = 0;
 			lastResult = null;
-			handleInput(inputValue);
+			fetchAtCompletions(dir);
 		} else if (lastResult.success && !lastResult.output) {
 			await hideWindow();
 		}
@@ -421,31 +567,72 @@ function handleConfirmDismiss() {
 	lastResult = null;
 }
 
+async function openFileByLabel(label: string) {
+	searchMode = false;
+	atMode = false;
+	atStart = -1;
+	completions = [];
+	completionIndex = -1;
+	cancelFileSearch();
+	inputValue = "";
+	await hideWindow();
+	await openUri(`file://${label}`);
+}
+
 function handleCompletionSelect(label: string) {
+	// / search mode — find and open files/folders directly
+	if (searchMode) {
+		openFileByLabel(label);
+		return;
+	}
+
+	// @ browse mode — reference a file in the command line
 	if (atMode) {
-		// If it's a directory (ends with /), keep @ mode active for drilling down
 		if (label.endsWith("/")) {
 			const before = inputValue.slice(0, atStart);
 			const afterAt = inputValue.slice(atStart);
 			const spaceIdx = afterAt.indexOf(" ", 1); // skip the @ itself
 			const after = spaceIdx === -1 ? "" : afterAt.slice(spaceIdx);
+			// Set input and immediately fetch — handleInput will also fire but
+			// debounce means our direct call wins
 			inputValue = `${before}@${label}${after}`;
-			// Re-trigger completions for the directory contents
-			handleInput(inputValue);
+			clearTimeout(debounceTimer);
+			fetchAtCompletions(label);
 			requestAnimationFrame(() => {
 				document.querySelector<HTMLInputElement>(".input-container input")?.focus();
 			});
 		} else {
-			// It's a file — open it directly
+			// Insert the file path into the command, replacing the @partial
+			const before = inputValue.slice(0, atStart);
+			const afterAt = inputValue.slice(atStart);
+			const spaceIdx = afterAt.indexOf(" ", 1);
+			const after = spaceIdx === -1 ? "" : afterAt.slice(spaceIdx);
+			inputValue = `${before}@${label}${after}`;
 			atMode = false;
 			atStart = -1;
 			completions = [];
 			completionIndex = -1;
-			runCommand(`file ${label}`);
 		}
 		return;
 	}
+
 	runCommand(`open ${label}`);
+}
+
+function handleScopeChange(index: number) {
+	scopeIndex = index;
+	if (searchMode && inputValue.startsWith("/")) {
+		// Re-trigger search with new scope — keep old results visible until new arrive
+		const query = inputValue.slice(1);
+		if (query) {
+			searchDone = false;
+			fileSearchId++;
+			const id = fileSearchId;
+			completions = [];
+			completionIndex = -1;
+			startFileSearch(query, mountPoints[index]?.path ?? "", id);
+		}
+	}
 }
 
 function handleHistorySelect(entry: string) {
@@ -551,11 +738,15 @@ async function handleDismiss() {
 		pendingPlan = null;
 		return;
 	}
-	if (completions.length > 0) {
+	if (completions.length > 0 || searchMode) {
 		completions = [];
 		completionIndex = -1;
 		atMode = false;
 		atStart = -1;
+		if (searchMode) {
+			cancelFileSearch();
+			searchMode = false;
+		}
 		return;
 	}
 	if (historyOpen) {
@@ -584,6 +775,62 @@ async function handleDismiss() {
 			executing={isExecuting}
 			{atMode}
 			{atStart}
+			{searchMode}
+			scopeCount={mountPoints.length}
+			ontabscope={() => handleScopeChange((scopeIndex + 1) % mountPoints.length)}
+			ontabcomplete={() => {
+				if (completions.length > 0 && completionIndex >= 0) {
+					const item = completions[completionIndex];
+					if (searchMode && item.icon_path === "__folder__") {
+						// Drill into folder — set input to folder path
+						const path = item.label.startsWith("~/") ? item.label.slice(2) : item.label;
+						inputValue = `/${path}`;
+						handleInput(inputValue);
+					} else if (searchMode) {
+						// File in search mode — open it
+						openFileByLabel(item.label);
+					} else {
+						// Browse mode — existing behavior
+						handleCompletionSelect(item.label);
+					}
+				}
+			}}
+			onshifttabback={() => {
+				if (searchMode && inputValue.startsWith("/")) {
+					const raw = inputValue.slice(1);
+					// Find last slash, then the one before it to go up
+					const trimmed = raw.endsWith("/") ? raw.slice(0, -1) : raw;
+					const lastSlash = trimmed.lastIndexOf("/");
+					if (lastSlash > 0) {
+						inputValue = `/${trimmed.slice(0, lastSlash + 1)}`;
+					} else {
+						inputValue = "/";
+					}
+					handleInput(inputValue);
+				} else if (atMode && atStart >= 0) {
+					const partial = inputValue.slice(atStart + 1);
+					const afterAt = inputValue.slice(atStart);
+					const spaceIdx = afterAt.indexOf(" ", 1);
+					const after = spaceIdx === -1 ? "" : afterAt.slice(spaceIdx);
+					const before = inputValue.slice(0, atStart);
+
+					// Strip trailing slash, find parent
+					const trimmed = partial.endsWith("/") ? partial.slice(0, -1) : partial;
+					const lastSlash = trimmed.lastIndexOf("/");
+					if (lastSlash > 0) {
+						const parent = trimmed.slice(0, lastSlash + 1);
+						inputValue = `${before}@${parent}${after}`;
+						clearTimeout(debounceTimer);
+						fetchAtCompletions(parent);
+					} else {
+						inputValue = `${before}@${after}`;
+						clearTimeout(debounceTimer);
+						fetchAtCompletions("");
+					}
+				}
+			}}
+			searchGhost={searchMode && completions.length > 0 && completionIndex >= 0 ? completions[completionIndex].label : ""}
+			browseGhost={atMode && completions.length > 0 && completionIndex >= 0 ? completions[completionIndex].label : ""}
 			history={historyEntries}
 		/>
 		{#if settingsOpen}
@@ -608,7 +855,17 @@ async function handleDismiss() {
 					items={completions}
 					selectedIndex={completionIndex}
 					onselect={handleCompletionSelect}
+					pathContext={searchMode ? searchPathContext : (atMode ? atPathContext : "")}
+					scopeTabs={searchMode && mountPoints.length > 1 ? mountPoints : []}
+					activeScopeIndex={scopeIndex}
+					onscopechange={handleScopeChange}
+					searching={searchMode && !searchDone}
+					browseMode={atMode}
 				/>
+			{:else if atMode && atNoResults}
+				<div class="empty-state">Empty folder</div>
+			{:else if searchMode && !searchDone}
+				<div class="empty-state">Searching...</div>
 			{/if}
 			{#if historyOpen}
 				<HistoryPanel entries={historyEntries} onselect={handleHistorySelect} />
@@ -666,6 +923,14 @@ async function handleDismiss() {
 		box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
 		animation: lychi-appear 120ms ease-out;
 		align-self: flex-start;
+	}
+
+	.empty-state {
+		padding: 12px 20px;
+		font-family: var(--font-mono);
+		font-size: 13px;
+		color: var(--fg-muted);
+		opacity: 0.6;
 	}
 
 	:global(main.lychi-closing) {

@@ -61,6 +61,8 @@ pub struct CompletionItem {
     pub label: String,
     pub icon_path: Option<String>,
     pub score: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Trait for action handlers. Each handler has a unique ID (e.g. "open", "web", "run")

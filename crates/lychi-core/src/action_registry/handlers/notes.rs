@@ -424,6 +424,7 @@ impl ActionHandler for TodoHandler {
                 label: s.to_string(),
                 icon_path: None,
                 score: if s.starts_with(&lower) { 100 } else { 50 },
+                description: None,
             })
             .collect()
     }
