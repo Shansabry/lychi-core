@@ -140,20 +140,11 @@ impl Default for WeatherConfig {
 
 /// Privacy consent flags — all default to false (C6: Privacy First).
 /// Each flag records whether the user has consented to a specific network call.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PrivacyConfig {
     /// Allow IP geolocation (weather auto-detect via freeipapi.com)
     pub allow_ip_geolocation: bool,
     /// Allow public IP lookup (sysinfo net via ifconfig.me)
     pub allow_public_ip: bool,
-}
-
-impl Default for PrivacyConfig {
-    fn default() -> Self {
-        Self {
-            allow_ip_geolocation: false,
-            allow_public_ip: false,
-        }
-    }
 }

@@ -13,16 +13,26 @@ import {
 	X,
 } from "lucide-svelte";
 import { onMount } from "svelte";
-import type { AiConfig, CommandsConfig, DirEntry, GeneralConfig, PrivacyConfig, ProjectsConfig } from "$lib/ipc";
+import type {
+	AiConfig,
+	CommandsConfig,
+	DirEntry,
+	GeneralConfig,
+	PrivacyConfig,
+	ProjectsConfig,
+} from "$lib/ipc";
 import {
 	checkAiHealth,
+	getActiveWindowStrategy,
 	getAiConfig,
 	getCommandsConfig,
 	getGeneralConfig,
+	getLayerShellSupported,
 	getPrivacyConfig,
 	getProjectsConfig,
 	listDirectories,
 	recordHotkey,
+	restartApp,
 	saveAiConfig,
 	saveCommandsConfig,
 	saveGeneralConfig,
@@ -30,9 +40,6 @@ import {
 	saveProjectsConfig,
 	setApiKey,
 	setHotkey,
-	getLayerShellSupported,
-	getActiveWindowStrategy,
-	restartApp,
 } from "$lib/ipc";
 import Select from "./Select.svelte";
 
@@ -98,16 +105,17 @@ let shellOptions = $derived([
 let projectDirs: string[] = $state([]);
 
 onMount(async () => {
-	const [ai, general, commands, projects, privacy, version, layerShell, activeStrategy] = await Promise.all([
-		getAiConfig(),
-		getGeneralConfig(),
-		getCommandsConfig(),
-		getProjectsConfig(),
-		getPrivacyConfig(),
-		getVersion().catch(() => "0.0.0"),
-		getLayerShellSupported(),
-		getActiveWindowStrategy(),
-	]);
+	const [ai, general, commands, projects, privacy, version, layerShell, activeStrategy] =
+		await Promise.all([
+			getAiConfig(),
+			getGeneralConfig(),
+			getCommandsConfig(),
+			getProjectsConfig(),
+			getPrivacyConfig(),
+			getVersion().catch(() => "0.0.0"),
+			getLayerShellSupported(),
+			getActiveWindowStrategy(),
+		]);
 	aiConfig = ai;
 	generalConfig = general;
 	commandsConfig = commands;
@@ -267,7 +275,7 @@ function resolveStrategy(strategy: string): string {
 }
 
 let strategyNeedsRestart = $derived(
-	resolveStrategy(generalConfig.window_strategy) !== activeWindowStrategy
+	resolveStrategy(generalConfig.window_strategy) !== activeWindowStrategy,
 );
 
 async function handleWindowStrategyChange(val: string) {

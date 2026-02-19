@@ -151,12 +151,12 @@ pub fn get_layer_shell_supported() -> bool {
 /// "layer-shell" if the main window is a layer-shell surface, "x11" otherwise.
 #[tauri::command]
 pub fn get_active_window_strategy(app: AppHandle) -> String {
-    if let Some(win) = app.get_webview_window("main") {
-        if let Ok(gtk_win) = win.gtk_window() {
-            use gtk_layer_shell::LayerShell;
-            if gtk_win.is_layer_window() {
-                return "layer-shell".to_string();
-            }
+    if let Some(win) = app.get_webview_window("main")
+        && let Ok(gtk_win) = win.gtk_window()
+    {
+        use gtk_layer_shell::LayerShell;
+        if gtk_win.is_layer_window() {
+            return "layer-shell".to_string();
         }
     }
     "x11".to_string()

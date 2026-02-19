@@ -95,9 +95,7 @@ pub async fn get_file_preview(path: String) -> Result<FilePreviewData, LychiErro
         )));
     }
     if !file_path.is_file() {
-        return Err(LychiError::ExecutionFailed(format!(
-            "Not a file: {path}"
-        )));
+        return Err(LychiError::ExecutionFailed(format!("Not a file: {path}")));
     }
 
     let metadata = std::fs::metadata(file_path)?;
@@ -109,10 +107,7 @@ pub async fn get_file_preview(path: String) -> Result<FilePreviewData, LychiErro
         .unwrap_or("")
         .to_lowercase();
 
-    let file_name = file_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let file_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
     // Check for image files
     if let Some(mime) = extension_to_image_mime(&ext) {
@@ -131,20 +126,16 @@ pub async fn get_file_preview(path: String) -> Result<FilePreviewData, LychiErro
     }
 
     // Check for text files by extension
-    let language = extension_to_language(&ext)
-        .or_else(|| {
-            // Try filename without extension for known files
-            let stem = file_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-            // If no extension, check the full filename
-            if ext.is_empty() {
-                known_text_filename(file_name)
-            } else {
-                known_text_filename(stem)
-            }
-        });
+    let language = extension_to_language(&ext).or_else(|| {
+        // Try filename without extension for known files
+        let stem = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        // If no extension, check the full filename
+        if ext.is_empty() {
+            known_text_filename(file_name)
+        } else {
+            known_text_filename(stem)
+        }
+    });
 
     if let Some(lang) = language {
         if size > MAX_TEXT_BYTES {
@@ -215,7 +206,11 @@ pub async fn get_file_preview(path: String) -> Result<FilePreviewData, LychiErro
 }
 
 /// Read a text file up to a byte and line limit.
-fn read_text_limited(path: &Path, max_bytes: usize, max_lines: usize) -> Result<String, LychiError> {
+fn read_text_limited(
+    path: &Path,
+    max_bytes: usize,
+    max_lines: usize,
+) -> Result<String, LychiError> {
     use std::io::{BufRead, BufReader};
     let file = std::fs::File::open(path)?;
     let reader = BufReader::new(file);

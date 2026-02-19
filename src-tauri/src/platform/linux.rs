@@ -104,10 +104,10 @@ fn find_cursor_monitor(display: &gdk::Display) -> Option<gdk::Monitor> {
     // coordinates — they're clamped to the focused surface's monitor.
     // Use KWin D-Bus to get the active output name, then kscreen-doctor
     // to resolve that output's geometry, and match against GDK monitors.
-    if gtk_layer_shell::is_supported() {
-        if let Some(m) = find_cursor_monitor_kde(display) {
-            return Some(m);
-        }
+    if gtk_layer_shell::is_supported()
+        && let Some(m) = find_cursor_monitor_kde(display)
+    {
+        return Some(m);
     }
 
     // GDK path (works on X11 and GNOME Wayland)
@@ -154,14 +154,12 @@ fn find_cursor_monitor_kde(display: &gdk::Display) -> Option<gdk::Monitor> {
 
     let reply = String::from_utf8_lossy(&output.stdout);
     // Reply format: `method return ...\n   string "DP-1"\n`
-    let active_name = reply
-        .lines()
-        .find_map(|line| {
-            let trimmed = line.trim();
-            trimmed
-                .strip_prefix("string \"")
-                .and_then(|s| s.strip_suffix('"'))
-        })?;
+    let active_name = reply.lines().find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("string \"")
+            .and_then(|s| s.strip_suffix('"'))
+    })?;
 
     tracing::debug!("KWin active output: {active_name}");
 
@@ -292,7 +290,9 @@ pub fn init_window(window: &WebviewWindow, strategy: &str) {
             if gtk_layer_shell::is_supported() {
                 true
             } else {
-                tracing::warn!("layer-shell strategy requested but not supported, falling back to x11");
+                tracing::warn!(
+                    "layer-shell strategy requested but not supported, falling back to x11"
+                );
                 false
             }
         }

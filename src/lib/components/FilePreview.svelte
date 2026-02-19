@@ -1,7 +1,7 @@
 <script lang="ts">
+import { FileQuestion, FileText, Image, LoaderCircle } from "lucide-svelte";
 import { marked } from "marked";
-import { LoaderCircle, FileText, Image, FileQuestion } from "lucide-svelte";
-import { getFilePreview, type FilePreviewData } from "$lib/ipc";
+import { type FilePreviewData, getFilePreview } from "$lib/ipc";
 
 let {
 	filePath,
@@ -57,9 +57,7 @@ $effect(() => {
 
 // Render markdown to HTML
 let renderedMarkdown = $derived(
-	preview?.kind === "Text" && preview.language === "markdown"
-		? marked.parse(preview.content)
-		: "",
+	preview?.kind === "Text" && preview.language === "markdown" ? marked.parse(preview.content) : "",
 );
 
 // Extract filename from path
