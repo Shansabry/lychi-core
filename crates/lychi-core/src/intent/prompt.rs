@@ -56,11 +56,8 @@ fn action_description(id: &str) -> &'static str {
         }
         "file" => "Open a file or directory in the default app (e.g. '~/Downloads')",
         "url" => "Open a URL in the browser (e.g. 'https://github.com')",
-        "spotify" => {
-            "Control Spotify. Args: play, pause, next, prev. Only when user explicitly mentions Spotify"
-        }
         "media" => {
-            "Control any/all media players. Args: play, pause, next, prev, 'pause all'. Use for generic media commands or non-Spotify players"
+            "Control media players. Args: play, pause, next, prev, toggle, 'pause all'. Prefix with provider to target a specific player (e.g. 'spotify pause', 'yt next'). Use for any media/music control"
         }
         "project" => {
             "Open a project folder by name in the code editor (e.g. 'readyroos', 'lychi'). Use when the user wants to open a project in VSCode/editor by its name"

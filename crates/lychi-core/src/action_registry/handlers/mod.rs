@@ -4,11 +4,11 @@ pub mod browse;
 pub mod calc;
 pub mod file_open;
 pub mod icons;
+#[cfg(feature = "mpris")]
+pub mod media;
 pub mod notes;
 pub mod project_open;
 pub mod shell_exec;
-#[cfg(feature = "mpris")]
-pub mod spotify;
 pub mod sysinfo;
 pub mod system;
 pub mod url_open;

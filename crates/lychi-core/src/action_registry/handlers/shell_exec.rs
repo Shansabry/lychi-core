@@ -64,6 +64,19 @@ impl ShellExec {
         Self { shell }
     }
 
+    /// Pre-capture the shell environment at startup so first `run` command is instant.
+    pub fn warmup(shell: &str) {
+        let t0 = Instant::now();
+        let env = capture_shell_env(shell);
+        if let Ok(mut guard) = SHELL_ENV.write() {
+            *guard = Some((shell.to_string(), env));
+        }
+        tracing::info!(
+            "[shell_exec] warmup done: {:.0}ms",
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
     fn get_env(&self) -> HashMap<String, String> {
         // Check if we have a cached env for this shell
         if let Ok(guard) = SHELL_ENV.read()

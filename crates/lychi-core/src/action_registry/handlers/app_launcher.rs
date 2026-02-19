@@ -42,6 +42,26 @@ impl AppLauncher {
         DESKTOP_ENTRIES.get_or_init(Self::discover_entries)
     }
 
+    /// Pre-warm desktop entries and icon paths.
+    /// Call from `spawn_blocking` at startup so the first completions call is instant.
+    pub fn warmup() {
+        let t0 = std::time::Instant::now();
+        let entries = Self::entries();
+        let t_entries = t0.elapsed();
+        for entry in entries.values() {
+            let _ = entry
+                .icon_path
+                .get_or_init(|| entry.icon.as_deref().and_then(resolve_icon));
+        }
+        tracing::info!(
+            "[app_launcher] warmup done: entries={:.0}ms icons={:.0}ms total={:.0}ms ({} apps)",
+            t_entries.as_secs_f64() * 1000.0,
+            (t0.elapsed() - t_entries).as_secs_f64() * 1000.0,
+            t0.elapsed().as_secs_f64() * 1000.0,
+            entries.len()
+        );
+    }
+
     fn discover_entries() -> HashMap<String, DesktopEntry> {
         let mut entries = HashMap::new();
 
@@ -238,22 +258,23 @@ impl ActionHandler for AppLauncher {
         if query.is_empty() {
             return Vec::new();
         }
-        let entries = Self::entries();
+        // Non-blocking: return empty if warmup hasn't populated entries yet
+        let Some(entries) = DESKTOP_ENTRIES.get() else {
+            return Vec::new();
+        };
         let matches = Self::fuzzy_match(entries, query);
 
         matches
             .into_iter()
             .take(8)
-            .map(|(entry, _score)| {
-                // Resolve icon once, cache the result
-                let icon_path = entry
-                    .icon_path
-                    .get_or_init(|| entry.icon.as_deref().and_then(resolve_icon))
-                    .clone();
+            .map(|(entry, score)| {
+                // Use cached icon if available — never block completions on icon resolution.
+                // Icons are pre-warmed at startup; if warmup hasn't finished yet, show without icon.
+                let icon_path = entry.icon_path.get().cloned().flatten();
                 CompletionItem {
                     label: entry.name.clone(),
                     icon_path,
-                    score: _score,
+                    score,
                     description: None,
                 }
             })

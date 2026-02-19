@@ -20,11 +20,13 @@ pub fn run() {
     platform::init_app();
 
     let app_state = AppState::new();
-    let (hotkey, window_strategy) = {
+    let (hotkey, window_strategy, shell_path, project_dirs) = {
         let config = app_state.config.blocking_read();
         (
             config.general.hotkey.clone(),
             config.general.window_strategy.clone(),
+            config.commands.shell.clone(),
+            config.projects.directories.clone(),
         )
     };
 
@@ -42,6 +44,7 @@ pub fn run() {
             commands::execute::get_completions,
             commands::history::get_history,
             commands::history::clear_history,
+            commands::config::get_all_settings,
             commands::config::get_hide_on_blur,
             commands::config::save_window_position,
             commands::ai::get_ai_config,
@@ -77,6 +80,7 @@ pub fn run() {
             commands::media::media_seek,
             commands::media::media_refresh,
             commands::open_uri::open_uri,
+            commands::notes::get_all_notes,
             commands::notes::get_notes,
             commands::notes::add_note,
             commands::notes::update_note,
@@ -96,9 +100,24 @@ pub fn run() {
                 window::show_window(&win);
             }
 
-            // Warm up filesystem cache for snappy first search
+            // Warm up caches in parallel for snappy first search
             tauri::async_runtime::spawn_blocking(|| {
                 commands::filesystem::warmup_fs_cache();
+            });
+            tauri::async_runtime::spawn_blocking(|| {
+                lychi_core::action_registry::handlers::app_launcher::AppLauncher::warmup();
+            });
+            let shell_for_warmup = shell_path.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                lychi_core::action_registry::handlers::shell_exec::ShellExec::warmup(
+                    &shell_for_warmup,
+                );
+            });
+            let dirs_for_warmup = project_dirs.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                lychi_core::action_registry::handlers::project_open::ProjectOpen::warmup(
+                    &dirs_for_warmup,
+                );
             });
 
             // Register global shortcut
@@ -177,22 +196,23 @@ pub fn run() {
                         tracing::debug!("No MPRIS players found — listener idle");
                     }
 
-                    // Subscribe returns an owned stream — no borrow on manager
-                    let stream = match manager.subscribe_all_changes().await {
-                        Err(e) => {
-                            tracing::warn!("MPRIS subscribe error: {e}");
-                            let mut guard = mpris_state.write().await;
-                            *guard = Some(manager);
-                            return;
-                        }
-                        Ok(s) => s,
-                    };
-
-                    // Cache the manager (stream is owned, no borrow conflict)
+                    // Cache immediately so media commands work while we set up the stream
                     {
                         let mut guard = mpris_state.write().await;
                         *guard = Some(manager);
                     }
+                    tracing::info!("[mpris] Manager cached");
+
+                    // Subscribe to changes — read back from cache
+                    let guard = mpris_state.read().await;
+                    let stream = match guard.as_ref().unwrap().subscribe_all_changes().await {
+                        Err(e) => {
+                            tracing::warn!("MPRIS subscribe error: {e}");
+                            return;
+                        }
+                        Ok(s) => s,
+                    };
+                    drop(guard);
 
                     tokio::pin!(stream);
                     while let Some(track) = stream.next().await {

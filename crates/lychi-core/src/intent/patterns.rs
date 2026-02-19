@@ -18,7 +18,7 @@ const KNOWN_PREFIXES: &[&str] = &[
     "calc",
     "file",
     "url",
-    "spotify",
+    "media",
     "project",
     "system",
     "note",
@@ -176,7 +176,7 @@ fn try_explicit_prefix(input: &str) -> Option<Route> {
             "calc" => ("calc", args),
             "file" => ("file", args),
             "url" => ("url", args),
-            "spotify" => ("spotify", args),
+            "media" => ("media", args),
             "project" => ("project", args),
             "system" => ("system", args),
             "note" | "notes" => ("note", args),
@@ -281,14 +281,21 @@ fn try_keyword_route(input: &str) -> Option<Route> {
         });
     }
 
-    // --- media / spotify playback ---
-    if lower.contains("spotify") {
-        let verb = extract_media_verb(&lower);
-        return Some(Route {
-            handler: "spotify",
-            args: verb.into(),
-            explicit: false,
-        });
+    // --- media playback (provider-aware) ---
+    const MEDIA_PROVIDERS: &[(&str, &str)] = &[
+        ("spotify", "spotify"),
+        ("youtube", "yt"),
+        // Future: ("soundcloud", "soundcloud"), ("apple music", "apple"), etc.
+    ];
+    for (keyword, provider) in MEDIA_PROVIDERS {
+        if lower.contains(keyword) && has_media_verb(&lower) {
+            let verb = extract_media_verb(&lower);
+            return Some(Route {
+                handler: "media",
+                args: format!("{provider} {verb}"),
+                explicit: false,
+            });
+        }
     }
     if lower.contains("pause everything")
         || lower.contains("stop all")
@@ -505,30 +512,29 @@ fn try_keyword_route(input: &str) -> Option<Route> {
     None
 }
 
-/// Check if the input looks like a media playback command.
-fn is_media_phrase(lower: &str) -> bool {
-    let has_verb = lower.contains("pause")
-        || lower.contains("play")
-        || lower.contains("skip")
-        || lower.contains("next song")
-        || lower.contains("previous")
-        || lower.contains("stop");
-    let has_context = lower.contains("music")
-        || lower.contains("song")
-        || lower.contains("media")
-        || lower.contains("everything")
-        || lower.contains("all")
-        || lower.contains("track");
-    has_verb && has_context
+/// Media playback verbs recognised by the keyword router.
+const MEDIA_VERBS: &[&str] = &[
+    "pause", "play", "skip", "next", "previous", "prev", "stop", "toggle", "resume",
+];
+
+/// Check if input contains a media playback verb.
+fn has_media_verb(lower: &str) -> bool {
+    MEDIA_VERBS.iter().any(|v| lower.contains(v))
 }
 
-/// Extract the media verb from a phrase.
+/// Check if input is a natural-language media phrase (verb + context word).
+fn is_media_phrase(lower: &str) -> bool {
+    const CONTEXT_WORDS: &[&str] = &["music", "song", "media", "everything", "all", "track"];
+    has_media_verb(lower) && CONTEXT_WORDS.iter().any(|w| lower.contains(w))
+}
+
+/// Extract the canonical media verb from a phrase.
 fn extract_media_verb(lower: &str) -> &'static str {
     if lower.contains("pause") || lower.contains("stop") {
         "pause"
     } else if lower.contains("next") || lower.contains("skip") {
         "next"
-    } else if lower.contains("prev") {
+    } else if lower.contains("prev") || lower.contains("previous") {
         "prev"
     } else {
         "play"
@@ -725,9 +731,11 @@ mod tests {
         assert_eq!(r.args, "firefox");
         assert!(!r.explicit);
 
+        // Bare "spotify" opens the app, not media control
         let r = route("spotify");
-        assert_eq!(r.handler, "spotify");
-        assert!(r.explicit);
+        assert_eq!(r.handler, "open");
+        assert_eq!(r.args, "spotify");
+        assert!(!r.explicit);
     }
 
     #[test]
@@ -806,12 +814,44 @@ mod tests {
     #[test]
     fn keyword_spotify() {
         let r = route("play something on spotify");
-        assert_eq!(r.handler, "spotify");
-        assert_eq!(r.args, "play");
+        assert_eq!(r.handler, "media");
+        assert_eq!(r.args, "spotify play");
 
         let r = route("next song on spotify");
-        assert_eq!(r.handler, "spotify");
-        assert_eq!(r.args, "next");
+        assert_eq!(r.handler, "media");
+        assert_eq!(r.args, "spotify next");
+    }
+
+    #[test]
+    fn explicit_media_prefix() {
+        let r = route("media pause");
+        assert_eq!(r.handler, "media");
+        assert_eq!(r.args, "pause");
+        assert!(r.explicit);
+
+        let r = route("media spotify pause");
+        assert_eq!(r.handler, "media");
+        assert_eq!(r.args, "spotify pause");
+        assert!(r.explicit);
+
+        let r = route("media yt next");
+        assert_eq!(r.handler, "media");
+        assert_eq!(r.args, "yt next");
+        assert!(r.explicit);
+    }
+
+    #[test]
+    fn spotify_keyword_routes_to_media() {
+        // "spotify pause" — no longer a prefix, hits keyword routing
+        let r = route("spotify pause");
+        assert_eq!(r.handler, "media");
+        assert_eq!(r.args, "spotify pause");
+        assert!(!r.explicit);
+
+        let r = route("spotify next");
+        assert_eq!(r.handler, "media");
+        assert_eq!(r.args, "spotify next");
+        assert!(!r.explicit);
     }
 
     #[test]

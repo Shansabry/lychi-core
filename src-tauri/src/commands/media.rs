@@ -11,21 +11,19 @@ mod inner {
     pub async fn media_get_status(
         state: State<'_, AppState>,
     ) -> Result<Vec<TrackInfo>, LychiError> {
-        // Try cached manager — refresh to pick up new players
+        // Brief write lock for refresh only — release before reading status
         {
             let mut guard = state.mpris.write().await;
             if let Some(manager) = guard.as_mut() {
                 let _ = manager.refresh().await;
-                return Ok(manager.get_all_status().await);
+            } else {
+                *guard = Some(MprisManager::connect().await?);
             }
         }
 
-        // Not connected yet — try to connect
-        let manager = MprisManager::connect().await?;
-        let status = manager.get_all_status().await;
-        let mut guard = state.mpris.write().await;
-        *guard = Some(manager);
-        Ok(status)
+        // Read lock for status — doesn't block completions
+        let guard = state.mpris.read().await;
+        Ok(guard.as_ref().unwrap().get_all_status().await)
     }
 
     /// Send a transport control action to a specific player.

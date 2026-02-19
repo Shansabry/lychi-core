@@ -1,4 +1,5 @@
 <script lang="ts">
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { onMount } from "svelte";
 import AgentPlanPanel from "$lib/components/AgentPlanPanel.svelte";
 import CommandInput from "$lib/components/CommandInput.svelte";
@@ -35,6 +36,7 @@ import {
 	saveWindowPosition,
 	startFileSearch,
 } from "$lib/ipc";
+import { preloadAll } from "$lib/preloadCache";
 
 let inputValue = $state("");
 let isExecuting = $state(false);
@@ -96,7 +98,7 @@ let mediaOpen = $state(false);
 let notesOpen = $state(false);
 let pendingNoteText: string | null = $state(null);
 let mediaPlayers: TrackInfo[] = $state([]);
-let mediaPollTimer: ReturnType<typeof setInterval> | undefined;
+let mediaPollTimer: ReturnType<typeof setTimeout> | undefined;
 
 // Derive the "now playing" track — first playing, or first in list
 let nowPlaying = $derived.by(() => {
@@ -122,20 +124,25 @@ $effect(() => {
 	});
 });
 
-// Poll media player status (every 5s)
+// Poll media player status — 5s when playing/paused, 30s when idle
 $effect(() => {
-	function poll() {
-		mediaGetStatus()
-			.then((players) => {
-				mediaPlayers = players.filter((p) => p.title || p.status !== "stopped");
-			})
-			.catch(() => {
-				mediaPlayers = [];
-			});
+	function scheduleNext() {
+		const hasActive = mediaPlayers.some((p) => p.status === "playing" || p.status === "paused");
+		mediaPollTimer = setTimeout(poll, hasActive ? 5000 : 30000);
 	}
+
+	async function poll() {
+		try {
+			const players = await mediaGetStatus();
+			mediaPlayers = players.filter((p) => p.title || p.status !== "stopped");
+		} catch {
+			mediaPlayers = [];
+		}
+		scheduleNext();
+	}
+
 	poll();
-	mediaPollTimer = setInterval(poll, 5000);
-	return () => clearInterval(mediaPollTimer);
+	return () => clearTimeout(mediaPollTimer);
 });
 
 // Immediate @ mode completion fetch (no debounce) — used when drilling into dirs
@@ -253,7 +260,6 @@ function handleInput(val: string) {
 	}
 
 	debounceTimer = setTimeout(async () => {
-		// Send raw input — the backend router handles intent detection
 		try {
 			const results = await getCompletions(trimmed);
 			completions = results;
@@ -265,15 +271,13 @@ function handleInput(val: string) {
 }
 
 onMount(() => {
-	// Load config
 	getHideOnBlur().then((v) => {
 		hideOnBlur = v;
 	});
-
-	// Load mount points for @ search scope
 	getMountPoints().then((mounts) => {
 		mountPoints = mounts;
 	});
+	preloadAll();
 
 	// Guard: only attach Tauri listeners if running inside Tauri
 	if (!("__TAURI_INTERNALS__" in window)) return;
@@ -286,7 +290,6 @@ onMount(() => {
 	let unlisteners: (() => void)[] = [];
 
 	(async () => {
-		const { getCurrentWindow } = await import("@tauri-apps/api/window");
 		const win = getCurrentWindow();
 
 		// Listen for agent step events
@@ -910,13 +913,20 @@ async function handleDismiss() {
 			browseGhost={atMode && completions.length > 0 && completionIndex >= 0 ? completions[completionIndex].label : ""}
 			history={historyEntries}
 		/>
-		{#if settingsOpen}
+		<!-- Panels: always mounted, hidden via CSS (visibility:hidden) for instant toggle -->
+		<div class:panel-hidden={!settingsOpen}>
 			<SettingsPanel ondismiss={() => { settingsOpen = false; }} />
-		{:else if mediaOpen}
-			<MediaPanel ondismiss={() => { mediaOpen = false; }} players={mediaPlayers} />
-		{:else if notesOpen}
+		</div>
+		<div class:panel-hidden={!notesOpen}>
 			<NotesPanel ondismiss={() => { notesOpen = false; pendingNoteText = null; }} {pendingNoteText} onpendingcleared={() => { pendingNoteText = null; }} />
-		{:else if pendingPlan}
+		</div>
+		<div class:panel-hidden={!mediaOpen}>
+			<MediaPanel ondismiss={() => { mediaOpen = false; }} players={mediaPlayers} />
+		</div>
+		<div class:panel-hidden={!historyOpen}>
+			<HistoryPanel entries={historyEntries} onselect={handleHistorySelect} />
+		</div>
+		{#if pendingPlan}
 			<AgentPlanPanel
 				bind:this={planPanelRef}
 				plan={pendingPlan}
@@ -926,7 +936,7 @@ async function handleDismiss() {
 				}}
 				ondismiss={() => { pendingPlan = null; }}
 			/>
-		{:else}
+		{:else if !settingsOpen && !notesOpen && !mediaOpen && !historyOpen}
 			{#if completions.length > 0}
 				<CompletionsList
 					items={completions}
@@ -944,9 +954,7 @@ async function handleDismiss() {
 			{:else if searchMode && !searchDone}
 				<div class="empty-state">Searching...</div>
 			{/if}
-			{#if historyOpen}
-				<HistoryPanel entries={historyEntries} onselect={handleHistorySelect} />
-			{:else if lastResult}
+			{#if lastResult}
 				<ResultPanel result={lastResult} command={lastCommand}
 				onconfirm={handleConfirm} ondismiss={handleConfirmDismiss}
 				onopenurl={async () => {
@@ -1009,6 +1017,13 @@ async function handleDismiss() {
 		overflow: hidden;
 		box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
 		animation: lychi-appear 120ms ease-out;
+	}
+
+	.panel-hidden {
+		visibility: hidden;
+		position: absolute;
+		pointer-events: none;
+		width: 100%;
 	}
 
 	.empty-state {

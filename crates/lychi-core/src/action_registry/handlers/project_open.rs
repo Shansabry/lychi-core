@@ -37,6 +37,34 @@ impl ProjectOpen {
         Self { directories }
     }
 
+    /// Pre-scan project directories at startup so first project search is instant.
+    pub fn warmup(directories: &[String]) {
+        let t0 = Instant::now();
+        let entries = Self::discover_projects(directories);
+        let count = entries.len();
+        if let Ok(mut guard) = PROJECT_CACHE.write() {
+            *guard = Some((
+                directories.to_vec(),
+                entries
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            ProjectEntry {
+                                name: v.name.clone(),
+                                path: v.path.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+            ));
+        }
+        tracing::info!(
+            "[project_open] warmup done: {:.0}ms ({count} projects)",
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
     fn expand_path(path: &str) -> PathBuf {
         if let Some(rest) = path.strip_prefix("~/") {
             dirs::home_dir()

@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "RUST_LOG=debug tauri dev",
-    "build": "tauri build --bundles appimage",
+    "build": "NO_STRIP=1 tauri build --bundles appimage",
+    "build:debug": "RUST_LOG=debug tauri build --debug --no-bundle",
     "vite:dev": "vite dev",
     "vite:build": "vite build",
     "preview": "vite preview",

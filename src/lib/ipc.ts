@@ -133,6 +133,57 @@ export async function openUri(uri: string): Promise<void> {
 	return invoke("open_uri", { uri });
 }
 
+// --- Batch settings (single IPC call) ---
+
+export interface AllSettings {
+	ai: AiConfig;
+	general: GeneralConfig;
+	commands: CommandsConfig;
+	projects: ProjectsConfig;
+	privacy: PrivacyConfig;
+	app_version: string;
+	layer_shell_supported: boolean;
+	active_window_strategy: string;
+}
+
+export async function getAllSettings(): Promise<AllSettings> {
+	if (!isTauri())
+		return {
+			ai: { mode: "disabled", provider: "anthropic", model: "", ollama_url: "" },
+			general: {
+				hide_on_blur: true,
+				show_duration_ms: true,
+				theme: "dark",
+				hotkey: "Ctrl+Space",
+				window_x: null,
+				window_y: null,
+				monitor_mode: "cursor",
+				window_strategy: "auto",
+			},
+			commands: {
+				default_search_engine: "https://www.google.com/search?q=",
+				youtube_url: "https://www.youtube.com/results?search_query=",
+				shell: "/bin/bash",
+			},
+			projects: { directories: [] },
+			privacy: { allow_ip_geolocation: false, allow_public_ip: false },
+			app_version: "0.0.0",
+			layer_shell_supported: false,
+			active_window_strategy: "x11",
+		};
+	return invoke<AllSettings>("get_all_settings");
+}
+
+export interface AllNotes {
+	notes: NoteItem[];
+	todos: TodoItem[];
+}
+
+export async function getAllNotes(): Promise<AllNotes> {
+	if (!isTauri()) return { notes: [], todos: [] };
+	return invoke<AllNotes>("get_all_notes");
+}
+
 // --- General Config ---
 
 export interface GeneralConfig {

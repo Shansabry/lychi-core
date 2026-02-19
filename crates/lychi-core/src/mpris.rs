@@ -348,6 +348,33 @@ impl MprisManager {
         self.players.keys().cloned().collect()
     }
 
+    /// Find the first player whose bus name matches a predicate, or fall back to any player.
+    /// Returns the bus name. This avoids fetching full metadata just to pick a target.
+    /// Uses sorted keys for deterministic fallback when no predicate match is found.
+    pub fn find_player_by_bus(&self, predicate: impl Fn(&str) -> bool) -> Option<String> {
+        // Prefer a matching player
+        if let Some(name) = self.players.keys().find(|name| predicate(name.as_str())) {
+            return Some(name.clone());
+        }
+        // Deterministic fallback: sorted by bus name so the same player is always picked
+        let mut names: Vec<&String> = self.players.keys().collect();
+        names.sort();
+        names.first().cloned().cloned()
+    }
+
+    /// Send a control command to the first player matching a predicate (or any player).
+    pub async fn control_matching(
+        &self,
+        predicate: impl Fn(&str) -> bool,
+        action: &str,
+    ) -> Result<String, LychiError> {
+        let bus_name = self
+            .find_player_by_bus(predicate)
+            .ok_or_else(|| LychiError::ExecutionFailed("No media players running".to_string()))?;
+        self.control(&bus_name, action).await?;
+        Ok(friendly_name(&bus_name))
+    }
+
     /// Check if any players are connected.
     pub fn has_players(&self) -> bool {
         !self.players.is_empty()
@@ -373,8 +400,19 @@ impl MprisManager {
     }
 }
 
+impl TrackInfo {
+    /// Human-readable status with player name.
+    pub fn status_label(&self) -> String {
+        match self.status {
+            PlaybackStatus::Playing => format!("▶ {}", self.player_name),
+            PlaybackStatus::Paused => format!("⏸ {}", self.player_name),
+            PlaybackStatus::Stopped => format!("⏹ {}", self.player_name),
+        }
+    }
+}
+
 /// Extract friendly player name from a bus name.
-fn friendly_name(bus_name: &str) -> String {
+pub fn friendly_name(bus_name: &str) -> String {
     let raw = bus_name.strip_prefix(MPRIS_PREFIX).unwrap_or(bus_name);
     // Some players add ".instanceXXX" suffix — strip it
     let base = raw.split('.').next().unwrap_or(raw);

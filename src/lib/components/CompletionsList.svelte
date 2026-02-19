@@ -1,6 +1,6 @@
 <script lang="ts">
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { File, Folder, LoaderCircle } from "lucide-svelte";
+import { AppWindow, File, Folder, LoaderCircle } from "lucide-svelte";
 import type { CompletionItem, MountPoint } from "$lib/ipc";
 
 let {
@@ -124,13 +124,16 @@ let isSearchMode = $derived(scopeTabs.length > 0 || searching);
 		>
 			<span class="icon">
 				{#if item.icon_path === "__folder__"}
-					<Folder size={18} strokeWidth={1.5} class="icon-folder" />
+					<Folder size={20} strokeWidth={1.5} class="icon-folder" />
 				{:else if item.icon_path}
-					<img src={iconSrc(item.icon_path)} alt="" />
-				{:else if isSearchMode || pathContext}
-					<File size={18} strokeWidth={1.5} class="icon-file" />
+					{@const src = iconSrc(item.icon_path)}
+					{#if src}
+						<img src={src} alt="" width="24" height="24" decoding="async" loading="eager" />
+					{:else}
+						<File size={20} strokeWidth={1.5} class="icon-file" />
+					{/if}
 				{:else}
-					<span class="icon-fallback">⬡</span>
+					<AppWindow size={20} strokeWidth={1.5} class="icon-fallback" />
 				{/if}
 			</span>
 			{#if isSearchMode}
@@ -178,6 +181,8 @@ let isSearchMode = $derived(scopeTabs.length > 0 || searching);
 		flex: 1;
 		min-height: 0;
 	}
+
+
 
 	.scope-tabs {
 		display: flex;
@@ -255,18 +260,6 @@ let isSearchMode = $derived(scopeTabs.length > 0 || searching);
 		cursor: pointer;
 		border-left: 2px solid transparent;
 		transition: background 80ms ease, padding-left 80ms ease, border-color 80ms ease;
-		animation: item-enter 120ms ease-out;
-	}
-
-	@keyframes item-enter {
-		from {
-			opacity: 0;
-			transform: translateY(-4px);
-		}
-		to {
-			opacity: 1;
-			transform: translateY(0);
-		}
 	}
 
 	.completion-item:hover {
@@ -294,9 +287,9 @@ let isSearchMode = $derived(scopeTabs.length > 0 || searching);
 		object-fit: contain;
 	}
 
-	.icon-fallback {
+	.icon :global(.icon-fallback) {
 		color: var(--fg-muted);
-		font-size: 16px;
+		opacity: 0.5;
 	}
 
 	.icon :global(.icon-folder) {

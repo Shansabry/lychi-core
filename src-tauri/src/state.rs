@@ -7,11 +7,11 @@ use lychi_core::action_registry::handlers::ask::AskHandler;
 use lychi_core::action_registry::handlers::browse::BrowseHandler;
 use lychi_core::action_registry::handlers::calc::CalcHandler;
 use lychi_core::action_registry::handlers::file_open::FileOpen;
+#[cfg(feature = "mpris")]
+use lychi_core::action_registry::handlers::media::MediaHandler;
 use lychi_core::action_registry::handlers::notes::{NotesHandler, TodoHandler};
 use lychi_core::action_registry::handlers::project_open::ProjectOpen;
 use lychi_core::action_registry::handlers::shell_exec::ShellExec;
-#[cfg(feature = "mpris")]
-use lychi_core::action_registry::handlers::spotify::{MediaHandler, SpotifyHandler};
 use lychi_core::action_registry::handlers::sysinfo::SysInfoHandler;
 use lychi_core::action_registry::handlers::system::SystemCommand;
 use lychi_core::action_registry::handlers::url_open::UrlOpen;
@@ -61,6 +61,10 @@ impl AppState {
             }),
         ));
 
+        #[cfg(feature = "mpris")]
+        let mpris: Arc<RwLock<Option<lychi_core::mpris::MprisManager>>> =
+            Arc::new(RwLock::new(None));
+
         let mut registry = ActionRegistry::new();
         registry.register(Box::new(AppLauncher::new()));
         registry.register(Box::new(WebSearch::with_search_url(
@@ -75,8 +79,7 @@ impl AppState {
         registry.register(Box::new(UrlOpen::new()));
         #[cfg(feature = "mpris")]
         {
-            registry.register(Box::new(SpotifyHandler::new()));
-            registry.register(Box::new(MediaHandler::new()));
+            registry.register(Box::new(MediaHandler::new(Arc::clone(&mpris))));
         }
         registry.register(Box::new(ProjectOpen::with_directories(
             config.projects.directories.clone(),
@@ -144,7 +147,7 @@ impl AppState {
             pending_plan: Arc::new(RwLock::new(None)),
             active_file_search: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "mpris")]
-            mpris: Arc::new(RwLock::new(None)),
+            mpris,
         }
     }
 

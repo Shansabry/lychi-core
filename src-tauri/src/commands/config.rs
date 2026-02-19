@@ -1,10 +1,63 @@
 use crate::state::AppState;
 use crate::window;
 use lychi_core::config::schema::PrivacyConfig;
-use lychi_core::config::{CommandsConfig, GeneralConfig, ProjectsConfig};
+use lychi_core::config::{AiConfig, CommandsConfig, GeneralConfig, ProjectsConfig};
 use lychi_core::error::LychiError;
 use lychi_core::paths;
+use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
+
+/// Single-IPC batch response for all settings data the frontend needs at startup.
+#[derive(Serialize)]
+pub struct AllSettings {
+    pub ai: AiConfig,
+    pub general: GeneralConfig,
+    pub commands: CommandsConfig,
+    pub projects: ProjectsConfig,
+    pub privacy: PrivacyConfig,
+    pub app_version: String,
+    pub layer_shell_supported: bool,
+    pub active_window_strategy: String,
+}
+
+#[tauri::command]
+pub fn get_all_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<AllSettings, LychiError> {
+    let config = state.config.blocking_read();
+
+    let layer_shell_supported = gtk_layer_shell::is_supported();
+
+    let active_window_strategy = if let Some(win) = app.get_webview_window("main") {
+        if let Ok(gtk_win) = win.gtk_window() {
+            use gtk_layer_shell::LayerShell;
+            if gtk_win.is_layer_window() {
+                "layer-shell"
+            } else {
+                "x11"
+            }
+        } else {
+            "x11"
+        }
+    } else {
+        "x11"
+    }
+    .to_string();
+
+    let app_version = app.package_info().version.to_string();
+
+    Ok(AllSettings {
+        ai: config.ai.clone(),
+        general: config.general.clone(),
+        commands: config.commands.clone(),
+        projects: config.projects.clone(),
+        privacy: config.privacy.clone(),
+        app_version,
+        layer_shell_supported,
+        active_window_strategy,
+    })
+}
 
 #[tauri::command]
 pub async fn get_hide_on_blur(state: State<'_, AppState>) -> Result<bool, LychiError> {

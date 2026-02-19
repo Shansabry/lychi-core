@@ -1,5 +1,4 @@
 <script lang="ts">
-import { getVersion } from "@tauri-apps/api/app";
 import {
 	BookOpen,
 	Check,
@@ -23,13 +22,6 @@ import type {
 } from "$lib/ipc";
 import {
 	checkAiHealth,
-	getActiveWindowStrategy,
-	getAiConfig,
-	getCommandsConfig,
-	getGeneralConfig,
-	getLayerShellSupported,
-	getPrivacyConfig,
-	getProjectsConfig,
 	listDirectories,
 	recordHotkey,
 	restartApp,
@@ -41,6 +33,7 @@ import {
 	setApiKey,
 	setHotkey,
 } from "$lib/ipc";
+import { preloadSettings } from "$lib/preloadCache";
 import Select from "./Select.svelte";
 
 let { ondismiss }: { ondismiss: () => void } = $props();
@@ -104,30 +97,27 @@ let shellOptions = $derived([
 
 let projectDirs: string[] = $state([]);
 
-onMount(async () => {
-	const [ai, general, commands, projects, privacy, version, layerShell, activeStrategy] =
-		await Promise.all([
-			getAiConfig(),
-			getGeneralConfig(),
-			getCommandsConfig(),
-			getProjectsConfig(),
-			getPrivacyConfig(),
-			getVersion().catch(() => "0.0.0"),
-			getLayerShellSupported(),
-			getActiveWindowStrategy(),
-		]);
-	aiConfig = ai;
-	generalConfig = general;
-	commandsConfig = commands;
-	privacyConfig = privacy;
-	customShell = !knownShells.includes(commands.shell);
-	projectDirs = projects.directories;
-	appVersion = version;
-	layerShellSupported = layerShell;
-	activeWindowStrategy = activeStrategy;
-	// C6: Fetch remote model list only when AI is enabled (no network call in default mode)
-	providerModels = await fetchModels(ai.mode);
-	await refreshHealth();
+onMount(() => {
+	// Non-blocking: render with defaults, update when data arrives in next frame
+	preloadSettings().then((cached) => {
+		requestAnimationFrame(() => {
+			aiConfig = cached.aiConfig;
+			generalConfig = cached.generalConfig;
+			commandsConfig = cached.commandsConfig;
+			privacyConfig = cached.privacyConfig;
+			customShell = !knownShells.includes(cached.commandsConfig.shell);
+			projectDirs = cached.projectsConfig.directories;
+			appVersion = cached.appVersion;
+			layerShellSupported = cached.layerShellSupported;
+			activeWindowStrategy = cached.activeWindowStrategy;
+
+			// These depend on cached data, fire after settings arrive
+			fetchModels(cached.aiConfig.mode).then((m) => {
+				providerModels = m;
+			});
+			refreshHealth();
+		});
+	});
 });
 
 async function refreshHealth() {

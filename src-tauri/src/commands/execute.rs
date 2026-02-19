@@ -39,7 +39,8 @@ pub async fn get_completions(
     state: State<'_, AppState>,
 ) -> Result<Vec<CompletionItem>, LychiError> {
     let executor = state.executor.read().await;
-    Ok(executor.completions(&input).await)
+    let results = executor.completions(&input).await;
+    Ok(results)
 }
 
 /// Check if the input is a notes/todo write operation (not a read).

@@ -221,8 +221,7 @@ function handleKeydown(e: KeyboardEvent) {
 		{/if}
 		{#if result.output}
 			{#if isTerminal}
-				<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions a11y_no_noninteractive_element_interactions -->
-				<pre class="output terminal" onclick={lsDirectory ? handleTerminalClick : undefined}>{@html processedHtml}</pre>
+				<pre class="output terminal" role={lsDirectory ? "button" : undefined} tabindex={lsDirectory ? 0 : undefined} onclick={lsDirectory ? handleTerminalClick : undefined} onkeydown={lsDirectory ? (e) => { if (e.key === 'Enter') handleTerminalClick(e); } : undefined}>{@html processedHtml}</pre>
 			{:else if outputType === "text"}
 				<div class="output text">{result.output}</div>
 			{:else if outputType === "weather"}

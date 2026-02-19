@@ -340,6 +340,7 @@ function handleKeydown(e: KeyboardEvent) {
 			type="text"
 			spellcheck="false"
 			autocomplete="off"
+			autofocus
 		/>
 	</div>
 </div>

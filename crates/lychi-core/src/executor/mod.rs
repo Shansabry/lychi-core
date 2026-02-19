@@ -118,8 +118,8 @@ impl Executor {
     /// Get completions using the intent resolver to pick the right handler.
     pub async fn completions(&self, raw: &str) -> Vec<CompletionItem> {
         let route = crate::intent::patterns::route(raw);
-
         let results = self.registry.completions(route.handler, &route.args).await;
+
         if !results.is_empty() {
             return results;
         }

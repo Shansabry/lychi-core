@@ -13,6 +13,7 @@ import {
 	toggleTodo,
 	updateNote,
 } from "$lib/ipc";
+import { invalidateNotes, preloadNotes } from "$lib/preloadCache";
 
 const MAX_NOTES = 5;
 const MAX_NOTE_CHARS = 500;
@@ -49,14 +50,15 @@ let sortedTodos = $derived.by(() => {
 let remainingTodos = $derived(todos.filter((t) => !t.done).length);
 
 onMount(() => {
-	loadData();
+	initialLoad();
 
 	let unlisten: (() => void) | undefined;
 	(async () => {
 		const win = getCurrentWindow();
 		unlisten = await win.listen("lychi://notes-changed", () => {
 			clearTimeout(saveTimer);
-			loadData();
+			invalidateNotes();
+			reloadData();
 		});
 	})();
 
@@ -65,13 +67,25 @@ onMount(() => {
 	};
 });
 
-async function loadData() {
+function initialLoad() {
+	preloadNotes()
+		.then((cached) => {
+			requestAnimationFrame(() => {
+				notes = cached.notes;
+				todos = cached.todos;
+			});
+		})
+		.catch((err) => {
+			console.error("[notes] load error:", err);
+		});
+}
+
+async function reloadData() {
 	clearTimeout(saveTimer);
 	try {
 		const [n, t] = await Promise.all([getNotes(), getTodos()]);
 		notes = n;
 		todos = t;
-		// If editing a note that was deleted externally, go back to list
 		if (editingNote && !n.find((x) => x.id === editingNote?.id)) {
 			editingNote = null;
 		}

@@ -1,9 +1,25 @@
+use serde::Serialize;
 use tauri::State;
 
 use lychi_core::error::LychiError;
 use lychi_core::notes::{NoteItem, TodoItem};
 
 use crate::state::AppState;
+
+#[derive(Serialize)]
+pub struct AllNotes {
+    pub notes: Vec<NoteItem>,
+    pub todos: Vec<TodoItem>,
+}
+
+#[tauri::command]
+pub async fn get_all_notes(state: State<'_, AppState>) -> Result<AllNotes, LychiError> {
+    let store = state.notes.read().await;
+    Ok(AllNotes {
+        notes: store.get_notes().to_vec(),
+        todos: store.get_todos().to_vec(),
+    })
+}
 
 // ---- Notes ----
 
