@@ -8,6 +8,24 @@ pub fn init_app() {
     glib::set_application_name("Lychi");
 }
 
+/// Strip ANSI escape codes from kscreen-doctor output.
+fn strip_ansi(text: &str) -> String {
+    text.chars()
+        .scan(false, |in_esc, ch| {
+            if *in_esc {
+                *in_esc = ch != 'm';
+                Some(None)
+            } else if ch == '\x1b' {
+                *in_esc = true;
+                Some(None)
+            } else {
+                Some(Some(ch))
+            }
+        })
+        .flatten()
+        .collect()
+}
+
 /// Find the primary monitor, working around KDE Wayland where GDK's
 /// `primary_monitor()` always returns None.
 fn find_primary_monitor(display: &gdk::Display) -> Option<gdk::Monitor> {
@@ -26,22 +44,7 @@ fn find_primary_monitor(display: &gdk::Display) -> Option<gdk::Monitor> {
         .output()
     {
         let text = String::from_utf8_lossy(&output.stdout);
-        // Strip ANSI escape codes
-        let clean: String = text
-            .chars()
-            .scan(false, |in_esc, ch| {
-                if *in_esc {
-                    *in_esc = ch != 'm';
-                    Some(None)
-                } else if ch == '\x1b' {
-                    *in_esc = true;
-                    Some(None)
-                } else {
-                    Some(Some(ch))
-                }
-            })
-            .flatten()
-            .collect();
+        let clean = strip_ansi(&text);
 
         // Parse kscreen-doctor output to find the priority-1 output's geometry.
         // Format:
@@ -74,7 +77,7 @@ fn find_primary_monitor(display: &gdk::Display) -> Option<gdk::Monitor> {
         }
 
         if let Some((px, py)) = primary_geom {
-            tracing::info!("KDE primary monitor at {px},{py}");
+            tracing::debug!("KDE primary monitor at {px},{py}");
             let n = display.n_monitors();
             for i in 0..n {
                 if let Some(m) = display.monitor(i) {
@@ -92,8 +95,188 @@ fn find_primary_monitor(display: &gdk::Display) -> Option<gdk::Monitor> {
     display.monitor(0)
 }
 
+/// Find the monitor currently under the pointer cursor.
+/// Falls back to primary monitor if cursor position cannot be determined.
+fn find_cursor_monitor(display: &gdk::Display) -> Option<gdk::Monitor> {
+    use gdk::prelude::{DeviceExt, MonitorExt, SeatExt};
+
+    // On KDE Wayland, GDK3's device.position() doesn't return real global
+    // coordinates — they're clamped to the focused surface's monitor.
+    // Use KWin D-Bus to get the active output name, then kscreen-doctor
+    // to resolve that output's geometry, and match against GDK monitors.
+    if gtk_layer_shell::is_supported() {
+        if let Some(m) = find_cursor_monitor_kde(display) {
+            return Some(m);
+        }
+    }
+
+    // GDK path (works on X11 and GNOME Wayland)
+    let seat = display.default_seat()?;
+    let pointer = seat.pointer()?;
+    let (_screen, x, y) = pointer.position();
+    tracing::debug!("Cursor position (GDK): ({x}, {y})");
+
+    let monitor = display
+        .monitor_at_point(x, y)
+        .or_else(|| find_primary_monitor(display));
+
+    if let Some(ref m) = monitor {
+        let geom = m.geometry();
+        tracing::debug!(
+            "Cursor monitor resolved at {},{} ({}x{})",
+            geom.x(),
+            geom.y(),
+            geom.width(),
+            geom.height()
+        );
+    }
+
+    monitor
+}
+
+/// KDE Wayland fallback: ask KWin for the active output name via D-Bus,
+/// then resolve it to a GDK monitor via kscreen-doctor geometry matching.
+fn find_cursor_monitor_kde(display: &gdk::Display) -> Option<gdk::Monitor> {
+    use gtk::prelude::MonitorExt;
+
+    // Step 1: Get the active output name from KWin D-Bus
+    // org.kde.KWin /KWin org.kde.KWin.activeOutputName
+    let output = std::process::Command::new("dbus-send")
+        .args([
+            "--session",
+            "--dest=org.kde.KWin",
+            "--print-reply",
+            "/KWin",
+            "org.kde.KWin.activeOutputName",
+        ])
+        .output()
+        .ok()?;
+
+    let reply = String::from_utf8_lossy(&output.stdout);
+    // Reply format: `method return ...\n   string "DP-1"\n`
+    let active_name = reply
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_prefix("string \"")
+                .and_then(|s| s.strip_suffix('"'))
+        })?;
+
+    tracing::debug!("KWin active output: {active_name}");
+
+    // Step 2: Parse kscreen-doctor to find this output's geometry
+    let kscreen = std::process::Command::new("kscreen-doctor")
+        .arg("-o")
+        .output()
+        .ok()?;
+
+    let text = String::from_utf8_lossy(&kscreen.stdout);
+    let clean = strip_ansi(&text);
+
+    let mut current_is_target = false;
+    let mut target_geom: Option<(i32, i32)> = None;
+
+    for line in clean.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Output:") {
+            // "Output: 2 HDMI-A-1 ..." — check if this output matches
+            current_is_target = trimmed
+                .split_whitespace()
+                .nth(2)
+                .is_some_and(|name| name == active_name);
+        } else if current_is_target && trimmed.starts_with("Geometry:") {
+            // "Geometry: 1920,0 1920x1080"
+            if let Some(coords) = trimmed.strip_prefix("Geometry:").map(|s| s.trim())
+                && let Some(pos) = coords.split_whitespace().next()
+            {
+                let parts: Vec<&str> = pos.split(',').collect();
+                if parts.len() == 2
+                    && let (Ok(x), Ok(y)) = (parts[0].parse(), parts[1].parse())
+                {
+                    target_geom = Some((x, y));
+                }
+            }
+            break;
+        }
+    }
+
+    // Step 3: Match geometry to a GDK monitor
+    let (tx, ty) = target_geom?;
+    tracing::debug!("KDE cursor monitor '{active_name}' at {tx},{ty}");
+
+    let n = display.n_monitors();
+    for i in 0..n {
+        if let Some(m) = display.monitor(i) {
+            let g = m.geometry();
+            if g.x() == tx && g.y() == ty {
+                return Some(m);
+            }
+        }
+    }
+    tracing::warn!("KDE active output '{active_name}' at {tx},{ty} not matched in GDK monitors");
+    None
+}
+
+/// Resolve the target monitor based on the monitor_mode config value.
+/// "cursor" → monitor under the pointer; "primary" → primary monitor.
+pub fn get_monitor_for_mode(mode: &str) -> Option<gdk::Monitor> {
+    let display = gdk::Display::default()?;
+    if mode == "cursor" {
+        find_cursor_monitor(&display)
+    } else {
+        find_primary_monitor(&display)
+    }
+}
+
+/// Reposition the window to the given monitor.
+/// On Wayland layer-shell: hides the GTK window, calls set_monitor(), then
+/// re-shows it — KWin and some compositors require the surface to be unmapped
+/// before a monitor change takes effect.
+/// On X11: calls move_() + set_size_request().
+pub fn reposition_to_monitor(window: &WebviewWindow, monitor: &gdk::Monitor) {
+    use gtk::prelude::{GtkWindowExt, MonitorExt, WidgetExt};
+
+    let gtk_win = match window.gtk_window() {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!("reposition_to_monitor: no GTK window: {e}");
+            return;
+        }
+    };
+
+    let geom = monitor.geometry();
+
+    // Check if this window actually has layer-shell initialized (not just
+    // whether the compositor supports it). Respects the window_strategy override.
+    use gtk_layer_shell::LayerShell;
+    if gtk_win.is_layer_window() {
+        // Must unmap → set_monitor → remap for compositor to honour the change
+        gtk_win.hide();
+        gtk_win.set_monitor(monitor);
+        tracing::debug!(
+            "Repositioned layer-shell to monitor at {},{} ({}x{})",
+            geom.x(),
+            geom.y(),
+            geom.width(),
+            geom.height()
+        );
+    } else {
+        gtk_win.move_(geom.x(), geom.y());
+        gtk_win.set_size_request(geom.width(), geom.height());
+        tracing::debug!(
+            "Repositioned X11 window to monitor at {},{} ({}x{})",
+            geom.x(),
+            geom.y(),
+            geom.width(),
+            geom.height()
+        );
+    }
+}
+
 /// Configure the GTK window for Wayland layer-shell or X11 skip-taskbar.
-pub fn init_window(window: &WebviewWindow) {
+/// `strategy`: "auto" (detect), "layer-shell" (force Wayland), or "x11" (force X11 path).
+pub fn init_window(window: &WebviewWindow, strategy: &str) {
     let gtk_win = match window.gtk_window() {
         Ok(w) => w,
         Err(e) => {
@@ -103,6 +286,19 @@ pub fn init_window(window: &WebviewWindow) {
     };
 
     use gtk::prelude::{GtkWindowExt, MonitorExt, WidgetExt};
+
+    let use_layer_shell = match strategy {
+        "layer-shell" => {
+            if gtk_layer_shell::is_supported() {
+                true
+            } else {
+                tracing::warn!("layer-shell strategy requested but not supported, falling back to x11");
+                false
+            }
+        }
+        "x11" => false,
+        _ => gtk_layer_shell::is_supported(), // "auto"
+    };
 
     // Gracefully handle missing screen/monitor instead of panicking
     let setup_ok = (|| -> Option<()> {
@@ -117,8 +313,7 @@ pub fn init_window(window: &WebviewWindow) {
         }
         gtk_win.set_app_paintable(true);
 
-        // Use layer shell if available (Wayland) — hides from taskbar
-        if gtk_layer_shell::is_supported() {
+        if use_layer_shell {
             use gtk_layer_shell::LayerShell;
             gtk_win.hide(); // Must unmap before init_layer_shell
             gtk_win.init_layer_shell();
@@ -132,14 +327,14 @@ pub fn init_window(window: &WebviewWindow) {
             gtk_win.set_anchor(gtk_layer_shell::Edge::Left, true);
             gtk_win.set_anchor(gtk_layer_shell::Edge::Right, true);
             gtk_win.set_namespace("lychi");
-            tracing::info!("Layer shell initialized (Wayland) on primary monitor");
+            tracing::debug!("Layer shell initialized (strategy: {strategy})");
         } else {
-            // X11 fallback — position on primary monitor with skip-taskbar hints
+            // X11 path — position on primary monitor with skip-taskbar hints
             gtk_win.move_(geom.x(), geom.y());
             gtk_win.set_size_request(geom.width(), geom.height());
             gtk_win.set_skip_taskbar_hint(true);
             gtk_win.set_skip_pager_hint(true);
-            tracing::info!("Using X11 skip-taskbar hints on primary monitor");
+            tracing::debug!("X11 window hints applied (strategy: {strategy})");
         }
         Some(())
     })();

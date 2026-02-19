@@ -13,21 +13,26 @@ import {
 	X,
 } from "lucide-svelte";
 import { onMount } from "svelte";
-import type { AiConfig, CommandsConfig, DirEntry, GeneralConfig, ProjectsConfig } from "$lib/ipc";
+import type { AiConfig, CommandsConfig, DirEntry, GeneralConfig, PrivacyConfig, ProjectsConfig } from "$lib/ipc";
 import {
 	checkAiHealth,
 	getAiConfig,
 	getCommandsConfig,
 	getGeneralConfig,
+	getPrivacyConfig,
 	getProjectsConfig,
 	listDirectories,
 	recordHotkey,
 	saveAiConfig,
 	saveCommandsConfig,
 	saveGeneralConfig,
+	savePrivacyConfig,
 	saveProjectsConfig,
 	setApiKey,
 	setHotkey,
+	getLayerShellSupported,
+	getActiveWindowStrategy,
+	restartApp,
 } from "$lib/ipc";
 import Select from "./Select.svelte";
 
@@ -36,6 +41,8 @@ let { ondismiss }: { ondismiss: () => void } = $props();
 let activeTab: "general" | "ai" | "projects" | "guide" | "about" = $state("general");
 let guideTab: "shortcuts" | "commands" | "triggers" = $state("shortcuts");
 let appVersion = $state("");
+let layerShellSupported = $state(false);
+let activeWindowStrategy = $state("auto");
 
 let aiConfig: AiConfig = $state({
 	mode: "disabled",
@@ -50,6 +57,8 @@ let generalConfig: GeneralConfig = $state({
 	hotkey: "Super+Space",
 	window_x: null,
 	window_y: null,
+	monitor_mode: "cursor",
+	window_strategy: "auto",
 });
 let commandsConfig: CommandsConfig = $state({
 	default_search_engine: "https://www.google.com/search?q=",
@@ -57,6 +66,10 @@ let commandsConfig: CommandsConfig = $state({
 	shell: "/bin/bash",
 });
 
+let privacyConfig: PrivacyConfig = $state({
+	allow_ip_geolocation: false,
+	allow_public_ip: false,
+});
 let apiKeyInput = $state("");
 let healthStatus: "checking" | "healthy" | "error" | "disabled" = $state("disabled");
 let saving = $state(false);
@@ -85,21 +98,27 @@ let shellOptions = $derived([
 let projectDirs: string[] = $state([]);
 
 onMount(async () => {
-	const [ai, general, commands, projects, manifest, version] = await Promise.all([
+	const [ai, general, commands, projects, privacy, version, layerShell, activeStrategy] = await Promise.all([
 		getAiConfig(),
 		getGeneralConfig(),
 		getCommandsConfig(),
 		getProjectsConfig(),
-		fetchModels(),
+		getPrivacyConfig(),
 		getVersion().catch(() => "0.0.0"),
+		getLayerShellSupported(),
+		getActiveWindowStrategy(),
 	]);
 	aiConfig = ai;
 	generalConfig = general;
 	commandsConfig = commands;
+	privacyConfig = privacy;
 	customShell = !knownShells.includes(commands.shell);
 	projectDirs = projects.directories;
-	providerModels = manifest;
 	appVersion = version;
+	layerShellSupported = layerShell;
+	activeWindowStrategy = activeStrategy;
+	// C6: Fetch remote model list only when AI is enabled (no network call in default mode)
+	providerModels = await fetchModels(ai.mode);
 	await refreshHealth();
 });
 
@@ -136,6 +155,11 @@ async function saveAi() {
 async function handleModeChange(val: string) {
 	aiConfig.mode = val;
 	await saveAi();
+	// C6: Fetch remote models now that AI is enabled (was skipped if mode was disabled)
+	if (val !== "disabled") {
+		cachedManifest = null;
+		providerModels = await fetchModels(val);
+	}
 }
 
 type ModelEntry = { value: string; label: string };
@@ -165,19 +189,23 @@ const FALLBACK_MODELS: ModelManifest = {
 
 let cachedManifest: ModelManifest | null = null;
 
-async function fetchModels(): Promise<ModelManifest> {
+async function fetchModels(aiMode: string): Promise<ModelManifest> {
 	if (cachedManifest) return cachedManifest;
-	try {
-		const res = await fetch(MODELS_URL, { signal: AbortSignal.timeout(3000) });
-		if (!res.ok) throw new Error(`HTTP ${res.status}`);
-		const data = await res.json();
-		if (data.providers && typeof data.providers === "object") {
-			const manifest: ModelManifest = data.providers;
-			cachedManifest = manifest;
-			return manifest;
+	// C6: Only fetch remote models when AI is actually enabled.
+	// No network calls in default (disabled) mode.
+	if (aiMode !== "disabled") {
+		try {
+			const res = await fetch(MODELS_URL, { signal: AbortSignal.timeout(3000) });
+			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+			const data = await res.json();
+			if (data.providers && typeof data.providers === "object") {
+				const manifest: ModelManifest = data.providers;
+				cachedManifest = manifest;
+				return manifest;
+			}
+		} catch {
+			// Offline or bad response — use fallback
 		}
-	} catch {
-		// Offline or bad response — use fallback
 	}
 	cachedManifest = FALLBACK_MODELS;
 	return FALLBACK_MODELS;
@@ -217,6 +245,37 @@ async function handleHideOnBlurToggle() {
 		await saveGeneralConfig(generalConfig);
 	} catch (err) {
 		console.error("[settings] Failed to save general config:", err);
+		saveError = `Failed to save: ${err}`;
+	}
+}
+
+async function handleMonitorModeChange(val: string) {
+	generalConfig.monitor_mode = val;
+	try {
+		await saveGeneralConfig(generalConfig);
+	} catch (err) {
+		console.error("[settings] Failed to save monitor mode:", err);
+		saveError = `Failed to save: ${err}`;
+	}
+}
+
+// Resolve what strategy the config would pick at next startup
+function resolveStrategy(strategy: string): string {
+	if (strategy === "layer-shell") return layerShellSupported ? "layer-shell" : "x11";
+	if (strategy === "x11") return "x11";
+	return layerShellSupported ? "layer-shell" : "x11"; // "auto"
+}
+
+let strategyNeedsRestart = $derived(
+	resolveStrategy(generalConfig.window_strategy) !== activeWindowStrategy
+);
+
+async function handleWindowStrategyChange(val: string) {
+	generalConfig.window_strategy = val;
+	try {
+		await saveGeneralConfig(generalConfig);
+	} catch (err) {
+		console.error("[settings] Failed to save window strategy:", err);
 		saveError = `Failed to save: ${err}`;
 	}
 }
@@ -441,6 +500,37 @@ function handleKeydown(e: KeyboardEvent) {
 				</button>
 			</div>
 			<div class="field">
+				<label for="monitor-mode">Open on</label>
+				<Select
+					id="monitor-mode"
+					value={generalConfig.monitor_mode}
+					options={[
+						{ value: "cursor", label: "Current monitor" },
+						{ value: "primary", label: "Primary monitor" },
+					]}
+					onchange={handleMonitorModeChange}
+				/>
+			</div>
+			<div class="field">
+				<label for="window-strategy">Window strategy</label>
+				<Select
+					id="window-strategy"
+					value={generalConfig.window_strategy}
+					options={[
+						{ value: "auto", label: "Auto (recommended)" },
+						...(layerShellSupported
+							? [{ value: "layer-shell", label: "Layer shell (Wayland)" }]
+							: [{ value: "x11", label: "X11 positioned" }]),
+					]}
+					onchange={handleWindowStrategyChange}
+				/>
+				{#if strategyNeedsRestart}
+					<button class="restart-btn" onclick={() => restartApp()}>
+						Restart to apply
+					</button>
+				{/if}
+			</div>
+			<div class="field">
 				<label for="shell-select">Shell</label>
 				{#if customShell}
 					<div class="key-row">
@@ -466,6 +556,49 @@ function handleKeydown(e: KeyboardEvent) {
 					/>
 				{/if}
 			</div>
+			<div class="section-label">Privacy</div>
+			<div class="field">
+				<label for="allow-geolocation">Allow IP geolocation</label>
+				<button
+					id="allow-geolocation"
+					class="checkbox"
+					class:checked={privacyConfig.allow_ip_geolocation}
+					onclick={async () => {
+						privacyConfig.allow_ip_geolocation = !privacyConfig.allow_ip_geolocation;
+						await savePrivacyConfig(privacyConfig);
+					}}
+					role="checkbox"
+					aria-checked={privacyConfig.allow_ip_geolocation}
+				>
+					{#if privacyConfig.allow_ip_geolocation}
+						<svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+							<path d="M2 6L5 9L10 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+						</svg>
+					{/if}
+				</button>
+			</div>
+			<div class="field-hint">Weather auto-detect via freeipapi.com</div>
+			<div class="field">
+				<label for="allow-public-ip">Allow public IP lookup</label>
+				<button
+					id="allow-public-ip"
+					class="checkbox"
+					class:checked={privacyConfig.allow_public_ip}
+					onclick={async () => {
+						privacyConfig.allow_public_ip = !privacyConfig.allow_public_ip;
+						await savePrivacyConfig(privacyConfig);
+					}}
+					role="checkbox"
+					aria-checked={privacyConfig.allow_public_ip}
+				>
+					{#if privacyConfig.allow_public_ip}
+						<svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+							<path d="M2 6L5 9L10 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+						</svg>
+					{/if}
+				</button>
+			</div>
+			<div class="field-hint">sysinfo net/ip via ifconfig.me</div>
 		{:else if activeTab === "ai"}
 			<div class="field">
 				<label for="ai-mode">Mode</label>
@@ -854,6 +987,40 @@ function handleKeydown(e: KeyboardEvent) {
 		font-size: 12px;
 		flex-shrink: 0;
 		min-width: 70px;
+	}
+
+
+	.section-label {
+		font-size: 11px;
+		color: var(--fg-muted);
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		padding: 12px 0 4px;
+		border-top: 1px solid var(--border);
+		margin-top: 4px;
+	}
+
+	.field-hint {
+		font-size: 10px;
+		color: var(--fg-muted);
+		opacity: 0.7;
+		padding: 0 0 2px;
+	}
+
+	.restart-btn {
+		font-size: 11px;
+		padding: 2px 8px;
+		border-radius: 4px;
+		border: 1px solid var(--warning, #f59e0b);
+		background: transparent;
+		color: var(--warning, #f59e0b);
+		cursor: pointer;
+		flex-shrink: 0;
+	}
+
+	.restart-btn:hover {
+		background: var(--warning, #f59e0b);
+		color: var(--bg);
 	}
 
 	input[type="password"],

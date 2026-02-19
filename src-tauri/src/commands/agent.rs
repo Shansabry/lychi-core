@@ -38,6 +38,7 @@ pub async fn execute_agent_plan(
     };
 
     let executor = state.executor.read().await;
+    let privacy = state.config.read().await.privacy.clone();
 
     for (i, step) in plan.steps.iter().enumerate() {
         // Emit running status
@@ -54,7 +55,7 @@ pub async fn execute_agent_plan(
         // Execute step through the executor pipeline (resolve → validate → execute)
         // Plan steps are pre-confirmed (confirmed=true) since user approved the plan
         let result = executor
-            .run(&format!("{} {}", step.action_id, step.args), true)
+            .run(&format!("{} {}", step.action_id, step.args), true, &privacy)
             .await
             .unwrap_or_else(|e| ActionResult {
                 success: false,

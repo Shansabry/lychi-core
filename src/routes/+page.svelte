@@ -3,6 +3,7 @@ import { onMount } from "svelte";
 import AgentPlanPanel from "$lib/components/AgentPlanPanel.svelte";
 import CommandInput from "$lib/components/CommandInput.svelte";
 import CompletionsList from "$lib/components/CompletionsList.svelte";
+import FilePreview from "$lib/components/FilePreview.svelte";
 import HistoryPanel from "$lib/components/HistoryPanel.svelte";
 import MediaPanel from "$lib/components/MediaPanel.svelte";
 import NotesPanel from "$lib/components/NotesPanel.svelte";
@@ -26,6 +27,7 @@ import {
 	getHideOnBlur,
 	getHistory,
 	getMountPoints,
+	grantPrivacyConsent,
 	hideWindow,
 	listPathCompletions,
 	mediaGetStatus,
@@ -60,6 +62,7 @@ let mountPoints: MountPoint[] = $state([]);
 let scopeIndex = $state(0);
 let activeScope = $derived(mountPoints[scopeIndex]?.path ?? "");
 let searchScopePath = $state(""); // absolute path when drilled into a folder
+let filePathMap: Map<string, string> = $state(new Map()); // label → full_path for preview
 
 // Derive breadcrumb path context for / search mode (when drilled into a folder)
 let searchPathContext = $derived.by(() => {
@@ -87,6 +90,8 @@ let blurEnabled = $state(false);
 
 let pendingPlan: AgentPlan | null = $state(null);
 let planPanelRef: AgentPlanPanel | undefined = $state(undefined);
+// C1/C15: generation counter for AI routing — ESC increments to cancel stale responses
+let routingGeneration = 0;
 let mediaOpen = $state(false);
 let notesOpen = $state(false);
 let pendingNoteText: string | null = $state(null);
@@ -100,6 +105,16 @@ let nowPlaying = $derived.by(() => {
 });
 
 let multiplePlayers = $derived(mediaPlayers.length > 1);
+
+// File preview — show for non-folder files in search or browse mode
+let previewPath = $derived.by(() => {
+	if (!searchMode && !atMode) return "";
+	if (completions.length === 0 || completionIndex < 0) return "";
+	const item = completions[completionIndex];
+	if (!item || item.icon_path === "__folder__") return "";
+	return resolveFullPath(item.label);
+});
+let showPreview = $derived(previewPath.length > 0);
 
 $effect(() => {
 	getHistory().then((entries) => {
@@ -138,6 +153,18 @@ async function fetchAtCompletions(partial: string) {
 		completionIndex = -1;
 		atNoResults = true;
 	}
+}
+
+// Resolve the absolute path for a completion label (for preview)
+function resolveFullPath(label: string): string {
+	const mapped = filePathMap.get(label);
+	if (mapped) return mapped;
+	// Browse mode: labels like "~/foo/bar.txt"
+	if (label.startsWith("~/")) {
+		const home = mountPoints[0]?.path ?? "";
+		return `${home}/${label.slice(2)}`;
+	}
+	return label.endsWith("/") ? label.slice(0, -1) : label;
 }
 
 // Called by CommandInput on every keystroke
@@ -195,6 +222,7 @@ function handleInput(val: string) {
 		cancelFileSearch();
 		searchScopePath = "";
 		searchMode = false;
+		filePathMap = new Map();
 	}
 
 	// Detect @ file reference — find the last @ in the input
@@ -281,6 +309,9 @@ onMount(() => {
 			atMode = false;
 			atStart = -1;
 			searchMode = false;
+			// C15: Cancel any in-flight AI routing on summon reset
+			routingGeneration++;
+			isRouting = false;
 			cancelFileSearch();
 			// Re-arm blur after grace period on each summon
 			blurEnabled = false;
@@ -313,6 +344,13 @@ onMount(() => {
 			(e) => {
 				const batch = e.payload;
 				if (batch.search_id !== fileSearchId) return;
+
+				// Populate path map for preview
+				const pathUpdates = new Map(filePathMap);
+				for (const r of batch.results) {
+					pathUpdates.set(r.label, r.full_path);
+				}
+				filePathMap = pathUpdates;
 
 				const newItems: CompletionItem[] = batch.results.map((r) => ({
 					label: r.label,
@@ -459,24 +497,48 @@ async function handleSubmit() {
 	// In search mode, don't fall through to command execution
 	if (searchMode) return;
 
-	// Try AI plan first — if it returns a multi-step plan, show preview
+	// C1/C15: Race AI plan against a short timeout.
+	// If AI responds within 200ms, use the plan. Otherwise, execute immediately.
+	// ESC cancels via generation counter — stale responses are discarded.
+	const gen = ++routingGeneration;
 	isRouting = true;
-	try {
-		const plan = await getAgentPlan(trimmed);
-		if (plan) {
-			pendingPlan = plan;
-			completions = [];
-			completionIndex = -1;
-			historyOpen = false;
-			return;
-		}
-	} catch (err) {
+
+	const planPromise = getAgentPlan(trimmed).catch((err) => {
 		console.error("[agent plan] error:", err);
-	} finally {
+		return null;
+	});
+	const timeout = new Promise<null>((r) => setTimeout(() => r(null), 200));
+
+	const fastPlan = await Promise.race([planPromise, timeout]);
+
+	// If ESC was pressed during the race, bail out
+	if (gen !== routingGeneration) {
 		isRouting = false;
+		return;
 	}
 
-	await runCommand(trimmed);
+	if (fastPlan) {
+		// AI responded quickly with a plan — show preview
+		isRouting = false;
+		pendingPlan = fastPlan;
+		completions = [];
+		completionIndex = -1;
+		historyOpen = false;
+		return;
+	}
+
+	// AI didn't respond in time — execute immediately, but let plan arrive in background
+	isRouting = false;
+	const commandPromise = runCommand(trimmed);
+
+	// If AI plan arrives later and we're still on the same generation, offer it
+	planPromise.then((plan) => {
+		if (plan && gen === routingGeneration && !pendingPlan) {
+			pendingPlan = plan;
+		}
+	});
+
+	await commandPromise;
 }
 
 async function runCommand(command: string) {
@@ -547,6 +609,14 @@ async function handleConfirm() {
 	if (isExecuting || !lastResult?.needs_confirmation) return;
 	isExecuting = true;
 	try {
+		// C6: If this is a privacy consent confirmation, grant and persist it
+		const reason = lastResult.needs_confirmation;
+		if (reason.includes("freeipapi.com")) {
+			await grantPrivacyConsent("ip_geolocation");
+		} else if (reason.includes("ifconfig.me")) {
+			await grantPrivacyConsent("public_ip");
+		}
+
 		lastResult = await executeCommand(lastCommand, true);
 		historyEntries = [...historyEntries, lastCommand];
 		inputValue = "";
@@ -718,6 +788,12 @@ function handleArrowDown() {
 }
 
 async function handleDismiss() {
+	// C15: Cancel in-flight AI routing immediately on ESC
+	if (isRouting) {
+		routingGeneration++;
+		isRouting = false;
+		return;
+	}
 	if (settingsOpen) {
 		settingsOpen = false;
 		return;
@@ -758,6 +834,7 @@ async function handleDismiss() {
 </script>
 
 <div class="launcher-wrapper" role="presentation" onmousedown={(e) => { if (e.target === e.currentTarget) hideWindow(); }}>
+	<div class="launcher-row">
 	<main>
 		<CommandInput
 			bind:value={inputValue}
@@ -900,6 +977,10 @@ async function handleDismiss() {
 		hasPlan={!!pendingPlan}
 		/>
 	</main>
+	{#if showPreview}
+		<FilePreview filePath={previewPath} visible={showPreview} />
+	{/if}
+	</div>
 </div>
 
 <style>
@@ -912,6 +993,12 @@ async function handleDismiss() {
 		background: transparent;
 	}
 
+	.launcher-row {
+		position: relative;
+		width: 680px;
+		align-self: flex-start;
+	}
+
 	main {
 		width: 680px;
 		max-height: 60vh;
@@ -922,7 +1009,6 @@ async function handleDismiss() {
 		overflow: hidden;
 		box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
 		animation: lychi-appear 120ms ease-out;
-		align-self: flex-start;
 	}
 
 	.empty-state {

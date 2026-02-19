@@ -8,7 +8,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::action_registry::{ActionHandler, ActionResult, OutputType, RiskLevel};
+use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType, RiskLevel};
 use crate::error::LychiError;
 
 const USER_AGENT: &str = "Lychi/1.0 (https://lychi.app)";
@@ -356,6 +356,8 @@ impl WeatherHandler {
         };
 
         let (lat, lon, display_name) = if location_str.is_empty() {
+            // C6: This path is gated by the Rules Engine — the user must consent
+            // to IP geolocation (privacy.allow_ip_geolocation) before reaching here.
             self.detect_location().await?
         } else {
             self.geocode(&location_str).await?
@@ -390,7 +392,13 @@ impl ActionHandler for WeatherHandler {
     }
 
     async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+        // "here" = auto-detect location (same as empty args)
         let input = args.trim();
+        let input = if input.eq_ignore_ascii_case("here") {
+            ""
+        } else {
+            input
+        };
 
         let cache_key = if input.is_empty() {
             "__auto__".to_string()
@@ -443,6 +451,20 @@ impl ActionHandler for WeatherHandler {
             executed_args: None,
         })
     }
+
+    async fn completions(&self, partial: &str) -> Vec<CompletionItem> {
+        let lower = partial.to_lowercase();
+        let mut items = Vec::new();
+        if "here".contains(&lower) || lower.is_empty() {
+            items.push(CompletionItem {
+                label: "here".to_string(),
+                icon_path: None,
+                score: 100,
+                description: Some("Detect current location".to_string()),
+            });
+        }
+        items
+    }
 }
 
 /// Allow `Arc<WeatherHandler>` to be registered in the ActionRegistry
@@ -460,6 +482,9 @@ impl ActionHandler for Arc<WeatherHandler> {
     }
     async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
         self.as_ref().execute(args).await
+    }
+    async fn completions(&self, partial: &str) -> Vec<CompletionItem> {
+        self.as_ref().completions(partial).await
     }
 }
 

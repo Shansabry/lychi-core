@@ -142,6 +142,8 @@ export interface GeneralConfig {
 	hotkey: string;
 	window_x: number | null;
 	window_y: number | null;
+	monitor_mode: string;
+	window_strategy: string;
 }
 
 export async function getGeneralConfig(): Promise<GeneralConfig> {
@@ -153,6 +155,8 @@ export async function getGeneralConfig(): Promise<GeneralConfig> {
 			hotkey: "Ctrl+Space",
 			window_x: null,
 			window_y: null,
+			monitor_mode: "cursor",
+			window_strategy: "auto",
 		};
 	return invoke<GeneralConfig>("get_general_config");
 }
@@ -160,6 +164,16 @@ export async function getGeneralConfig(): Promise<GeneralConfig> {
 export async function saveGeneralConfig(general: GeneralConfig): Promise<void> {
 	if (!isTauri()) return;
 	return invoke("save_general_config", { general });
+}
+
+export async function getLayerShellSupported(): Promise<boolean> {
+	if (!isTauri()) return false;
+	return invoke<boolean>("get_layer_shell_supported");
+}
+
+export async function getActiveWindowStrategy(): Promise<string> {
+	if (!isTauri()) return "x11";
+	return invoke<string>("get_active_window_strategy");
 }
 
 export interface CommandsConfig {
@@ -198,6 +212,29 @@ export async function getProjectsConfig(): Promise<ProjectsConfig> {
 export async function saveProjectsConfig(projects: ProjectsConfig): Promise<void> {
 	if (!isTauri()) return;
 	return invoke("save_projects_config", { projects });
+}
+
+// --- Privacy ---
+
+export interface PrivacyConfig {
+	allow_ip_geolocation: boolean;
+	allow_public_ip: boolean;
+}
+
+export async function getPrivacyConfig(): Promise<PrivacyConfig> {
+	if (!isTauri()) return { allow_ip_geolocation: false, allow_public_ip: false };
+	return invoke<PrivacyConfig>("get_privacy_config");
+}
+
+export async function savePrivacyConfig(privacy: PrivacyConfig): Promise<void> {
+	if (!isTauri()) return;
+	return invoke("save_privacy_config", { privacy });
+}
+
+/** C6: Grant a specific privacy consent and persist to config. */
+export async function grantPrivacyConsent(feature: string): Promise<void> {
+	if (!isTauri()) return;
+	return invoke("grant_privacy_consent", { feature });
 }
 
 export async function restartApp(): Promise<void> {
@@ -398,4 +435,16 @@ export async function toggleTodo(id: string): Promise<void> {
 export async function deleteTodo(id: string): Promise<void> {
 	if (!isTauri()) return;
 	return invoke("delete_todo", { id });
+}
+
+// --- File Preview ---
+
+export type FilePreviewData =
+	| { kind: "Text"; content: string; language: string; truncated: boolean }
+	| { kind: "Image"; base64: string; mime: string }
+	| { kind: "Unsupported"; mime: string; size_bytes: number };
+
+export async function getFilePreview(path: string): Promise<FilePreviewData> {
+	if (!isTauri()) return { kind: "Unsupported", mime: "unknown", size_bytes: 0 };
+	return invoke<FilePreviewData>("get_file_preview", { path });
 }

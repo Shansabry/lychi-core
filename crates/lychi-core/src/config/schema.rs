@@ -10,6 +10,7 @@ pub struct Config {
     pub ai: AiConfig,
     pub projects: ProjectsConfig,
     pub weather: WeatherConfig,
+    pub privacy: PrivacyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +22,10 @@ pub struct GeneralConfig {
     pub hotkey: String,
     pub window_x: Option<i32>,
     pub window_y: Option<i32>,
+    /// Which monitor to open the launcher on: "cursor" or "primary"
+    pub monitor_mode: String,
+    /// Window strategy: "auto", "layer-shell", or "x11"
+    pub window_strategy: String,
 }
 
 impl Default for GeneralConfig {
@@ -32,6 +37,8 @@ impl Default for GeneralConfig {
             hotkey: "Super+Space".to_string(),
             window_x: None,
             window_y: None,
+            monitor_mode: "cursor".to_string(),
+            window_strategy: "auto".to_string(),
         }
     }
 }
@@ -127,6 +134,26 @@ impl Default for WeatherConfig {
         Self {
             unit: "celsius".to_string(),
             default_location: String::new(),
+        }
+    }
+}
+
+/// Privacy consent flags — all default to false (C6: Privacy First).
+/// Each flag records whether the user has consented to a specific network call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrivacyConfig {
+    /// Allow IP geolocation (weather auto-detect via freeipapi.com)
+    pub allow_ip_geolocation: bool,
+    /// Allow public IP lookup (sysinfo net via ifconfig.me)
+    pub allow_public_ip: bool,
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            allow_ip_geolocation: false,
+            allow_public_ip: false,
         }
     }
 }

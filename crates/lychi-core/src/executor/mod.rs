@@ -1,5 +1,6 @@
 use crate::action_registry::registry::ActionRegistry;
 use crate::action_registry::{ActionResult, CompletionItem, RiskLevel};
+use crate::config::schema::PrivacyConfig;
 use crate::error::LychiError;
 use crate::intent::{IntentResolver, RoutingMethod};
 use crate::providers::AgentPlan;
@@ -27,7 +28,12 @@ impl Executor {
     ///
     /// If `confirmed` is true, `Confirm` decisions are treated as `Execute`.
     /// `Deny` decisions are always enforced regardless of `confirmed`.
-    pub async fn run(&self, input: &str, confirmed: bool) -> Result<ActionResult, LychiError> {
+    pub async fn run(
+        &self,
+        input: &str,
+        confirmed: bool,
+        privacy: &PrivacyConfig,
+    ) -> Result<ActionResult, LychiError> {
         let intent = self.resolver.resolve(input, &self.registry).await;
         tracing::info!(
             "Resolved '{}' → action={}, args='{}', routing={:?}",
@@ -49,12 +55,15 @@ impl Executor {
         };
 
         // Validate through rules engine
-        let decision = self.rules.validate(&ValidationRequest {
-            action_id: &intent.action_id,
-            args: &intent.args,
-            routed_by,
-            default_risk: handler.default_risk(),
-        });
+        let decision = self.rules.validate(
+            &ValidationRequest {
+                action_id: &intent.action_id,
+                args: &intent.args,
+                routed_by,
+                default_risk: handler.default_risk(),
+            },
+            privacy,
+        );
 
         match decision {
             ValidationDecision::Deny { reason } => Ok(ActionResult {

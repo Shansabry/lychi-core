@@ -1,5 +1,6 @@
 use crate::state::AppState;
 use crate::window;
+use lychi_core::config::schema::PrivacyConfig;
 use lychi_core::config::{CommandsConfig, GeneralConfig, ProjectsConfig};
 use lychi_core::error::LychiError;
 use lychi_core::paths;
@@ -96,9 +97,69 @@ pub async fn save_projects_config(
     Ok(())
 }
 
+// --- Privacy ---
+
+#[tauri::command]
+pub async fn get_privacy_config(state: State<'_, AppState>) -> Result<PrivacyConfig, LychiError> {
+    let config = state.config.read().await;
+    Ok(config.privacy.clone())
+}
+
+#[tauri::command]
+pub async fn save_privacy_config(
+    state: State<'_, AppState>,
+    privacy: PrivacyConfig,
+) -> Result<(), LychiError> {
+    let mut config = state.config.write().await;
+    config.privacy = privacy;
+    config.save(&paths::config_file())
+}
+
+/// C6: Grant a specific privacy consent and persist it.
+/// Called by the frontend when the user confirms a privacy-gated action.
+/// `feature` is one of: "ip_geolocation", "public_ip"
+#[tauri::command]
+pub async fn grant_privacy_consent(
+    state: State<'_, AppState>,
+    feature: String,
+) -> Result<(), LychiError> {
+    let mut config = state.config.write().await;
+    match feature.as_str() {
+        "ip_geolocation" => config.privacy.allow_ip_geolocation = true,
+        "public_ip" => config.privacy.allow_public_ip = true,
+        other => {
+            return Err(LychiError::Config(format!(
+                "Unknown privacy feature: {other}"
+            )));
+        }
+    }
+    config.save(&paths::config_file())
+}
+
 #[tauri::command]
 pub fn restart_app(app: AppHandle) {
     app.restart();
+}
+
+/// Returns whether layer-shell (Wayland) is supported on this session.
+#[tauri::command]
+pub fn get_layer_shell_supported() -> bool {
+    gtk_layer_shell::is_supported()
+}
+
+/// Returns the window strategy that is currently active (what init_window chose).
+/// "layer-shell" if the main window is a layer-shell surface, "x11" otherwise.
+#[tauri::command]
+pub fn get_active_window_strategy(app: AppHandle) -> String {
+    if let Some(win) = app.get_webview_window("main") {
+        if let Ok(gtk_win) = win.gtk_window() {
+            use gtk_layer_shell::LayerShell;
+            if gtk_win.is_layer_window() {
+                return "layer-shell".to_string();
+            }
+        }
+    }
+    "x11".to_string()
 }
 
 /// Change the global hotkey at runtime: unregister old, register new, persist to config.

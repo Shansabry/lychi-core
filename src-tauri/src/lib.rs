@@ -20,9 +20,12 @@ pub fn run() {
     platform::init_app();
 
     let app_state = AppState::new();
-    let hotkey = {
+    let (hotkey, window_strategy) = {
         let config = app_state.config.blocking_read();
-        config.general.hotkey.clone()
+        (
+            config.general.hotkey.clone(),
+            config.general.window_strategy.clone(),
+        )
     };
 
     let app = tauri::Builder::default()
@@ -52,9 +55,14 @@ pub fn run() {
             commands::config::save_commands_config,
             commands::config::get_projects_config,
             commands::config::save_projects_config,
+            commands::config::get_privacy_config,
+            commands::config::save_privacy_config,
+            commands::config::grant_privacy_consent,
             commands::config::restart_app,
             commands::config::set_hotkey,
             commands::config::record_hotkey,
+            commands::config::get_layer_shell_supported,
+            commands::config::get_active_window_strategy,
             commands::agent::get_agent_plan,
             commands::agent::store_agent_plan,
             commands::agent::execute_agent_plan,
@@ -77,15 +85,21 @@ pub fn run() {
             commands::notes::add_todo,
             commands::notes::toggle_todo,
             commands::notes::delete_todo,
+            commands::preview::get_file_preview,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
 
             // Platform-specific window setup (layer-shell, skip-taskbar, etc.)
             if let Some(win) = app.get_webview_window("main") {
-                platform::init_window(&win);
-                let _ = win.show();
+                platform::init_window(&win, &window_strategy);
+                window::show_window(&win);
             }
+
+            // Warm up filesystem cache for snappy first search
+            tauri::async_runtime::spawn_blocking(|| {
+                commands::filesystem::warmup_fs_cache();
+            });
 
             // Register global shortcut
             use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};

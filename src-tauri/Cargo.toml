@@ -31,6 +31,7 @@ tracing-subscriber = { workspace = true }
 futures-util = { version = "0.3", optional = true }
 ignore = "0.4"
 nucleo-matcher = "0.3"
+base64 = "0.22"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"

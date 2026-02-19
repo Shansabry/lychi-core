@@ -433,7 +433,9 @@ fn walk_and_emit(
             description,
         });
 
-        if batch.len() >= BATCH_SIZE {
+        // Emit first batch sooner (3 items) for faster perceived response
+        let effective_batch = if total_sent == 0 { 3 } else { BATCH_SIZE };
+        if batch.len() >= effective_batch {
             batch.sort_by(|a, b| b.score.cmp(&a.score));
             let _ = app.emit(
                 "lychi://file-search-results",
@@ -443,7 +445,7 @@ fn walk_and_emit(
                     done: false,
                 },
             );
-            total_sent += BATCH_SIZE;
+            total_sent += effective_batch;
             if total_sent >= MAX_RESULTS {
                 break;
             }
@@ -458,5 +460,30 @@ fn walk_and_emit(
             results: batch,
             done: true,
         },
+    );
+}
+
+/// Pre-walk home directory to warm the OS filesystem cache.
+/// Called once at startup in a background thread so the first user search hits warm cache.
+pub fn warmup_fs_cache() {
+    let Some(home) = dirs::home_dir() else { return };
+    let walker = WalkBuilder::new(&home)
+        .hidden(true)
+        .ignore(true)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(false)
+        .follow_links(false)
+        .build();
+    let mut count = 0u64;
+    for _ in walker {
+        count += 1;
+        if count >= 100_000 {
+            break;
+        }
+    }
+    tracing::debug!(
+        "FS cache warmup: visited {count} entries under {}",
+        home.display()
     );
 }

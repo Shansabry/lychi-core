@@ -20,7 +20,10 @@ pub async fn execute_command(
 
     // Run through executor pipeline: resolve → validate → execute
     let executor = state.executor.read().await;
-    let result = executor.run(&input, confirmed.unwrap_or(false)).await?;
+    let privacy = state.config.read().await.privacy.clone();
+    let result = executor
+        .run(&input, confirmed.unwrap_or(false), &privacy)
+        .await?;
 
     // Notify frontend when notes/todos are mutated by a handler
     if result.success && is_notes_mutation(&input) {

@@ -7,3 +7,4 @@ pub mod history;
 pub mod media;
 pub mod notes;
 pub mod open_uri;
+pub mod preview;

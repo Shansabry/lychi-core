@@ -476,7 +476,8 @@ fn read_network() -> String {
         }
     }
 
-    // Public IP (with short timeout)
+    // C6: Public IP lookup is gated by the Rules Engine — the user must consent
+    // to public IP lookup (privacy.allow_public_ip) before reaching here.
     if let Ok(pub_ip) = run_cmd("sh", &["-c", "curl -s --max-time 3 https://ifconfig.me"]) {
         let pub_ip = pub_ip.trim();
         if !pub_ip.is_empty() {
