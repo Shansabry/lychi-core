@@ -11,6 +11,7 @@ import type {
 	AllSettings,
 	CommandsConfig,
 	GeneralConfig,
+	KeybindingsConfig,
 	PrivacyConfig,
 	ProjectsConfig,
 } from "$lib/ipc";
@@ -24,6 +25,7 @@ export interface SettingsCache {
 	commandsConfig: CommandsConfig;
 	projectsConfig: ProjectsConfig;
 	privacyConfig: PrivacyConfig;
+	keybindingsConfig: KeybindingsConfig;
 	appVersion: string;
 	layerShellSupported: boolean;
 	activeWindowStrategy: string;
@@ -39,6 +41,7 @@ export function preloadSettings(): Promise<SettingsCache> {
 			commandsConfig: s.commands,
 			projectsConfig: s.projects,
 			privacyConfig: s.privacy,
+			keybindingsConfig: s.keybindings,
 			appVersion: s.app_version,
 			layerShellSupported: s.layer_shell_supported,
 			activeWindowStrategy: s.active_window_strategy,

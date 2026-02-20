@@ -11,6 +11,7 @@ pub struct Config {
     pub projects: ProjectsConfig,
     pub weather: WeatherConfig,
     pub privacy: PrivacyConfig,
+    pub keybindings: KeybindingsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,4 +148,38 @@ pub struct PrivacyConfig {
     pub allow_ip_geolocation: bool,
     /// Allow public IP lookup (sysinfo net via ifconfig.me)
     pub allow_public_ip: bool,
+}
+
+/// Configurable keyboard shortcuts for in-app actions.
+/// Uses "Modifier+Key" string format (e.g. "Ctrl+1", "Shift+Tab").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeybindingsConfig {
+    pub toggle_history: String,
+    pub toggle_notes: String,
+    pub toggle_media: String,
+    pub toggle_settings: String,
+    pub open_inline_url: String,
+    pub submit: String,
+    pub dismiss: String,
+    pub tab_complete: String,
+    pub tab_back: String,
+    pub switch_scope: String,
+}
+
+impl Default for KeybindingsConfig {
+    fn default() -> Self {
+        Self {
+            toggle_history: "Ctrl+1".to_string(),
+            toggle_notes: "Ctrl+2".to_string(),
+            toggle_media: "Ctrl+3".to_string(),
+            toggle_settings: "Ctrl+4".to_string(),
+            open_inline_url: "Ctrl+O".to_string(),
+            submit: "Enter".to_string(),
+            dismiss: "Escape".to_string(),
+            tab_complete: "Tab".to_string(),
+            tab_back: "Shift+Tab".to_string(),
+            switch_scope: "Ctrl+Tab".to_string(),
+        }
+    }
 }

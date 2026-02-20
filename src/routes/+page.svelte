@@ -36,6 +36,7 @@ import {
 	saveWindowPosition,
 	startFileSearch,
 } from "$lib/ipc";
+import { loadKeybindings } from "$lib/keybindings";
 import { preloadAll } from "$lib/preloadCache";
 
 let inputValue = $state("");
@@ -303,10 +304,14 @@ onMount(() => {
 	getHistory().then((entries) => {
 		historyEntries = entries;
 	});
-	Promise.all([preloadAll(), getCompletions("__warmup__").catch(() => {})]).finally(() => {
-		backendReady = true;
-		if (inputValue.trim()) handleInput(inputValue);
-	});
+	Promise.all([preloadAll(), getCompletions("__warmup__").catch(() => {})])
+		.then(([[settings]]) => {
+			loadKeybindings(settings.keybindingsConfig);
+		})
+		.finally(() => {
+			backendReady = true;
+			if (inputValue.trim()) handleInput(inputValue);
+		});
 
 	// Guard: only attach Tauri listeners if running inside Tauri
 	if (!("__TAURI_INTERNALS__" in window)) return;

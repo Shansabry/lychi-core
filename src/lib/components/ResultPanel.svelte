@@ -1,6 +1,7 @@
 <script lang="ts">
 import AnsiToHtml from "ansi-to-html";
 import type { CommandResult } from "$lib/ipc";
+import { matchesAction } from "$lib/keybindings";
 import WeatherCard from "./WeatherCard.svelte";
 
 let {
@@ -174,7 +175,7 @@ function handleKeydown(e: KeyboardEvent) {
 		e.preventDefault();
 		e.stopPropagation();
 		ondismiss();
-	} else if (e.key === "o" && e.ctrlKey && onopenurl && hasInlineUrl) {
+	} else if (matchesAction(e, "open_inline_url") && onopenurl && hasInlineUrl) {
 		e.preventDefault();
 		e.stopPropagation();
 		onopenurl();

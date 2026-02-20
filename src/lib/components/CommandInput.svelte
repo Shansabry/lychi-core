@@ -1,6 +1,7 @@
 <script lang="ts">
 import { LoaderCircle } from "lucide-svelte";
 import { fuzzyRank } from "$lib/fuzzy";
+import { matchesAction } from "$lib/keybindings";
 
 let {
 	value = $bindable(""),
@@ -241,24 +242,17 @@ function acceptGhost() {
 	return false;
 }
 
-function isTab(e: KeyboardEvent) {
-	return e.key === "Tab" || e.code === "Tab";
-}
-
 function handleKeydown(e: KeyboardEvent) {
-	if (isTab(e) && e.shiftKey) {
-		// Shift+Tab = go back up one folder level (search mode) or reverse
+	if (matchesAction(e, "tab_back")) {
 		e.preventDefault();
 		onshifttabback();
-	} else if (isTab(e) && e.ctrlKey && scopeCount > 1) {
-		// Ctrl+Tab = switch scope
+	} else if (matchesAction(e, "switch_scope") && scopeCount > 1) {
 		e.preventDefault();
 		ontabscope();
-	} else if (isTab(e) && (searchMode || atMode)) {
-		// Tab in search/browse mode = drill into folder or accept ghost
+	} else if (matchesAction(e, "tab_complete") && (searchMode || atMode)) {
 		e.preventDefault();
 		ontabcomplete();
-	} else if (isTab(e) && ghost) {
+	} else if (matchesAction(e, "tab_complete") && ghost) {
 		e.preventDefault();
 		acceptGhost();
 	} else if (
@@ -269,7 +263,7 @@ function handleKeydown(e: KeyboardEvent) {
 	) {
 		e.preventDefault();
 		acceptGhost();
-	} else if (e.key === "Enter" && !e.shiftKey) {
+	} else if (matchesAction(e, "submit") && !e.shiftKey) {
 		e.preventDefault();
 		onsubmit();
 	} else if (e.key === "ArrowUp") {
@@ -278,19 +272,19 @@ function handleKeydown(e: KeyboardEvent) {
 	} else if (e.key === "ArrowDown") {
 		e.preventDefault();
 		onarrowdown();
-	} else if (e.key === "Escape") {
+	} else if (matchesAction(e, "dismiss")) {
 		e.preventDefault();
 		ondismiss();
-	} else if (e.ctrlKey && e.key === "1") {
+	} else if (matchesAction(e, "toggle_history")) {
 		e.preventDefault();
 		ontogglehistory();
-	} else if (e.ctrlKey && e.key === "2") {
+	} else if (matchesAction(e, "toggle_notes")) {
 		e.preventDefault();
 		ontogglenotes();
-	} else if (e.ctrlKey && e.key === "3") {
+	} else if (matchesAction(e, "toggle_media")) {
 		e.preventDefault();
 		ontogglemedia();
-	} else if (e.ctrlKey && e.key === "4") {
+	} else if (matchesAction(e, "toggle_settings")) {
 		e.preventDefault();
 		ontogglesettings();
 	}

@@ -61,6 +61,8 @@ pub fn run() {
             commands::config::get_privacy_config,
             commands::config::save_privacy_config,
             commands::config::grant_privacy_consent,
+            commands::config::get_keybindings_config,
+            commands::config::save_keybindings_config,
             commands::config::restart_app,
             commands::config::set_hotkey,
             commands::config::record_hotkey,

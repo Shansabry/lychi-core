@@ -1,7 +1,7 @@
 use crate::state::AppState;
 use crate::window;
 use lychi_core::config::db as config_db;
-use lychi_core::config::schema::PrivacyConfig;
+use lychi_core::config::schema::{KeybindingsConfig, PrivacyConfig};
 use lychi_core::config::{AiConfig, CommandsConfig, GeneralConfig, ProjectsConfig};
 use lychi_core::error::LychiError;
 use lychi_core::paths;
@@ -16,6 +16,7 @@ pub struct AllSettings {
     pub commands: CommandsConfig,
     pub projects: ProjectsConfig,
     pub privacy: PrivacyConfig,
+    pub keybindings: KeybindingsConfig,
     pub app_version: String,
     pub layer_shell_supported: bool,
     pub active_window_strategy: String,
@@ -54,6 +55,7 @@ pub fn get_all_settings(
         commands: config.commands.clone(),
         projects: config.projects.clone(),
         privacy: config.privacy.clone(),
+        keybindings: config.keybindings.clone(),
         app_version,
         layer_shell_supported,
         active_window_strategy,
@@ -194,6 +196,27 @@ pub async fn grant_privacy_consent(
         }
     }
     config.save(&paths::config_file())
+}
+
+// --- Keybindings ---
+
+#[tauri::command]
+pub async fn get_keybindings_config(
+    state: State<'_, AppState>,
+) -> Result<KeybindingsConfig, LychiError> {
+    let config = state.config.read().await;
+    Ok(config.keybindings.clone())
+}
+
+#[tauri::command]
+pub async fn save_keybindings_config(
+    state: State<'_, AppState>,
+    keybindings: KeybindingsConfig,
+) -> Result<(), LychiError> {
+    let mut config = state.config.write().await;
+    config.keybindings = keybindings;
+    config.save(&paths::config_file())?;
+    Ok(())
 }
 
 #[tauri::command]

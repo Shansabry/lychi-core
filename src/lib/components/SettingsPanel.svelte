@@ -5,7 +5,9 @@ import {
 	ChevronRight,
 	FolderOpen,
 	Info,
+	Keyboard,
 	Moon,
+	RotateCcw,
 	SlidersHorizontal,
 	Sparkles,
 	Sun,
@@ -17,29 +19,40 @@ import type {
 	CommandsConfig,
 	DirEntry,
 	GeneralConfig,
+	KeybindingsConfig,
 	PrivacyConfig,
 	ProjectsConfig,
 } from "$lib/ipc";
 import {
 	checkAiHealth,
+	KEYBINDINGS_DEFAULTS,
 	listDirectories,
 	recordHotkey,
 	restartApp,
 	saveAiConfig,
 	saveCommandsConfig,
 	saveGeneralConfig,
+	saveKeybindingsConfig,
 	savePrivacyConfig,
 	saveProjectsConfig,
 	setApiKey,
 	setHotkey,
 } from "$lib/ipc";
-import { preloadSettings } from "$lib/preloadCache";
+import {
+	ACTION_LABELS,
+	type ActionId,
+	ALL_ACTIONS,
+	comboFromEvent,
+	findConflicts,
+	loadKeybindings,
+} from "$lib/keybindings";
+import { invalidateSettings, preloadSettings } from "$lib/preloadCache";
 import Select from "./Select.svelte";
 
 let { ondismiss }: { ondismiss: () => void } = $props();
 
-let activeTab: "general" | "ai" | "projects" | "guide" | "about" = $state("general");
-let guideTab: "shortcuts" | "commands" | "triggers" = $state("shortcuts");
+let activeTab: "general" | "ai" | "projects" | "shortcuts" | "guide" | "about" = $state("general");
+let guideTab: "commands" | "triggers" = $state("commands");
 let appVersion = $state("");
 let layerShellSupported = $state(false);
 let activeWindowStrategy = $state("auto");
@@ -70,6 +83,9 @@ let privacyConfig: PrivacyConfig = $state({
 	allow_ip_geolocation: false,
 	allow_public_ip: false,
 });
+let keybindingsConfig: KeybindingsConfig = $state({ ...KEYBINDINGS_DEFAULTS });
+let recordingAction: ActionId | null = $state(null);
+let conflictWarning = $state("");
 let apiKeyInput = $state("");
 let healthStatus: "checking" | "healthy" | "error" | "disabled" = $state("disabled");
 let saving = $state(false);
@@ -105,6 +121,7 @@ onMount(() => {
 			generalConfig = cached.generalConfig;
 			commandsConfig = cached.commandsConfig;
 			privacyConfig = cached.privacyConfig;
+			keybindingsConfig = cached.keybindingsConfig;
 			customShell = !knownShells.includes(cached.commandsConfig.shell);
 			projectDirs = cached.projectsConfig.directories;
 			appVersion = cached.appVersion;
@@ -132,6 +149,57 @@ async function refreshHealth() {
 	} catch {
 		healthStatus = "error";
 	}
+}
+
+// --- Keybindings ---
+
+function startRecording(action: ActionId) {
+	recordingAction = action;
+	conflictWarning = "";
+
+	const handler = (e: KeyboardEvent) => {
+		e.preventDefault();
+		e.stopPropagation();
+
+		const combo = comboFromEvent(e);
+		if (!combo) return; // bare modifier key, wait for real key
+
+		// Escape without modifiers = cancel
+		if (e.key === "Escape" && !e.ctrlKey && !e.shiftKey && !e.altKey) {
+			recordingAction = null;
+			window.removeEventListener("keydown", handler, true);
+			return;
+		}
+
+		// Check for conflicts
+		const testConfig = { ...keybindingsConfig, [action]: combo };
+		const conflicts = findConflicts(testConfig);
+		if (conflicts.length > 0) {
+			const [a, b] = conflicts[0];
+			const other = a === action ? b : a;
+			conflictWarning = `"${combo}" conflicts with ${ACTION_LABELS[other]}`;
+		} else {
+			conflictWarning = "";
+		}
+
+		// Apply
+		keybindingsConfig = { ...keybindingsConfig, [action]: combo };
+		loadKeybindings(keybindingsConfig);
+		saveKeybindingsConfig(keybindingsConfig);
+		invalidateSettings();
+		recordingAction = null;
+		window.removeEventListener("keydown", handler, true);
+	};
+
+	window.addEventListener("keydown", handler, true);
+}
+
+async function resetAllShortcuts() {
+	keybindingsConfig = { ...KEYBINDINGS_DEFAULTS };
+	loadKeybindings(keybindingsConfig);
+	await saveKeybindingsConfig(keybindingsConfig);
+	invalidateSettings();
+	conflictWarning = "";
 }
 
 let saveError = $state("");
@@ -403,6 +471,14 @@ function handleKeydown(e: KeyboardEvent) {
 		>
 			<FolderOpen size={14} strokeWidth={1.5} />
 			<span>Projects</span>
+		</button>
+		<button
+			class="tab-btn"
+			class:active={activeTab === "shortcuts"}
+			onclick={() => (activeTab = "shortcuts")}
+		>
+			<Keyboard size={14} strokeWidth={1.5} />
+			<span>Shortcuts</span>
 		</button>
 		<button
 			class="tab-btn"
@@ -724,16 +800,36 @@ function handleKeydown(e: KeyboardEvent) {
 					Browse folder
 				</button>
 			{/if}
+		{:else if activeTab === "shortcuts"}
+			<div class="section-label">Keyboard Shortcuts</div>
+			{#each ALL_ACTIONS as action}
+				<div class="field shortcut-row">
+					<span class="field-label">{ACTION_LABELS[action]}</span>
+					<button
+						class="hotkey-btn"
+						class:recording={recordingAction === action}
+						onclick={() => startRecording(action)}
+					>
+						{#if recordingAction === action}
+							Press keys...
+						{:else}
+							{keybindingsConfig[action]}
+						{/if}
+					</button>
+				</div>
+			{/each}
+			{#if conflictWarning}
+				<div class="field-error">{conflictWarning}</div>
+			{/if}
+			<div class="field" style="justify-content: flex-end; padding-top: 8px;">
+				<button class="reset-btn" onclick={resetAllShortcuts}>
+					<RotateCcw size={12} strokeWidth={1.5} />
+					Reset all to defaults
+				</button>
+			</div>
 		{:else if activeTab === "guide"}
 			<div class="guide" role="region" aria-label="Guide">
 				<div class="guide-tab-bar">
-					<button
-						class="guide-tab"
-						class:active={guideTab === "shortcuts"}
-						onmousedown={(e) => e.preventDefault()}
-						onclick={() => { guideTab = "shortcuts"; }}
-						tabindex={-1}
-					>Shortcuts</button>
 					<button
 						class="guide-tab"
 						class:active={guideTab === "commands"}
@@ -750,50 +846,7 @@ function handleKeydown(e: KeyboardEvent) {
 					>Triggers</button>
 				</div>
 
-				{#if guideTab === "shortcuts"}
-					<div class="guide-table">
-						<div class="guide-row">
-							<kbd>{generalConfig.hotkey}</kbd>
-							<span>Toggle Lychi</span>
-						</div>
-						<div class="guide-row">
-							<kbd>Escape</kbd>
-							<span>Hide / dismiss</span>
-						</div>
-						<div class="guide-row">
-							<kbd>Enter</kbd>
-							<span>Execute command</span>
-						</div>
-						<div class="guide-row">
-							<kbd>Tab</kbd>
-							<span>Accept completion</span>
-						</div>
-						<div class="guide-row">
-							<kbd>Up / Down</kbd>
-							<span>Navigate completions</span>
-						</div>
-						<div class="guide-row">
-							<kbd>Ctrl+1</kbd>
-							<span>Toggle history</span>
-						</div>
-						<div class="guide-row">
-							<kbd>Ctrl+2</kbd>
-							<span>Toggle media</span>
-						</div>
-						<div class="guide-row">
-							<kbd>Ctrl+3</kbd>
-							<span>Toggle settings</span>
-						</div>
-						<div class="guide-row">
-							<kbd>Ctrl+4</kbd>
-							<span>Toggle notes</span>
-						</div>
-						<div class="guide-row">
-							<kbd>@</kbd>
-							<span>File/folder reference</span>
-						</div>
-					</div>
-				{:else if guideTab === "commands"}
+				{#if guideTab === "commands"}
 					<div class="guide-table">
 						<div class="guide-row">
 							<code>open &lt;app&gt;</code>
@@ -936,7 +989,7 @@ function handleKeydown(e: KeyboardEvent) {
 		padding: 12px 8px;
 		border-right: 1px solid var(--border);
 		flex-shrink: 0;
-		width: 110px;
+		width: 120px;
 	}
 
 	.tab-btn {
@@ -984,7 +1037,7 @@ function handleKeydown(e: KeyboardEvent) {
 		color: var(--fg-muted);
 		font-size: 12px;
 		flex-shrink: 0;
-		min-width: 70px;
+		width: 120px;
 	}
 
 
@@ -1442,7 +1495,6 @@ function handleKeydown(e: KeyboardEvent) {
 		padding: 3px 0;
 	}
 
-	.guide-row kbd,
 	.guide-row code {
 		font-family: var(--font-mono);
 		font-size: 11px;
@@ -1546,5 +1598,35 @@ function handleKeydown(e: KeyboardEvent) {
 		color: var(--fg-muted);
 		margin: 4px 0 0 0;
 		opacity: 0.6;
+	}
+
+	/* Shortcuts tab */
+	.shortcut-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+	}
+
+	.shortcut-row .hotkey-btn {
+		min-width: 110px;
+	}
+
+	.reset-btn {
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		background: var(--bg-secondary);
+		color: var(--fg-muted);
+		border: 1px solid var(--border);
+		border-radius: 4px;
+		padding: 4px 10px;
+		font-size: 11px;
+		cursor: pointer;
+		transition: color 100ms ease, border-color 100ms ease;
+	}
+
+	.reset-btn:hover {
+		color: var(--fg);
+		border-color: var(--fg-muted);
 	}
 </style>

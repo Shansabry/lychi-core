@@ -141,6 +141,7 @@ export interface AllSettings {
 	commands: CommandsConfig;
 	projects: ProjectsConfig;
 	privacy: PrivacyConfig;
+	keybindings: KeybindingsConfig;
 	app_version: string;
 	layer_shell_supported: boolean;
 	active_window_strategy: string;
@@ -167,6 +168,18 @@ export async function getAllSettings(): Promise<AllSettings> {
 			},
 			projects: { directories: [] },
 			privacy: { allow_ip_geolocation: false, allow_public_ip: false },
+			keybindings: {
+				toggle_history: "Ctrl+1",
+				toggle_notes: "Ctrl+2",
+				toggle_media: "Ctrl+3",
+				toggle_settings: "Ctrl+4",
+				open_inline_url: "Ctrl+O",
+				submit: "Enter",
+				dismiss: "Escape",
+				tab_complete: "Tab",
+				tab_back: "Shift+Tab",
+				switch_scope: "Ctrl+Tab",
+			},
 			app_version: "0.0.0",
 			layer_shell_supported: false,
 			active_window_strategy: "x11",
@@ -301,6 +314,44 @@ export async function setHotkey(hotkey: string): Promise<void> {
 export async function recordHotkey(): Promise<string> {
 	if (!isTauri()) return "";
 	return invoke("record_hotkey");
+}
+
+// --- Keybindings ---
+
+export interface KeybindingsConfig {
+	toggle_history: string;
+	toggle_notes: string;
+	toggle_media: string;
+	toggle_settings: string;
+	open_inline_url: string;
+	submit: string;
+	dismiss: string;
+	tab_complete: string;
+	tab_back: string;
+	switch_scope: string;
+}
+
+export const KEYBINDINGS_DEFAULTS: KeybindingsConfig = {
+	toggle_history: "Ctrl+1",
+	toggle_notes: "Ctrl+2",
+	toggle_media: "Ctrl+3",
+	toggle_settings: "Ctrl+4",
+	open_inline_url: "Ctrl+O",
+	submit: "Enter",
+	dismiss: "Escape",
+	tab_complete: "Tab",
+	tab_back: "Shift+Tab",
+	switch_scope: "Ctrl+Tab",
+};
+
+export async function getKeybindingsConfig(): Promise<KeybindingsConfig> {
+	if (!isTauri()) return { ...KEYBINDINGS_DEFAULTS };
+	return invoke<KeybindingsConfig>("get_keybindings_config");
+}
+
+export async function saveKeybindingsConfig(keybindings: KeybindingsConfig): Promise<void> {
+	if (!isTauri()) return;
+	return invoke("save_keybindings_config", { keybindings });
 }
 
 // --- AI ---
