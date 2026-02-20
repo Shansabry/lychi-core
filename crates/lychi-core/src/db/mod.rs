@@ -3,7 +3,7 @@ pub mod schema;
 use std::path::Path;
 use std::sync::Arc;
 
-use redb::{Database, ReadableTableMetadata, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTableMetadata, TableDefinition};
 
 use crate::error::LychiError;
 
@@ -20,11 +20,21 @@ pub const TODOS: TableDefinition<&str, &[u8]> = TableDefinition::new("todos");
 pub const SETTINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("settings");
 
 /// Open (or create) the redb database at the given path.
+/// If the file exists but uses an older format version, back it up and recreate.
 pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let db = Database::create(path)?;
+    let db = match Database::create(path) {
+        Ok(db) => db,
+        Err(e) if path.exists() => {
+            tracing::warn!("[db] cannot open database ({e}), backing up and recreating");
+            let backup = path.with_extension("redb.bak");
+            let _ = std::fs::rename(path, &backup);
+            Database::create(path)?
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     // Ensure all tables exist by opening them in a write transaction.
     let txn = db.begin_write()?;

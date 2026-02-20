@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use redb::{Database, ReadableTable, ReadableTableMetadata};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata};
 
 use crate::config::Config;
 use crate::db::{

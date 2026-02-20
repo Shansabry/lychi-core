@@ -89,10 +89,166 @@ impl ProjectOpen {
 
         for dir_str in directories {
             let dir = Self::expand_path(dir_str);
-            Self::scan_dir(&dir, 0, 3, &mut entries);
+            Self::scan_dir(&dir, 0, 5, &mut entries);
         }
 
         entries
+    }
+
+    /// Markers that indicate a directory is a real project root.
+    const PROJECT_MARKERS: &[&str] = &[
+        // VCS
+        ".git",
+        ".hg",
+        ".svn",
+        // Rust
+        "Cargo.toml",
+        // JavaScript / TypeScript / Node / Bun / Deno
+        "package.json",
+        "bun.lockb",
+        "bunfig.toml",
+        "deno.json",
+        "deno.jsonc",
+        // Python
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "Pipfile",
+        "requirements.txt",
+        // Go
+        "go.mod",
+        // Java / Kotlin / Scala
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "build.sbt",
+        // C / C++
+        "CMakeLists.txt",
+        "Makefile",
+        "meson.build",
+        "conanfile.txt",
+        "conanfile.py",
+        "vcpkg.json",
+        // C# / .NET / F#
+        "*.sln",
+        "*.csproj",
+        "*.fsproj",
+        // Ruby
+        "Gemfile",
+        // PHP
+        "composer.json",
+        // Elixir
+        "mix.exs",
+        // Dart / Flutter
+        "pubspec.yaml",
+        // Tauri
+        "tauri.conf.json",
+        // Electron
+        "electron.vite.config.ts",
+        "electron-builder.yml",
+        "electron-builder.json5",
+        // Swift / Xcode
+        "Package.swift",
+        "*.xcodeproj",
+        "*.xcworkspace",
+        // Haskell
+        "stack.yaml",
+        "cabal.project",
+        "*.cabal",
+        // Zig
+        "build.zig",
+        // Nim
+        "*.nimble",
+        // OCaml
+        "dune-project",
+        // Clojure
+        "project.clj",
+        "deps.edn",
+        // Lua
+        "rockspec",
+        // R
+        "DESCRIPTION",
+        // Julia
+        "Project.toml",
+        // Nix
+        "flake.nix",
+        // Terraform / Infra
+        "main.tf",
+        // Docker (standalone projects)
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        // Eclipse
+        ".project",
+    ];
+
+    /// Directories to never recurse into — build artifacts, dependencies, caches.
+    const SKIP_DIRS: &[&str] = &[
+        // JS / TS / Bun / Node
+        "node_modules",
+        ".next",
+        ".nuxt",
+        // Rust
+        "target",
+        ".cargo",
+        // Python
+        ".venv",
+        "venv",
+        "env",
+        "__pycache__",
+        ".eggs",
+        "*.egg-info",
+        ".tox",
+        ".mypy_cache",
+        ".ruff_cache",
+        // Go
+        "vendor",
+        // Java / Kotlin / Scala
+        ".gradle",
+        ".mvn",
+        ".idea",
+        // C# / .NET
+        "bin",
+        "obj",
+        "packages",
+        // Elixir
+        "deps",
+        "_build",
+        // General build / output
+        "dist",
+        "build",
+        "out",
+        ".cache",
+        // Zig
+        "zig-cache",
+        "zig-out",
+        // OCaml
+        "_opam",
+        // Haskell
+        ".stack-work",
+        // Flutter / Dart
+        ".dart_tool",
+        // Terraform
+        ".terraform",
+    ];
+
+    fn is_project_root(path: &PathBuf) -> bool {
+        for marker in Self::PROJECT_MARKERS {
+            if let Some(ext) = marker.strip_prefix('*') {
+                // Glob pattern like "*.sln" — check if any file matches the extension
+                if let Ok(rd) = fs::read_dir(path) {
+                    for entry in rd.flatten() {
+                        if let Some(name) = entry.file_name().to_str()
+                            && name.ends_with(ext)
+                        {
+                            return true;
+                        }
+                    }
+                }
+            } else if path.join(marker).exists() {
+                return true;
+            }
+        }
+        false
     }
 
     fn scan_dir(
@@ -118,16 +274,22 @@ impl ProjectOpen {
                 Some(n) => n.to_string(),
                 None => continue,
             };
-            if name.starts_with('.') {
+            if name.starts_with('.') || Self::SKIP_DIRS.contains(&name.as_str()) {
                 continue;
             }
-            let key = name.to_lowercase();
-            entries.entry(key).or_insert_with(|| ProjectEntry {
-                name,
-                path: path.clone(),
-            });
-            // Recurse into subdirectories
-            Self::scan_dir(&path, depth + 1, max_depth, entries);
+
+            if Self::is_project_root(&path) {
+                // Found a project — index it but don't recurse deeper
+                // (nested projects like monorepo packages are their own roots)
+                let key = name.to_lowercase();
+                entries.entry(key).or_insert_with(|| ProjectEntry {
+                    name,
+                    path: path.clone(),
+                });
+            } else {
+                // Not a project — keep scanning deeper
+                Self::scan_dir(&path, depth + 1, max_depth, entries);
+            }
         }
     }
 
@@ -241,11 +403,32 @@ impl ActionHandler for ProjectOpen {
         }
 
         let start = Instant::now();
+
+        if self.directories.is_empty() {
+            return Ok(ActionResult {
+                success: false,
+                output: None,
+                error: Some(
+                    "No project directories configured. Add your project folders in Settings → Projects."
+                        .to_string(),
+                ),
+                duration_ms: 0,
+                routed_by: None,
+                open_url: None,
+                needs_confirmation: None,
+                risk_level: None,
+                output_type: None,
+                executed_args: None,
+            });
+        }
+
         let entries = self.get_projects();
 
         let matches = Self::fuzzy_match(&entries, query);
         let (entry, _) = matches.into_iter().next().ok_or_else(|| {
-            LychiError::ExecutionFailed(format!("No project matching '{query}' found"))
+            LychiError::ExecutionFailed(format!(
+                "No project matching '{query}' found. Make sure the project's parent directory is added in Settings → Projects."
+            ))
         })?;
 
         let path = &entry.path;

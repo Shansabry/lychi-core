@@ -57,7 +57,7 @@ impl ActionHandler for UrlOpen {
 
         Ok(ActionResult {
             success: true,
-            output: Some(format!("Opening {url}")),
+            output: None,
             error: None,
             duration_ms: 0,
             routed_by: None,

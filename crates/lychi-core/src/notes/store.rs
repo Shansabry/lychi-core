@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use redb::{Database, ReadableTable};
+use redb::{Database, ReadableDatabase, ReadableTable};
 
 use crate::db::{
     self,

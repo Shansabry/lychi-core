@@ -49,6 +49,8 @@ impl AppLauncher {
     /// Call from `spawn_blocking` at startup so the first completions call is instant.
     pub fn warmup() {
         let t0 = std::time::Instant::now();
+        // Build icon index first so resolve_icon() calls below are fast
+        super::icons::warmup_icons();
         let entries = Self::entries();
         let t_entries = t0.elapsed();
         for entry in entries.values() {

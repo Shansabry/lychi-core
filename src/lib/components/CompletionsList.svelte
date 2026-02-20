@@ -32,6 +32,9 @@ const POOL_INDICES = Array.from({ length: POOL_SIZE }, (_, i) => i);
 
 let listEl: HTMLUListElement | undefined = $state();
 
+// Track icon paths that failed to load — show fallback instead of broken image
+let brokenIcons = $state(new Set<string>());
+
 // Count non-item rows above the list items for scroll offset
 let headerRows = $derived((pathContext ? 1 : 0) + (scopeTabs.length > 1 ? 1 : 0));
 
@@ -122,6 +125,10 @@ let hasItems = $derived(items.length > 0);
 		{@const isFolder = item?.icon_path === "__folder__"}
 		{@const hasCustomIcon = !!(item?.icon_path && item.icon_path !== "__folder__")}
 		{@const noIcon = !item?.icon_path}
+		{@const iconKey = item?.icon_path ?? ""}
+		{@const iconBroken = hasCustomIcon && brokenIcons.has(iconKey)}
+		{@const showImg = hasCustomIcon && !iconBroken}
+		{@const showFallback = noIcon || iconBroken}
 		{@const search = searchDisplayName(label)}
 		<li
 			class="completion-item"
@@ -138,13 +145,14 @@ let hasItems = $derived(items.length > 0);
 				<span style:visibility={isFolder ? "visible" : "hidden"} class="icon-slot">
 					<Folder size={20} strokeWidth={1.5} class="icon-folder" />
 				</span>
-				<span style:visibility={hasCustomIcon ? "visible" : "hidden"} class="icon-slot">
+				<span style:visibility={showImg ? "visible" : "hidden"} class="icon-slot">
 					<img
-						src={hasCustomIcon ? (iconSrc(item.icon_path) ?? "") : "data:,"}
-						alt="" width="24" height="24" decoding="async" loading="lazy"
+						src={showImg && Math.abs(idx - selectedIndex) <= 3 ? (iconSrc(item.icon_path) ?? "") : "data:,"}
+						alt="" width="24" height="24" decoding="async"
+						onerror={() => { if (item?.icon_path) brokenIcons.add(item.icon_path); brokenIcons = brokenIcons; }}
 					/>
 				</span>
-				<span style:visibility={noIcon ? "visible" : "hidden"} class="icon-slot">
+				<span style:visibility={showFallback ? "visible" : "hidden"} class="icon-slot">
 					<AppWindow size={20} strokeWidth={1.5} class="icon-fallback" />
 				</span>
 			</span>

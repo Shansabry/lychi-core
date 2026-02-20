@@ -329,6 +329,12 @@ onMount(() => {
 		// Listen for agent step events
 		const unlistenStep = await win.listen<StepEvent>("lychi://agent-step", (e) => {
 			planPanelRef?.handleStepEvent(e.payload);
+			// When the final step completes, expose its result to the StatusBar
+			// so the AI sparkle indicator shows for AI-routed plans.
+			const { result, status } = e.payload;
+			if (result && (status === "done" || status === "failed")) {
+				lastResult = { ...result, routed_by: "ai" };
+			}
 		});
 		unlisteners.push(unlistenStep);
 
@@ -525,10 +531,36 @@ async function handleSubmit() {
 			// language query (e.g. "what is the weather here") — run it as-is so the
 			// backend's keyword/AI routing handles it correctly.
 			const KNOWN_PREFIXES = new Set([
-				"ask", "browse", "open", "web", "yt", "run", "calc", "file", "url",
-				"media", "project", "system", "note", "notes", "todo", "todos",
-				"weather", "sysinfo", "ip", "cpu", "mem", "disk", "temp", "gpu",
-				"battery", "net", "audio", "display", "os", "speedtest",
+				"ask",
+				"browse",
+				"open",
+				"web",
+				"yt",
+				"run",
+				"calc",
+				"file",
+				"url",
+				"media",
+				"project",
+				"system",
+				"note",
+				"notes",
+				"todo",
+				"todos",
+				"weather",
+				"sysinfo",
+				"ip",
+				"cpu",
+				"mem",
+				"disk",
+				"temp",
+				"gpu",
+				"battery",
+				"net",
+				"audio",
+				"display",
+				"os",
+				"speedtest",
 			]);
 			const spaceIdx = trimmed.indexOf(" ");
 			if (spaceIdx !== -1) {

@@ -20,14 +20,15 @@ toml = { workspace = true }
 redb = { workspace = true }
 uuid = { workspace = true }
 postcard = { workspace = true }
-urlencoding = "2"
+urlencoding = "2.1"
 dirs = "6"
-nucleo-matcher = "0.3"
-meval = "0.2.0"
-reqwest = { version = "0.12", features = ["json"] }
+nucleo-matcher = "0.3.1"
+freedesktop-icons = "0.4"
+meval = "0.2"
+reqwest = { version = "0.13", features = ["json", "query"] }
 zbus = { version = "5", features = ["tokio"], optional = true }
-futures-util = { version = "0.3.32", optional = true }
-futures-core = { version = "0.3.32", optional = true }
+futures-util = { version = "0.3", optional = true }
+futures-core = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
