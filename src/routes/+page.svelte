@@ -520,11 +520,25 @@ async function handleSubmit() {
 				return;
 			}
 			// Check if input has an explicit prefix (e.g. "spotify ", "system ", "media ")
-			// If so, append the selected completion to the prefix
+			// If so, append the selected completion to the prefix.
+			// But if the first word isn't a known handler prefix, this is a natural
+			// language query (e.g. "what is the weather here") — run it as-is so the
+			// backend's keyword/AI routing handles it correctly.
+			const KNOWN_PREFIXES = new Set([
+				"ask", "browse", "open", "web", "yt", "run", "calc", "file", "url",
+				"media", "project", "system", "note", "notes", "todo", "todos",
+				"weather", "sysinfo", "ip", "cpu", "mem", "disk", "temp", "gpu",
+				"battery", "net", "audio", "display", "os", "speedtest",
+			]);
 			const spaceIdx = trimmed.indexOf(" ");
 			if (spaceIdx !== -1) {
-				const prefix = trimmed.slice(0, spaceIdx);
-				await runCommand(`${prefix} ${selected.label}`);
+				const prefix = trimmed.slice(0, spaceIdx).toLowerCase();
+				if (KNOWN_PREFIXES.has(prefix)) {
+					await runCommand(`${prefix} ${selected.label}`);
+				} else {
+					// Natural language — let the backend route the original input
+					await runCommand(trimmed);
+				}
 			} else if (selected.label.toLowerCase() === trimmed.toLowerCase()) {
 				// Completion matches input exactly (e.g. "mem" → sysinfo "mem")
 				// Let the backend router handle it directly
