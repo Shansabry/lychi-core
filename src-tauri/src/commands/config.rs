@@ -1,5 +1,6 @@
 use crate::state::AppState;
 use crate::window;
+use lychi_core::config::db as config_db;
 use lychi_core::config::schema::PrivacyConfig;
 use lychi_core::config::{AiConfig, CommandsConfig, GeneralConfig, ProjectsConfig};
 use lychi_core::error::LychiError;
@@ -90,7 +91,9 @@ pub async fn save_general_config(
 ) -> Result<(), LychiError> {
     let mut config = state.config.write().await;
     config.general = general;
-    config.save(&paths::config_file())
+    config.save(&paths::config_file())?;
+    config_db::save_config_to_db(&state.db, &config)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -109,6 +112,7 @@ pub async fn save_commands_config(
     let old_shell = config.commands.shell.clone();
     config.commands = commands;
     config.save(&paths::config_file())?;
+    config_db::save_config_to_db(&state.db, &config)?;
 
     // If shell changed, invalidate cached env and re-register handler
     if old_shell != new_shell {
@@ -140,6 +144,7 @@ pub async fn save_projects_config(
     let mut config = state.config.write().await;
     config.projects = projects;
     config.save(&paths::config_file())?;
+    config_db::save_config_to_db(&state.db, &config)?;
 
     // Re-register project handler with updated directories
     let mut executor = state.executor.write().await;
@@ -165,7 +170,9 @@ pub async fn save_privacy_config(
 ) -> Result<(), LychiError> {
     let mut config = state.config.write().await;
     config.privacy = privacy;
-    config.save(&paths::config_file())
+    config.save(&paths::config_file())?;
+    config_db::save_config_to_db(&state.db, &config)?;
+    Ok(())
 }
 
 /// C6: Grant a specific privacy consent and persist it.

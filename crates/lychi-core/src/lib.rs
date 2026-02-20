@@ -1,5 +1,6 @@
 pub mod action_registry;
 pub mod config;
+pub mod db;
 pub mod error;
 pub mod executor;
 pub mod history;

@@ -151,7 +151,7 @@ let processedHtml = $derived(
 
 let isHighRisk = $derived(result.risk_level === "high");
 
-function handleTerminalClick(e: MouseEvent) {
+function handleTerminalClick(e: MouseEvent | KeyboardEvent) {
 	const target = (e.target as HTMLElement).closest(".clickable-file");
 	if (!target || !onopenfile) return;
 	const filepath = target.getAttribute("data-filepath");

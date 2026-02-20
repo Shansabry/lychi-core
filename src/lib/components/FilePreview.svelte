@@ -56,9 +56,12 @@ $effect(() => {
 });
 
 // Render markdown to HTML
-let renderedMarkdown = $derived(
-	preview?.kind === "Text" && preview.language === "markdown" ? marked.parse(preview.content) : "",
-);
+let renderedMarkdown = $derived.by(() => {
+	if (preview && preview.kind === "Text" && preview.language === "markdown") {
+		return marked.parse(preview.content);
+	}
+	return "";
+});
 
 // Extract filename from path
 let fileName = $derived(() => {

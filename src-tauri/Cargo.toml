@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 lychi-core = { path = "../crates/lychi-core" }
+redb = { workspace = true }
 dirs = "6"
 tauri = { version = "2", features = ["protocol-asset", "tray-icon"] }
 tauri-plugin-shell = "2"

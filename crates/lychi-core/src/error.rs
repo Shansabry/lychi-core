@@ -31,6 +31,39 @@ pub enum LychiError {
 
     #[error("Notes error: {0}")]
     Notes(String),
+
+    #[error("Database error: {0}")]
+    Database(String),
+}
+
+impl From<redb::DatabaseError> for LychiError {
+    fn from(e: redb::DatabaseError) -> Self {
+        LychiError::Database(e.to_string())
+    }
+}
+
+impl From<redb::StorageError> for LychiError {
+    fn from(e: redb::StorageError) -> Self {
+        LychiError::Database(e.to_string())
+    }
+}
+
+impl From<redb::TransactionError> for LychiError {
+    fn from(e: redb::TransactionError) -> Self {
+        LychiError::Database(e.to_string())
+    }
+}
+
+impl From<redb::TableError> for LychiError {
+    fn from(e: redb::TableError) -> Self {
+        LychiError::Database(e.to_string())
+    }
+}
+
+impl From<redb::CommitError> for LychiError {
+    fn from(e: redb::CommitError) -> Self {
+        LychiError::Database(e.to_string())
+    }
 }
 
 impl serde::Serialize for LychiError {

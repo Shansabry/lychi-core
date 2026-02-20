@@ -23,10 +23,6 @@ pub fn config_file() -> PathBuf {
     config_dir().join("config.toml")
 }
 
-pub fn history_file() -> PathBuf {
-    data_dir().join("history.json")
-}
-
-pub fn notes_file() -> PathBuf {
-    data_dir().join("notes.json")
+pub fn db_file() -> PathBuf {
+    data_dir().join("lychi.redb")
 }

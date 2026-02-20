@@ -6,7 +6,7 @@ use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
 use crate::action_registry::{ActionHandler, ActionResult, CompletionItem};
@@ -23,6 +23,9 @@ type ProjectCacheData = (Vec<String>, HashMap<String, ProjectEntry>);
 /// Cache of discovered projects. Uses RwLock so it can be invalidated
 /// when project directories change in settings.
 static PROJECT_CACHE: RwLock<Option<ProjectCacheData>> = RwLock::new(None);
+
+/// Cached nucleo matcher — reused across calls to avoid cold-start cost.
+static MATCHER: Mutex<Option<Matcher>> = Mutex::new(None);
 
 pub struct ProjectOpen {
     directories: Vec<String>,
@@ -59,6 +62,12 @@ impl ProjectOpen {
                     .collect(),
             ));
         }
+        // Pre-warm the nucleo matcher so first real query is instant
+        {
+            let mut guard = MATCHER.lock().unwrap();
+            guard.get_or_insert_with(|| Matcher::new(Config::DEFAULT));
+        }
+
         tracing::info!(
             "[project_open] warmup done: {:.0}ms ({count} projects)",
             t0.elapsed().as_secs_f64() * 1000.0
@@ -172,7 +181,8 @@ impl ProjectOpen {
             return Vec::new();
         }
 
-        let mut matcher = Matcher::new(Config::DEFAULT);
+        let mut guard = MATCHER.lock().unwrap();
+        let matcher = guard.get_or_insert_with(|| Matcher::new(Config::DEFAULT));
         let pattern = Atom::new(
             query,
             CaseMatching::Ignore,
@@ -186,7 +196,7 @@ impl ProjectOpen {
             .filter_map(|entry| {
                 let mut buf = Vec::new();
                 let haystack = Utf32Str::new(&entry.name, &mut buf);
-                let score = pattern.score(haystack, &mut matcher)?;
+                let score = pattern.score(haystack, matcher)?;
                 Some((entry, score))
             })
             .collect();

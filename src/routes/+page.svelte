@@ -41,6 +41,7 @@ import { preloadAll } from "$lib/preloadCache";
 let inputValue = $state("");
 let isExecuting = $state(false);
 let isRouting = $state(false);
+let backendReady = $state(false);
 let lastResult: CommandResult | null = $state(null);
 let lastCommand = $state("");
 
@@ -50,6 +51,7 @@ let historyOpen = $state(false);
 let completions: CompletionItem[] = $state([]);
 let completionIndex = $state(-1);
 let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+let completionGen = 0;
 
 // @ file reference mode (browse — point to a file in a command)
 let atMode = $state(false);
@@ -118,12 +120,6 @@ let previewPath = $derived.by(() => {
 });
 let showPreview = $derived(previewPath.length > 0);
 
-$effect(() => {
-	getHistory().then((entries) => {
-		historyEntries = entries;
-	});
-});
-
 // Poll media player status — 5s when playing/paused, 30s when idle
 $effect(() => {
 	function scheduleNext() {
@@ -149,16 +145,21 @@ $effect(() => {
 async function fetchAtCompletions(partial: string) {
 	try {
 		const results = await listPathCompletions(partial);
-		completions = results;
-		completionIndex = results.length > 0 ? 0 : -1;
-		atNoResults = results.length === 0 && partial.length > 0;
+		// Defer state update to next frame so it never blocks a keystroke paint
+		requestAnimationFrame(() => {
+			completions = results;
+			completionIndex = results.length > 0 ? 0 : -1;
+			atNoResults = results.length === 0 && partial.length > 0;
+		});
 		// Stay in @ mode even when empty — user can backspace to navigate up
 	} catch (err) {
 		console.error("[@completions] error:", err);
 		// Stay in @ mode on error too — don't kick the user out
-		completions = [];
-		completionIndex = -1;
-		atNoResults = true;
+		requestAnimationFrame(() => {
+			completions = [];
+			completionIndex = -1;
+			atNoResults = true;
+		});
 	}
 }
 
@@ -176,6 +177,8 @@ function resolveFullPath(label: string): string {
 
 // Called by CommandInput on every keystroke
 function handleInput(val: string) {
+	// Skip completions until backend is ready — input still updates visually via bind:value
+	if (!backendReady) return;
 	historyOpen = false;
 	clearTimeout(debounceTimer);
 	atNoResults = false;
@@ -243,7 +246,25 @@ function handleInput(val: string) {
 			atMode = true;
 			atStart = atIdx;
 			cancelFileSearch();
-			debounceTimer = setTimeout(() => fetchAtCompletions(partial), 30);
+			const gen = ++completionGen;
+			listPathCompletions(partial)
+				.then((results) => {
+					if (gen !== completionGen) return;
+					requestAnimationFrame(() => {
+						completions = results;
+						completionIndex = results.length > 0 ? 0 : -1;
+						atNoResults = results.length === 0 && partial.length > 0;
+					});
+				})
+				.catch((err) => {
+					console.error("[@completions] error:", err);
+					if (gen !== completionGen) return;
+					requestAnimationFrame(() => {
+						completions = [];
+						completionIndex = -1;
+						atNoResults = true;
+					});
+				});
 			return;
 		}
 	}
@@ -254,20 +275,22 @@ function handleInput(val: string) {
 
 	const trimmed = val.trim();
 	if (trimmed.length < 2) {
+		completionGen++;
 		completions = [];
 		completionIndex = -1;
 		return;
 	}
 
-	debounceTimer = setTimeout(async () => {
-		try {
-			const results = await getCompletions(trimmed);
+	const gen = ++completionGen;
+	getCompletions(trimmed)
+		.then((results) => {
+			if (gen !== completionGen) return;
 			completions = results;
 			completionIndex = results.length > 0 ? 0 : -1;
-		} catch (err) {
+		})
+		.catch((err) => {
 			console.error("[completions] error:", err);
-		}
-	}, 80);
+		});
 }
 
 onMount(() => {
@@ -277,7 +300,13 @@ onMount(() => {
 	getMountPoints().then((mounts) => {
 		mountPoints = mounts;
 	});
-	preloadAll();
+	getHistory().then((entries) => {
+		historyEntries = entries;
+	});
+	Promise.all([preloadAll(), getCompletions("__warmup__").catch(() => {})]).finally(() => {
+		backendReady = true;
+		if (inputValue.trim()) handleInput(inputValue);
+	});
 
 	// Guard: only attach Tauri listeners if running inside Tauri
 	if (!("__TAURI_INTERNALS__" in window)) return;
@@ -353,7 +382,6 @@ onMount(() => {
 				for (const r of batch.results) {
 					pathUpdates.set(r.label, r.full_path);
 				}
-				filePathMap = pathUpdates;
 
 				const newItems: CompletionItem[] = batch.results.map((r) => ({
 					label: r.label,
@@ -362,23 +390,30 @@ onMount(() => {
 					description: r.description ?? null,
 				}));
 
-				completions = [...completions, ...newItems]
-					.sort((a, b) => {
-						const aDir = a.icon_path === "__folder__" ? 1 : 0;
-						const bDir = b.icon_path === "__folder__" ? 1 : 0;
-						if (bDir !== aDir) return bDir - aDir; // folders first
-						return b.score - a.score; // then by score
-					})
-					.slice(0, 20);
+				const isDone = batch.done;
 
-				if (completions.length > 0 && completionIndex < 0) {
-					completionIndex = 0;
-				}
+				// Defer state update to next frame so it never blocks a keystroke paint
+				requestAnimationFrame(() => {
+					filePathMap = pathUpdates;
 
-				if (batch.done) {
-					searchDone = true;
-					atNoResults = completions.length === 0;
-				}
+					completions = [...completions, ...newItems]
+						.sort((a, b) => {
+							const aDir = a.icon_path === "__folder__" ? 1 : 0;
+							const bDir = b.icon_path === "__folder__" ? 1 : 0;
+							if (bDir !== aDir) return bDir - aDir; // folders first
+							return b.score - a.score; // then by score
+						})
+						.slice(0, 20);
+
+					if (completions.length > 0 && completionIndex < 0) {
+						completionIndex = 0;
+					}
+
+					if (isDone) {
+						searchDone = true;
+						atNoResults = completions.length === 0;
+					}
+				});
 			},
 		);
 		unlisteners.push(unlistenFileSearch);
@@ -418,7 +453,7 @@ onMount(() => {
 
 async function handleSubmit() {
 	const trimmed = inputValue.trim();
-	if (!trimmed || isExecuting) return;
+	if (!trimmed || isExecuting || !backendReady) return;
 
 	// If a plan is showing and user presses Enter, execute it
 	if (pendingPlan) return;
@@ -914,8 +949,9 @@ async function handleDismiss() {
 			history={historyEntries}
 		/>
 		<!-- Panels: always mounted, hidden via CSS (visibility:hidden) for instant toggle -->
-		<div class:panel-hidden={!settingsOpen}>
-			<SettingsPanel ondismiss={() => { settingsOpen = false; }} />
+		<!-- Order matches shortcuts: Ctrl+1 History, Ctrl+2 Notes, Ctrl+3 Media, Ctrl+4 Settings -->
+		<div class:panel-hidden={!historyOpen}>
+			<HistoryPanel entries={historyEntries} onselect={handleHistorySelect} />
 		</div>
 		<div class:panel-hidden={!notesOpen}>
 			<NotesPanel ondismiss={() => { notesOpen = false; pendingNoteText = null; }} {pendingNoteText} onpendingcleared={() => { pendingNoteText = null; }} />
@@ -923,8 +959,8 @@ async function handleDismiss() {
 		<div class:panel-hidden={!mediaOpen}>
 			<MediaPanel ondismiss={() => { mediaOpen = false; }} players={mediaPlayers} />
 		</div>
-		<div class:panel-hidden={!historyOpen}>
-			<HistoryPanel entries={historyEntries} onselect={handleHistorySelect} />
+		<div class:panel-hidden={!settingsOpen}>
+			<SettingsPanel ondismiss={() => { settingsOpen = false; }} />
 		</div>
 		{#if pendingPlan}
 			<AgentPlanPanel
@@ -937,21 +973,20 @@ async function handleDismiss() {
 				ondismiss={() => { pendingPlan = null; }}
 			/>
 		{:else if !settingsOpen && !notesOpen && !mediaOpen && !historyOpen}
-			{#if completions.length > 0}
-				<CompletionsList
-					items={completions}
-					selectedIndex={completionIndex}
-					onselect={handleCompletionSelect}
-					pathContext={searchMode ? searchPathContext : (atMode ? atPathContext : "")}
-					scopeTabs={searchMode && mountPoints.length > 1 ? mountPoints : []}
-					activeScopeIndex={scopeIndex}
-					onscopechange={handleScopeChange}
-					searching={searchMode && !searchDone}
-					browseMode={atMode}
-				/>
-			{:else if atMode && atNoResults}
+			<CompletionsList
+				items={completions}
+				selectedIndex={completionIndex}
+				onselect={handleCompletionSelect}
+				pathContext={searchMode ? searchPathContext : (atMode ? atPathContext : "")}
+				scopeTabs={searchMode && mountPoints.length > 1 ? mountPoints : []}
+				activeScopeIndex={scopeIndex}
+				onscopechange={handleScopeChange}
+				searching={searchMode && !searchDone}
+				browseMode={atMode}
+			/>
+			{#if completions.length === 0 && atMode && atNoResults}
 				<div class="empty-state">Empty folder</div>
-			{:else if searchMode && !searchDone}
+			{:else if completions.length === 0 && searchMode && !searchDone}
 				<div class="empty-state">Searching...</div>
 			{/if}
 			{#if lastResult}
@@ -1024,6 +1059,7 @@ async function handleDismiss() {
 		position: absolute;
 		pointer-events: none;
 		width: 100%;
+		will-change: transform;
 	}
 
 	.empty-state {

@@ -2,6 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tokio::sync::RwLock;
 
+use redb::Database;
+
 use lychi_core::action_registry::handlers::app_launcher::AppLauncher;
 use lychi_core::action_registry::handlers::ask::AskHandler;
 use lychi_core::action_registry::handlers::browse::BrowseHandler;
@@ -27,7 +29,6 @@ use lychi_core::intent::IntentResolver;
 use lychi_core::intent::ai_router::AiRouter;
 #[cfg(feature = "mpris")]
 use lychi_core::mpris::MprisManager;
-use lychi_core::notes::store::NotesStore;
 use lychi_core::paths;
 use lychi_core::providers::byo::{BYOClient, BYOProvider};
 use lychi_core::providers::{AgentPlan, AiProvider};
@@ -35,9 +36,9 @@ use lychi_core::rules::RulesEngine;
 
 pub struct AppState {
     pub executor: Arc<RwLock<Executor>>,
-    pub history: Arc<RwLock<HistoryStore>>,
+    pub db: Arc<Database>,
+    pub history: HistoryStore,
     pub config: Arc<RwLock<Config>>,
-    pub notes: Arc<RwLock<NotesStore>>,
     pub pending_plan: Arc<RwLock<Option<AgentPlan>>>,
     pub active_file_search: Arc<AtomicU64>,
     #[cfg(feature = "mpris")]
@@ -46,20 +47,54 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        let config = Config::load_or_default(&paths::config_file());
+        let mut config = Config::load_or_default(&paths::config_file());
 
-        // Load notes store early so handlers can share the reference
-        let notes = Arc::new(RwLock::new(
-            NotesStore::load_or_create(&paths::notes_file()).unwrap_or_else(|e| {
-                tracing::error!("Failed to load notes: {e} — starting fresh");
-                NotesStore::load_or_create(&paths::notes_file()).unwrap_or_else(|_| {
-                    NotesStore::load_or_create(
-                        &std::env::temp_dir().join("lychi-notes-fallback.json"),
-                    )
-                    .expect("Failed to create fallback notes store")
-                })
-            }),
-        ));
+        // Open redb database (creates file if missing)
+        let db_path = paths::db_file();
+        let db = lychi_core::db::open_database(&db_path).unwrap_or_else(|e| {
+            panic!("Failed to open database: {e}");
+        });
+        let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+        tracing::info!(
+            "Database opened: {} ({:.1} KB)",
+            db_path.display(),
+            db_size as f64 / 1024.0
+        );
+
+        // Seed settings from TOML on first launch (if settings table is empty)
+        if let Err(e) = lychi_core::config::db::seed_from_config(&db, &config) {
+            tracing::error!("Failed to seed settings: {e}");
+        }
+
+        // Sync TOML hand-edits → DB (if user edited TOML between launches)
+        match lychi_core::config::db::load_syncable(&db) {
+            Ok(db_settings) => {
+                if let Err(e) =
+                    lychi_core::config::db::sync_toml_changes(&db, &config, &db_settings)
+                {
+                    tracing::error!("Failed to sync TOML changes: {e}");
+                }
+                // Apply DB settings over TOML (DB wins for syncable fields)
+                lychi_core::config::db::apply_to_config(&db_settings, &mut config);
+            }
+            Err(e) => {
+                tracing::error!("Failed to load settings from DB: {e}");
+            }
+        }
+
+        // Log DB table stats
+        if let Ok(stats) = lychi_core::db::table_stats(&db) {
+            let total = stats.history + stats.notes + stats.todos + stats.settings;
+            tracing::info!(
+                "DB tables: {} history, {} notes, {} todos, {} settings ({} total rows, {:.1} KB on disk)",
+                stats.history,
+                stats.notes,
+                stats.todos,
+                stats.settings,
+                total,
+                db_size as f64 / 1024.0,
+            );
+        }
 
         #[cfg(feature = "mpris")]
         let mpris: Arc<RwLock<Option<lychi_core::mpris::MprisManager>>> =
@@ -86,8 +121,8 @@ impl AppState {
         )));
         registry.register(Box::new(SystemCommand::new()));
         registry.register(Box::new(SysInfoHandler::new()));
-        registry.register(Box::new(NotesHandler::new(notes.clone())));
-        registry.register(Box::new(TodoHandler::new(notes.clone())));
+        registry.register(Box::new(NotesHandler::new(db.clone())));
+        registry.register(Box::new(TodoHandler::new(db.clone())));
         registry.register(Box::new(BrowseHandler::new()));
         let weather_handler = Arc::new(WeatherHandler::new(
             config.weather.unit.clone(),
@@ -126,23 +161,12 @@ impl AppState {
         let rules = RulesEngine::new();
         let executor = Executor::new(registry, rules, resolver);
 
-        let history = HistoryStore::load_or_create(
-            &paths::history_file(),
-            config.history.max_entries,
-            config.history.deduplicate,
-        )
-        .unwrap_or_else(|e| {
-            tracing::error!("Failed to load history: {e}");
-            HistoryStore::load_or_create(&paths::history_file(), 500, true).unwrap_or_else(|e2| {
-                tracing::error!("Failed to create history store: {e2} — using in-memory only");
-                HistoryStore::empty(paths::history_file(), 500, true)
-            })
-        });
+        let history = HistoryStore::new(config.history.max_entries, config.history.deduplicate);
 
         Self {
             executor: Arc::new(RwLock::new(executor)),
-            history: Arc::new(RwLock::new(history)),
-            notes,
+            db,
+            history,
             config: Arc::new(RwLock::new(config)),
             pending_plan: Arc::new(RwLock::new(None)),
             active_file_search: Arc::new(AtomicU64::new(0)),

@@ -13,10 +13,7 @@ pub async fn execute_command(
     state: State<'_, AppState>,
 ) -> Result<ActionResult, LychiError> {
     // Record in history
-    {
-        let mut history = state.history.write().await;
-        history.push(&input);
-    }
+    state.history.push(&state.db, &input)?;
 
     // Run through executor pipeline: resolve → validate → execute
     let executor = state.executor.read().await;

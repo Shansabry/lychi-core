@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use tokio::sync::RwLock;
+use redb::Database;
 
 use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType};
 use crate::error::LychiError;
@@ -11,12 +11,12 @@ use crate::notes::store::{MAX_NOTES, NotesStore};
 // ---- Notes handler ----
 
 pub struct NotesHandler {
-    store: Arc<RwLock<NotesStore>>,
+    db: Arc<Database>,
 }
 
 impl NotesHandler {
-    pub fn new(store: Arc<RwLock<NotesStore>>) -> Self {
-        Self { store }
+    pub fn new(db: Arc<Database>) -> Self {
+        Self { db }
     }
 
     /// Format a note's first line as its title (truncated to 40 chars).
@@ -43,6 +43,7 @@ impl ActionHandler for NotesHandler {
     async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
         let start = Instant::now();
         let text = args.trim();
+        let store = NotesStore::new();
 
         // No args → open notes panel
         if text.is_empty() {
@@ -62,8 +63,7 @@ impl ActionHandler for NotesHandler {
 
         // "read" / "list" → list all notes
         if text.eq_ignore_ascii_case("read") || text.eq_ignore_ascii_case("list") {
-            let store = self.store.read().await;
-            let notes = store.get_notes();
+            let notes = store.get_notes(&self.db)?;
             if notes.is_empty() {
                 return Ok(ActionResult {
                     success: true,
@@ -109,8 +109,7 @@ impl ActionHandler for NotesHandler {
             .or_else(|| text.strip_prefix("rm "))
         {
             let id = rest.trim();
-            let mut store = self.store.write().await;
-            store.delete_note(id)?;
+            store.delete_note(&self.db, id)?;
             return Ok(ActionResult {
                 success: true,
                 output: Some(format!("Note deleted: {id}")),
@@ -126,14 +125,13 @@ impl ActionHandler for NotesHandler {
         }
 
         // Add a new note
-        let mut store = self.store.write().await;
-        match store.add_note(text) {
+        match store.add_note(&self.db, text) {
             Ok(item) => Ok(ActionResult {
                 success: true,
                 output: Some(format!(
                     "Note saved ({} chars, {}/{})",
                     item.text.len(),
-                    store.notes_count(),
+                    store.notes_count(&self.db)?,
                     MAX_NOTES
                 )),
                 error: None,
@@ -168,12 +166,12 @@ impl ActionHandler for NotesHandler {
 // ---- Todo handler ----
 
 pub struct TodoHandler {
-    store: Arc<RwLock<NotesStore>>,
+    db: Arc<Database>,
 }
 
 impl TodoHandler {
-    pub fn new(store: Arc<RwLock<NotesStore>>) -> Self {
-        Self { store }
+    pub fn new(db: Arc<Database>) -> Self {
+        Self { db }
     }
 }
 
@@ -192,6 +190,7 @@ impl ActionHandler for TodoHandler {
     async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
         let start = Instant::now();
         let trimmed = args.trim();
+        let store = NotesStore::new();
 
         // No args → open notes panel
         if trimmed.is_empty() {
@@ -228,8 +227,7 @@ impl ActionHandler for TodoHandler {
                         executed_args: None,
                     });
                 }
-                let mut store = self.store.write().await;
-                let item = store.add_todo(rest)?;
+                let item = store.add_todo(&self.db, rest)?;
                 Ok(ActionResult {
                     success: true,
                     output: Some(format!("Added: {} ({})", item.text, item.id)),
@@ -244,8 +242,7 @@ impl ActionHandler for TodoHandler {
                 })
             }
             "list" | "ls" => {
-                let store = self.store.read().await;
-                let todos = store.get_todos();
+                let todos = store.get_todos(&self.db)?;
                 if todos.is_empty() {
                     return Ok(ActionResult {
                         success: true,
@@ -281,9 +278,8 @@ impl ActionHandler for TodoHandler {
                 })
             }
             "summary" => {
-                let store = self.store.read().await;
-                let notes = store.get_notes();
-                let todos = store.get_todos();
+                let notes = store.get_notes(&self.db)?;
+                let todos = store.get_todos(&self.db)?;
 
                 let mut lines = Vec::new();
 
@@ -350,8 +346,7 @@ impl ActionHandler for TodoHandler {
                         executed_args: None,
                     });
                 }
-                let mut store = self.store.write().await;
-                store.toggle_todo(rest)?;
+                store.toggle_todo(&self.db, rest)?;
                 Ok(ActionResult {
                     success: true,
                     output: Some(format!("Toggled: {rest}")),
@@ -380,8 +375,7 @@ impl ActionHandler for TodoHandler {
                         executed_args: None,
                     });
                 }
-                let mut store = self.store.write().await;
-                store.delete_todo(rest)?;
+                store.delete_todo(&self.db, rest)?;
                 Ok(ActionResult {
                     success: true,
                     output: Some(format!("Deleted: {rest}")),
@@ -397,8 +391,7 @@ impl ActionHandler for TodoHandler {
             }
             // If the first word isn't a subcommand, treat the entire args as "add"
             _ => {
-                let mut store = self.store.write().await;
-                let item = store.add_todo(trimmed)?;
+                let item = store.add_todo(&self.db, trimmed)?;
                 Ok(ActionResult {
                     success: true,
                     output: Some(format!("Added: {} ({})", item.text, item.id)),

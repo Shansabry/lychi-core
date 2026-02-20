@@ -2,6 +2,7 @@ use serde::Serialize;
 use tauri::State;
 
 use lychi_core::error::LychiError;
+use lychi_core::notes::store::NotesStore;
 use lychi_core::notes::{NoteItem, TodoItem};
 
 use crate::state::AppState;
@@ -14,10 +15,10 @@ pub struct AllNotes {
 
 #[tauri::command]
 pub async fn get_all_notes(state: State<'_, AppState>) -> Result<AllNotes, LychiError> {
-    let store = state.notes.read().await;
+    let store = NotesStore::new();
     Ok(AllNotes {
-        notes: store.get_notes().to_vec(),
-        todos: store.get_todos().to_vec(),
+        notes: store.get_notes(&state.db)?,
+        todos: store.get_todos(&state.db)?,
     })
 }
 
@@ -25,14 +26,14 @@ pub async fn get_all_notes(state: State<'_, AppState>) -> Result<AllNotes, Lychi
 
 #[tauri::command]
 pub async fn get_notes(state: State<'_, AppState>) -> Result<Vec<NoteItem>, LychiError> {
-    let notes = state.notes.read().await;
-    Ok(notes.get_notes().to_vec())
+    let store = NotesStore::new();
+    store.get_notes(&state.db)
 }
 
 #[tauri::command]
 pub async fn add_note(text: String, state: State<'_, AppState>) -> Result<NoteItem, LychiError> {
-    let mut notes = state.notes.write().await;
-    notes.add_note(&text)
+    let store = NotesStore::new();
+    store.add_note(&state.db, &text)
 }
 
 #[tauri::command]
@@ -41,38 +42,38 @@ pub async fn update_note(
     text: String,
     state: State<'_, AppState>,
 ) -> Result<(), LychiError> {
-    let mut notes = state.notes.write().await;
-    notes.update_note(&id, &text)
+    let store = NotesStore::new();
+    store.update_note(&state.db, &id, &text)
 }
 
 #[tauri::command]
 pub async fn delete_note(id: String, state: State<'_, AppState>) -> Result<(), LychiError> {
-    let mut notes = state.notes.write().await;
-    notes.delete_note(&id)
+    let store = NotesStore::new();
+    store.delete_note(&state.db, &id)
 }
 
 // ---- Todos ----
 
 #[tauri::command]
 pub async fn get_todos(state: State<'_, AppState>) -> Result<Vec<TodoItem>, LychiError> {
-    let notes = state.notes.read().await;
-    Ok(notes.get_todos().to_vec())
+    let store = NotesStore::new();
+    store.get_todos(&state.db)
 }
 
 #[tauri::command]
 pub async fn add_todo(text: String, state: State<'_, AppState>) -> Result<TodoItem, LychiError> {
-    let mut notes = state.notes.write().await;
-    notes.add_todo(&text)
+    let store = NotesStore::new();
+    store.add_todo(&state.db, &text)
 }
 
 #[tauri::command]
 pub async fn toggle_todo(id: String, state: State<'_, AppState>) -> Result<(), LychiError> {
-    let mut notes = state.notes.write().await;
-    notes.toggle_todo(&id)
+    let store = NotesStore::new();
+    store.toggle_todo(&state.db, &id)
 }
 
 #[tauri::command]
 pub async fn delete_todo(id: String, state: State<'_, AppState>) -> Result<(), LychiError> {
-    let mut notes = state.notes.write().await;
-    notes.delete_todo(&id)
+    let store = NotesStore::new();
+    store.delete_todo(&state.db, &id)
 }

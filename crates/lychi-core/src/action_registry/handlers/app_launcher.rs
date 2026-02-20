@@ -6,7 +6,7 @@ use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::action_registry::handlers::icons::resolve_icon;
@@ -24,6 +24,9 @@ struct DesktopEntry {
 
 /// Global cache for desktop entries — discovered once, reused for all queries.
 static DESKTOP_ENTRIES: OnceLock<HashMap<String, DesktopEntry>> = OnceLock::new();
+
+/// Cached nucleo matcher — reused across calls to avoid ~192ms cold-start on first invocation.
+static MATCHER: Mutex<Option<Matcher>> = Mutex::new(None);
 
 pub struct AppLauncher;
 
@@ -53,6 +56,12 @@ impl AppLauncher {
                 .icon_path
                 .get_or_init(|| entry.icon.as_deref().and_then(resolve_icon));
         }
+        // Pre-warm the nucleo matcher so first real query doesn't pay cold-start cost
+        {
+            let mut guard = MATCHER.lock().unwrap();
+            guard.get_or_insert_with(|| Matcher::new(Config::DEFAULT));
+        }
+
         tracing::info!(
             "[app_launcher] warmup done: entries={:.0}ms icons={:.0}ms total={:.0}ms ({} apps)",
             t_entries.as_secs_f64() * 1000.0,
@@ -162,7 +171,8 @@ impl AppLauncher {
             return Vec::new();
         }
 
-        let mut matcher = Matcher::new(Config::DEFAULT);
+        let mut guard = MATCHER.lock().unwrap();
+        let matcher = guard.get_or_insert_with(|| Matcher::new(Config::DEFAULT));
         let pattern = Atom::new(
             query,
             CaseMatching::Ignore,
@@ -176,7 +186,7 @@ impl AppLauncher {
             .filter_map(|entry| {
                 let mut buf = Vec::new();
                 let haystack = Utf32Str::new(&entry.name, &mut buf);
-                let score = pattern.score(haystack, &mut matcher)?;
+                let score = pattern.score(haystack, matcher)?;
                 Some((entry, score))
             })
             .collect();

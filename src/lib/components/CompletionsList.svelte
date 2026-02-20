@@ -1,6 +1,7 @@
 <script lang="ts">
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { AppWindow, File, Folder, LoaderCircle } from "lucide-svelte";
+import { AppWindow, Folder, LoaderCircle } from "lucide-svelte";
+import { onMount } from "svelte";
 import type { CompletionItem, MountPoint } from "$lib/ipc";
 
 let {
@@ -25,6 +26,10 @@ let {
 	browseMode?: boolean;
 } = $props();
 
+// Fixed pool size — matches the max completions returned (20 for search, ~10 for normal)
+const POOL_SIZE = 20;
+const POOL_INDICES = Array.from({ length: POOL_SIZE }, (_, i) => i);
+
 let listEl: HTMLUListElement | undefined = $state();
 
 // Count non-item rows above the list items for scroll offset
@@ -47,10 +52,8 @@ function iconSrc(path: string | null): string | null {
 }
 
 function displayName(label: string): string {
-	// Show just the filename for path labels (e.g. "~/Documents/foo.txt" → "foo.txt")
 	const lastSlash = label.lastIndexOf("/");
 	if (lastSlash === -1) return label;
-	// For directories, strip trailing slash for display, then get last segment
 	if (label.endsWith("/")) {
 		const trimmed = label.slice(0, -1);
 		const idx = trimmed.lastIndexOf("/");
@@ -59,7 +62,6 @@ function displayName(label: string): string {
 	return label.slice(lastSlash + 1);
 }
 
-// In search mode, show filename + muted parent path
 function searchDisplayName(label: string): { name: string; parent: string } {
 	const lastSlash = label.lastIndexOf("/");
 	if (lastSlash === -1) return { name: label, parent: "" };
@@ -78,9 +80,10 @@ function searchDisplayName(label: string): { name: string; parent: string } {
 }
 
 let isSearchMode = $derived(scopeTabs.length > 0 || searching);
+let hasItems = $derived(items.length > 0);
 </script>
 
-<ul class="completions" role="listbox" bind:this={listEl}>
+<ul class="completions" class:empty={!hasItems} role="listbox" bind:this={listEl}>
 	{#if scopeTabs.length > 1}
 		<li class="scope-tabs" aria-hidden="true">
 			{#each scopeTabs as tab, i}
@@ -111,67 +114,61 @@ let isSearchMode = $derived(scopeTabs.length > 0 || searching);
 			<span class="breadcrumb-path">{pathContext}</span>
 		</li>
 	{/if}
-	{#each items as item, i (item.label)}
+	<!-- Fixed pool: NO {#if} inside slots — all DOM nodes exist from first mount -->
+	{#each POOL_INDICES as idx}
+		{@const item = items[idx]}
+		{@const active = idx < items.length}
+		{@const label = item?.label ?? "\u00A0"}
+		{@const isFolder = item?.icon_path === "__folder__"}
+		{@const hasCustomIcon = !!(item?.icon_path && item.icon_path !== "__folder__")}
+		{@const noIcon = !item?.icon_path}
+		{@const search = searchDisplayName(label)}
 		<li
 			class="completion-item"
-			class:selected={i === selectedIndex}
+			class:selected={active && idx === selectedIndex}
+			class:inactive={!active}
 			onmousedown={(e) => e.preventDefault()}
-			onclick={() => onselect(item.label)}
-			onkeydown={(e) => e.key === "Enter" && onselect(item.label)}
+			onclick={() => active && onselect(item.label)}
+			onkeydown={(e) => e.key === "Enter" && active && onselect(item.label)}
 			role="option"
-			aria-selected={i === selectedIndex}
+			aria-selected={active && idx === selectedIndex}
 			tabindex="-1"
 		>
 			<span class="icon">
-				{#if item.icon_path === "__folder__"}
+				<span style:visibility={isFolder ? "visible" : "hidden"} class="icon-slot">
 					<Folder size={20} strokeWidth={1.5} class="icon-folder" />
-				{:else if item.icon_path}
-					{@const src = iconSrc(item.icon_path)}
-					{#if src}
-						<img src={src} alt="" width="24" height="24" decoding="async" loading="eager" />
-					{:else}
-						<File size={20} strokeWidth={1.5} class="icon-file" />
-					{/if}
-				{:else}
+				</span>
+				<span style:visibility={hasCustomIcon ? "visible" : "hidden"} class="icon-slot">
+					<img
+						src={hasCustomIcon ? (iconSrc(item.icon_path) ?? "") : "data:,"}
+						alt="" width="24" height="24" decoding="async" loading="lazy"
+					/>
+				</span>
+				<span style:visibility={noIcon ? "visible" : "hidden"} class="icon-slot">
 					<AppWindow size={20} strokeWidth={1.5} class="icon-fallback" />
-				{/if}
+				</span>
 			</span>
-			{#if isSearchMode}
-				{@const display = searchDisplayName(item.label)}
-				<div class="label-group">
-					<span class="label">{display.name}</span>
-					{#if display.parent}
-						<span class="search-path">{display.parent}</span>
-					{/if}
-				</div>
-			{:else}
-				<div class="label-group">
-					<span class="label">{pathContext ? displayName(item.label) : item.label}</span>
-					{#if item.description}
-						<span class="description">{item.description}</span>
-					{/if}
-				</div>
-			{/if}
+			<!-- Search-mode label group -->
+			<div class="label-group" class:label-hidden={!isSearchMode}>
+				<span class="label">{search.name}</span>
+				<span class="search-path" style:visibility={search.parent ? "visible" : "hidden"}>{search.parent || "\u00A0"}</span>
+			</div>
+			<!-- Normal-mode label group -->
+			<div class="label-group" class:label-hidden={isSearchMode}>
+				<span class="label">{pathContext ? displayName(label) : label}</span>
+				<span class="description" style:visibility={item?.description ? "visible" : "hidden"}>{item?.description ?? "\u00A0"}</span>
+			</div>
 		</li>
 	{/each}
-	{#if items.length > 0}
-		<li class="hints" aria-hidden="true">
-			<span class="hint"><kbd>↑↓</kbd> navigate</span>
-			<span class="hint"><kbd>↵</kbd> {isSearchMode ? "open" : (items[selectedIndex]?.icon_path === "__folder__" ? "open folder" : "select")}</span>
-			{#if (browseMode || isSearchMode) && items[selectedIndex]?.icon_path === "__folder__"}
-				<span class="hint"><kbd>tab</kbd> drill into</span>
-			{/if}
-			{#if isSearchMode}
-				<span class="hint"><kbd>⇧tab</kbd> go back</span>
-			{:else if browseMode && pathContext && pathContext !== "~/"}
-				<span class="hint"><kbd>⇧tab</kbd> go back</span>
-			{/if}
-			{#if scopeTabs.length > 1}
-				<span class="hint"><kbd>ctrl+tab</kbd> switch scope</span>
-			{/if}
-			<span class="hint"><kbd>esc</kbd> dismiss</span>
-		</li>
-	{/if}
+	<!-- Hints bar — kept with {#if} since it's not in the hot path -->
+	<li class="hints" aria-hidden="true" class:inactive={items.length === 0}>
+		<span class="hint"><kbd>↑↓</kbd> navigate</span>
+		<span class="hint"><kbd>↵</kbd> {isSearchMode ? "open" : (items[selectedIndex]?.icon_path === "__folder__" ? "open folder" : "select")}</span>
+		<span class="hint" style:visibility={(browseMode || isSearchMode) && items[selectedIndex]?.icon_path === "__folder__" ? "visible" : "hidden"}><kbd>tab</kbd> drill into</span>
+		<span class="hint" style:visibility={isSearchMode || (browseMode && pathContext && pathContext !== "~/") ? "visible" : "hidden"}><kbd>⇧tab</kbd> go back</span>
+		<span class="hint" style:visibility={scopeTabs.length > 1 ? "visible" : "hidden"}><kbd>ctrl+tab</kbd> switch scope</span>
+		<span class="hint"><kbd>esc</kbd> dismiss</span>
+	</li>
 </ul>
 
 <style>
@@ -180,9 +177,15 @@ let isSearchMode = $derived(scopeTabs.length > 0 || searching);
 		overflow-y: auto;
 		flex: 1;
 		min-height: 0;
+		will-change: transform;
 	}
 
-
+	.completions.empty {
+		visibility: hidden;
+		max-height: 0;
+		overflow: hidden;
+		pointer-events: none;
+	}
 
 	.scope-tabs {
 		display: flex;
@@ -252,6 +255,22 @@ let isSearchMode = $derived(scopeTabs.length > 0 || searching);
 		user-select: none;
 	}
 
+	.inactive {
+		max-height: 0;
+		overflow: hidden;
+		opacity: 0;
+		pointer-events: none;
+		padding: 0 !important;
+		margin: 0 !important;
+		border: none !important;
+	}
+
+	.label-hidden {
+		visibility: hidden;
+		position: absolute;
+		pointer-events: none;
+	}
+
 	.completion-item {
 		display: flex;
 		align-items: center;
@@ -259,11 +278,12 @@ let isSearchMode = $derived(scopeTabs.length > 0 || searching);
 		padding: 8px 20px 8px 18px;
 		cursor: pointer;
 		border-left: 2px solid transparent;
-		transition: background 80ms ease, padding-left 80ms ease, border-color 80ms ease;
+		position: relative;
 	}
 
 	.completion-item:hover {
 		background: var(--bg-secondary);
+		transition: background 80ms ease;
 	}
 
 	.completion-item.selected {
@@ -275,10 +295,19 @@ let isSearchMode = $derived(scopeTabs.length > 0 || searching);
 	.icon {
 		width: 24px;
 		height: 24px;
+		position: relative;
+		flex-shrink: 0;
+	}
+
+	.icon-slot {
+		position: absolute;
+		top: 0;
+		left: 0;
+		width: 24px;
+		height: 24px;
 		display: flex;
 		align-items: center;
 		justify-content: center;
-		flex-shrink: 0;
 	}
 
 	.icon img {

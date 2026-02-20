@@ -286,13 +286,13 @@ function handleKeydown(e: KeyboardEvent) {
 		ontogglehistory();
 	} else if (e.ctrlKey && e.key === "2") {
 		e.preventDefault();
-		ontogglemedia();
+		ontogglenotes();
 	} else if (e.ctrlKey && e.key === "3") {
 		e.preventDefault();
-		ontogglesettings();
+		ontogglemedia();
 	} else if (e.ctrlKey && e.key === "4") {
 		e.preventDefault();
-		ontogglenotes();
+		ontogglesettings();
 	}
 }
 </script>
@@ -316,21 +316,16 @@ function handleKeydown(e: KeyboardEvent) {
 				<span class="placeholder-text">{placeholderText}</span>
 			</div>
 		{/if}
-		{#if ghostSuffix}
-			<div class="ghost-overlay" aria-hidden="true">
-				<span class="ghost-typed">{value}</span><span class="ghost-suffix">{ghostSuffix}</span>
-			</div>
-		{/if}
-		{#if ghostFull}
-			<div class="ghost-overlay" aria-hidden="true">
-				<span class="ghost-typed">{value}</span><span class="ghost-fuzzy-hint"> ~{ghostFull}</span>
-			</div>
-		{/if}
-		{#if ghostAtSuffix}
-			<div class="ghost-overlay" aria-hidden="true">
-				<span class="ghost-typed">{value}</span><span class="ghost-suffix">{ghostAtSuffix}</span>
-			</div>
-		{/if}
+		<div class="ghost-overlay" aria-hidden="true" style:visibility={ghostSuffix ? "visible" : "hidden"}>
+			<span class="ghost-typed">{value}</span><span class="ghost-suffix">{ghostSuffix}</span>
+		</div>
+		<div class="ghost-overlay" aria-hidden="true" style:visibility={ghostFull ? "visible" : "hidden"}>
+			<span class="ghost-typed">{value}</span><span class="ghost-fuzzy-hint"> ~{ghostFull}</span>
+		</div>
+		<div class="ghost-overlay" aria-hidden="true" style:visibility={ghostAtSuffix ? "visible" : "hidden"}>
+			<span class="ghost-typed">{value}</span><span class="ghost-suffix">{ghostAtSuffix}</span>
+		</div>
+		<!-- svelte-ignore a11y_autofocus — launcher input must grab focus immediately -->
 		<input
 			bind:this={inputEl}
 			bind:value
@@ -466,6 +461,7 @@ function handleKeydown(e: KeyboardEvent) {
 		white-space: pre;
 		display: flex;
 		align-items: center;
+		will-change: transform;
 	}
 
 	.ghost-typed {

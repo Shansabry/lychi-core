@@ -147,30 +147,30 @@ async function togglePlayPause() {
 		</button>
 		<button
 			class="bar-icon"
-			class:active={mediaOpen}
-			onmousedown={(e) => e.preventDefault()}
-			onclick={ontogglemedia}
-			title="Media (Ctrl+2)"
-			tabindex={-1}
-		>
-			<Music size={14} strokeWidth={1.5} />
-		</button>
-		<button
-			class="bar-icon"
 			class:active={notesOpen}
 			onmousedown={(e) => e.preventDefault()}
 			onclick={ontogglenotes}
-			title="Notes (Ctrl+4)"
+			title="Notes (Ctrl+2)"
 			tabindex={-1}
 		>
 			<StickyNote size={14} strokeWidth={1.5} />
 		</button>
 		<button
 			class="bar-icon"
+			class:active={mediaOpen}
+			onmousedown={(e) => e.preventDefault()}
+			onclick={ontogglemedia}
+			title="Media (Ctrl+3)"
+			tabindex={-1}
+		>
+			<Music size={14} strokeWidth={1.5} />
+		</button>
+		<button
+			class="bar-icon"
 			class:active={settingsOpen}
 			onmousedown={(e) => e.preventDefault()}
 			onclick={ontogglesettings}
-			title="Settings (Ctrl+3)"
+			title="Settings (Ctrl+4)"
 			tabindex={-1}
 		>
 			<Settings size={14} strokeWidth={1.5} />
