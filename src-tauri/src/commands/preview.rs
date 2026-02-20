@@ -22,6 +22,16 @@ pub enum FilePreviewData {
         mime: String,
         size_bytes: u64,
     },
+    Directory {
+        item_count: usize,
+        children: Vec<DirChild>,
+    },
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct DirChild {
+    pub name: String,
+    pub is_dir: bool,
 }
 
 /// Derive a language identifier from a file extension.
@@ -93,6 +103,26 @@ pub async fn get_file_preview(path: String) -> Result<FilePreviewData, LychiErro
         return Err(LychiError::ExecutionFailed(format!(
             "File not found: {path}"
         )));
+    }
+    if file_path.is_dir() {
+        let mut children: Vec<DirChild> = std::fs::read_dir(file_path)?
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                if name.starts_with('.') {
+                    return None;
+                }
+                let is_dir = e.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                Some(DirChild { name, is_dir })
+            })
+            .collect();
+        children.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
+        let item_count = children.len();
+        children.truncate(20);
+        return Ok(FilePreviewData::Directory {
+            item_count,
+            children,
+        });
     }
     if !file_path.is_file() {
         return Err(LychiError::ExecutionFailed(format!("Not a file: {path}")));

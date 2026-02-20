@@ -29,7 +29,7 @@ let {
 	history = [],
 }: {
 	value: string;
-	onsubmit: () => void;
+	onsubmit: (opts?: { ctrlKey?: boolean }) => void;
 	onarrowup: () => void;
 	onarrowdown: () => void;
 	ondismiss: () => void;
@@ -265,7 +265,7 @@ function handleKeydown(e: KeyboardEvent) {
 		acceptGhost();
 	} else if (matchesAction(e, "submit") && !e.shiftKey) {
 		e.preventDefault();
-		onsubmit();
+		onsubmit({ ctrlKey: e.ctrlKey || e.metaKey });
 	} else if (e.key === "ArrowUp") {
 		e.preventDefault();
 		onarrowup();

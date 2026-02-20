@@ -96,12 +96,15 @@ export interface FileSearchResult {
 	is_dir: boolean;
 	score: number;
 	description?: string | null;
+	size_bytes?: number | null;
+	modified_secs?: number | null;
 }
 
 export interface FileSearchBatch {
 	search_id: number;
 	results: FileSearchResult[];
 	done: boolean;
+	has_ignore_rules?: boolean;
 }
 
 export async function getMountPoints(): Promise<MountPoint[]> {
@@ -544,7 +547,8 @@ export async function deleteTodo(id: string): Promise<void> {
 export type FilePreviewData =
 	| { kind: "Text"; content: string; language: string; truncated: boolean }
 	| { kind: "Image"; base64: string; mime: string }
-	| { kind: "Unsupported"; mime: string; size_bytes: number };
+	| { kind: "Unsupported"; mime: string; size_bytes: number }
+	| { kind: "Directory"; item_count: number; children: { name: string; is_dir: boolean }[] };
 
 export async function getFilePreview(path: string): Promise<FilePreviewData> {
 	if (!isTauri()) return { kind: "Unsupported", mime: "unknown", size_bytes: 0 };

@@ -227,6 +227,8 @@ pub struct FileSearchResult {
     pub is_dir: bool,
     pub score: u16,
     pub description: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub modified_secs: Option<u64>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -234,6 +236,7 @@ pub struct FileSearchBatch {
     pub search_id: u64,
     pub results: Vec<FileSearchResult>,
     pub done: bool,
+    pub has_ignore_rules: bool,
 }
 
 /// Detect real mounted filesystems. Home directory is always first.
@@ -292,9 +295,8 @@ pub async fn get_mount_points() -> Result<Vec<MountPoint>, LychiError> {
 }
 
 /// Build a display label for a search result path.
-fn search_display_label(path: &Path, is_dir: bool) -> String {
-    let home = dirs::home_dir();
-    let display = if let Some(ref home) = home {
+fn search_display_label(path: &Path, is_dir: bool, home: Option<&Path>) -> String {
+    let display = if let Some(home) = home {
         if let Ok(rel) = path.strip_prefix(home) {
             format!("~/{}", rel.display())
         } else {
@@ -348,6 +350,9 @@ fn walk_and_emit(
     const MAX_RESULTS: usize = 50;
 
     let is_listing = query.is_empty();
+    let wants_hidden = query.starts_with('.');
+    let query_has_slash = query.contains('/');
+    let home = dirs::home_dir();
 
     let mut matcher = Matcher::new(MatcherConfig::DEFAULT);
     let pattern = Atom::new(
@@ -358,19 +363,113 @@ fn walk_and_emit(
         false,
     );
 
+    const MAX_SEARCH_DEPTH: usize = 10;
+
+    let scope_path = Path::new(scope);
+    let has_ignore_rules =
+        scope_path.join(".gitignore").exists() || scope_path.join(".ignore").exists();
+
     let mut builder = WalkBuilder::new(scope);
     builder
-        .hidden(true)
-        .ignore(true)
-        .git_ignore(true)
+        .hidden(!wants_hidden)
+        .ignore(!is_listing) // Don't apply .ignore rules when listing — they hide folders silently
+        .git_ignore(!is_listing) // Only apply .gitignore during search, not directory listing
         .git_global(false)
         .git_exclude(false)
-        .follow_links(false);
-    if is_listing {
-        builder.max_depth(Some(1));
-    }
+        .follow_links(false)
+        .max_depth(Some(if is_listing { 1 } else { MAX_SEARCH_DEPTH }));
     let walker = builder.build();
 
+    // Helper: build a result from a walk entry
+    let build_result = |entry: &ignore::DirEntry,
+                        file_name: &str,
+                        is_dir: bool,
+                        score: u16,
+                        home: Option<&Path>|
+     -> FileSearchResult {
+        let path = entry.path();
+        let meta = entry.metadata().ok();
+        let size_bytes = meta.as_ref().map(|m| m.len());
+        let modified_secs = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        let description = if is_dir {
+            Some("Folder".into())
+        } else {
+            file_name
+                .rsplit('.')
+                .next()
+                .filter(|ext| !ext.is_empty() && ext.len() < 6 && *ext != file_name)
+                .map(|ext| ext.to_uppercase())
+        };
+        FileSearchResult {
+            label: search_display_label(path, is_dir, home),
+            full_path: path.to_string_lossy().to_string(),
+            is_dir,
+            score,
+            description,
+            size_bytes,
+            modified_secs,
+        }
+    };
+
+    if is_listing {
+        // Directory listing: collect ALL items, sort globally (dirs first, then alpha), emit once.
+        // With max_depth=1 this is just a readdir — fast even for 500+ items.
+        let mut all: Vec<FileSearchResult> = Vec::new();
+
+        for entry in walker {
+            if active_id.load(Ordering::Relaxed) != search_id {
+                return;
+            }
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let file_name = match entry.file_name().to_str() {
+                Some(n) => n,
+                None => continue,
+            };
+            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+            if entry.depth() == 0 {
+                continue;
+            }
+            if file_name.starts_with('.') && !wants_hidden {
+                continue;
+            }
+            let score = if is_dir { 100 } else { 50 };
+            all.push(build_result(
+                &entry,
+                file_name,
+                is_dir,
+                score,
+                home.as_deref(),
+            ));
+        }
+
+        // Sort: dirs first, then alphabetically by label within each group
+        all.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase()))
+        });
+        all.truncate(MAX_RESULTS);
+
+        let _ = app.emit(
+            "lychi://file-search-results",
+            FileSearchBatch {
+                search_id,
+                results: all,
+                done: true,
+                has_ignore_rules,
+            },
+        );
+        return;
+    }
+
+    // Fuzzy search: stream results in batches for responsive UI
     let mut batch: Vec<FileSearchResult> = Vec::with_capacity(BATCH_SIZE);
     let mut total_sent: usize = 0;
 
@@ -391,47 +490,36 @@ fn walk_and_emit(
 
         let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
 
-        // Skip the root directory itself and hidden files in listing mode
-        if is_listing {
-            if entry.depth() == 0 {
-                continue;
-            }
-            if file_name.starts_with('.') {
-                continue;
-            }
+        if file_name.starts_with('.') && !wants_hidden {
+            continue;
         }
-
-        let score = if is_listing {
-            // Directory listing — no fuzzy scoring, dirs first
-            if is_dir { 100 } else { 50 }
-        } else {
-            let mut buf = Vec::new();
-            let haystack = Utf32Str::new(file_name, &mut buf);
-            match pattern.score(haystack, &mut matcher) {
-                Some(s) => s,
-                None => continue,
-            }
-        };
 
         let path = entry.path();
 
-        let description = if is_dir {
-            Some("Folder".into())
-        } else {
-            file_name
-                .rsplit('.')
-                .next()
-                .filter(|ext| !ext.is_empty() && ext.len() < 6 && *ext != file_name)
-                .map(|ext| ext.to_uppercase())
+        let mut buf = Vec::new();
+        // Try filename match first — boosted so name hits rank above path-only hits
+        let name_haystack = Utf32Str::new(file_name, &mut buf);
+        let name_score = pattern.score(name_haystack, &mut matcher);
+
+        // Also try path match for queries with '/'
+        let rel = path.strip_prefix(scope).unwrap_or(path).to_string_lossy();
+        buf.clear();
+        let path_haystack = Utf32Str::new(&rel, &mut buf);
+        let path_score = pattern.score(path_haystack, &mut matcher);
+
+        let score = match (name_score, path_score) {
+            (Some(ns), _) => ns.saturating_add(100), // filename match: boosted
+            (None, Some(ps)) if query_has_slash => ps, // path match: only when query has '/'
+            _ => continue,
         };
 
-        batch.push(FileSearchResult {
-            label: search_display_label(path, is_dir),
-            full_path: path.to_string_lossy().to_string(),
+        batch.push(build_result(
+            &entry,
+            file_name,
             is_dir,
             score,
-            description,
-        });
+            home.as_deref(),
+        ));
 
         // Emit first batch sooner (3 items) for faster perceived response
         let effective_batch = if total_sent == 0 { 3 } else { BATCH_SIZE };
@@ -443,6 +531,7 @@ fn walk_and_emit(
                     search_id,
                     results: std::mem::take(&mut batch),
                     done: false,
+                    has_ignore_rules,
                 },
             );
             total_sent += effective_batch;
@@ -459,6 +548,7 @@ fn walk_and_emit(
             search_id,
             results: batch,
             done: true,
+            has_ignore_rules,
         },
     );
 }

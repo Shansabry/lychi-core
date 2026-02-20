@@ -1,5 +1,5 @@
 <script lang="ts">
-import { FileQuestion, FileText, Image, LoaderCircle } from "lucide-svelte";
+import { File, FileQuestion, FileText, Folder, Image, LoaderCircle } from "lucide-svelte";
 import { marked } from "marked";
 import { type FilePreviewData, getFilePreview } from "$lib/ipc";
 
@@ -110,6 +110,28 @@ function formatBytes(bytes: number): string {
 				<FileQuestion size={24} strokeWidth={1.5} />
 				<span class="unsupported-type">{preview.mime}</span>
 				<span class="unsupported-size">{formatBytes(preview.size_bytes)}</span>
+			</div>
+		{:else if preview.kind === "Directory"}
+			<div class="preview-header">
+				<Folder size={14} strokeWidth={1.5} />
+				<span class="lang-badge">{preview.item_count} item{preview.item_count === 1 ? "" : "s"}</span>
+			</div>
+			<div class="preview-content dir-listing">
+				{#each preview.children as child}
+					<div class="dir-child">
+						{#if child.is_dir}
+							<Folder size={13} strokeWidth={1.5} class="dir-child-icon-folder" />
+						{:else}
+							<File size={13} strokeWidth={1.5} class="dir-child-icon-file" />
+						{/if}
+						<span class="dir-child-name">{child.name}{child.is_dir ? "/" : ""}</span>
+					</div>
+				{/each}
+				{#if preview.item_count > preview.children.length}
+					<div class="dir-child dir-child-more">
+						+{preview.item_count - preview.children.length} more
+					</div>
+				{/if}
 			</div>
 		{/if}
 	{/if}
@@ -281,6 +303,44 @@ function formatBytes(bytes: number): string {
 		background: var(--bg-secondary);
 	}
 
+	.dir-listing {
+		padding: 6px 0;
+	}
+
+	.dir-child {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 3px 14px;
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--fg);
+	}
+
+	.dir-child :global(.dir-child-icon-folder) {
+		color: var(--accent);
+		flex-shrink: 0;
+	}
+
+	.dir-child :global(.dir-child-icon-file) {
+		color: var(--fg-muted);
+		opacity: 0.5;
+		flex-shrink: 0;
+	}
+
+	.dir-child-name {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.dir-child-more {
+		color: var(--fg-muted);
+		opacity: 0.5;
+		font-size: 11px;
+		padding-left: 35px;
+	}
+
 	.image-container {
 		display: flex;
 		align-items: center;
@@ -348,41 +408,10 @@ function formatBytes(bytes: number): string {
 		opacity: 0.4;
 	}
 
-	/* Shrink preview on medium landscape screens */
-	@media (max-width: 1400px) and (min-width: 1101px) {
+	/* Narrow/portrait screens: hide preview entirely — result list metadata is sufficient */
+	@media (max-width: 1100px), (orientation: portrait) {
 		.preview-panel {
-			width: 280px;
-		}
-	}
-
-	/* Narrow screens: reposition below the launcher instead of to the right */
-	@media (max-width: 1100px) {
-		.preview-panel {
-			position: absolute;
-			left: 0;
-			top: 100%;
-			margin-top: 8px;
-			width: 100%;
-			max-height: 20vh;
-		}
-	}
-
-	/* Portrait orientation: always below, compact height since launcher uses most vertical space */
-	@media (orientation: portrait) {
-		.preview-panel {
-			position: absolute;
-			left: 0;
-			top: 100%;
-			margin-top: 8px;
-			width: 100%;
-			max-height: 18vh;
-		}
-	}
-
-	/* Short viewports (e.g. landscape ultra-short or small screens) */
-	@media (max-height: 600px) {
-		.preview-panel {
-			max-height: 25vh;
+			display: none;
 		}
 	}
 </style>

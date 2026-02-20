@@ -57,7 +57,24 @@ function parseCombo(combo: string): ParsedBinding {
 	};
 }
 
-function normalizeKey(key: string): string {
+// Map e.code → logical key name for when WebKitGTK returns "Unidentified" for e.key
+const CODE_TO_KEY: Record<string, string> = {
+	Tab: "tab",
+	Space: "space",
+	Enter: "enter",
+	Escape: "escape",
+	Backspace: "backspace",
+	Delete: "delete",
+	ArrowUp: "arrowup",
+	ArrowDown: "arrowdown",
+	ArrowLeft: "arrowleft",
+	ArrowRight: "arrowright",
+};
+
+function normalizeKey(key: string, code?: string): string {
+	if (key === "Unidentified" && code) {
+		return CODE_TO_KEY[code] ?? code.toLowerCase();
+	}
 	if (key === " ") return "space";
 	return key.toLowerCase();
 }
@@ -73,7 +90,7 @@ function fingerprint(
 }
 
 function eventFp(e: KeyboardEvent): string {
-	return fingerprint(e.ctrlKey, e.shiftKey, e.altKey, e.metaKey, normalizeKey(e.key));
+	return fingerprint(e.ctrlKey, e.shiftKey, e.altKey, e.metaKey, normalizeKey(e.key, e.code));
 }
 
 function bindingFp(b: ParsedBinding): string {

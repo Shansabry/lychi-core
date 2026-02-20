@@ -14,6 +14,9 @@ let {
 	onscopechange = () => {},
 	searching = false,
 	browseMode = false,
+	searchMode = false,
+	metaMap = undefined,
+	ignoreActive = false,
 }: {
 	items: CompletionItem[];
 	selectedIndex: number;
@@ -24,6 +27,9 @@ let {
 	onscopechange?: (index: number) => void;
 	searching?: boolean;
 	browseMode?: boolean;
+	searchMode?: boolean;
+	metaMap?: Map<string, { size_bytes?: number | null; modified_secs?: number | null }>;
+	ignoreActive?: boolean;
 } = $props();
 
 // Fixed pool size — matches the max completions returned (20 for search, ~10 for normal)
@@ -82,8 +88,25 @@ function searchDisplayName(label: string): { name: string; parent: string } {
 	};
 }
 
-let isSearchMode = $derived(scopeTabs.length > 0 || searching);
+let isSearchMode = $derived(searchMode || scopeTabs.length > 0);
 let hasItems = $derived(items.length > 0);
+
+function relativeTime(secs: number | null | undefined): string {
+	if (!secs) return "";
+	const diff = Math.floor(Date.now() / 1000) - secs;
+	if (diff < 60) return "just now";
+	if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+	if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+	if (diff < 604800) return `${Math.floor(diff / 86400)}d ago`;
+	return new Date(secs * 1000).toLocaleDateString();
+}
+
+function formatSize(bytes: number | null | undefined): string {
+	if (!bytes) return "";
+	if (bytes < 1024) return `${bytes} B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+	return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 </script>
 
 <ul class="completions" class:empty={!hasItems} role="listbox" bind:this={listEl}>
@@ -115,6 +138,13 @@ let hasItems = $derived(items.length > 0);
 	{#if pathContext}
 		<li class="breadcrumb" aria-hidden="true">
 			<span class="breadcrumb-path">{pathContext}</span>
+			{#if ignoreActive}
+				<span class="ignore-badge">.gitignore</span>
+			{/if}
+		</li>
+	{:else if ignoreActive && isSearchMode}
+		<li class="breadcrumb" aria-hidden="true">
+			<span class="ignore-badge">.gitignore</span>
 		</li>
 	{/if}
 	<!-- Fixed pool: NO {#if} inside slots — all DOM nodes exist from first mount -->
@@ -130,6 +160,8 @@ let hasItems = $derived(items.length > 0);
 		{@const showImg = hasCustomIcon && !iconBroken}
 		{@const showFallback = noIcon || iconBroken}
 		{@const search = searchDisplayName(label)}
+		{@const meta = metaMap?.get(label)}
+		{@const timeStr = relativeTime(meta?.modified_secs)}
 		<li
 			class="completion-item"
 			class:selected={active && idx === selectedIndex}
@@ -147,7 +179,7 @@ let hasItems = $derived(items.length > 0);
 				</span>
 				<span style:visibility={showImg ? "visible" : "hidden"} class="icon-slot">
 					<img
-						src={showImg && Math.abs(idx - selectedIndex) <= 3 ? (iconSrc(item.icon_path) ?? "") : "data:,"}
+						src={showImg ? (iconSrc(item.icon_path) ?? "") : "data:,"}
 						alt="" width="24" height="24" decoding="async"
 						onerror={() => { if (item?.icon_path) brokenIcons.add(item.icon_path); brokenIcons = brokenIcons; }}
 					/>
@@ -157,8 +189,12 @@ let hasItems = $derived(items.length > 0);
 				</span>
 			</span>
 			<!-- Search-mode label group -->
-			<div class="label-group" class:label-hidden={!isSearchMode}>
-				<span class="label">{search.name}</span>
+			<div class="label-group search-label-group" class:label-hidden={!isSearchMode}>
+				<span class="label search-name">{search.name}</span>
+				<span class="search-meta">
+					<span class="type-badge" style:visibility={item?.description && !isFolder ? "visible" : "hidden"}>{item?.description ?? "\u00A0"}</span>
+					<span class="meta-time" style:visibility={timeStr && !isFolder ? "visible" : "hidden"}>{timeStr || "\u00A0"}</span>
+				</span>
 				<span class="search-path" style:visibility={search.parent ? "visible" : "hidden"}>{search.parent || "\u00A0"}</span>
 			</div>
 			<!-- Normal-mode label group -->
@@ -171,8 +207,9 @@ let hasItems = $derived(items.length > 0);
 	<!-- Hints bar — kept with {#if} since it's not in the hot path -->
 	<li class="hints" aria-hidden="true" class:inactive={items.length === 0}>
 		<span class="hint"><kbd>↑↓</kbd> navigate</span>
-		<span class="hint"><kbd>↵</kbd> {isSearchMode ? "open" : (items[selectedIndex]?.icon_path === "__folder__" ? "open folder" : "select")}</span>
-		<span class="hint" style:visibility={(browseMode || isSearchMode) && items[selectedIndex]?.icon_path === "__folder__" ? "visible" : "hidden"}><kbd>tab</kbd> drill into</span>
+		<span class="hint"><kbd>↵</kbd> {isSearchMode ? (items[selectedIndex]?.icon_path === "__folder__" ? "drill into" : "open") : (items[selectedIndex]?.icon_path === "__folder__" ? "open folder" : "select")}</span>
+		<span class="hint" style:visibility={isSearchMode && items[selectedIndex]?.icon_path === "__folder__" ? "visible" : "hidden"}><kbd>ctrl+↵</kbd> open</span>
+		<span class="hint" style:visibility={browseMode && items[selectedIndex]?.icon_path === "__folder__" ? "visible" : "hidden"}><kbd>tab</kbd> drill into</span>
 		<span class="hint" style:visibility={isSearchMode || (browseMode && pathContext && pathContext !== "~/") ? "visible" : "hidden"}><kbd>⇧tab</kbd> go back</span>
 		<span class="hint" style:visibility={scopeTabs.length > 1 ? "visible" : "hidden"}><kbd>ctrl+tab</kbd> switch scope</span>
 		<span class="hint"><kbd>esc</kbd> dismiss</span>
@@ -261,6 +298,20 @@ let hasItems = $derived(items.length > 0);
 		color: var(--fg-muted);
 		opacity: 0.6;
 		user-select: none;
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+
+	.ignore-badge {
+		font-family: var(--font-mono);
+		font-size: 9px;
+		color: var(--fg-muted);
+		background: var(--bg-secondary);
+		padding: 1px 6px;
+		border-radius: 4px;
+		opacity: 0.6;
+		margin-left: auto;
 	}
 
 	.inactive {
@@ -274,9 +325,7 @@ let hasItems = $derived(items.length > 0);
 	}
 
 	.label-hidden {
-		visibility: hidden;
-		position: absolute;
-		pointer-events: none;
+		display: none !important;
 	}
 
 	.completion-item {
@@ -322,6 +371,10 @@ let hasItems = $derived(items.length > 0);
 		width: 24px;
 		height: 24px;
 		object-fit: contain;
+		border: none;
+		outline: none;
+		background: transparent;
+		color: transparent; /* hides alt text and broken-image glyph */
 	}
 
 	.icon :global(.icon-fallback) {
@@ -345,6 +398,10 @@ let hasItems = $derived(items.length > 0);
 		flex: 1;
 	}
 
+	.search-label-group {
+		gap: 6px;
+	}
+
 	.label {
 		font-family: var(--font-mono);
 		font-size: 14px;
@@ -354,12 +411,45 @@ let hasItems = $derived(items.length > 0);
 		text-overflow: ellipsis;
 	}
 
+	/* In search mode, filename should shrink to make room for meta + path */
+	.search-name {
+		flex-shrink: 1;
+		min-width: 60px;
+	}
+
 	.description {
 		font-family: var(--font-mono);
 		font-size: 11px;
 		color: var(--fg-muted);
 		opacity: 0.5;
 		flex-shrink: 0;
+	}
+
+	.search-meta {
+		display: flex;
+		align-items: baseline;
+		gap: 6px;
+		flex-shrink: 0;
+	}
+
+	.type-badge {
+		font-family: var(--font-mono);
+		font-size: 10px;
+		color: var(--accent);
+		background: var(--bg-secondary);
+		padding: 1px 6px;
+		border-radius: 4px;
+		flex-shrink: 0;
+		opacity: 0.7;
+	}
+
+	.meta-time {
+		font-family: var(--font-mono);
+		font-size: 10px;
+		color: var(--fg-muted);
+		opacity: 0.4;
+		flex-shrink: 0;
+		white-space: nowrap;
 	}
 
 	.search-path {
@@ -371,6 +461,8 @@ let hasItems = $derived(items.length > 0);
 		overflow: hidden;
 		text-overflow: ellipsis;
 		margin-left: auto;
+		flex-shrink: 1;
+		min-width: 0;
 	}
 
 	.completion-item.selected .label {

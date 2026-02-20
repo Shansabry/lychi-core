@@ -36,7 +36,7 @@ import {
 	saveWindowPosition,
 	startFileSearch,
 } from "$lib/ipc";
-import { loadKeybindings } from "$lib/keybindings";
+import { loadKeybindings, matchesAction } from "$lib/keybindings";
 import { preloadAll } from "$lib/preloadCache";
 
 let inputValue = $state("");
@@ -68,6 +68,9 @@ let scopeIndex = $state(0);
 let activeScope = $derived(mountPoints[scopeIndex]?.path ?? "");
 let searchScopePath = $state(""); // absolute path when drilled into a folder
 let filePathMap: Map<string, string> = $state(new Map()); // label → full_path for preview
+let fileMetaMap: Map<string, { size_bytes?: number | null; modified_secs?: number | null }> =
+	$state(new Map());
+let ignoreActive = $state(false);
 
 // Derive breadcrumb path context for / search mode (when drilled into a folder)
 let searchPathContext = $derived.by(() => {
@@ -111,12 +114,12 @@ let nowPlaying = $derived.by(() => {
 
 let multiplePlayers = $derived(mediaPlayers.length > 1);
 
-// File preview — show for non-folder files in search or browse mode
+// File preview — show for files and folders in search or browse mode
 let previewPath = $derived.by(() => {
 	if (!searchMode && !atMode) return "";
 	if (completions.length === 0 || completionIndex < 0) return "";
 	const item = completions[completionIndex];
-	if (!item || item.icon_path === "__folder__") return "";
+	if (!item) return "";
 	return resolveFullPath(item.label);
 });
 let showPreview = $derived(previewPath.length > 0);
@@ -187,23 +190,34 @@ function handleInput(val: string) {
 	// Detect / file search mode — must be at the start of input
 	if (val.startsWith("/")) {
 		const raw = val.slice(1);
-		if (!raw.includes(" ")) {
+
+		// Parse path first: /folder/subfolder/query → scope=folder/subfolder, searchTerm=query
+		const lastSlash = raw.lastIndexOf("/");
+		const searchTermCandidate = lastSlash >= 0 ? raw.slice(lastSlash + 1) : raw;
+
+		// Only reject if the search term (part after last /) has a space — folder paths can have spaces
+		if (!searchTermCandidate.includes(" ")) {
 			// Exit @ mode if active
 			atMode = false;
 			atStart = -1;
+
+			// Refresh mount points on entering search mode (detects new USB drives etc.)
+			if (!searchMode) {
+				getMountPoints().then((mounts) => {
+					mountPoints = mounts;
+				});
+			}
 
 			searchMode = true;
 			searchDone = false;
 			fileSearchId++;
 			const id = fileSearchId;
 
-			// Parse path: /folder/subfolder/query → scope=folder/subfolder, searchTerm=query
-			const lastSlash = raw.lastIndexOf("/");
 			let searchScope: string;
 			let searchTerm: string;
 			if (lastSlash >= 0) {
-				const folderPart = raw.slice(0, lastSlash); // e.g. "Documents/reports"
-				searchTerm = raw.slice(lastSlash + 1); // e.g. "q1" or ""
+				const folderPart = raw.slice(0, lastSlash); // e.g. "Documents/Agent agnes"
+				searchTerm = searchTermCandidate; // e.g. "q1" or ""
 				const baseScope = activeScope || (mountPoints[0]?.path ?? "");
 				searchScope = folderPart ? `${baseScope}/${folderPart}` : baseScope;
 				searchScopePath = searchScope;
@@ -221,8 +235,10 @@ function handleInput(val: string) {
 					if (searchScope) startFileSearch(searchTerm, searchScope, id);
 				}, 150);
 			} else {
+				// Just "/" typed — list the active scope immediately (home dir by default)
 				completions = [];
 				completionIndex = -1;
+				if (searchScope) startFileSearch("", searchScope, id);
 			}
 			return;
 		}
@@ -234,6 +250,8 @@ function handleInput(val: string) {
 		searchScopePath = "";
 		searchMode = false;
 		filePathMap = new Map();
+		fileMetaMap = new Map();
+		ignoreActive = false;
 	}
 
 	// Detect @ file reference — find the last @ in the input
@@ -388,10 +406,12 @@ onMount(() => {
 				const batch = e.payload;
 				if (batch.search_id !== fileSearchId) return;
 
-				// Populate path map for preview
+				// Populate path map for preview and metadata map for display
 				const pathUpdates = new Map(filePathMap);
+				const metaUpdates = new Map(fileMetaMap);
 				for (const r of batch.results) {
 					pathUpdates.set(r.label, r.full_path);
+					metaUpdates.set(r.label, { size_bytes: r.size_bytes, modified_secs: r.modified_secs });
 				}
 
 				const newItems: CompletionItem[] = batch.results.map((r) => ({
@@ -406,6 +426,8 @@ onMount(() => {
 				// Defer state update to next frame so it never blocks a keystroke paint
 				requestAnimationFrame(() => {
 					filePathMap = pathUpdates;
+					fileMetaMap = metaUpdates;
+					if (batch.has_ignore_rules) ignoreActive = true;
 
 					completions = [...completions, ...newItems]
 						.sort((a, b) => {
@@ -436,9 +458,29 @@ onMount(() => {
 			}
 		});
 
+		// Prevent WebKitGTK from stealing tab_back for native focus navigation
+		window.addEventListener(
+			"keydown",
+			(e) => {
+				if (matchesAction(e, "tab_back")) {
+					e.preventDefault();
+				}
+			},
+			true,
+		);
+
 		// Hide on blur
 		const unlistenFocus = await win.onFocusChanged(({ payload: focused }) => {
 			if (!focused && hideOnBlur && blurEnabled && !settingsOpen && !notesOpen) {
+				// Clear search/browse state before hiding so preview panel is torn down
+				if (searchMode) {
+					cancelFileSearch();
+					searchMode = false;
+				}
+				completions = [];
+				completionIndex = -1;
+				atMode = false;
+				atStart = -1;
 				hideWindow();
 			}
 		});
@@ -462,7 +504,7 @@ onMount(() => {
 	};
 });
 
-async function handleSubmit() {
+async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 	const trimmed = inputValue.trim();
 	if (!trimmed || isExecuting || !backendReady) return;
 
@@ -522,7 +564,7 @@ async function handleSubmit() {
 			}
 			// @ browse or / search mode — drill into directory or open file
 			if (atMode || searchMode) {
-				handleCompletionSelect(selected.label);
+				handleCompletionSelect(selected.label, opts?.ctrlKey);
 				return;
 			}
 			// Check if input has an explicit prefix (e.g. "spotify ", "system ", "media ")
@@ -738,10 +780,24 @@ async function openFileByLabel(label: string) {
 	await openUri(`file://${label}`);
 }
 
-function handleCompletionSelect(label: string) {
-	// / search mode — find and open files/folders directly
+function handleCompletionSelect(label: string, forceOpen?: boolean) {
+	// / search mode — drill into folders (Enter), or open in file manager (Ctrl+Enter)
 	if (searchMode) {
-		openFileByLabel(label);
+		const item = completions[completionIndex];
+		if (item?.icon_path === "__folder__" && !forceOpen) {
+			// Make label relative to active scope for the input value
+			let path = item.label;
+			if (path.startsWith("~/")) {
+				path = path.slice(2); // ~/Downloads/ → Downloads/
+			} else if (activeScope && path.startsWith(activeScope)) {
+				path = path.slice(activeScope.length); // /mnt/DevSSD/Colris/ → Colris/
+				if (path.startsWith("/")) path = path.slice(1);
+			}
+			inputValue = `/${path}`;
+			handleInput(inputValue);
+		} else {
+			openFileByLabel(label);
+		}
 		return;
 	}
 
@@ -781,16 +837,31 @@ function handleCompletionSelect(label: string) {
 function handleScopeChange(index: number) {
 	scopeIndex = index;
 	if (searchMode && inputValue.startsWith("/")) {
-		// Re-trigger search with new scope — keep old results visible until new arrive
-		const query = inputValue.slice(1);
-		if (query) {
-			searchDone = false;
-			fileSearchId++;
-			const id = fileSearchId;
-			completions = [];
-			completionIndex = -1;
-			startFileSearch(query, mountPoints[index]?.path ?? "", id);
+		// Re-trigger search with new scope
+		searchDone = false;
+		fileSearchId++;
+		const id = fileSearchId;
+		completions = [];
+		completionIndex = -1;
+		searchScopePath = "";
+
+		const raw = inputValue.slice(1);
+		const lastSlash = raw.lastIndexOf("/");
+		const baseScope = mountPoints[index]?.path ?? "";
+
+		let searchScope: string;
+		let searchTerm: string;
+		if (lastSlash >= 0) {
+			const folderPart = raw.slice(0, lastSlash);
+			searchTerm = raw.slice(lastSlash + 1);
+			searchScope = folderPart ? `${baseScope}/${folderPart}` : baseScope;
+			searchScopePath = searchScope;
+		} else {
+			searchTerm = raw;
+			searchScope = baseScope;
 		}
+
+		if (searchScope) startFileSearch(searchTerm, searchScope, id);
 	}
 }
 
@@ -948,8 +1019,14 @@ async function handleDismiss() {
 				if (completions.length > 0 && completionIndex >= 0) {
 					const item = completions[completionIndex];
 					if (searchMode && item.icon_path === "__folder__") {
-						// Drill into folder — set input to folder path
-						const path = item.label.startsWith("~/") ? item.label.slice(2) : item.label;
+						// Drill into folder — make label relative to active scope
+						let path = item.label;
+						if (path.startsWith("~/")) {
+							path = path.slice(2);
+						} else if (activeScope && path.startsWith(activeScope)) {
+							path = path.slice(activeScope.length);
+							if (path.startsWith("/")) path = path.slice(1);
+						}
 						inputValue = `/${path}`;
 						handleInput(inputValue);
 					} else if (searchMode) {
@@ -1034,6 +1111,9 @@ async function handleDismiss() {
 				onscopechange={handleScopeChange}
 				searching={searchMode && !searchDone}
 				browseMode={atMode}
+				searchMode={searchMode}
+				metaMap={searchMode ? fileMetaMap : undefined}
+				ignoreActive={searchMode && ignoreActive}
 			/>
 			{#if completions.length === 0 && atMode && atNoResults}
 				<div class="empty-state">Empty folder</div>
