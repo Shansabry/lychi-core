@@ -1,18 +1,30 @@
+pub mod aliases;
+pub mod app_control;
 pub mod app_launcher;
 pub mod ask;
+pub mod bookmarks;
 pub mod browse;
 pub mod calc;
+pub mod clipboard;
+pub mod emoji;
 pub mod file_open;
 pub mod icons;
+#[cfg(target_os = "linux")]
+mod kwin_windows;
 #[cfg(feature = "mpris")]
 pub mod media;
 pub mod notes;
 pub mod project_open;
 pub mod shell_exec;
+pub mod symbol;
 pub mod sysinfo;
 pub mod system;
+pub mod time;
+pub mod unicode;
 pub mod url_open;
 pub mod weather;
 pub mod weather_ask;
 pub mod web_search;
+#[cfg(target_os = "linux")]
+mod x11_windows;
 pub mod youtube;

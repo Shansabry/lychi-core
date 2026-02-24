@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod ai;
+pub mod aliases;
 pub mod config;
 pub mod execute;
 pub mod filesystem;

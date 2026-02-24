@@ -4,18 +4,26 @@ use tokio::sync::RwLock;
 
 use redb::Database;
 
+use lychi_core::action_registry::handlers::aliases::AliasHandler;
+use lychi_core::action_registry::handlers::app_control::AppControlHandler;
 use lychi_core::action_registry::handlers::app_launcher::AppLauncher;
 use lychi_core::action_registry::handlers::ask::AskHandler;
+use lychi_core::action_registry::handlers::bookmarks::BookmarkHandler;
 use lychi_core::action_registry::handlers::browse::BrowseHandler;
 use lychi_core::action_registry::handlers::calc::CalcHandler;
+use lychi_core::action_registry::handlers::clipboard::ClipboardHandler;
+use lychi_core::action_registry::handlers::emoji::EmojiHandler;
 use lychi_core::action_registry::handlers::file_open::FileOpen;
 #[cfg(feature = "mpris")]
 use lychi_core::action_registry::handlers::media::MediaHandler;
 use lychi_core::action_registry::handlers::notes::{NotesHandler, TodoHandler};
 use lychi_core::action_registry::handlers::project_open::ProjectOpen;
 use lychi_core::action_registry::handlers::shell_exec::ShellExec;
+use lychi_core::action_registry::handlers::symbol::SymbolHandler;
 use lychi_core::action_registry::handlers::sysinfo::SysInfoHandler;
 use lychi_core::action_registry::handlers::system::SystemCommand;
+use lychi_core::action_registry::handlers::time::TimeHandler;
+use lychi_core::action_registry::handlers::unicode::UnicodeHandler;
 use lychi_core::action_registry::handlers::url_open::UrlOpen;
 use lychi_core::action_registry::handlers::weather::WeatherHandler;
 use lychi_core::action_registry::handlers::weather_ask::WeatherAskHandler;
@@ -84,13 +92,22 @@ impl AppState {
 
         // Log DB table stats
         if let Ok(stats) = lychi_core::db::table_stats(&db) {
-            let total = stats.history + stats.notes + stats.todos + stats.settings;
+            let total = stats.history
+                + stats.notes
+                + stats.todos
+                + stats.clipboard
+                + stats.settings
+                + stats.frecency
+                + stats.aliases;
             tracing::info!(
-                "DB tables: {} history, {} notes, {} todos, {} settings ({} total rows, {:.1} KB on disk)",
+                "DB tables: {} history, {} notes, {} todos, {} clipboard, {} settings, {} frecency, {} aliases ({} total rows, {:.1} KB on disk)",
                 stats.history,
                 stats.notes,
                 stats.todos,
+                stats.clipboard,
                 stats.settings,
+                stats.frecency,
+                stats.aliases,
                 total,
                 db_size as f64 / 1024.0,
             );
@@ -101,7 +118,10 @@ impl AppState {
             Arc::new(RwLock::new(None));
 
         let mut registry = ActionRegistry::new();
-        registry.register(Box::new(AppLauncher::new()));
+        registry.register(Box::new(AppControlHandler::new()));
+        registry.register(Box::new(AppLauncher::new(db.clone())));
+        registry.register(Box::new(BookmarkHandler::new()));
+        registry.register(Box::new(EmojiHandler::new()));
         registry.register(Box::new(WebSearch::with_search_url(
             config.commands.default_search_engine.clone(),
         )));
@@ -110,7 +130,8 @@ impl AppState {
             config.commands.shell.clone(),
         )));
         registry.register(Box::new(CalcHandler::new()));
-        registry.register(Box::new(FileOpen::new()));
+        registry.register(Box::new(ClipboardHandler::new(db.clone())));
+        registry.register(Box::new(FileOpen::new(db.clone())));
         registry.register(Box::new(UrlOpen::new()));
         #[cfg(feature = "mpris")]
         {
@@ -120,9 +141,13 @@ impl AppState {
             config.projects.directories.clone(),
         )));
         registry.register(Box::new(SystemCommand::new()));
+        registry.register(Box::new(TimeHandler::new()));
+        registry.register(Box::new(SymbolHandler::new()));
         registry.register(Box::new(SysInfoHandler::new()));
+        registry.register(Box::new(UnicodeHandler::new()));
         registry.register(Box::new(NotesHandler::new(db.clone())));
         registry.register(Box::new(TodoHandler::new(db.clone())));
+        registry.register(Box::new(AliasHandler::new(db.clone())));
         registry.register(Box::new(BrowseHandler::new()));
         let weather_handler = Arc::new(WeatherHandler::new(
             config.weather.unit.clone(),

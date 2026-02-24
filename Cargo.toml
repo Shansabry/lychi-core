@@ -21,3 +21,4 @@ toml = "1"
 redb = "3"
 uuid = { version = "1", features = ["v7"] }
 postcard = { version = "1", features = ["alloc"] }
+chrono-tz = "0.10"

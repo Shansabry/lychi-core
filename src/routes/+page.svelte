@@ -545,6 +545,12 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 		completionIndex = 0;
 	}
 
+	// Colon triggers (e.g. "al:list", "tz:tokyo") — send directly to backend, skip completion selection
+	if (/^[a-z]{1,4}:/.test(lower) && !lower.startsWith("http")) {
+		await runCommand(trimmed);
+		return;
+	}
+
 	// If completions are visible and one is selected, execute based on context
 	if (completions.length > 0 && completionIndex >= 0) {
 		const selected = completions[completionIndex];
@@ -574,8 +580,18 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 			// backend's keyword/AI routing handles it correctly.
 			const KNOWN_PREFIXES = new Set([
 				"ask",
+				"bm",
+				"bookmark",
 				"browse",
+				"clip",
+				"clipboard",
+				"close",
+				"emoji",
+				"focus",
+				"kill",
 				"open",
+				"sym",
+				"unicode",
 				"web",
 				"yt",
 				"run",
@@ -584,6 +600,7 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 				"url",
 				"media",
 				"project",
+				"quit",
 				"system",
 				"note",
 				"notes",
@@ -603,6 +620,11 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 				"display",
 				"os",
 				"speedtest",
+				"time",
+				"tz",
+				"clock",
+				"alias",
+				"aliases",
 			]);
 			const spaceIdx = trimmed.indexOf(" ");
 			if (spaceIdx !== -1) {
@@ -613,7 +635,10 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 					// Natural language — let the backend route the original input
 					await runCommand(trimmed);
 				}
-			} else if (selected.label.toLowerCase() === trimmed.toLowerCase()) {
+			} else if (KNOWN_PREFIXES.has(lower)) {
+				// Input is a bare prefix (e.g. "clip", "focus") — send prefix + selected label
+				await runCommand(`${lower} ${selected.label}`);
+			} else if (selected.label.toLowerCase() === lower) {
 				// Completion matches input exactly (e.g. "mem" → sysinfo "mem")
 				// Let the backend router handle it directly
 				await runCommand(trimmed);
@@ -952,42 +977,6 @@ async function handleDismiss() {
 	if (isRouting) {
 		routingGeneration++;
 		isRouting = false;
-		return;
-	}
-	if (settingsOpen) {
-		settingsOpen = false;
-		return;
-	}
-	if (mediaOpen) {
-		mediaOpen = false;
-		return;
-	}
-	if (notesOpen) {
-		notesOpen = false;
-		return;
-	}
-	if (lastResult?.needs_confirmation) {
-		lastResult = null;
-		return;
-	}
-	if (pendingPlan) {
-		pendingPlan = null;
-		return;
-	}
-	if (completions.length > 0 || searchMode) {
-		completions = [];
-		completionIndex = -1;
-		atMode = false;
-		atStart = -1;
-		if (searchMode) {
-			cancelFileSearch();
-			searchMode = false;
-		}
-		return;
-	}
-	if (historyOpen) {
-		historyOpen = false;
-		return;
 	}
 	await hideWindow();
 }

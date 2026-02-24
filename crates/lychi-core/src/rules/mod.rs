@@ -48,9 +48,30 @@ impl RulesEngine {
         match req.action_id {
             "run" => self.shell_rules.validate(req.args),
             "system" => {
-                // System commands always require confirmation
+                use crate::action_registry::handlers::system::DESTRUCTIVE_ACTIONS;
+                let action = req.args.trim().to_lowercase();
+                // Only destructive actions (shutdown, reboot, etc.) require confirmation.
+                // Reversible toggles (mute, volume, brightness, wifi, bluetooth) auto-execute.
+                if DESTRUCTIVE_ACTIONS.iter().any(|d| action.starts_with(d)) {
+                    ValidationDecision::Confirm {
+                        reason: format!(
+                            "System action '{}' requires confirmation",
+                            req.args.trim()
+                        ),
+                    }
+                } else {
+                    ValidationDecision::Execute
+                }
+            }
+            "appctl" if req.args.trim_start().starts_with("kill ") => {
+                let target = req
+                    .args
+                    .trim_start()
+                    .strip_prefix("kill ")
+                    .unwrap_or("")
+                    .trim();
                 ValidationDecision::Confirm {
-                    reason: format!("System action '{}' requires confirmation", req.args.trim()),
+                    reason: format!("Force-kill '{target}'? This may cause data loss."),
                 }
             }
             // C6: speedtest uploads data to Cloudflare — require consent
@@ -169,10 +190,66 @@ mod tests {
     }
 
     #[test]
-    fn system_always_confirms() {
+    fn system_destructive_confirms() {
         let engine = RulesEngine::new();
-        let result = engine.validate(&req("system", "shutdown"), &privacy());
-        assert!(matches!(result, ValidationDecision::Confirm { .. }));
+        let p = privacy();
+        // Destructive actions require confirmation
+        assert!(matches!(
+            engine.validate(&req("system", "shutdown"), &p),
+            ValidationDecision::Confirm { .. }
+        ));
+        assert!(matches!(
+            engine.validate(&req("system", "reboot"), &p),
+            ValidationDecision::Confirm { .. }
+        ));
+        assert!(matches!(
+            engine.validate(&req("system", "hibernate"), &p),
+            ValidationDecision::Confirm { .. }
+        ));
+        assert!(matches!(
+            engine.validate(&req("system", "logout"), &p),
+            ValidationDecision::Confirm { .. }
+        ));
+    }
+
+    #[test]
+    fn system_reversible_auto_executes() {
+        let engine = RulesEngine::new();
+        let p = privacy();
+        // Non-destructive toggles auto-execute
+        assert_eq!(
+            engine.validate(&req("system", "mute"), &p),
+            ValidationDecision::Execute
+        );
+        assert_eq!(
+            engine.validate(&req("system", "unmute"), &p),
+            ValidationDecision::Execute
+        );
+        assert_eq!(
+            engine.validate(&req("system", "volume up"), &p),
+            ValidationDecision::Execute
+        );
+        assert_eq!(
+            engine.validate(&req("system", "brightness 50"), &p),
+            ValidationDecision::Execute
+        );
+        assert_eq!(
+            engine.validate(&req("system", "wifi on"), &p),
+            ValidationDecision::Execute
+        );
+        assert_eq!(
+            engine.validate(&req("system", "bluetooth off"), &p),
+            ValidationDecision::Execute
+        );
+        // Lock and suspend are non-destructive too
+        assert_eq!(
+            engine.validate(&req("system", "lock"), &p),
+            ValidationDecision::Execute
+        );
+        assert_eq!(
+            engine.validate(&req("system", "suspend"), &p),
+            ValidationDecision::Execute
+        );
     }
 
     #[test]

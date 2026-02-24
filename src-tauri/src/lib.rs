@@ -91,6 +91,10 @@ pub fn run() {
             commands::notes::add_todo,
             commands::notes::toggle_todo,
             commands::notes::delete_todo,
+            commands::aliases::get_aliases,
+            commands::aliases::add_alias,
+            commands::aliases::update_alias,
+            commands::aliases::delete_alias,
             commands::preview::get_file_preview,
         ])
         .setup(move |app| {
@@ -120,6 +124,21 @@ pub fn run() {
                 lychi_core::action_registry::handlers::project_open::ProjectOpen::warmup(
                     &dirs_for_warmup,
                 );
+            });
+
+            // Warm alias cache for transparent alias resolution in router
+            let alias_db = app.state::<state::AppState>().db.clone();
+            lychi_core::aliases::store::warm_cache(&alias_db);
+
+            // Pre-fetch exchange rates for currency conversion (fire-and-forget)
+            tauri::async_runtime::spawn(async {
+                lychi_core::action_registry::handlers::calc::fetch_exchange_rates().await;
+            });
+
+            // Background clipboard monitor
+            let clip_db = app.state::<AppState>().db.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                lychi_core::clipboard::store::run_clipboard_monitor(clip_db);
             });
 
             // Register global shortcut

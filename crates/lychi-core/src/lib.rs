@@ -1,4 +1,6 @@
 pub mod action_registry;
+pub mod aliases;
+pub mod clipboard;
 pub mod config;
 pub mod db;
 pub mod error;

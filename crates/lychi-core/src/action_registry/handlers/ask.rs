@@ -85,7 +85,7 @@ impl ActionHandler for AskHandler {
                 output: Some(text),
                 error: None,
                 duration_ms: duration,
-                routed_by: None,
+                routed_by: Some("ai".to_string()),
                 open_url: Some(search_url),
                 needs_confirmation: None,
                 risk_level: None,

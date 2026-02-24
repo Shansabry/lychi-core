@@ -127,7 +127,11 @@ impl Executor {
         // Fallback: if the routed handler returned nothing, try app search.
         // Use the args (not raw) so trigger-char prefixes like ">" are stripped.
         if route.handler != "open" {
-            let search_term = if route.args.is_empty() { raw } else { &route.args };
+            let search_term = if route.args.is_empty() {
+                raw
+            } else {
+                &route.args
+            };
             return self.registry.completions("open", search_term).await;
         }
 

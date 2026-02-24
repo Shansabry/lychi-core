@@ -1,3 +1,4 @@
+pub mod frecency;
 pub mod schema;
 
 use std::path::Path;
@@ -16,8 +17,18 @@ pub const NOTES: TableDefinition<&str, &[u8]> = TableDefinition::new("notes");
 /// Todos: key = UUID v7 string, value = postcard-serialized TodoEntry.
 pub const TODOS: TableDefinition<&str, &[u8]> = TableDefinition::new("todos");
 
+/// Clipboard history: key = UUID v7 string (time-ordered), value = postcard-serialized ClipboardEntry.
+pub const CLIPBOARD: TableDefinition<&str, &[u8]> = TableDefinition::new("clipboard");
+
 /// Settings: key = dotted path (e.g. "general.theme"), value = postcard-serialized SettingEntry.
 pub const SETTINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("settings");
+
+/// Frecency: key = normalized identifier (app name lowercase, file path),
+/// value = postcard-serialized FrecencyEntry.
+pub const FRECENCY: TableDefinition<&str, &[u8]> = TableDefinition::new("frecency");
+
+/// Aliases: key = alias name (lowercase), value = postcard-serialized AliasEntry.
+pub const ALIASES: TableDefinition<&str, &[u8]> = TableDefinition::new("aliases");
 
 /// Open (or create) the redb database at the given path.
 /// If the file exists but uses an older format version, back it up and recreate.
@@ -41,7 +52,10 @@ pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
     txn.open_table(HISTORY)?;
     txn.open_table(NOTES)?;
     txn.open_table(TODOS)?;
+    txn.open_table(CLIPBOARD)?;
     txn.open_table(SETTINGS)?;
+    txn.open_table(FRECENCY)?;
+    txn.open_table(ALIASES)?;
     txn.commit()?;
 
     Ok(Arc::new(db))
@@ -66,7 +80,10 @@ pub struct TableStats {
     pub history: u64,
     pub notes: u64,
     pub todos: u64,
+    pub clipboard: u64,
     pub settings: u64,
+    pub frecency: u64,
+    pub aliases: u64,
 }
 
 /// Get row counts for all tables.
@@ -76,7 +93,10 @@ pub fn table_stats(db: &Arc<Database>) -> Result<TableStats, LychiError> {
         history: txn.open_table(HISTORY)?.len()?,
         notes: txn.open_table(NOTES)?.len()?,
         todos: txn.open_table(TODOS)?.len()?,
+        clipboard: txn.open_table(CLIPBOARD)?.len()?,
         settings: txn.open_table(SETTINGS)?.len()?,
+        frecency: txn.open_table(FRECENCY)?.len()?,
+        aliases: txn.open_table(ALIASES)?.len()?,
     })
 }
 

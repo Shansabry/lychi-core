@@ -153,12 +153,13 @@ function formatSize(bytes: number | null | undefined): string {
 		{@const active = idx < items.length}
 		{@const label = item?.label ?? "\u00A0"}
 		{@const isFolder = item?.icon_path === "__folder__"}
-		{@const hasCustomIcon = !!(item?.icon_path && item.icon_path !== "__folder__")}
+		{@const hideIcon = item?.icon_path === "__none__"}
+		{@const hasCustomIcon = !!(item?.icon_path && item.icon_path !== "__folder__" && item.icon_path !== "__none__")}
 		{@const noIcon = !item?.icon_path}
 		{@const iconKey = item?.icon_path ?? ""}
 		{@const iconBroken = hasCustomIcon && brokenIcons.has(iconKey)}
 		{@const showImg = hasCustomIcon && !iconBroken}
-		{@const showFallback = noIcon || iconBroken}
+		{@const showFallback = (noIcon || iconBroken) && !hideIcon}
 		{@const search = searchDisplayName(label)}
 		{@const meta = metaMap?.get(label)}
 		{@const timeStr = relativeTime(meta?.modified_secs)}
@@ -173,14 +174,14 @@ function formatSize(bytes: number | null | undefined): string {
 			aria-selected={active && idx === selectedIndex}
 			tabindex="-1"
 		>
-			<span class="icon">
+			<span class="icon" style:display={hideIcon ? "none" : ""}>
 				<span style:visibility={isFolder ? "visible" : "hidden"} class="icon-slot">
 					<Folder size={20} strokeWidth={1.5} class="icon-folder" />
 				</span>
 				<span style:visibility={showImg ? "visible" : "hidden"} class="icon-slot">
 					<img
 						src={showImg ? (iconSrc(item.icon_path) ?? "") : "data:,"}
-						alt="" width="24" height="24" decoding="async"
+						alt="" width={showImg ? 24 : 0} height={showImg ? 24 : 0} decoding="async"
 						onerror={() => { if (item?.icon_path) brokenIcons.add(item.icon_path); brokenIcons = brokenIcons; }}
 					/>
 				</span>
@@ -332,10 +333,12 @@ function formatSize(bytes: number | null | undefined): string {
 		display: flex;
 		align-items: center;
 		gap: 12px;
-		padding: 8px 20px 8px 18px;
+		padding: 8px 20px;
+		height: 36px;
+		box-sizing: border-box;
 		cursor: pointer;
-		border-left: 2px solid transparent;
 		position: relative;
+		overflow: hidden;
 	}
 
 	.completion-item:hover {
@@ -345,8 +348,16 @@ function formatSize(bytes: number | null | undefined): string {
 
 	.completion-item.selected {
 		background: var(--bg-secondary);
-		border-left-color: var(--accent);
-		padding-left: 20px;
+	}
+
+	.completion-item.selected::before {
+		content: '';
+		position: absolute;
+		left: 0;
+		top: 0;
+		bottom: 0;
+		width: 2px;
+		background: var(--accent);
 	}
 
 	.icon {
@@ -368,13 +379,13 @@ function formatSize(bytes: number | null | undefined): string {
 	}
 
 	.icon img {
-		width: 24px;
-		height: 24px;
 		object-fit: contain;
 		border: none;
 		outline: none;
 		background: transparent;
 		color: transparent; /* hides alt text and broken-image glyph */
+		appearance: none;
+		-webkit-appearance: none;
 	}
 
 	.icon :global(.icon-fallback) {
@@ -421,7 +432,7 @@ function formatSize(bytes: number | null | undefined): string {
 		font-family: var(--font-mono);
 		font-size: 11px;
 		color: var(--fg-muted);
-		opacity: 0.5;
+		opacity: 0.7;
 		flex-shrink: 0;
 	}
 
@@ -447,7 +458,7 @@ function formatSize(bytes: number | null | undefined): string {
 		font-family: var(--font-mono);
 		font-size: 10px;
 		color: var(--fg-muted);
-		opacity: 0.4;
+		opacity: 0.6;
 		flex-shrink: 0;
 		white-space: nowrap;
 	}
@@ -456,7 +467,7 @@ function formatSize(bytes: number | null | undefined): string {
 		font-family: var(--font-mono);
 		font-size: 11px;
 		color: var(--fg-muted);
-		opacity: 0.4;
+		opacity: 0.6;
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
@@ -480,7 +491,7 @@ function formatSize(bytes: number | null | undefined): string {
 		font-family: var(--font-mono);
 		font-size: 10px;
 		color: var(--fg-muted);
-		opacity: 0.4;
+		opacity: 0.6;
 	}
 
 	.hint kbd {

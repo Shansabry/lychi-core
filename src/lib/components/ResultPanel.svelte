@@ -162,8 +162,10 @@ function handleTerminalClick(e: MouseEvent | KeyboardEvent) {
 	}
 }
 
-function autofocus(node: HTMLElement) {
-	requestAnimationFrame(() => node.focus());
+function autofocus(node: HTMLElement, shouldFocus: boolean = true) {
+	if (shouldFocus) {
+		requestAnimationFrame(() => node.focus());
+	}
 }
 
 function handleKeydown(e: KeyboardEvent) {
@@ -214,7 +216,8 @@ function handleKeydown(e: KeyboardEvent) {
 {:else if result.output || result.error}
 	<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 	<div class="result-panel" class:has-url={hasInlineUrl} onkeydown={hasInlineUrl ? handleKeydown : undefined}
-		tabindex={hasInlineUrl ? -1 : undefined} role={hasInlineUrl ? "region" : undefined} use:autofocus>
+		tabindex={hasInlineUrl ? -1 : undefined} role={hasInlineUrl ? "region" : undefined}
+		use:autofocus={hasInlineUrl}>
 		{#if command && isTerminal}
 			<div class="command-header">
 				<span class="prompt">$</span> {command}

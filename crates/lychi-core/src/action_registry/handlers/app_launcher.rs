@@ -9,8 +9,13 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+use std::sync::Arc;
+
+use redb::Database;
+
 use crate::action_registry::handlers::icons::resolve_icon;
 use crate::action_registry::{ActionHandler, ActionResult, CompletionItem};
+use crate::db::frecency;
 use crate::error::LychiError;
 
 #[derive(Debug)]
@@ -28,17 +33,13 @@ static DESKTOP_ENTRIES: OnceLock<HashMap<String, DesktopEntry>> = OnceLock::new(
 /// Cached nucleo matcher — reused across calls to avoid ~192ms cold-start on first invocation.
 static MATCHER: Mutex<Option<Matcher>> = Mutex::new(None);
 
-pub struct AppLauncher;
-
-impl Default for AppLauncher {
-    fn default() -> Self {
-        Self::new()
-    }
+pub struct AppLauncher {
+    db: Arc<Database>,
 }
 
 impl AppLauncher {
-    pub fn new() -> Self {
-        Self
+    pub fn new(db: Arc<Database>) -> Self {
+        Self { db }
     }
 
     fn entries() -> &'static HashMap<String, DesktopEntry> {
@@ -251,6 +252,10 @@ impl ActionHandler for AppLauncher {
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
+        // Record frecency access (fire-and-forget, don't block response)
+        let key = entry.name.to_lowercase();
+        let _ = frecency::record(&self.db, &key);
+
         Ok(ActionResult {
             success: true,
             output: Some(format!("Launched {}", entry.name)),
@@ -276,20 +281,33 @@ impl ActionHandler for AppLauncher {
         };
         let matches = Self::fuzzy_match(entries, query);
 
-        matches
+        // Load frecency scores (single read transaction)
+        let frecency_scores = frecency::get_scores(&self.db);
+
+        let mut items: Vec<CompletionItem> = matches
             .into_iter()
-            .take(8)
-            .map(|(entry, score)| {
-                // Use cached icon if available — never block completions on icon resolution.
-                // Icons are pre-warmed at startup; if warmup hasn't finished yet, show without icon.
+            .take(12) // Take more to allow re-ranking
+            .map(|(entry, nucleo_score)| {
                 let icon_path = entry.icon_path.get().cloned().flatten();
+                let key = entry.name.to_lowercase();
+                let frecency_val = frecency_scores.get(&key).copied().unwrap_or(0.0);
+
+                // Blend: 70% nucleo + 30% frecency (frecency normalized to nucleo range)
+                let frecency_boost = (frecency_val * 300.0) as u16; // max 300 points
+                let blended = nucleo_score.saturating_add(frecency_boost);
+
                 CompletionItem {
                     label: entry.name.clone(),
                     icon_path,
-                    score,
+                    score: blended,
                     description: None,
                 }
             })
-            .collect()
+            .collect();
+
+        // Re-sort by blended score and take top 8
+        items.sort_by(|a, b| b.score.cmp(&a.score));
+        items.truncate(8);
+        items
     }
 }
