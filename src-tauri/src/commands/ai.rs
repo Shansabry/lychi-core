@@ -24,9 +24,15 @@ pub async fn save_ai_config(
 pub async fn set_api_key(provider: String, key: String) -> Result<(), LychiError> {
     let entry = keyring::Entry::new("lychi", &format!("byo-{provider}"))
         .map_err(|e| LychiError::Config(format!("Keyring error: {e}")))?;
-    entry
-        .set_password(&key)
-        .map_err(|e| LychiError::Config(format!("Failed to store API key: {e}")))
+    if key.is_empty() {
+        // Delete the key from the keyring
+        let _ = entry.delete_credential(); // ignore error if not found
+        Ok(())
+    } else {
+        entry
+            .set_password(&key)
+            .map_err(|e| LychiError::Config(format!("Failed to store API key: {e}")))
+    }
 }
 
 #[tauri::command]
@@ -70,6 +76,28 @@ pub async fn check_ai_health(state: State<'_, AppState>) -> Result<bool, LychiEr
     }
 
     Ok(false)
+}
+
+#[tauri::command]
+pub async fn get_masked_api_key(provider: String) -> Result<Option<String>, LychiError> {
+    match get_stored_key(&provider) {
+        Ok(key) => Ok(Some(mask_key(&key))),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Mask an API key for display: show first 4 and last 4 chars with "..." in the middle.
+/// Short keys (<=10 chars) show first 3 + "..." + last 3.
+fn mask_key(key: &str) -> String {
+    let len = key.len();
+    if len <= 6 {
+        return "*".repeat(len);
+    }
+    if len <= 10 {
+        format!("{}...{}", &key[..3], &key[len - 3..])
+    } else {
+        format!("{}...{}", &key[..4], &key[len - 4..])
+    }
 }
 
 fn get_stored_key(provider: &str) -> Result<String, LychiError> {

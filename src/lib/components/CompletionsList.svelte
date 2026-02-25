@@ -1,6 +1,6 @@
 <script lang="ts">
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { AppWindow, Folder, LoaderCircle } from "lucide-svelte";
+import { AppWindow, Clock, Folder, LoaderCircle } from "lucide-svelte";
 import { onMount } from "svelte";
 import type { CompletionItem, MountPoint } from "$lib/ipc";
 
@@ -152,9 +152,11 @@ function formatSize(bytes: number | null | undefined): string {
 		{@const item = items[idx]}
 		{@const active = idx < items.length}
 		{@const label = item?.label ?? "\u00A0"}
+		{@const isSeparator = item?.icon_path === "__separator__"}
 		{@const isFolder = item?.icon_path === "__folder__"}
-		{@const hideIcon = item?.icon_path === "__none__"}
-		{@const hasCustomIcon = !!(item?.icon_path && item.icon_path !== "__folder__" && item.icon_path !== "__none__")}
+		{@const isHistory = item?.icon_path === "__history__"}
+		{@const hideIcon = item?.icon_path === "__none__" || isSeparator}
+		{@const hasCustomIcon = !!(item?.icon_path && item.icon_path !== "__folder__" && item.icon_path !== "__none__" && item.icon_path !== "__history__" && item.icon_path !== "__separator__")}
 		{@const noIcon = !item?.icon_path}
 		{@const iconKey = item?.icon_path ?? ""}
 		{@const iconBroken = hasCustomIcon && brokenIcons.has(iconKey)}
@@ -165,18 +167,29 @@ function formatSize(bytes: number | null | undefined): string {
 		{@const timeStr = relativeTime(meta?.modified_secs)}
 		<li
 			class="completion-item"
-			class:selected={active && idx === selectedIndex}
+			class:completion-separator={active && isSeparator}
+			class:selected={active && idx === selectedIndex && !isSeparator}
 			class:inactive={!active}
 			onmousedown={(e) => e.preventDefault()}
-			onclick={() => active && onselect(item.label)}
-			onkeydown={(e) => e.key === "Enter" && active && onselect(item.label)}
-			role="option"
-			aria-selected={active && idx === selectedIndex}
+			onclick={() => active && !isSeparator && onselect(item.label)}
+			onkeydown={(e) => e.key === "Enter" && active && !isSeparator && onselect(item.label)}
+			role={isSeparator ? "separator" : "option"}
+			aria-selected={active && idx === selectedIndex && !isSeparator}
 			tabindex="-1"
 		>
+			<!-- Separator layout -->
+			<div class="separator-content" style:display={isSeparator ? "" : "none"}>
+				<span class="separator-line"></span>
+				<span class="separator-text">{label}</span>
+				<span class="separator-line"></span>
+			</div>
+			<!-- Normal item layout -->
 			<span class="icon" style:display={hideIcon ? "none" : ""}>
 				<span style:visibility={isFolder ? "visible" : "hidden"} class="icon-slot">
 					<Folder size={20} strokeWidth={1.5} class="icon-folder" />
+				</span>
+				<span style:visibility={isHistory ? "visible" : "hidden"} class="icon-slot">
+					<Clock size={20} strokeWidth={1.5} class="icon-history" />
 				</span>
 				<span style:visibility={showImg ? "visible" : "hidden"} class="icon-slot">
 					<img
@@ -190,7 +203,7 @@ function formatSize(bytes: number | null | undefined): string {
 				</span>
 			</span>
 			<!-- Search-mode label group -->
-			<div class="label-group search-label-group" class:label-hidden={!isSearchMode}>
+			<div class="label-group search-label-group" class:label-hidden={!isSearchMode || isSeparator}>
 				<span class="label search-name">{search.name}</span>
 				<span class="search-meta">
 					<span class="type-badge" style:visibility={item?.description && !isFolder ? "visible" : "hidden"}>{item?.description ?? "\u00A0"}</span>
@@ -199,7 +212,7 @@ function formatSize(bytes: number | null | undefined): string {
 				<span class="search-path" style:visibility={search.parent ? "visible" : "hidden"}>{search.parent || "\u00A0"}</span>
 			</div>
 			<!-- Normal-mode label group -->
-			<div class="label-group" class:label-hidden={isSearchMode}>
+			<div class="label-group" class:label-hidden={isSearchMode || isSeparator}>
 				<span class="label">{pathContext ? displayName(label) : label}</span>
 				<span class="description" style:visibility={item?.description ? "visible" : "hidden"}>{item?.description ?? "\u00A0"}</span>
 			</div>
@@ -341,6 +354,40 @@ function formatSize(bytes: number | null | undefined): string {
 		overflow: hidden;
 	}
 
+	.completion-separator {
+		height: 24px;
+		padding: 0 20px;
+		cursor: default;
+		pointer-events: none;
+	}
+
+	.completion-separator:hover {
+		background: none;
+	}
+
+	.separator-content {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		width: 100%;
+	}
+
+	.separator-line {
+		flex: 1;
+		height: 1px;
+		background: var(--border);
+		opacity: 0.4;
+	}
+
+	.separator-text {
+		font-family: var(--font-mono);
+		font-size: 10px;
+		color: var(--fg-muted);
+		opacity: 0.5;
+		text-transform: lowercase;
+		flex-shrink: 0;
+	}
+
 	.completion-item:hover {
 		background: var(--bg-secondary);
 		transition: background 80ms ease;
@@ -395,6 +442,11 @@ function formatSize(bytes: number | null | undefined): string {
 
 	.icon :global(.icon-folder) {
 		color: var(--accent);
+	}
+
+	.icon :global(.icon-history) {
+		color: var(--fg-muted);
+		opacity: 0.6;
 	}
 
 	.icon :global(.icon-file) {

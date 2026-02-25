@@ -4,7 +4,10 @@ use crate::providers::{AgentPlan, AgentStep, AiResponse, AiRoute, generate_plan_
 use crate::rules::shell::ShellRules;
 
 /// Build the system prompt for intent routing.
-pub fn system_prompt(known_actions: &[&str]) -> String {
+///
+/// If `context_hint` is provided, it's appended to help the AI make
+/// context-aware decisions (e.g., knowing the user is in a Rust project).
+pub fn system_prompt(known_actions: &[&str], context_hint: Option<&str>) -> String {
     let commands = known_actions
         .iter()
         .map(|cmd| {
@@ -14,10 +17,14 @@ pub fn system_prompt(known_actions: &[&str]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
 
+    let context_section = context_hint
+        .map(|hint| format!("\n\nUser's current context:\n{hint}"))
+        .unwrap_or_default();
+
     format!(
         r#"You are a command router for a desktop launcher. Given natural language input, determine the best matching command and extract the arguments.
 
-Most common inputs (weather, system power, media control, sysinfo, todos, notes, direct questions) are already handled before reaching you. You only see ambiguous or complex cases.
+Most common inputs (weather, system power, media control, sysinfo, todos, notes, timers, direct questions) are already handled before reaching you. You only see ambiguous or complex cases.
 
 Available commands:
 {commands}
@@ -37,7 +44,7 @@ Rules:
 - When uncertain between two handlers, prefer the more specific one.
 - Extract clean arguments — strip filler words ("please", "can you", "I want to").
 - Respond with ONLY valid JSON. No extra text.
-- Fallback: question → "ask", non-question → "web"."#
+- Fallback: question → "ask", non-question → "web".{context_section}"#
     )
 }
 
@@ -73,6 +80,18 @@ fn action_description(id: &str) -> &'static str {
         "weather" => "Get current weather/forecast. Args: city name, or empty for default location",
         "weather-ask" => {
             "Answer conversational weather questions with real data. Args: the full question (e.g. 'will it rain today', 'do I need a jacket')"
+        }
+        "timer" => {
+            "Timer and stopwatch. Args: 'start [name] <duration>' (e.g. 'start 25m', 'start workout 5m'), 'stopwatch [name]' to start a count-up stopwatch, 'stop [name]', 'pause [name]', 'resume [name]', 'status', 'clear'. Shorthand: bare duration like '25m' starts a timer"
+        }
+        "time" => {
+            "Show current time in a timezone or convert between timezones. Args: timezone name or city (e.g. 'tokyo', 'EST', 'london'). Empty for local time"
+        }
+        "alias" => {
+            "Manage command aliases. Args: 'set <name> <command>', 'remove <name>', 'list'. Creates shortcuts for common commands"
+        }
+        "reminder" => {
+            "Set timed reminders with desktop notifications. Args: 'add <text> in/at <time>' (e.g. 'add buy milk in 30m', 'add standup at 9am', 'add meeting tomorrow 2pm'), 'list', 'delete <id>', 'clear'. Without 'add', infers from natural language"
         }
         _ => "Unknown command",
     }
@@ -301,9 +320,22 @@ mod tests {
 
     #[test]
     fn system_prompt_contains_commands() {
-        let prompt = system_prompt(&["web", "yt", "open"]);
+        let prompt = system_prompt(&["web", "yt", "open"], None);
         assert!(prompt.contains("web <args>"));
         assert!(prompt.contains("yt <args>"));
         assert!(prompt.contains("open <args>"));
+    }
+
+    #[test]
+    fn system_prompt_with_context() {
+        let prompt = system_prompt(
+            &["run"],
+            Some(
+                "- Working directory: ~/projects/lychi\n- Git branch: main (dirty)\n- Project type: Rust",
+            ),
+        );
+        assert!(prompt.contains("User's current context:"));
+        assert!(prompt.contains("Git branch: main"));
+        assert!(prompt.contains("Rust"));
     }
 }

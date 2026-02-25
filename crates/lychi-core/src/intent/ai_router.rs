@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::error::LychiError;
@@ -8,6 +8,8 @@ use crate::providers::{AiProvider, AiResponse, AiRoute};
 pub struct AiRouter {
     provider: Arc<dyn AiProvider>,
     timeout: Duration,
+    /// Optional context hint for AI routing (set by Executor before resolve).
+    context_hint: Mutex<Option<String>>,
 }
 
 impl AiRouter {
@@ -15,6 +17,7 @@ impl AiRouter {
         Self {
             provider: Arc::from(provider),
             timeout: Duration::from_secs(8),
+            context_hint: Mutex::new(None),
         }
     }
 
@@ -22,7 +25,20 @@ impl AiRouter {
         Self {
             provider,
             timeout: Duration::from_secs(8),
+            context_hint: Mutex::new(None),
         }
+    }
+
+    /// Set the context hint for the next AI routing call.
+    pub fn set_context_hint(&self, hint: Option<String>) {
+        if let Ok(mut guard) = self.context_hint.lock() {
+            *guard = hint;
+        }
+    }
+
+    /// Take the current context hint (consuming it).
+    fn take_context_hint(&self) -> Option<String> {
+        self.context_hint.lock().ok().and_then(|mut g| g.take())
     }
 
     /// Route natural language input through the AI provider (single-shot only).
@@ -50,9 +66,11 @@ impl AiRouter {
         input: &str,
         known_actions: &[&str],
     ) -> Result<Option<AiResponse>, LychiError> {
+        let hint = self.take_context_hint();
         match tokio::time::timeout(
             self.timeout,
-            self.provider.route_or_plan(input, known_actions),
+            self.provider
+                .route_or_plan(input, known_actions, hint.as_deref()),
         )
         .await
         {

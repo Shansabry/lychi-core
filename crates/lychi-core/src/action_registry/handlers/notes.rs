@@ -10,6 +10,11 @@ use crate::notes::store::{MAX_NOTES, NotesStore};
 
 // ---- Notes handler ----
 
+const NOTE_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("read", "List all saved notes"),
+    ("delete", "Delete a note by ID (e.g. note delete abc)"),
+];
+
 pub struct NotesHandler {
     db: Arc<Database>,
 }
@@ -161,6 +166,20 @@ impl ActionHandler for NotesHandler {
             Err(e) => Err(e),
         }
     }
+
+    async fn completions(&self, partial: &str) -> Vec<CompletionItem> {
+        let lower = partial.to_lowercase();
+        NOTE_SUBCOMMANDS
+            .iter()
+            .filter(|(cmd, _)| cmd.contains(&lower) || lower.is_empty())
+            .map(|(cmd, desc)| CompletionItem {
+                label: cmd.to_string(),
+                icon_path: None,
+                score: if cmd.starts_with(&lower) { 100 } else { 50 },
+                description: Some(desc.to_string()),
+            })
+            .collect()
+    }
 }
 
 // ---- Todo handler ----
@@ -175,7 +194,13 @@ impl TodoHandler {
     }
 }
 
-const TODO_SUBCOMMANDS: &[&str] = &["add", "list", "done", "delete", "summary"];
+const TODO_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("add", "Add a todo item (e.g. todo add buy milk)"),
+    ("list", "List all todo items"),
+    ("done", "Mark a todo as done by ID"),
+    ("delete", "Delete a todo by ID"),
+    ("summary", "Show notes and todos summary"),
+];
 
 #[async_trait]
 impl ActionHandler for TodoHandler {
@@ -412,12 +437,12 @@ impl ActionHandler for TodoHandler {
         let lower = partial.to_lowercase();
         TODO_SUBCOMMANDS
             .iter()
-            .filter(|s| s.contains(&lower) || lower.is_empty())
-            .map(|s| CompletionItem {
-                label: s.to_string(),
+            .filter(|(cmd, _)| cmd.contains(&lower) || lower.is_empty())
+            .map(|(cmd, desc)| CompletionItem {
+                label: cmd.to_string(),
                 icon_path: None,
-                score: if s.starts_with(&lower) { 100 } else { 50 },
-                description: None,
+                score: if cmd.starts_with(&lower) { 100 } else { 50 },
+                description: Some(desc.to_string()),
             })
             .collect()
     }

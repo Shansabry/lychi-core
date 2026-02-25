@@ -1,13 +1,20 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 use redb::{Database, ReadableDatabase, ReadableTable};
 
+use crate::action_registry::CompletionItem;
 use crate::db::{
-    self,
+    self, frecency,
     schema::{HistoryEntry, SYNC_LOCAL},
 };
 use crate::error::LychiError;
 
+/// Cached nucleo matcher for history fuzzy search.
+static MATCHER: Mutex<Option<Matcher>> = Mutex::new(None);
+
+#[derive(Clone)]
 pub struct HistoryStore {
     max_entries: usize,
     deduplicate: bool,
@@ -128,6 +135,70 @@ impl HistoryStore {
         }
         txn.commit()?;
         Ok(())
+    }
+
+    /// Fuzzy-search history entries against `query`, blended with frecency scores.
+    /// Returns up to 5 `CompletionItem`s sorted by blended score (descending).
+    pub fn fuzzy_search(&self, db: &Arc<Database>, query: &str) -> Vec<CompletionItem> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Vec::new();
+        }
+
+        let entries = match self.entries(db) {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut guard = MATCHER.lock().unwrap();
+        let matcher = guard.get_or_insert_with(|| Matcher::new(Config::DEFAULT));
+        let pattern = Atom::new(
+            query,
+            CaseMatching::Ignore,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+            false,
+        );
+
+        let mut scored: Vec<(&str, u16)> = entries
+            .iter()
+            .filter_map(|cmd| {
+                let mut buf = Vec::new();
+                let haystack = Utf32Str::new(cmd, &mut buf);
+                let score = pattern.score(haystack, matcher)?;
+                Some((cmd.as_str(), score))
+            })
+            .collect();
+
+        // Blend with frecency
+        let frecency_scores = frecency::get_scores(db);
+        let mut items: Vec<CompletionItem> = scored
+            .drain(..)
+            .take(10)
+            .map(|(cmd, nucleo_score)| {
+                let key = format!("history:{cmd}");
+                let frecency_val = frecency_scores.get(&key).copied().unwrap_or(0.0);
+                let frecency_boost = (frecency_val * 300.0) as u16;
+                let blended = nucleo_score.saturating_add(frecency_boost);
+
+                CompletionItem {
+                    label: cmd.to_string(),
+                    icon_path: Some("__history__".to_string()),
+                    score: blended,
+                    description: None,
+                }
+            })
+            .collect();
+
+        items.sort_by(|a, b| b.score.cmp(&a.score));
+        items.truncate(5);
+        items
+    }
+
+    /// Pre-warm the nucleo matcher so the first fuzzy search doesn't pay cold-start cost.
+    pub fn warmup() {
+        let mut guard = MATCHER.lock().unwrap();
+        guard.get_or_insert_with(|| Matcher::new(Config::DEFAULT));
     }
 
     fn enforce_max(&self, table: &mut redb::Table<&str, &[u8]>) -> Result<(), LychiError> {

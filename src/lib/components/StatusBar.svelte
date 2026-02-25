@@ -1,5 +1,6 @@
 <script lang="ts">
 import {
+	ClipboardList,
 	Clock,
 	Music,
 	Pause,
@@ -7,7 +8,6 @@ import {
 	Settings,
 	Sparkles,
 	SquareTerminal,
-	StickyNote,
 } from "lucide-svelte";
 import type { CommandResult, TrackInfo } from "$lib/ipc";
 import { mediaControl } from "$lib/ipc";
@@ -150,10 +150,10 @@ async function togglePlayPause() {
 			class:active={notesOpen}
 			onmousedown={(e) => e.preventDefault()}
 			onclick={ontogglenotes}
-			title="Notes (Ctrl+2)"
+			title="Utility (Ctrl+2)"
 			tabindex={-1}
 		>
-			<StickyNote size={14} strokeWidth={1.5} />
+			<ClipboardList size={14} strokeWidth={1.5} />
 		</button>
 		<button
 			class="bar-icon"
@@ -338,4 +338,5 @@ async function togglePlayPause() {
 		display: flex;
 		align-items: center;
 	}
+
 </style>

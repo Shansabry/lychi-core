@@ -30,6 +30,12 @@ pub const FRECENCY: TableDefinition<&str, &[u8]> = TableDefinition::new("frecenc
 /// Aliases: key = alias name (lowercase), value = postcard-serialized AliasEntry.
 pub const ALIASES: TableDefinition<&str, &[u8]> = TableDefinition::new("aliases");
 
+/// Reminders: key = UUID v7 string (time-ordered), value = postcard-serialized ReminderEntry.
+pub const REMINDERS: TableDefinition<&str, &[u8]> = TableDefinition::new("reminders");
+
+/// Snippets: key = UUID v7 string, value = postcard-serialized SnippetEntry.
+pub const SNIPPETS: TableDefinition<&str, &[u8]> = TableDefinition::new("snippets");
+
 /// Open (or create) the redb database at the given path.
 /// If the file exists but uses an older format version, back it up and recreate.
 pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
@@ -56,6 +62,8 @@ pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
     txn.open_table(SETTINGS)?;
     txn.open_table(FRECENCY)?;
     txn.open_table(ALIASES)?;
+    txn.open_table(REMINDERS)?;
+    txn.open_table(SNIPPETS)?;
     txn.commit()?;
 
     Ok(Arc::new(db))
@@ -84,6 +92,8 @@ pub struct TableStats {
     pub settings: u64,
     pub frecency: u64,
     pub aliases: u64,
+    pub reminders: u64,
+    pub snippets: u64,
 }
 
 /// Get row counts for all tables.
@@ -97,6 +107,8 @@ pub fn table_stats(db: &Arc<Database>) -> Result<TableStats, LychiError> {
         settings: txn.open_table(SETTINGS)?.len()?,
         frecency: txn.open_table(FRECENCY)?.len()?,
         aliases: txn.open_table(ALIASES)?.len()?,
+        reminders: txn.open_table(REMINDERS)?.len()?,
+        snippets: txn.open_table(SNIPPETS)?.len()?,
     })
 }
 

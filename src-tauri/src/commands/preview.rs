@@ -7,8 +7,20 @@ const MAX_TEXT_LINES: usize = 500;
 const MAX_IMAGE_BYTES: u64 = 10_000_000; // 10MB
 
 #[derive(serde::Serialize)]
+pub struct FilePreviewData {
+    #[serde(flatten)]
+    pub detail: FilePreviewDetail,
+    /// File size in bytes (0 for directories).
+    pub size_bytes: u64,
+    /// Last modified time as seconds since Unix epoch (0 if unavailable).
+    pub modified_epoch: u64,
+    /// Full canonical path.
+    pub full_path: String,
+}
+
+#[derive(serde::Serialize)]
 #[serde(tag = "kind")]
-pub enum FilePreviewData {
+pub enum FilePreviewDetail {
     Text {
         content: String,
         language: String,
@@ -20,7 +32,6 @@ pub enum FilePreviewData {
     },
     Unsupported {
         mime: String,
-        size_bytes: u64,
     },
     Directory {
         item_count: usize,
@@ -95,9 +106,24 @@ fn extension_to_image_mime(ext: &str) -> Option<&'static str> {
     }
 }
 
+/// Extract modified time as seconds since Unix epoch.
+fn modified_epoch(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[tauri::command]
 pub async fn get_file_preview(path: String) -> Result<FilePreviewData, LychiError> {
     let file_path = Path::new(&path);
+    let full_path = file_path
+        .canonicalize()
+        .unwrap_or_else(|_| file_path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
 
     if !file_path.exists() {
         return Err(LychiError::ExecutionFailed(format!(
@@ -105,6 +131,7 @@ pub async fn get_file_preview(path: String) -> Result<FilePreviewData, LychiErro
         )));
     }
     if file_path.is_dir() {
+        let dir_meta = std::fs::metadata(file_path).ok();
         let mut children: Vec<DirChild> = std::fs::read_dir(file_path)?
             .flatten()
             .filter_map(|e| {
@@ -119,9 +146,14 @@ pub async fn get_file_preview(path: String) -> Result<FilePreviewData, LychiErro
         children.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
         let item_count = children.len();
         children.truncate(20);
-        return Ok(FilePreviewData::Directory {
-            item_count,
-            children,
+        return Ok(FilePreviewData {
+            detail: FilePreviewDetail::Directory {
+                item_count,
+                children,
+            },
+            size_bytes: 0,
+            modified_epoch: dir_meta.as_ref().map(modified_epoch).unwrap_or(0),
+            full_path,
         });
     }
     if !file_path.is_file() {
@@ -130,6 +162,7 @@ pub async fn get_file_preview(path: String) -> Result<FilePreviewData, LychiErro
 
     let metadata = std::fs::metadata(file_path)?;
     let size = metadata.len();
+    let mtime = modified_epoch(&metadata);
 
     let ext = file_path
         .extension()
@@ -139,20 +172,26 @@ pub async fn get_file_preview(path: String) -> Result<FilePreviewData, LychiErro
 
     let file_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
+    let wrap = |detail: FilePreviewDetail| FilePreviewData {
+        detail,
+        size_bytes: size,
+        modified_epoch: mtime,
+        full_path: full_path.clone(),
+    };
+
     // Check for image files
     if let Some(mime) = extension_to_image_mime(&ext) {
         if size > MAX_IMAGE_BYTES {
-            return Ok(FilePreviewData::Unsupported {
+            return Ok(wrap(FilePreviewDetail::Unsupported {
                 mime: mime.to_string(),
-                size_bytes: size,
-            });
+            }));
         }
         let bytes = std::fs::read(file_path)?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        return Ok(FilePreviewData::Image {
+        return Ok(wrap(FilePreviewDetail::Image {
             base64: b64,
             mime: mime.to_string(),
-        });
+        }));
     }
 
     // Check for text files by extension
@@ -171,20 +210,19 @@ pub async fn get_file_preview(path: String) -> Result<FilePreviewData, LychiErro
         if size > MAX_TEXT_BYTES {
             // Read only up to the limit
             let content = read_text_limited(file_path, MAX_TEXT_BYTES as usize, MAX_TEXT_LINES)?;
-            return Ok(FilePreviewData::Text {
+            return Ok(wrap(FilePreviewDetail::Text {
                 content,
                 language: lang.to_string(),
                 truncated: true,
-            });
+            }));
         }
         let raw = std::fs::read(file_path)?;
         // Check if it looks like binary (contains null bytes in first 8KB)
         let check_len = raw.len().min(8192);
         if raw[..check_len].contains(&0) {
-            return Ok(FilePreviewData::Unsupported {
+            return Ok(wrap(FilePreviewDetail::Unsupported {
                 mime: "application/octet-stream".to_string(),
-                size_bytes: size,
-            });
+            }));
         }
         let full = String::from_utf8_lossy(&raw);
         let mut truncated = false;
@@ -197,11 +235,11 @@ pub async fn get_file_preview(path: String) -> Result<FilePreviewData, LychiErro
         } else {
             full.into_owned()
         };
-        return Ok(FilePreviewData::Text {
+        return Ok(wrap(FilePreviewDetail::Text {
             content,
             language: lang.to_string(),
             truncated,
-        });
+        }));
     }
 
     // No recognized extension — try binary detection on small files
@@ -221,18 +259,17 @@ pub async fn get_file_preview(path: String) -> Result<FilePreviewData, LychiErro
             } else {
                 full.into_owned()
             };
-            return Ok(FilePreviewData::Text {
+            return Ok(wrap(FilePreviewDetail::Text {
                 content,
                 language: "text".to_string(),
                 truncated,
-            });
+            }));
         }
     }
 
-    Ok(FilePreviewData::Unsupported {
+    Ok(wrap(FilePreviewDetail::Unsupported {
         mime: "application/octet-stream".to_string(),
-        size_bytes: size,
-    })
+    }))
 }
 
 /// Read a text file up to a byte and line limit.

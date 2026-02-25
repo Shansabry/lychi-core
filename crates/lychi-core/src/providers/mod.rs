@@ -61,10 +61,12 @@ pub trait AiProvider: Send + Sync {
     ) -> Result<AiRoute, LychiError>;
 
     /// Route input, returning either a single route or a multi-step plan.
+    /// `context_hint` is an optional environment context string appended to the system prompt.
     async fn route_or_plan(
         &self,
         input: &str,
         known_actions: &[&str],
+        context_hint: Option<&str>,
     ) -> Result<AiResponse, LychiError>;
 
     /// Check if the provider is reachable and functional.

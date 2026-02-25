@@ -1,9 +1,13 @@
 use tauri::{AppHandle, Emitter, State};
 
 use lychi_core::action_registry::{ActionResult, CompletionItem};
+use lychi_core::db::frecency;
 use lychi_core::error::LychiError;
 
 use crate::state::AppState;
+
+/// Action IDs that mutate panel data (notes, todos, reminders).
+const PANEL_MUTATION_ACTIONS: &[&str] = &["note", "todo", "reminder"];
 
 #[tauri::command]
 pub async fn execute_command(
@@ -12,22 +16,26 @@ pub async fn execute_command(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ActionResult, LychiError> {
-    // Record in history
+    // Record in history + frecency for fuzzy search ranking
     state.history.push(&state.db, &input)?;
+    let trimmed = input.trim();
+    if !trimmed.is_empty() {
+        let _ = frecency::record(&state.db, &format!("history:{trimmed}"));
+    }
 
     // Run through executor pipeline: resolve → validate → execute
     let executor = state.executor.read().await;
     let privacy = state.config.read().await.privacy.clone();
-    let result = executor
+    let exec = executor
         .run(&input, confirmed.unwrap_or(false), &privacy)
         .await?;
 
-    // Notify frontend when notes/todos are mutated by a handler
-    if result.success && is_notes_mutation(&input) {
+    // Notify frontend when notes/todos/reminders are mutated by a handler
+    if exec.result.success && PANEL_MUTATION_ACTIONS.contains(&exec.action_id.as_str()) {
         let _ = app.emit("lychi://notes-changed", ());
     }
 
-    Ok(result)
+    Ok(exec.result)
 }
 
 #[tauri::command]
@@ -38,15 +46,4 @@ pub async fn get_completions(
     let executor = state.executor.read().await;
     let results = executor.completions(&input).await;
     Ok(results)
-}
-
-/// Check if the input is a notes/todo write operation (not a read).
-fn is_notes_mutation(input: &str) -> bool {
-    let lower = input.trim().to_lowercase();
-    let is_note_write = lower.starts_with("note ") && !lower.starts_with("note read");
-    let is_todo_write = lower.starts_with("todo ")
-        && !lower.starts_with("todo list")
-        && !lower.starts_with("todo ls")
-        && !lower.starts_with("todo summary");
-    is_note_write || is_todo_write
 }

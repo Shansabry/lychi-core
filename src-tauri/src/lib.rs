@@ -50,6 +50,7 @@ pub fn run() {
             commands::ai::get_ai_config,
             commands::ai::save_ai_config,
             commands::ai::set_api_key,
+            commands::ai::get_masked_api_key,
             commands::ai::get_ai_status,
             commands::ai::check_ai_health,
             commands::config::get_general_config,
@@ -96,6 +97,15 @@ pub fn run() {
             commands::aliases::update_alias,
             commands::aliases::delete_alias,
             commands::preview::get_file_preview,
+            commands::timer::get_timers,
+            commands::reminders::get_reminders,
+            commands::reminders::add_reminder,
+            commands::reminders::delete_reminder,
+            commands::snippets::get_snippets,
+            commands::snippets::add_snippet,
+            commands::snippets::update_snippet,
+            commands::snippets::delete_snippet,
+            commands::context::get_context,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -125,6 +135,9 @@ pub fn run() {
                     &dirs_for_warmup,
                 );
             });
+            tauri::async_runtime::spawn_blocking(|| {
+                lychi_core::history::HistoryStore::warmup();
+            });
 
             // Warm alias cache for transparent alias resolution in router
             let alias_db = app.state::<state::AppState>().db.clone();
@@ -139,6 +152,16 @@ pub fn run() {
             let clip_db = app.state::<AppState>().db.clone();
             tauri::async_runtime::spawn_blocking(move || {
                 lychi_core::clipboard::store::run_clipboard_monitor(clip_db);
+            });
+
+            // Background timer + reminder monitor (single thread for all notify-rust calls)
+            let timer_state = app.state::<AppState>().timer_state.clone();
+            let monitor_db = app.state::<AppState>().db.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                lychi_core::action_registry::handlers::timer::run_timer_monitor(
+                    timer_state,
+                    monitor_db,
+                );
             });
 
             // Register global shortcut

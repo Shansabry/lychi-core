@@ -72,7 +72,24 @@ let fileName = $derived(() => {
 function formatBytes(bytes: number): string {
 	if (bytes < 1024) return `${bytes} B`;
 	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-	return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+	if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+	return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function formatRelativeTime(epoch: number): string {
+	if (!epoch) return "";
+	const now = Math.floor(Date.now() / 1000);
+	const diff = now - epoch;
+	if (diff < 60) return "just now";
+	if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+	if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+	if (diff < 604800) return `${Math.floor(diff / 86400)}d ago`;
+	const d = new Date(epoch * 1000);
+	return d.toLocaleDateString(undefined, {
+		month: "short",
+		day: "numeric",
+		year: d.getFullYear() !== new Date().getFullYear() ? "numeric" : undefined,
+	});
 }
 </script>
 
@@ -88,14 +105,31 @@ function formatBytes(bytes: number): string {
 			<span>Preview unavailable</span>
 		</div>
 	{:else if preview}
-		{#if preview.kind === "Text"}
-			<div class="preview-header">
-				<FileText size={14} strokeWidth={1.5} />
-				<span class="lang-badge">{preview.language}</span>
-				{#if preview.truncated}
+		<div class="preview-meta">
+			<span class="meta-name" title={preview.full_path}>{fileName()}</span>
+			<div class="meta-details">
+				{#if preview.kind === "Text"}
+					<span class="meta-badge">{preview.language}</span>
+				{:else if preview.kind === "Directory"}
+					<span class="meta-badge">{preview.item_count} item{preview.item_count === 1 ? "" : "s"}</span>
+				{:else if preview.kind === "Unsupported"}
+					<span class="meta-badge">{preview.mime}</span>
+				{/if}
+				{#if preview.size_bytes > 0}
+					<span class="meta-sep">&middot;</span>
+					<span>{formatBytes(preview.size_bytes)}</span>
+				{/if}
+				{#if preview.modified_epoch}
+					<span class="meta-sep">&middot;</span>
+					<span>{formatRelativeTime(preview.modified_epoch)}</span>
+				{/if}
+				{#if preview.kind === "Text" && preview.truncated}
+					<span class="meta-sep">&middot;</span>
 					<span class="truncated-badge">truncated</span>
 				{/if}
 			</div>
+		</div>
+		{#if preview.kind === "Text"}
 			{#if preview.language === "markdown" && renderedMarkdown}
 				<div class="preview-content markdown">{@html renderedMarkdown}</div>
 			{:else}
@@ -108,14 +142,9 @@ function formatBytes(bytes: number): string {
 		{:else if preview.kind === "Unsupported"}
 			<div class="preview-unsupported">
 				<FileQuestion size={24} strokeWidth={1.5} />
-				<span class="unsupported-type">{preview.mime}</span>
-				<span class="unsupported-size">{formatBytes(preview.size_bytes)}</span>
+				<span class="unsupported-label">No preview available</span>
 			</div>
 		{:else if preview.kind === "Directory"}
-			<div class="preview-header">
-				<Folder size={14} strokeWidth={1.5} />
-				<span class="lang-badge">{preview.item_count} item{preview.item_count === 1 ? "" : "s"}</span>
-			</div>
 			<div class="preview-content dir-listing">
 				{#each preview.children as child}
 					<div class="dir-child">
@@ -165,31 +194,46 @@ function formatBytes(bytes: number): string {
 		}
 	}
 
-	.preview-header {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		padding: 8px 14px;
+	.preview-meta {
+		padding: 10px 14px 8px;
 		border-bottom: 1px solid var(--border);
-		color: var(--fg-muted);
 		flex-shrink: 0;
 	}
 
-	.lang-badge {
+	.meta-name {
+		display: block;
+		font-family: var(--font-mono);
+		font-size: 12px;
+		font-weight: 600;
+		color: var(--fg);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		margin-bottom: 4px;
+	}
+
+	.meta-details {
+		display: flex;
+		align-items: center;
+		gap: 4px;
 		font-family: var(--font-mono);
 		font-size: 11px;
+		color: var(--fg-muted);
+	}
+
+	.meta-badge {
 		color: var(--accent);
 		background: var(--bg-secondary);
 		padding: 1px 8px;
 		border-radius: 8px;
 	}
 
+	.meta-sep {
+		opacity: 0.4;
+	}
+
 	.truncated-badge {
-		font-family: var(--font-mono);
-		font-size: 10px;
-		color: var(--fg-muted);
 		opacity: 0.5;
-		margin-left: auto;
 	}
 
 	.preview-content {
@@ -396,16 +440,10 @@ function formatBytes(bytes: number): string {
 		color: var(--fg-muted);
 	}
 
-	.unsupported-type {
+	.unsupported-label {
 		font-family: var(--font-mono);
 		font-size: 12px;
-		opacity: 0.6;
-	}
-
-	.unsupported-size {
-		font-family: var(--font-mono);
-		font-size: 11px;
-		opacity: 0.4;
+		opacity: 0.5;
 	}
 
 	/* Narrow/portrait screens: hide preview entirely — result list metadata is sufficient */

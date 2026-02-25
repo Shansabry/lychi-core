@@ -35,6 +35,9 @@ pub enum LychiError {
     #[error("Alias error: {0}")]
     Alias(String),
 
+    #[error("Snippet error: {0}")]
+    Snippet(String),
+
     #[error("Database error: {0}")]
     Database(String),
 }

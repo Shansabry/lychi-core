@@ -24,6 +24,7 @@ let {
 	ontabscope = () => {},
 	ontabcomplete = () => {},
 	onshifttabback = () => {},
+	contextPill = "",
 	searchGhost = "",
 	browseGhost = "",
 	history = [],
@@ -48,6 +49,7 @@ let {
 	ontabscope?: () => void;
 	ontabcomplete?: () => void;
 	onshifttabback?: () => void;
+	contextPill?: string;
 	searchGhost?: string;
 	browseGhost?: string;
 	history: string[];
@@ -143,6 +145,7 @@ const SUGGESTIONS = [
 	"find large files in Downloads",
 	"pause all music",
 	"github.com",
+	"snip email-intro",
 ];
 
 // Fisher-Yates shuffle
@@ -332,6 +335,9 @@ function handleKeydown(e: KeyboardEvent) {
 			autofocus
 		/>
 	</div>
+	{#if contextPill}
+		<span class="context-pill">{contextPill}</span>
+	{/if}
 </div>
 
 <style>
@@ -352,10 +358,23 @@ function handleKeydown(e: KeyboardEvent) {
 		user-select: none;
 		display: flex;
 		align-items: center;
-		justify-content: center;
-		width: 18px;
+		gap: 6px;
 		height: 18px;
 		transition: color 200ms ease;
+		white-space: nowrap;
+	}
+
+	.context-pill {
+		flex-shrink: 0;
+		font-size: 10px;
+		font-family: var(--font-mono);
+		color: var(--fg-muted);
+		opacity: 0.45;
+		background: rgba(255, 255, 255, 0.06);
+		padding: 2px 8px;
+		border-radius: 9999px;
+		white-space: nowrap;
+		user-select: none;
 	}
 
 	.prompt.routing {

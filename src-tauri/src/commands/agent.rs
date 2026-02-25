@@ -54,10 +54,21 @@ pub async fn execute_agent_plan(
 
         // Execute step through the executor pipeline (resolve → validate → execute)
         // Plan steps are pre-confirmed (confirmed=true) since user approved the plan
-        let result = executor
+        let exec = executor
             .run(&format!("{} {}", step.action_id, step.args), true, &privacy)
-            .await
-            .unwrap_or_else(|e| ActionResult {
+            .await;
+
+        let result = match exec {
+            Ok(exec) => {
+                // Notify frontend when notes/todos/reminders are mutated by a plan step
+                if exec.result.success
+                    && matches!(exec.action_id.as_str(), "note" | "todo" | "reminder")
+                {
+                    let _ = app.emit("lychi://notes-changed", ());
+                }
+                exec.result
+            }
+            Err(e) => ActionResult {
                 success: false,
                 output: None,
                 error: Some(e.to_string()),
@@ -68,12 +79,8 @@ pub async fn execute_agent_plan(
                 risk_level: None,
                 output_type: None,
                 executed_args: None,
-            });
-
-        // Notify frontend when notes/todos are mutated by a plan step
-        if result.success && (step.action_id == "note" || step.action_id == "todo") {
-            let _ = app.emit("lychi://notes-changed", ());
-        }
+            },
+        };
 
         let failed = !result.success;
 

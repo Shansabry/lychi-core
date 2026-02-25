@@ -252,6 +252,7 @@ pub fn reposition_to_monitor(window: &WebviewWindow, monitor: &gdk::Monitor) {
         // Must unmap → set_monitor → remap for compositor to honour the change
         gtk_win.hide();
         gtk_win.set_monitor(monitor);
+        gtk_win.show();
         tracing::debug!(
             "Repositioned layer-shell to monitor at {},{} ({}x{})",
             geom.x(),

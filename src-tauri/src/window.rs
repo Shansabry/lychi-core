@@ -22,6 +22,9 @@ pub fn show_window(window: &WebviewWindow) {
         state.config.blocking_read().general.monitor_mode.clone()
     };
 
+    // Snapshot the active window BEFORE we show Lychi (otherwise we'd detect ourselves).
+    let pre_window = lychi_core::context::snapshot_active_window();
+
     // Reposition the window to the target monitor BEFORE showing it.
     // GDK/GTK calls must run on the GLib main thread, so dispatch via
     // glib::MainContext and block until complete (same pattern as open_uri).
@@ -51,4 +54,41 @@ pub fn show_window(window: &WebviewWindow) {
 
     // Tell frontend to reset state (clear input, refocus input element)
     let _ = window.emit("lychi://summon", ());
+
+    // Gather environment context asynchronously (never blocks summon).
+    // Result is stored in Executor.context and emitted to frontend.
+    let ctx_handle = window.app_handle().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let ctx = lychi_core::context::gather(pre_window);
+        tracing::info!(
+            "Context gathered in {}ms: window={}, cwd={}, git={}, project={}, docker={}",
+            ctx.gather_ms,
+            ctx.active_window
+                .as_ref()
+                .map(|w| w.wm_class.as_str())
+                .unwrap_or("none"),
+            ctx.cwd.as_deref().unwrap_or("none"),
+            ctx.git
+                .as_ref()
+                .map(|g| g.branch.as_str())
+                .unwrap_or("none"),
+            ctx.project
+                .as_ref()
+                .map(|p| format!("{:?}", p.kind))
+                .unwrap_or_else(|| "none".into()),
+            ctx.docker
+                .as_ref()
+                .map(|d| d.containers.len().to_string())
+                .unwrap_or_else(|| "none".into()),
+        );
+
+        // Store in executor
+        let state = ctx_handle.state::<AppState>();
+        if let Ok(mut executor) = state.executor.try_write() {
+            executor.context = Some(ctx.clone());
+        }
+
+        // Notify frontend that context is ready
+        let _ = ctx_handle.emit("lychi://context-ready", &ctx);
+    });
 }

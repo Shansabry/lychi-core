@@ -1,10 +1,22 @@
+use std::sync::Arc;
+
+use redb::Database;
+
 use crate::action_registry::registry::ActionRegistry;
 use crate::action_registry::{ActionResult, CompletionItem, RiskLevel};
 use crate::config::schema::PrivacyConfig;
+use crate::context::EnvironmentContext;
 use crate::error::LychiError;
+use crate::history::HistoryStore;
 use crate::intent::{IntentResolver, RoutingMethod};
 use crate::providers::AgentPlan;
 use crate::rules::{RulesEngine, ValidationDecision, ValidationRequest};
+
+/// Result of executing a command, including the resolved action_id.
+pub struct ExecuteResult {
+    pub result: ActionResult,
+    pub action_id: String,
+}
 
 /// Executor — the single orchestrator that wires all bricks together.
 ///
@@ -13,14 +25,27 @@ pub struct Executor {
     pub registry: ActionRegistry,
     pub rules: RulesEngine,
     pub resolver: IntentResolver,
+    pub history: HistoryStore,
+    pub db: Arc<Database>,
+    /// Current environment context, refreshed on each summon.
+    pub context: Option<EnvironmentContext>,
 }
 
 impl Executor {
-    pub fn new(registry: ActionRegistry, rules: RulesEngine, resolver: IntentResolver) -> Self {
+    pub fn new(
+        registry: ActionRegistry,
+        rules: RulesEngine,
+        resolver: IntentResolver,
+        history: HistoryStore,
+        db: Arc<Database>,
+    ) -> Self {
         Self {
             registry,
             rules,
             resolver,
+            history,
+            db,
+            context: None,
         }
     }
 
@@ -33,7 +58,13 @@ impl Executor {
         input: &str,
         confirmed: bool,
         privacy: &PrivacyConfig,
-    ) -> Result<ActionResult, LychiError> {
+    ) -> Result<ExecuteResult, LychiError> {
+        // Set context hint on AI router so it's included in the prompt
+        if let Some(ai) = self.resolver.ai_router() {
+            let hint = self.context.as_ref().and_then(|ctx| ctx.ai_hint());
+            ai.set_context_hint(hint);
+        }
+
         let intent = self.resolver.resolve(input, &self.registry).await;
         tracing::info!(
             "Resolved '{}' → action={}, args='{}', routing={:?}",
@@ -42,6 +73,8 @@ impl Executor {
             intent.args,
             intent.routing
         );
+
+        let action_id = intent.action_id.clone();
 
         let handler = self
             .registry
@@ -65,8 +98,8 @@ impl Executor {
             privacy,
         );
 
-        match decision {
-            ValidationDecision::Deny { reason } => Ok(ActionResult {
+        let result = match decision {
+            ValidationDecision::Deny { reason } => ActionResult {
                 success: false,
                 output: None,
                 error: Some(format!("Blocked: {reason}")),
@@ -77,8 +110,8 @@ impl Executor {
                 risk_level: Some(RiskLevel::High),
                 output_type: None,
                 executed_args: None,
-            }),
-            ValidationDecision::Confirm { reason } if !confirmed => Ok(ActionResult {
+            },
+            ValidationDecision::Confirm { reason } if !confirmed => ActionResult {
                 success: false,
                 output: None,
                 error: None,
@@ -89,9 +122,13 @@ impl Executor {
                 risk_level: Some(handler.default_risk()),
                 output_type: None,
                 executed_args: None,
-            }),
+            },
             // Execute (or Confirm with confirmed=true)
             _ => {
+                // Set context CWD so shell commands run in the detected workspace
+                crate::action_registry::handlers::shell_exec::set_context_cwd(
+                    self.context.as_ref().and_then(|ctx| ctx.cwd.clone()),
+                );
                 let mut result = handler.execute(&intent.args).await?;
                 if intent.routing == RoutingMethod::Ai {
                     result.routed_by = Some("ai".to_string());
@@ -107,21 +144,67 @@ impl Executor {
                     && intent.routing != RoutingMethod::Ai
                     && let Some(web) = self.registry.get("web")
                 {
-                    return web.execute(input).await;
+                    return Ok(ExecuteResult {
+                        result: web.execute(input).await?,
+                        action_id: "web".to_string(),
+                    });
                 }
 
-                Ok(result)
+                result
             }
-        }
+        };
+
+        Ok(ExecuteResult { result, action_id })
     }
 
-    /// Get completions using the intent resolver to pick the right handler.
+    /// Get completions using the intent resolver to pick the right handler,
+    /// with history entries shown in a separate section below.
+    /// When input is empty and context is available, shows contextual suggestions.
     pub async fn completions(&self, raw: &str) -> Vec<CompletionItem> {
-        let route = crate::intent::patterns::route(raw);
-        let results = self.registry.completions(route.handler, &route.args).await;
+        // Contextual suggestions for empty/very short input
+        let trimmed = raw.trim();
+        if trimmed.len() <= 1
+            && let Some(ref ctx) = self.context
+        {
+            let ctx_items = crate::context::suggestions::suggest(ctx);
+            if !ctx_items.is_empty() && trimmed.is_empty() {
+                return ctx_items;
+            }
+        }
 
-        if !results.is_empty() {
-            return results;
+        let route = crate::intent::patterns::route(raw);
+        let mut handler_results = self.registry.completions(route.handler, &route.args).await;
+
+        // Get history completions (deduplicated against handler results)
+        let trimmed = raw.trim();
+        let mut history_results = Vec::new();
+        if !trimmed.is_empty() {
+            for hist in self.history.fuzzy_search(&self.db, trimmed) {
+                if !handler_results.iter().any(|r| r.label == hist.label) {
+                    history_results.push(hist);
+                }
+            }
+        }
+
+        // Build sectioned output: handler results first, then separator, then history
+        if !handler_results.is_empty() || !history_results.is_empty() {
+            handler_results.truncate(5);
+            history_results.truncate(3);
+
+            let mut out = handler_results;
+
+            if !history_results.is_empty() && !out.is_empty() {
+                // Insert separator between sections
+                out.push(CompletionItem {
+                    label: "history".to_string(),
+                    icon_path: Some("__separator__".to_string()),
+                    score: 0,
+                    description: None,
+                });
+            }
+
+            out.extend(history_results);
+            return out;
         }
 
         // Fallback: if the routed handler returned nothing, try app search.
@@ -132,7 +215,15 @@ impl Executor {
             } else {
                 &route.args
             };
-            return self.registry.completions("open", search_term).await;
+            let app_results = self.registry.completions("open", search_term).await;
+            if !app_results.is_empty() {
+                return app_results;
+            }
+        }
+
+        // Typo correction: suggest "Did you mean: X?" for near-miss inputs
+        if let Some(suggestion) = crate::intent::typo_suggest::suggest(raw) {
+            return vec![suggestion];
         }
 
         Vec::new()
@@ -146,5 +237,10 @@ impl Executor {
     /// Whether AI is available.
     pub fn has_ai(&self) -> bool {
         self.resolver.has_ai()
+    }
+
+    /// Refresh environment context (call on summon).
+    pub fn refresh_context(&mut self, pre_window: Option<crate::context::WindowContext>) {
+        self.context = Some(crate::context::gather(pre_window));
     }
 }

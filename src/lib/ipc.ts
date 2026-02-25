@@ -388,6 +388,11 @@ export async function setApiKey(provider: string, key: string): Promise<void> {
 	return invoke("set_api_key", { provider, key });
 }
 
+export async function getMaskedApiKey(provider: string): Promise<string | null> {
+	if (!isTauri()) return null;
+	return invoke<string | null>("get_masked_api_key", { provider });
+}
+
 export async function getAiStatus(): Promise<AiStatus> {
 	if (!isTauri()) return { mode: "disabled", provider: "", model: "", has_ai_router: false };
 	return invoke<AiStatus>("get_ai_status");
@@ -542,15 +547,147 @@ export async function deleteTodo(id: string): Promise<void> {
 	return invoke("delete_todo", { id });
 }
 
+// --- Timer ---
+
+export interface TimerStatus {
+	id: string;
+	name: string;
+	duration_secs: number;
+	remaining_secs: number;
+	elapsed_secs: number;
+	paused: boolean;
+	done: boolean;
+	stopwatch: boolean;
+}
+
+export async function getTimers(): Promise<TimerStatus[]> {
+	if (!isTauri()) return [];
+	return invoke<TimerStatus[]>("get_timers");
+}
+
+// --- Reminders ---
+
+export interface ReminderItem {
+	id: string;
+	text: string;
+	due_at: number;
+	fired: boolean;
+	created_at: number;
+}
+
+export async function getReminders(): Promise<ReminderItem[]> {
+	if (!isTauri()) return [];
+	return invoke<ReminderItem[]>("get_reminders");
+}
+
+export async function addReminder(text: string, dueAt: number): Promise<ReminderItem> {
+	if (!isTauri()) return { id: "", text, due_at: dueAt, fired: false, created_at: 0 };
+	return invoke<ReminderItem>("add_reminder", { text, dueAt });
+}
+
+export async function deleteReminder(id: string): Promise<void> {
+	if (!isTauri()) return;
+	return invoke<void>("delete_reminder", { id });
+}
+
+// --- Snippets ---
+
+export interface SnippetItem {
+	id: string;
+	name: string;
+	body: string;
+	created_at: number;
+	updated_at: number;
+}
+
+export async function getSnippets(): Promise<SnippetItem[]> {
+	if (!isTauri()) return [];
+	return invoke<SnippetItem[]>("get_snippets");
+}
+
+export async function addSnippet(name: string, body: string): Promise<SnippetItem> {
+	if (!isTauri()) return { id: "", name, body, created_at: 0, updated_at: 0 };
+	return invoke<SnippetItem>("add_snippet", { name, body });
+}
+
+export async function updateSnippet(id: string, name: string, body: string): Promise<void> {
+	if (!isTauri()) return;
+	return invoke("update_snippet", { id, name, body });
+}
+
+export async function deleteSnippet(id: string): Promise<void> {
+	if (!isTauri()) return;
+	return invoke("delete_snippet", { id });
+}
+
+// --- Context Awareness ---
+
+export interface WindowContext {
+	title: string;
+	wm_class: string;
+	pid: number;
+	is_terminal: boolean;
+}
+
+export interface GitContext {
+	repo_root: string;
+	branch: string;
+	dirty: boolean;
+	remote: string | null;
+}
+
+export interface ProjectContext {
+	root: string;
+	kind: string;
+}
+
+export interface ContainerInfo {
+	id: string;
+	name: string;
+	image: string;
+	status: string;
+}
+
+export interface DockerContext {
+	daemon_running: boolean;
+	containers: ContainerInfo[];
+}
+
+export interface EnvironmentContext {
+	active_window: WindowContext | null;
+	cwd: string | null;
+	git: GitContext | null;
+	project: ProjectContext | null;
+	docker: DockerContext | null;
+	gather_ms: number;
+}
+
+export async function getContext(): Promise<EnvironmentContext | null> {
+	if (!isTauri()) return null;
+	return invoke<EnvironmentContext | null>("get_context");
+}
+
 // --- File Preview ---
 
-export type FilePreviewData =
+export type FilePreviewData = {
+	size_bytes: number;
+	modified_epoch: number;
+	full_path: string;
+} & (
 	| { kind: "Text"; content: string; language: string; truncated: boolean }
 	| { kind: "Image"; base64: string; mime: string }
-	| { kind: "Unsupported"; mime: string; size_bytes: number }
-	| { kind: "Directory"; item_count: number; children: { name: string; is_dir: boolean }[] };
+	| { kind: "Unsupported"; mime: string }
+	| { kind: "Directory"; item_count: number; children: { name: string; is_dir: boolean }[] }
+);
 
 export async function getFilePreview(path: string): Promise<FilePreviewData> {
-	if (!isTauri()) return { kind: "Unsupported", mime: "unknown", size_bytes: 0 };
+	if (!isTauri())
+		return {
+			kind: "Unsupported",
+			mime: "unknown",
+			size_bytes: 0,
+			modified_epoch: 0,
+			full_path: "",
+		};
 	return invoke<FilePreviewData>("get_file_preview", { path });
 }

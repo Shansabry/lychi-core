@@ -68,3 +68,29 @@ pub struct AliasEntry {
     #[serde(default)]
     pub sync_status: SyncStatus,
 }
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ReminderEntry {
+    pub text: String,
+    pub due_at: u64,
+    #[serde(default)]
+    pub fired: bool,
+    pub created_at: u64,
+    pub updated_at: u64,
+    #[serde(default)]
+    pub deleted_at: Option<u64>,
+    #[serde(default)]
+    pub sync_status: SyncStatus,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SnippetEntry {
+    pub name: String,
+    pub body: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    #[serde(default)]
+    pub deleted_at: Option<u64>,
+    #[serde(default)]
+    pub sync_status: SyncStatus,
+}

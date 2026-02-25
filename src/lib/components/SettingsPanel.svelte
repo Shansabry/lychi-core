@@ -25,6 +25,7 @@ import type {
 } from "$lib/ipc";
 import {
 	checkAiHealth,
+	getMaskedApiKey,
 	KEYBINDINGS_DEFAULTS,
 	listDirectories,
 	recordHotkey,
@@ -87,6 +88,9 @@ let keybindingsConfig: KeybindingsConfig = $state({ ...KEYBINDINGS_DEFAULTS });
 let recordingAction: ActionId | null = $state(null);
 let conflictWarning = $state("");
 let apiKeyInput = $state("");
+let maskedKey: string | null = $state(null);
+let editingKey = $state(false);
+let confirmingClear = $state(false);
 let healthStatus: "checking" | "healthy" | "error" | "disabled" = $state("disabled");
 let saving = $state(false);
 let hotkeyError = $state("");
@@ -133,6 +137,7 @@ onMount(() => {
 				providerModels = m;
 			});
 			refreshHealth();
+			refreshMaskedKey(cached.aiConfig.provider);
 		});
 	});
 });
@@ -148,6 +153,14 @@ async function refreshHealth() {
 		healthStatus = ok ? "healthy" : "error";
 	} catch {
 		healthStatus = "error";
+	}
+}
+
+async function refreshMaskedKey(provider: string) {
+	try {
+		maskedKey = await getMaskedApiKey(provider);
+	} catch {
+		maskedKey = null;
 	}
 }
 
@@ -285,7 +298,11 @@ async function handleProviderChange(val: string) {
 	aiConfig.provider = val;
 	const available = providerModels[aiConfig.provider];
 	aiConfig.model = available?.[0]?.value ?? "";
+	apiKeyInput = "";
+	editingKey = false;
+	confirmingClear = false;
 	await saveAi();
+	refreshMaskedKey(val);
 }
 
 async function handleModelChange(val: string) {
@@ -299,6 +316,27 @@ async function handleSetApiKey() {
 	try {
 		await setApiKey(aiConfig.provider, apiKeyInput.trim());
 		apiKeyInput = "";
+		editingKey = false;
+		confirmingClear = false;
+		await refreshHealth();
+		await refreshMaskedKey(aiConfig.provider);
+	} finally {
+		saving = false;
+	}
+}
+
+async function handleClearApiKey() {
+	if (!confirmingClear) {
+		confirmingClear = true;
+		return;
+	}
+	confirmingClear = false;
+	saving = true;
+	try {
+		await setApiKey(aiConfig.provider, "");
+		maskedKey = null;
+		apiKeyInput = "";
+		editingKey = false;
 		await refreshHealth();
 	} finally {
 		saving = false;
@@ -438,6 +476,12 @@ function removeProjectDir(index: number) {
 
 function handleKeydown(e: KeyboardEvent) {
 	if (e.key === "Escape") {
+		if (confirmingClear) {
+			e.preventDefault();
+			e.stopPropagation();
+			confirmingClear = false;
+			return;
+		}
 		e.preventDefault();
 		e.stopPropagation();
 		ondismiss();
@@ -715,17 +759,32 @@ function handleKeydown(e: KeyboardEvent) {
 				<div class="field">
 					<label for="ai-key">API Key</label>
 					<div class="key-row">
-						<input
-							id="ai-key"
-							type="password"
-							bind:value={apiKeyInput}
-							placeholder="Enter key..."
-							spellcheck="false"
-							onkeydown={(e) => { if (e.key === "Enter") { e.preventDefault(); handleSetApiKey(); } }}
-						/>
-						<button class="set-btn" onclick={handleSetApiKey} disabled={saving || !apiKeyInput.trim()}>
-							Set
-						</button>
+						{#if maskedKey && !editingKey}
+							<span class="masked-key">{maskedKey}</span>
+							<button class="set-btn" onclick={() => { editingKey = true; confirmingClear = false; }} disabled={saving}>
+								Change
+							</button>
+							<button class="set-btn clear-btn" class:confirming={confirmingClear} onclick={handleClearApiKey} disabled={saving}>
+								{confirmingClear ? "Sure?" : "Clear"}
+							</button>
+						{:else}
+							<input
+								id="ai-key"
+								type="password"
+								bind:value={apiKeyInput}
+								placeholder="Enter API key..."
+								spellcheck="false"
+								onkeydown={(e) => { if (e.key === "Enter") { e.preventDefault(); handleSetApiKey(); } }}
+							/>
+							<button class="set-btn" onclick={handleSetApiKey} disabled={saving || !apiKeyInput.trim()}>
+								Set
+							</button>
+							{#if maskedKey}
+								<button class="set-btn" onclick={() => { editingKey = false; apiKeyInput = ""; confirmingClear = false; }} disabled={saving}>
+									Cancel
+								</button>
+							{/if}
+						{/if}
 					</div>
 				</div>
 
@@ -1098,11 +1157,24 @@ function handleKeydown(e: KeyboardEvent) {
 		gap: 6px;
 		flex: 1;
 		min-width: 0;
+		align-items: center;
 	}
 
 	.key-row input {
 		flex: 1;
 		min-width: 0;
+	}
+
+	.masked-key {
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--fg-muted);
+		letter-spacing: 0.02em;
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 
 	.set-btn {
@@ -1125,6 +1197,17 @@ function handleKeydown(e: KeyboardEvent) {
 	.set-btn:disabled {
 		opacity: 0.4;
 		cursor: default;
+	}
+
+	.clear-btn:hover {
+		color: var(--error);
+		border-color: var(--error);
+		background: var(--bg-secondary);
+	}
+
+	.clear-btn.confirming {
+		color: var(--error);
+		border-color: var(--error);
 	}
 
 	.health-status {

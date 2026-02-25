@@ -15,6 +15,7 @@ import type {
 	AgentPlan,
 	CommandResult,
 	CompletionItem,
+	EnvironmentContext,
 	FileSearchBatch,
 	MountPoint,
 	StepEvent,
@@ -25,6 +26,7 @@ import {
 	executeCommand,
 	getAgentPlan,
 	getCompletions,
+	getContext,
 	getHideOnBlur,
 	getHistory,
 	getMountPoints,
@@ -103,7 +105,17 @@ let routingGeneration = 0;
 let mediaOpen = $state(false);
 let notesOpen = $state(false);
 let pendingNoteText: string | null = $state(null);
+let initialNotesTab: "notes" | "todos" | "reminders" | "timers" | "snippets" | undefined =
+	$state(undefined);
 let mediaPlayers: TrackInfo[] = $state([]);
+let envContext: EnvironmentContext | null = $state(null);
+let contextPill = $derived.by(() => {
+	const folder = envContext?.cwd?.split("/").pop();
+	if (!folder) return "";
+	const branch = envContext?.git?.branch;
+	if (branch) return `${folder} · ${branch}`;
+	return folder;
+});
 let mediaPollTimer: ReturnType<typeof setTimeout> | undefined;
 
 // Derive the "now playing" track — first playing, or first in list
@@ -365,6 +377,7 @@ onMount(() => {
 			pendingPlan = null;
 			mediaOpen = false;
 			notesOpen = false;
+
 			completions = [];
 			completionIndex = -1;
 			atMode = false;
@@ -385,6 +398,12 @@ onMount(() => {
 			});
 		});
 		unlisteners.push(unlistenSummon);
+
+		// Listen for context-ready event from async context gathering
+		const unlistenContext = await win.listen<EnvironmentContext>("lychi://context-ready", (e) => {
+			envContext = e.payload;
+		});
+		unlisteners.push(unlistenContext);
 
 		// Listen for media track updates from background D-Bus listener
 		const unlistenMedia = await win.listen<TrackInfo>("lychi://media-track", (e) => {
@@ -522,6 +541,17 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 		return;
 	}
 
+	if (lower === "history") {
+		inputValue = "";
+		historyOpen = true;
+		settingsOpen = false;
+		notesOpen = false;
+		mediaOpen = false;
+		completions = [];
+		completionIndex = -1;
+		return;
+	}
+
 	if (lower === "spotify" || lower === "media" || lower === "music") {
 		inputValue = "";
 		mediaOpen = true;
@@ -531,12 +561,36 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 		return;
 	}
 
-	if (lower === "notes" || lower === "todo" || lower === "todos") {
+	if (
+		lower === "note" ||
+		lower === "notes" ||
+		lower === "todo" ||
+		lower === "todos" ||
+		lower === "reminder" ||
+		lower === "reminders" ||
+		lower === "timer" ||
+		lower === "timers" ||
+		lower === "stopwatch" ||
+		lower === "snip" ||
+		lower === "snippet" ||
+		lower === "snippets"
+	) {
 		inputValue = "";
 		notesOpen = true;
 		historyOpen = false;
 		completions = [];
 		completionIndex = -1;
+		if (lower === "reminder" || lower === "reminders") {
+			initialNotesTab = "reminders";
+		} else if (lower === "timer" || lower === "timers" || lower === "stopwatch") {
+			initialNotesTab = "timers";
+		} else if (lower === "todo" || lower === "todos") {
+			initialNotesTab = "todos";
+		} else if (lower === "snip" || lower === "snippet" || lower === "snippets") {
+			initialNotesTab = "snippets";
+		} else {
+			initialNotesTab = "notes";
+		}
 		return;
 	}
 
@@ -554,7 +608,7 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 	// If completions are visible and one is selected, execute based on context
 	if (completions.length > 0 && completionIndex >= 0) {
 		const selected = completions[completionIndex];
-		if (selected) {
+		if (selected && selected.icon_path !== "__separator__") {
 			// Calc results start with "= " — just display, don't execute
 			if (selected.label.startsWith("= ")) {
 				lastResult = {
@@ -566,6 +620,14 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 				inputValue = "";
 				completions = [];
 				completionIndex = -1;
+				return;
+			}
+			// "Did you mean: X?" typo suggestion — fill input with corrected text
+			if (selected.label.startsWith("Did you mean:") && selected.description) {
+				inputValue = selected.description;
+				completions = [];
+				completionIndex = -1;
+				handleInput(inputValue);
 				return;
 			}
 			// @ browse or / search mode — drill into directory or open file
@@ -625,6 +687,8 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 				"clock",
 				"alias",
 				"aliases",
+				"timer",
+				"stopwatch",
 			]);
 			const spaceIdx = trimmed.indexOf(" ");
 			if (spaceIdx !== -1) {
@@ -725,12 +789,37 @@ async function runCommand(command: string) {
 			historyOpen = false;
 			settingsOpen = false;
 			notesOpen = false;
+
 			lastResult = null;
 		} else if (lastResult.output === "__notes_panel__") {
 			notesOpen = true;
 			historyOpen = false;
 			settingsOpen = false;
 			mediaOpen = false;
+
+			lastResult = null;
+		} else if (lastResult.output === "__timer_panel__") {
+			notesOpen = true;
+			initialNotesTab = "timers";
+			historyOpen = false;
+			settingsOpen = false;
+			mediaOpen = false;
+			lastResult = null;
+		} else if (lastResult.output === "__reminders_panel__") {
+			notesOpen = true;
+			initialNotesTab = "reminders";
+			historyOpen = false;
+			settingsOpen = false;
+			mediaOpen = false;
+
+			lastResult = null;
+		} else if (lastResult.output === "__snippets_panel__") {
+			notesOpen = true;
+			initialNotesTab = "snippets";
+			historyOpen = false;
+			settingsOpen = false;
+			mediaOpen = false;
+
 			lastResult = null;
 		} else if (lastResult.output?.startsWith("__notes_limit__:")) {
 			pendingNoteText = lastResult.output.slice("__notes_limit__:".length);
@@ -738,6 +827,7 @@ async function runCommand(command: string) {
 			historyOpen = false;
 			settingsOpen = false;
 			mediaOpen = false;
+
 			lastResult = null;
 		} else if (lastResult.output?.startsWith("__browse_panel__:")) {
 			const dir = lastResult.output.slice("__browse_panel__:".length);
@@ -856,6 +946,14 @@ function handleCompletionSelect(label: string, forceOpen?: boolean) {
 		return;
 	}
 
+	// "Did you mean: X?" typo suggestion — fill input with corrected text
+	const item = completions[completionIndex];
+	if (item?.description && label.startsWith("Did you mean:")) {
+		inputValue = item.description;
+		handleInput(inputValue);
+		return;
+	}
+
 	runCommand(`open ${label}`);
 }
 
@@ -915,6 +1013,7 @@ function handleToggleSettings() {
 		historyOpen = false;
 		mediaOpen = false;
 		notesOpen = false;
+
 		completions = [];
 		completionIndex = -1;
 	}
@@ -926,6 +1025,7 @@ function handleToggleMedia() {
 		historyOpen = false;
 		settingsOpen = false;
 		notesOpen = false;
+
 		completions = [];
 		completionIndex = -1;
 	}
@@ -937,6 +1037,7 @@ function handleToggleNotes() {
 		historyOpen = false;
 		settingsOpen = false;
 		mediaOpen = false;
+
 		completions = [];
 		completionIndex = -1;
 	}
@@ -962,13 +1063,19 @@ function handleShowPlan() {
 
 function handleArrowUp() {
 	if (completions.length > 0) {
-		completionIndex = Math.max(0, completionIndex - 1);
+		let next = completionIndex - 1;
+		// Skip separator items
+		while (next >= 0 && completions[next]?.icon_path === "__separator__") next--;
+		completionIndex = Math.max(0, next);
 	}
 }
 
 function handleArrowDown() {
 	if (completions.length > 0) {
-		completionIndex = Math.min(completions.length - 1, completionIndex + 1);
+		let next = completionIndex + 1;
+		// Skip separator items
+		while (next < completions.length && completions[next]?.icon_path === "__separator__") next++;
+		completionIndex = Math.min(completions.length - 1, next);
 	}
 }
 
@@ -999,6 +1106,7 @@ async function handleDismiss() {
 			disabled={isExecuting || isRouting}
 			routing={isRouting}
 			executing={isExecuting}
+			{contextPill}
 			{atMode}
 			{atStart}
 			{searchMode}
@@ -1071,7 +1179,7 @@ async function handleDismiss() {
 			<HistoryPanel entries={historyEntries} onselect={handleHistorySelect} />
 		</div>
 		<div class:panel-hidden={!notesOpen}>
-			<NotesPanel ondismiss={() => { notesOpen = false; pendingNoteText = null; }} {pendingNoteText} onpendingcleared={() => { pendingNoteText = null; }} />
+			<NotesPanel ondismiss={() => { notesOpen = false; pendingNoteText = null; initialNotesTab = undefined; }} {pendingNoteText} onpendingcleared={() => { pendingNoteText = null; }} {initialNotesTab} visible={notesOpen} />
 		</div>
 		<div class:panel-hidden={!mediaOpen}>
 			<MediaPanel ondismiss={() => { mediaOpen = false; }} players={mediaPlayers} />
@@ -1159,11 +1267,13 @@ async function handleDismiss() {
 	.launcher-row {
 		position: relative;
 		width: 680px;
+		max-width: calc(100vw - 40px);
 		align-self: flex-start;
 	}
 
 	main {
 		width: 680px;
+		max-width: calc(100vw - 40px);
 		max-height: 60vh;
 		display: flex;
 		flex-direction: column;

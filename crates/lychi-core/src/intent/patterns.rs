@@ -7,8 +7,10 @@
 //! 4. Keyword detection (natural language → deterministic routing)
 //! 5. Default: app search → web search fallback
 
-/// Known handler prefixes.
-const KNOWN_PREFIXES: &[&str] = &[
+/// Known handler prefixes — single source of truth for all keyword recognition.
+/// Used by: pattern routing, typo correction, frontend completion handling.
+pub const KNOWN_PREFIXES: &[&str] = &[
+    // Explicit handler prefixes
     "ask",
     "bm",
     "bookmark",
@@ -26,6 +28,7 @@ const KNOWN_PREFIXES: &[&str] = &[
     "yt",
     "run",
     "calc",
+    "calculator",
     "file",
     "url",
     "media",
@@ -36,6 +39,9 @@ const KNOWN_PREFIXES: &[&str] = &[
     "notes",
     "todo",
     "todos",
+    "snip",
+    "snippet",
+    "snippets",
     "weather",
     "sysinfo",
     "ip",
@@ -55,6 +61,26 @@ const KNOWN_PREFIXES: &[&str] = &[
     "clock",
     "alias",
     "aliases",
+    "timer",
+    "stopwatch",
+    "reminder",
+    "remind",
+    // System actions (routed via keyword patterns)
+    "shutdown",
+    "reboot",
+    "hibernate",
+    "logout",
+    "mute",
+    "unmute",
+    "volume",
+    "brightness",
+    "bluetooth",
+    "spotify",
+    "pomodoro",
+    "recent",
+    // Sysinfo keywords
+    "memory",
+    "temperature",
 ];
 
 /// Common TLDs for URL detection.
@@ -72,6 +98,11 @@ pub struct Route {
     pub args: String,
     /// Whether this route was explicitly triggered (prefix or trigger char)
     pub explicit: bool,
+}
+
+/// Check if a word is a known handler prefix (used by typo_suggest to skip exact matches).
+pub fn is_known_prefix(word: &str) -> bool {
+    KNOWN_PREFIXES.iter().any(|p| p.eq_ignore_ascii_case(word))
 }
 
 /// Route raw user input to the appropriate handler.
@@ -116,6 +147,9 @@ fn route_inner(raw: &str, check_aliases: bool) -> Route {
         ("p:", "project"),
         ("tz:", "time"),
         ("al:", "alias"),
+        ("sn:", "snip"),
+        ("tm:", "timer"),
+        ("rm:", "reminder"),
         ("a:", "ask"),
     ];
     for &(prefix, handler) in COLON_TRIGGERS {
@@ -290,6 +324,7 @@ fn try_explicit_prefix(input: &str) -> Option<Route> {
             "system" => ("system", args),
             "note" | "notes" => ("note", args),
             "todo" | "todos" => ("todo", args),
+            "snip" | "snippet" | "snippets" => ("snip", args),
             "weather" => {
                 // Strip leading "in " — "weather in tokyo" → args "tokyo"
                 let weather_args = args.strip_prefix("in ").unwrap_or(&args).to_string();
@@ -303,6 +338,25 @@ fn try_explicit_prefix(input: &str) -> Option<Route> {
                 ("time", time_args)
             }
             "alias" | "aliases" => ("alias", args),
+            "reminder" => ("reminder", args),
+            "remind" => {
+                // "remind me to X in 30m" → strip "me to " prefix
+                let reminder_args = args
+                    .strip_prefix("me to ")
+                    .or_else(|| args.strip_prefix("me "))
+                    .unwrap_or(&args)
+                    .to_string();
+                ("reminder", format!("add {reminder_args}"))
+            }
+            "timer" => ("timer", args),
+            "stopwatch" => {
+                // Route "stopwatch [args]" → timer handler with "stopwatch [args]"
+                if args.is_empty() {
+                    ("timer", "stopwatch".to_string())
+                } else {
+                    ("timer", format!("stopwatch {args}"))
+                }
+            }
             // Bare shortcuts — pass the keyword itself as args
             "ip" | "cpu" | "mem" | "disk" | "temp" | "gpu" | "battery" | "net" | "audio"
             | "display" | "os" | "speedtest" => ("sysinfo", lower.clone()),
@@ -567,15 +621,40 @@ fn try_keyword_route(input: &str) -> Option<Route> {
         return Some(r);
     }
 
-    // --- todo / task management ---
-    if lower.starts_with("remind me to ") {
-        let text = input["remind me to ".len()..].trim();
+    // --- reminders ---
+    if lower.starts_with("remind me to ") || lower.starts_with("remind me ") {
+        let text = if lower.starts_with("remind me to ") {
+            input["remind me to ".len()..].trim()
+        } else {
+            input["remind me ".len()..].trim()
+        };
         return Some(Route {
-            handler: "todo",
+            handler: "reminder",
             args: format!("add {text}"),
             explicit: false,
         });
     }
+    if lower.starts_with("set a reminder") || lower.starts_with("set reminder") {
+        let rest = lower
+            .trim_start_matches("set a reminder")
+            .trim_start_matches("set reminder")
+            .trim_start_matches(" for ")
+            .trim_start_matches(" to ")
+            .trim();
+        let rest = if rest.is_empty() {
+            String::new()
+        } else {
+            let original_rest = &input[input.len() - rest.len()..];
+            format!("add {original_rest}")
+        };
+        return Some(Route {
+            handler: "reminder",
+            args: rest,
+            explicit: false,
+        });
+    }
+
+    // --- todo / task management ---
     if lower.starts_with("add to my list") {
         let text = input.get("add to my list".len()..).unwrap_or("").trim();
         let text = text.strip_prefix(':').unwrap_or(text).trim();
@@ -634,6 +713,93 @@ fn try_keyword_route(input: &str) -> Option<Route> {
         return Some(Route {
             handler: "clip",
             args: String::new(),
+            explicit: false,
+        });
+    }
+
+    // --- timer / stopwatch ---
+    if lower.starts_with("set a timer")
+        || lower.starts_with("start a timer")
+        || lower.starts_with("set timer")
+        || lower.starts_with("start timer")
+    {
+        // Extract duration from "set a timer for 25 minutes" etc.
+        let rest = lower
+            .trim_start_matches("set a timer")
+            .trim_start_matches("start a timer")
+            .trim_start_matches("set timer")
+            .trim_start_matches("start timer")
+            .trim_start_matches(" for ")
+            .trim_start_matches(" of ")
+            .trim();
+        return Some(Route {
+            handler: "timer",
+            args: if rest.is_empty() {
+                String::new()
+            } else {
+                format!("start {rest}")
+            },
+            explicit: false,
+        });
+    }
+    if lower == "pomodoro" || lower.starts_with("pomodoro ") {
+        let rest = lower.strip_prefix("pomodoro").unwrap_or("").trim();
+        let duration = if rest.is_empty() { "25m" } else { rest };
+        return Some(Route {
+            handler: "timer",
+            args: format!("start Pomodoro {duration}"),
+            explicit: false,
+        });
+    }
+    if lower == "stop timer" || lower == "cancel timer" {
+        return Some(Route {
+            handler: "timer",
+            args: "stop".into(),
+            explicit: false,
+        });
+    }
+    if lower == "pause timer" {
+        return Some(Route {
+            handler: "timer",
+            args: "pause".into(),
+            explicit: false,
+        });
+    }
+    if lower == "resume timer" {
+        return Some(Route {
+            handler: "timer",
+            args: "resume".into(),
+            explicit: false,
+        });
+    }
+    if lower.starts_with("countdown ") {
+        let rest = input["countdown ".len()..].trim();
+        return Some(Route {
+            handler: "timer",
+            args: format!("start {rest}"),
+            explicit: false,
+        });
+    }
+    if lower == "start stopwatch" || lower == "start a stopwatch" || lower == "start the stopwatch"
+    {
+        return Some(Route {
+            handler: "timer",
+            args: "stopwatch".into(),
+            explicit: false,
+        });
+    }
+    if lower.starts_with("start stopwatch ") {
+        let name = input["start stopwatch ".len()..].trim();
+        return Some(Route {
+            handler: "timer",
+            args: format!("stopwatch {name}"),
+            explicit: false,
+        });
+    }
+    if lower == "stop stopwatch" || lower == "stop the stopwatch" {
+        return Some(Route {
+            handler: "timer",
+            args: "stopwatch stop".into(),
             explicit: false,
         });
     }
@@ -1317,10 +1483,6 @@ mod tests {
 
     #[test]
     fn keyword_todo() {
-        let r = route("remind me to buy milk");
-        assert_eq!(r.handler, "todo");
-        assert_eq!(r.args, "add buy milk");
-
         let r = route("add to my list: fix the login bug");
         assert_eq!(r.handler, "todo");
         assert_eq!(r.args, "add fix the login bug");
@@ -1332,6 +1494,35 @@ mod tests {
         let r = route("show my todos");
         assert_eq!(r.handler, "todo");
         assert_eq!(r.args, "list");
+    }
+
+    #[test]
+    fn keyword_reminder() {
+        let r = route("remind me to buy milk");
+        assert_eq!(r.handler, "reminder");
+        assert_eq!(r.args, "add buy milk");
+
+        let r = route("remind me to call dentist in 2 hours");
+        assert_eq!(r.handler, "reminder");
+        assert_eq!(r.args, "add call dentist in 2 hours");
+
+        let r = route("set a reminder for standup at 9am");
+        assert_eq!(r.handler, "reminder");
+        assert!(r.args.contains("standup at 9am"));
+
+        // Explicit prefix
+        let r = route("reminder add test in 5m");
+        assert_eq!(r.handler, "reminder");
+        assert_eq!(r.args, "add test in 5m");
+
+        let r = route("reminder list");
+        assert_eq!(r.handler, "reminder");
+        assert_eq!(r.args, "list");
+
+        // "remind" prefix strips "me to"
+        let r = route("remind me to walk the dog in 30 minutes");
+        assert_eq!(r.handler, "reminder");
+        assert_eq!(r.args, "add walk the dog in 30 minutes");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
 use crate::action_registry::{ActionHandler, ActionResult, OutputType, RiskLevel};
@@ -10,6 +10,22 @@ use crate::error::LychiError;
 /// Captured environment from the user's interactive login shell.
 /// Uses RwLock so it can be refreshed when the shell config changes.
 static SHELL_ENV: RwLock<Option<(String, HashMap<String, String>)>> = RwLock::new(None);
+
+/// Context CWD — set by the executor before each shell command.
+/// When set, shell commands run in this directory instead of Lychi's process CWD.
+static CONTEXT_CWD: Mutex<Option<String>> = Mutex::new(None);
+
+/// Set the working directory for the next shell command.
+pub fn set_context_cwd(cwd: Option<String>) {
+    if let Ok(mut guard) = CONTEXT_CWD.lock() {
+        *guard = cwd;
+    }
+}
+
+/// Get the current context CWD.
+fn get_context_cwd() -> Option<String> {
+    CONTEXT_CWD.lock().ok().and_then(|g| g.clone())
+}
 
 /// Spawn an interactive login shell and capture its full environment.
 fn capture_shell_env(shell: &str) -> HashMap<String, String> {
@@ -130,7 +146,8 @@ impl ActionHandler for ShellExec {
         // Run as interactive shell (-ic) so that rc files are sourced and
         // shell functions like nvm, pyenv, rvm etc. are available.
         let env = self.get_env();
-        let output = Command::new(&self.shell)
+        let mut command = Command::new(&self.shell);
+        command
             .args(["-ic", cmd])
             .env_clear()
             .envs(&env)
@@ -138,8 +155,14 @@ impl ActionHandler for ShellExec {
             .env("COLUMNS", "120")
             .stdin(Stdio::null())
             .stderr(Stdio::piped())
-            .stdout(Stdio::piped())
-            .output()?;
+            .stdout(Stdio::piped());
+
+        // Use context CWD if available (e.g. detected from VS Code workspace)
+        if let Some(cwd) = get_context_cwd() {
+            command.current_dir(&cwd);
+        }
+
+        let output = command.output()?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();

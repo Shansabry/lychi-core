@@ -1,6 +1,7 @@
 pub mod ai_router;
 pub mod patterns;
 pub mod prompt;
+pub mod typo_suggest;
 
 use crate::action_registry::registry::ActionRegistry;
 use crate::providers::{AgentPlan, AiResponse};

@@ -151,7 +151,7 @@ impl AiProvider for BYOClient {
         input: &str,
         known_actions: &[&str],
     ) -> Result<AiRoute, LychiError> {
-        match self.route_or_plan(input, known_actions).await? {
+        match self.route_or_plan(input, known_actions, None).await? {
             AiResponse::SingleRoute(route) => Ok(route),
             AiResponse::Plan(_) => Err(LychiError::Ai(
                 "AI returned a plan but single route was expected".to_string(),
@@ -163,8 +163,9 @@ impl AiProvider for BYOClient {
         &self,
         input: &str,
         known_actions: &[&str],
+        context_hint: Option<&str>,
     ) -> Result<AiResponse, LychiError> {
-        let sys_prompt = prompt::system_prompt(known_actions);
+        let sys_prompt = prompt::system_prompt(known_actions, context_hint);
 
         let response = match self.provider {
             BYOProvider::OpenAI | BYOProvider::Groq => {

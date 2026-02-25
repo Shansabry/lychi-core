@@ -18,11 +18,14 @@ use lychi_core::action_registry::handlers::file_open::FileOpen;
 use lychi_core::action_registry::handlers::media::MediaHandler;
 use lychi_core::action_registry::handlers::notes::{NotesHandler, TodoHandler};
 use lychi_core::action_registry::handlers::project_open::ProjectOpen;
+use lychi_core::action_registry::handlers::reminders::RemindersHandler;
 use lychi_core::action_registry::handlers::shell_exec::ShellExec;
+use lychi_core::action_registry::handlers::snippets::SnippetsHandler;
 use lychi_core::action_registry::handlers::symbol::SymbolHandler;
 use lychi_core::action_registry::handlers::sysinfo::SysInfoHandler;
 use lychi_core::action_registry::handlers::system::SystemCommand;
 use lychi_core::action_registry::handlers::time::TimeHandler;
+use lychi_core::action_registry::handlers::timer::{TimerHandler, TimerState};
 use lychi_core::action_registry::handlers::unicode::UnicodeHandler;
 use lychi_core::action_registry::handlers::url_open::UrlOpen;
 use lychi_core::action_registry::handlers::weather::WeatherHandler;
@@ -49,6 +52,7 @@ pub struct AppState {
     pub config: Arc<RwLock<Config>>,
     pub pending_plan: Arc<RwLock<Option<AgentPlan>>>,
     pub active_file_search: Arc<AtomicU64>,
+    pub timer_state: TimerState,
     #[cfg(feature = "mpris")]
     pub mpris: Arc<RwLock<Option<MprisManager>>>,
 }
@@ -98,9 +102,11 @@ impl AppState {
                 + stats.clipboard
                 + stats.settings
                 + stats.frecency
-                + stats.aliases;
+                + stats.aliases
+                + stats.reminders
+                + stats.snippets;
             tracing::info!(
-                "DB tables: {} history, {} notes, {} todos, {} clipboard, {} settings, {} frecency, {} aliases ({} total rows, {:.1} KB on disk)",
+                "DB tables: {} history, {} notes, {} todos, {} clipboard, {} settings, {} frecency, {} aliases, {} reminders, {} snippets ({} total rows, {:.1} KB on disk)",
                 stats.history,
                 stats.notes,
                 stats.todos,
@@ -108,10 +114,14 @@ impl AppState {
                 stats.settings,
                 stats.frecency,
                 stats.aliases,
+                stats.reminders,
+                stats.snippets,
                 total,
                 db_size as f64 / 1024.0,
             );
         }
+
+        let timer_state = lychi_core::action_registry::handlers::timer::new_timer_state();
 
         #[cfg(feature = "mpris")]
         let mpris: Arc<RwLock<Option<lychi_core::mpris::MprisManager>>> =
@@ -142,12 +152,15 @@ impl AppState {
         )));
         registry.register(Box::new(SystemCommand::new()));
         registry.register(Box::new(TimeHandler::new()));
+        registry.register(Box::new(TimerHandler::new(timer_state.clone())));
         registry.register(Box::new(SymbolHandler::new()));
         registry.register(Box::new(SysInfoHandler::new()));
         registry.register(Box::new(UnicodeHandler::new()));
         registry.register(Box::new(NotesHandler::new(db.clone())));
         registry.register(Box::new(TodoHandler::new(db.clone())));
         registry.register(Box::new(AliasHandler::new(db.clone())));
+        registry.register(Box::new(RemindersHandler::new(db.clone())));
+        registry.register(Box::new(SnippetsHandler::new(db.clone())));
         registry.register(Box::new(BrowseHandler::new()));
         let weather_handler = Arc::new(WeatherHandler::new(
             config.weather.unit.clone(),
@@ -182,11 +195,11 @@ impl AppState {
 
         let ai_router = ai_provider.map(AiRouter::new_shared);
 
+        let history = HistoryStore::new(config.history.max_entries, config.history.deduplicate);
+
         let resolver = IntentResolver::new(ai_router);
         let rules = RulesEngine::new();
-        let executor = Executor::new(registry, rules, resolver);
-
-        let history = HistoryStore::new(config.history.max_entries, config.history.deduplicate);
+        let executor = Executor::new(registry, rules, resolver, history.clone(), db.clone());
 
         Self {
             executor: Arc::new(RwLock::new(executor)),
@@ -195,6 +208,7 @@ impl AppState {
             config: Arc::new(RwLock::new(config)),
             pending_plan: Arc::new(RwLock::new(None)),
             active_file_search: Arc::new(AtomicU64::new(0)),
+            timer_state,
             #[cfg(feature = "mpris")]
             mpris,
         }
