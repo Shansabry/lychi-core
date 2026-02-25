@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::action_registry::{ActionHandler, ActionResult};
+use crate::action_registry::{ActionHandler, ActionResult, CompletionItem};
 use crate::error::LychiError;
 
 const DEFAULT_SEARCH_URL: &str = "https://www.google.com/search?q=";
@@ -35,6 +35,19 @@ impl ActionHandler for WebSearch {
 
     fn description(&self) -> &str {
         "Search the web in your default browser"
+    }
+
+    async fn completions(&self, partial: &str) -> Vec<CompletionItem> {
+        let query = partial.trim();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        vec![CompletionItem {
+            label: format!("Search web: {query}"),
+            icon_path: Some("__none__".to_string()),
+            score: 100,
+            description: Some("Enter to search".to_string()),
+        }]
     }
 
     async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {

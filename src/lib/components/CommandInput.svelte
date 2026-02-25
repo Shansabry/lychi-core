@@ -295,7 +295,7 @@ function handleKeydown(e: KeyboardEvent) {
 </script>
 
 <div class="input-container">
-	<span class="prompt" class:routing class:executing>
+	<span class="prompt" class:routing class:executing class:hidden-prompt={!executing && /^[>@/=]/.test(value)}>
 		{#if executing}
 			<LoaderCircle size={18} strokeWidth={1.5} />
 		{:else}
@@ -375,6 +375,10 @@ function handleKeydown(e: KeyboardEvent) {
 		border-radius: 9999px;
 		white-space: nowrap;
 		user-select: none;
+	}
+
+	.prompt.hidden-prompt {
+		display: none;
 	}
 
 	.prompt.routing {

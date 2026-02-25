@@ -135,6 +135,9 @@ async function togglePlayPause() {
 				<Sparkles size={14} strokeWidth={1.5} />
 			</button>
 		{/if}
+		{#if (result && (result.output || result.error)) || hasPlan}
+			<span class="toolbar-sep"></span>
+		{/if}
 		<button
 			class="bar-icon"
 			class:active={historyOpen}
@@ -194,6 +197,15 @@ async function togglePlayPause() {
 	.toolbar {
 		display: flex;
 		gap: 2px;
+		align-items: center;
+		flex-shrink: 0;
+	}
+
+	.toolbar-sep {
+		width: 1px;
+		height: 10px;
+		background: var(--border);
+		margin: 0 4px;
 		flex-shrink: 0;
 	}
 
@@ -264,6 +276,8 @@ async function togglePlayPause() {
 		white-space: nowrap;
 		color: var(--fg-muted);
 		font-size: 10px;
+		max-width: 240px;
+		opacity: 0.8;
 	}
 
 	.player-label {

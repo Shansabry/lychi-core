@@ -13,6 +13,7 @@ import {
 	Sun,
 	X,
 } from "lucide-svelte";
+import LychiIcon from "./LychiIcon.svelte";
 import { onMount } from "svelte";
 import type {
 	AiConfig,
@@ -979,10 +980,14 @@ function handleKeydown(e: KeyboardEvent) {
 			</div>
 		{:else if activeTab === "about"}
 			<div class="about">
-				<div class="about-header">
+				<span class="about-version-pill">v{appVersion}</span>
+				<div class="about-brand">
+					<div class="about-logo">
+						<LychiIcon size={56} />
+					</div>
 					<span class="about-name">Lychi</span>
-					<span class="about-version">v{appVersion}</span>
 				</div>
+
 				<p class="about-desc">A fast, local-first command surface. Your data stays on your device. AI is optional, never required. Built for speed, privacy, and security.</p>
 
 				<div class="about-links">
@@ -1604,27 +1609,51 @@ function handleKeydown(e: KeyboardEvent) {
 	}
 
 	.about {
+		position: relative;
 		display: flex;
 		flex-direction: column;
-		gap: 12px;
+		gap: 8px;
 		padding: 4px 0;
 	}
 
-	.about-header {
+	.about-brand {
 		display: flex;
-		align-items: baseline;
-		gap: 8px;
+		flex-direction: row;
+		align-items: center;
+		justify-content: center;
+		gap: 6px;
+		padding: 12px 0;
+	}
+
+	.about-version-pill {
+		position: absolute;
+		top: 8px;
+		right: 8px;
+		font-size: 10px;
+		color: var(--fg-muted);
+		background: var(--border);
+		padding: 2px 8px;
+		border-radius: 10px;
+	}
+
+	.about-logo {
+		color: var(--fg);
+		opacity: 0.9;
 	}
 
 	.about-name {
-		font-size: 16px;
-		font-weight: 600;
+		font-size: 30px;
+		font-weight: 300;
+		letter-spacing: 0.1em;
 		color: var(--fg);
+		opacity: 0.9;
+		font-family: var(--font-brand);
+		text-transform: lowercase;
 	}
 
-	.about-version {
-		font-size: 12px;
-		color: var(--fg-muted);
+	:global([data-theme="light"]) .about-logo,
+	:global([data-theme="light"]) .about-name {
+		opacity: 0.9;
 	}
 
 	.about-desc {
@@ -1632,6 +1661,7 @@ function handleKeydown(e: KeyboardEvent) {
 		color: var(--fg-muted);
 		line-height: 1.5;
 		margin: 0;
+		text-align: center;
 	}
 
 	.about-links {

@@ -1,3 +1,11 @@
+@font-face {
+	font-family: "Lexend";
+	src: url("./fonts/Lexend-latin.woff2") format("woff2");
+	font-weight: 200 500;
+	font-display: swap;
+	font-style: normal;
+}
+
 :root {
 	color-scheme: dark;
 	--bg: #0a0a0a;
@@ -5,12 +13,14 @@
 	--fg: #e0e0e0;
 	--fg-muted: #999;
 	--accent: #fff;
+	--accent-blue: #7c8cff;
 	--error: #ff4444;
 	--success: #44ff44;
 	--border: #222;
 	--ai: #a78bfa;
 	--font-mono: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
 	--font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+	--font-brand: "Lexend", sans-serif;
 }
 
 :root[data-theme="light"] {
@@ -20,6 +30,7 @@
 	--fg: #1a1a1a;
 	--fg-muted: #666;
 	--accent: #111;
+	--accent-blue: #5060cc;
 	--error: #cc2222;
 	--success: #228822;
 	--border: #ddd;

@@ -209,7 +209,9 @@ impl Executor {
 
         // Fallback: if the routed handler returned nothing, try app search.
         // Use the args (not raw) so trigger-char prefixes like ">" are stripped.
-        if route.handler != "open" {
+        // Skip for "web" — multi-word natural language was intentionally routed there,
+        // falling through to app search produces nonsense fuzzy matches ("How to make pasta" → "os").
+        if route.handler != "open" && route.handler != "web" {
             let search_term = if route.args.is_empty() {
                 raw
             } else {
@@ -221,9 +223,12 @@ impl Executor {
             }
         }
 
-        // Typo correction: suggest "Did you mean: X?" for near-miss inputs
-        if let Some(suggestion) = crate::intent::typo_suggest::suggest(raw) {
-            return vec![suggestion];
+        // Typo correction: suggest "Did you mean: X?" for near-miss inputs.
+        // Skip for web routes — natural language queries aren't typos.
+        if route.handler != "web" {
+            if let Some(suggestion) = crate::intent::typo_suggest::suggest(raw) {
+                return vec![suggestion];
+            }
         }
 
         Vec::new()
