@@ -162,6 +162,7 @@ impl ActionHandler for CalcHandler {
                 icon_path: None,
                 score: 1000,
                 description: None,
+                reason: None,
             }];
         }
 
@@ -172,6 +173,7 @@ impl ActionHandler for CalcHandler {
                 icon_path: None,
                 score: 1000,
                 description: None,
+                reason: None,
             }]
         } else {
             Vec::new()

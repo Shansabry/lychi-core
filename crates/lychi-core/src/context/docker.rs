@@ -9,26 +9,61 @@ use std::process::Command;
 use super::{ContainerInfo, DockerContext};
 
 /// Detect Docker daemon status and running containers.
+///
+/// Uses a 500ms timeout to avoid blocking when the daemon is unresponsive.
 pub fn detect() -> Option<DockerContext> {
+    use std::time::{Duration, Instant};
+
     // Fast path: skip if Docker socket doesn't exist
     if !Path::new("/var/run/docker.sock").exists() {
         return None;
     }
 
-    let output = Command::new("docker")
+    let mut child = Command::new("docker")
         .args([
             "ps",
             "--format",
             "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}",
         ])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
 
-    if !output.status.success() {
-        return None;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                break;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    tracing::warn!("docker ps timed out");
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = child
+        .stdout
+        .take()
+        .map(|out| {
+            use std::io::Read;
+            let mut s = String::new();
+            let mut reader = out;
+            let _ = reader.read_to_string(&mut s);
+            s
+        })
+        .unwrap_or_default();
+
     let containers: Vec<ContainerInfo> = stdout
         .lines()
         .filter_map(|line| {
@@ -46,8 +81,5 @@ pub fn detect() -> Option<DockerContext> {
         })
         .collect();
 
-    Some(DockerContext {
-        daemon_running: true,
-        containers,
-    })
+    Some(DockerContext { containers })
 }

@@ -1,6 +1,14 @@
 <script lang="ts">
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { AppWindow, Clock, Folder, LoaderCircle } from "lucide-svelte";
+import {
+	AppWindow,
+	Clock,
+	Folder,
+	LoaderCircle,
+	Terminal,
+	TriangleAlert,
+	Zap,
+} from "lucide-svelte";
 import { onMount } from "svelte";
 import type { CompletionItem, MountPoint } from "$lib/ipc";
 
@@ -155,8 +163,11 @@ function formatSize(bytes: number | null | undefined): string {
 		{@const isSeparator = item?.icon_path === "__separator__"}
 		{@const isFolder = item?.icon_path === "__folder__"}
 		{@const isHistory = item?.icon_path === "__history__"}
+		{@const isWarning = item?.icon_path === "__warning__"}
+		{@const isContext = item?.icon_path === "__context__"}
+		{@const isTerminal = item?.icon_path === "__terminal__"}
 		{@const hideIcon = item?.icon_path === "__none__" || isSeparator}
-		{@const hasCustomIcon = !!(item?.icon_path && item.icon_path !== "__folder__" && item.icon_path !== "__none__" && item.icon_path !== "__history__" && item.icon_path !== "__separator__")}
+		{@const hasCustomIcon = !!(item?.icon_path && item.icon_path !== "__folder__" && item.icon_path !== "__none__" && item.icon_path !== "__history__" && item.icon_path !== "__separator__" && item.icon_path !== "__warning__" && item.icon_path !== "__context__" && item.icon_path !== "__terminal__")}
 		{@const noIcon = !item?.icon_path}
 		{@const iconKey = item?.icon_path ?? ""}
 		{@const iconBroken = hasCustomIcon && brokenIcons.has(iconKey)}
@@ -168,13 +179,14 @@ function formatSize(bytes: number | null | undefined): string {
 		<li
 			class="completion-item"
 			class:completion-separator={active && isSeparator}
-			class:selected={active && idx === selectedIndex && !isSeparator}
+			class:completion-warning={active && isWarning}
+			class:selected={active && idx === selectedIndex && !isSeparator && !isWarning}
 			class:inactive={!active}
 			onmousedown={(e) => e.preventDefault()}
-			onclick={() => active && !isSeparator && onselect(item.label)}
-			onkeydown={(e) => e.key === "Enter" && active && !isSeparator && onselect(item.label)}
+			onclick={() => active && !isSeparator && !isWarning && onselect(item.label)}
+			onkeydown={(e) => e.key === "Enter" && active && !isSeparator && !isWarning && onselect(item.label)}
 			role={isSeparator ? "separator" : "option"}
-			aria-selected={active && idx === selectedIndex && !isSeparator}
+			aria-selected={active && idx === selectedIndex && !isSeparator && !isWarning}
 			tabindex="-1"
 		>
 			<!-- Separator layout -->
@@ -190,6 +202,15 @@ function formatSize(bytes: number | null | undefined): string {
 				</span>
 				<span style:visibility={isHistory ? "visible" : "hidden"} class="icon-slot">
 					<Clock size={20} strokeWidth={1.5} class="icon-history" />
+				</span>
+				<span style:visibility={isWarning ? "visible" : "hidden"} class="icon-slot">
+					<TriangleAlert size={20} strokeWidth={1.5} class="icon-warning" />
+				</span>
+				<span style:visibility={isContext ? "visible" : "hidden"} class="icon-slot">
+					<Zap size={20} strokeWidth={1.5} class="icon-context" />
+				</span>
+				<span style:visibility={isTerminal ? "visible" : "hidden"} class="icon-slot">
+					<Terminal size={20} strokeWidth={1.5} class="icon-terminal" />
 				</span>
 				<span style:visibility={showImg ? "visible" : "hidden"} class="icon-slot">
 					<img
@@ -214,7 +235,7 @@ function formatSize(bytes: number | null | undefined): string {
 			<!-- Normal-mode label group -->
 			<div class="label-group" class:label-hidden={isSearchMode || isSeparator}>
 				<span class="label">{pathContext ? displayName(label) : label}</span>
-				<span class="description" style:visibility={item?.description ? "visible" : "hidden"}>{item?.description ?? "\u00A0"}</span>
+				<span class="description" class:reason-highlight={isContext} style:visibility={item?.description ? "visible" : "hidden"}>{item?.description ?? "\u00A0"}</span>
 			</div>
 		</li>
 	{/each}
@@ -365,6 +386,12 @@ function formatSize(bytes: number | null | undefined): string {
 		background: none;
 	}
 
+	.completion-warning {
+		cursor: default;
+		pointer-events: none;
+		opacity: 0.85;
+	}
+
 	.separator-content {
 		display: flex;
 		align-items: center;
@@ -449,6 +476,21 @@ function formatSize(bytes: number | null | undefined): string {
 		opacity: 0.6;
 	}
 
+	.icon :global(.icon-warning) {
+		color: #e5a00d;
+		opacity: 0.9;
+	}
+
+	.icon :global(.icon-context) {
+		color: var(--accent);
+		opacity: 0.8;
+	}
+
+	.icon :global(.icon-terminal) {
+		color: var(--fg-muted);
+		opacity: 0.7;
+	}
+
 	.icon :global(.icon-file) {
 		color: var(--fg-muted);
 	}
@@ -486,6 +528,14 @@ function formatSize(bytes: number | null | undefined): string {
 		color: var(--fg-muted);
 		opacity: 0.7;
 		flex-shrink: 0;
+	}
+
+	.description.reason-highlight {
+		font-size: 10px;
+		border: 1px solid var(--border);
+		padding: 1px 8px;
+		border-radius: 8px;
+		opacity: 0.6;
 	}
 
 	.search-meta {

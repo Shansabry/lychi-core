@@ -6,6 +6,7 @@ pub mod bookmarks;
 pub mod browse;
 pub mod calc;
 pub mod clipboard;
+pub mod context_debug;
 pub mod emoji;
 pub mod file_open;
 pub mod icons;

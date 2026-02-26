@@ -12,6 +12,7 @@ pub mod intent;
 pub mod mpris;
 pub mod notes;
 pub mod paths;
+pub mod process_tracker;
 pub mod providers;
 pub mod reminders;
 pub mod rules;

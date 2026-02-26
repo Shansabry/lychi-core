@@ -17,6 +17,7 @@ pub const KNOWN_PREFIXES: &[&str] = &[
     "browse",
     "clip",
     "clipboard",
+    "ctx",
     "close",
     "emoji",
     "focus",
@@ -360,6 +361,7 @@ fn try_explicit_prefix(input: &str) -> Option<Route> {
             // Bare shortcuts — pass the keyword itself as args
             "ip" | "cpu" | "mem" | "disk" | "temp" | "gpu" | "battery" | "net" | "audio"
             | "display" | "os" | "speedtest" => ("sysinfo", lower.clone()),
+            "ctx" => ("ctx", args),
             _ => return None,
         };
         Some(Route {

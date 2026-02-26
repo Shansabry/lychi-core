@@ -50,6 +50,8 @@ pub struct CommandsConfig {
     pub default_search_engine: String,
     pub youtube_url: String,
     pub shell: String,
+    /// Default terminal emulator for `run` commands (auto-detected if empty).
+    pub terminal: String,
 }
 
 impl Default for CommandsConfig {
@@ -58,8 +60,38 @@ impl Default for CommandsConfig {
             default_search_engine: "https://www.google.com/search?q=".to_string(),
             youtube_url: "https://www.youtube.com/results?search_query=".to_string(),
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+            terminal: detect_terminal(),
         }
     }
+}
+
+/// Auto-detect the user's terminal emulator from PATH.
+fn detect_terminal() -> String {
+    const CANDIDATES: &[&str] = &[
+        "ghostty",
+        "kitty",
+        "alacritty",
+        "wezterm",
+        "foot",
+        "gnome-terminal",
+        "konsole",
+        "xfce4-terminal",
+        "mate-terminal",
+        "tilix",
+        "terminator",
+        "ptyxis",
+        "blackbox",
+        "rio",
+        "contour",
+        "sakura",
+        "xterm",
+    ];
+    for term in CANDIDATES {
+        if which::which(term).is_ok() {
+            return term.to_string();
+        }
+    }
+    "xterm".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -55,21 +55,50 @@ fn read_branch(repo_root: &str) -> Option<String> {
 
 /// Check if the repo has uncommitted changes via `git status --porcelain`.
 ///
-/// Uses a 500ms timeout to avoid blocking on large repos.
+/// Uses a 500ms timeout to avoid blocking on large repos or NFS mounts.
 fn check_dirty(repo_root: &str) -> bool {
-    // Use a child thread with timeout since Command doesn't support timeout natively
-    let root = repo_root.to_string();
-    let handle = std::thread::spawn(move || {
-        Command::new("git")
-            .args(["status", "--porcelain", "--untracked-files=no"])
-            .current_dir(&root)
-            .output()
-            .ok()
-            .map(|o| !o.stdout.is_empty())
-            .unwrap_or(false)
-    });
+    use std::time::{Duration, Instant};
 
-    handle.join().unwrap_or_default()
+    let mut child = match Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(repo_root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return false;
+                }
+                return child
+                    .stdout
+                    .take()
+                    .and_then(|mut out| {
+                        use std::io::Read;
+                        let mut buf = [0u8; 1];
+                        out.read(&mut buf).ok().map(|n| n > 0)
+                    })
+                    .unwrap_or(false);
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    tracing::warn!("git status timed out in {}", repo_root);
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return false,
+        }
+    }
 }
 
 /// Read the remote origin URL from `.git/config`.

@@ -18,6 +18,7 @@ const SYNCABLE_KEYS: &[&str] = &[
     "general.show_duration_ms",
     "commands.default_search_engine",
     "commands.youtube_url",
+    "commands.terminal",
     "history.max_entries",
     "history.deduplicate",
     "ai.mode",

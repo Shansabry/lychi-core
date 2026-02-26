@@ -107,6 +107,7 @@ pub fn suggest(raw: &str) -> Option<CompletionItem> {
                 icon_path: Some("__none__".to_string()),
                 score: 90,
                 description: Some(suggestion),
+                reason: None,
             });
         }
     }
@@ -148,6 +149,7 @@ fn suggest_phrase(words: &[&str]) -> Option<CompletionItem> {
                 icon_path: Some("__none__".to_string()),
                 score: 90,
                 description: Some(suggestion),
+                reason: None,
             });
         }
     }

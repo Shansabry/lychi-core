@@ -234,6 +234,7 @@ impl ActionHandler for UnicodeHandler {
                     icon_path: Some("__none__".to_string()),
                     score: (POPULAR.len() - i) as u16,
                     description: None,
+                    reason: None,
                 })
                 .collect();
         }
@@ -274,6 +275,7 @@ impl ActionHandler for UnicodeHandler {
                     icon_path: Some("__none__".to_string()),
                     score,
                     description: None,
+                    reason: None,
                 })
             })
             .collect()

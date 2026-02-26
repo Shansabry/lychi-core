@@ -158,6 +158,7 @@ pub async fn list_path_completions(partial: String) -> Result<Vec<CompletionItem
                 },
                 score,
                 description,
+                reason: None,
             })
         })
         .collect();

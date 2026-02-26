@@ -128,6 +128,10 @@ pub async fn save_commands_config(
         tracing::info!("Shell changed to: {new_shell}");
     }
 
+    // Update terminal setting
+    let new_terminal = config.commands.terminal.clone();
+    lychi_core::action_registry::handlers::shell_exec::set_terminal(Some(new_terminal));
+
     Ok(())
 }
 

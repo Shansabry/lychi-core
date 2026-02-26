@@ -125,10 +125,38 @@ impl Executor {
             },
             // Execute (or Confirm with confirmed=true)
             _ => {
-                // Set context CWD so shell commands run in the detected workspace
+                // Set context CWD so shell commands run in the detected workspace.
+                // When IDE is focused, prefer IDE workspace (cwd) over background terminal.
+                // Otherwise prefer terminal_cwd (from window stack) over cwd.
+                let focused_is_ide = self
+                    .context
+                    .as_ref()
+                    .and_then(|ctx| ctx.active_window.as_ref())
+                    .is_some_and(|w| w.is_ide);
                 crate::action_registry::handlers::shell_exec::set_context_cwd(
-                    self.context.as_ref().and_then(|ctx| ctx.cwd.clone()),
+                    self.context.as_ref().and_then(|ctx| {
+                        if focused_is_ide {
+                            ctx.cwd.clone().or_else(|| ctx.terminal_cwd.clone())
+                        } else {
+                            ctx.terminal_cwd.clone().or_else(|| ctx.cwd.clone())
+                        }
+                    }),
                 );
+                // If context detected a terminal emulator, use it for `run` commands
+                // (so commands open in the same terminal the user already has).
+                if let Some(ref ctx) = self.context
+                    && let Some(ref tc) = ctx.terminal_class
+                    && which::which(tc).is_ok()
+                {
+                    crate::action_registry::handlers::shell_exec::set_terminal(Some(tc.clone()));
+                }
+
+                // Set context snapshot for `ctx` debug handler
+                if intent.action_id == "ctx" {
+                    crate::action_registry::handlers::context_debug::set_context(
+                        self.context.clone(),
+                    );
+                }
                 let mut result = handler.execute(&intent.args).await?;
                 if intent.routing == RoutingMethod::Ai {
                     result.routed_by = Some("ai".to_string());
@@ -191,6 +219,40 @@ impl Executor {
             handler_results.truncate(5);
             history_results.truncate(3);
 
+            // Dirty project guard: warn if git is dirty and user is typing a destructive action
+            if let Some(ref ctx) = self.context
+                && let Some(ref git) = ctx.git
+                && git.dirty
+            {
+                let lower = trimmed.to_ascii_lowercase();
+                // Check both truly destructive actions and suspend (reversible but risks unsaved work)
+                const DIRTY_GUARD_ACTIONS: &[&str] =
+                    &["shutdown", "reboot", "hibernate", "logout", "suspend"];
+                let is_destructive = DIRTY_GUARD_ACTIONS
+                    .iter()
+                    .any(|&name| name.starts_with(&lower) || lower.starts_with(name));
+                if is_destructive {
+                    let project_name = ctx
+                        .project
+                        .as_ref()
+                        .and_then(|p| p.root.rsplit('/').next())
+                        .unwrap_or("repo");
+                    handler_results.insert(
+                        0,
+                        CompletionItem {
+                            label: format!("⚠ {project_name} has uncommitted changes"),
+                            icon_path: Some("__warning__".to_string()),
+                            score: 200,
+                            description: Some(format!(
+                                "Branch '{}' is dirty — consider committing first",
+                                git.branch
+                            )),
+                            reason: None,
+                        },
+                    );
+                }
+            }
+
             let mut out = handler_results;
 
             if !history_results.is_empty() && !out.is_empty() {
@@ -200,6 +262,7 @@ impl Executor {
                     icon_path: Some("__separator__".to_string()),
                     score: 0,
                     description: None,
+                    reason: None,
                 });
             }
 
@@ -225,10 +288,10 @@ impl Executor {
 
         // Typo correction: suggest "Did you mean: X?" for near-miss inputs.
         // Skip for web routes — natural language queries aren't typos.
-        if route.handler != "web" {
-            if let Some(suggestion) = crate::intent::typo_suggest::suggest(raw) {
-                return vec![suggestion];
-            }
+        if route.handler != "web"
+            && let Some(suggestion) = crate::intent::typo_suggest::suggest(raw)
+        {
+            return vec![suggestion];
         }
 
         Vec::new()

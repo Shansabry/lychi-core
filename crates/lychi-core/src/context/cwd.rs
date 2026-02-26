@@ -1,228 +1,107 @@
-//! Terminal/IDE CWD detection via `/proc`.
+//! Terminal CWD detection.
 //!
-//! For terminals: finds the shell child process and reads its CWD.
-//! For IDEs (VS Code, JetBrains, etc.): scans descendant processes for
-//! workspace CWDs, since the main process CWD is typically `$HOME`.
+//! Parses CWD from the terminal window title (e.g. `user@host:/path`).
+//! This reflects the **active tab** in tabbed terminals (GNOME Terminal,
+//! Konsole, etc.).
+//!
+//! No `/proc` fallback — multi-tab terminals share one PID, so walking
+//! the process tree picks a random tab's shell. Per C16: "No context is
+//! better than wrong context."
 
-use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
-
-/// Detect the working directory of a terminal or IDE process.
-pub fn detect(pid: u32, wm_class: &str, title: &str) -> Option<String> {
+/// Detect the working directory of a terminal process.
+///
+/// Parses the terminal window title for a path. Returns `None` if the
+/// title doesn't contain a recognizable path (e.g. when a command is
+/// running and the title shows `pnpm dev` instead of `user@host:/path`).
+pub fn detect(_pid: u32, _wm_class: &str, title: &str) -> Option<String> {
     let home = std::env::var("HOME").unwrap_or_default();
 
-    if is_ide(wm_class) {
-        return detect_workspace_from_descendants(pid, &home, title);
+    if let Some(cwd) = cwd_from_title(title, &home) {
+        tracing::debug!("cwd::detect: from title '{}' → {}", title, cwd);
+        return Some(cwd);
     }
 
-    // For terminals: walk to the shell child and read its CWD
-    let shell_pid = find_foreground_child(pid)?;
-    let cwd = fs::read_link(format!("/proc/{shell_pid}/cwd")).ok()?;
-    let cwd_str = cwd.to_string_lossy();
-
-    if cwd_str == home || !cwd.is_dir() {
-        return None;
-    }
-
-    Some(cwd_str.into_owned())
-}
-
-/// Known IDE WM classes whose main process CWD is unreliable.
-fn is_ide(wm_class: &str) -> bool {
-    const IDES: &[&str] = &[
-        "code",
-        "codium",
-        "vscodium",
-        "cursor",
-        "windsurf",
-        "zed",
-        "jetbrains-idea",
-        "jetbrains-clion",
-        "jetbrains-pycharm",
-        "jetbrains-webstorm",
-        "jetbrains-goland",
-        "jetbrains-rider",
-        "jetbrains-rustrover",
-        "jetbrains-fleet",
-    ];
-    IDES.iter().any(|ide| wm_class.contains(ide))
-}
-
-/// Scan descendant processes of `pid`, collect their CWDs, and return the
-/// most likely workspace directory.
-///
-/// Only scans processes that share the same executable as the IDE (avoids
-/// reading `/proc/*/status` for every process on the system). Falls back
-/// to full `/proc` scan if the exe can't be resolved.
-fn detect_workspace_from_descendants(pid: u32, home: &str, title: &str) -> Option<String> {
-    let ide_exe = fs::read_link(format!("/proc/{pid}/exe")).ok();
-    let descendants = collect_descendants(pid, ide_exe.as_deref());
-
-    let mut counts: HashMap<String, u32> = HashMap::new();
-
-    for child_pid in &descendants {
-        let Ok(cwd) = fs::read_link(format!("/proc/{child_pid}/cwd")) else {
-            continue;
-        };
-        let cwd_str = cwd.to_string_lossy();
-
-        if is_junk_path(&cwd_str, home) || !cwd.is_dir() {
-            continue;
-        }
-
-        *counts.entry(cwd_str.into_owned()).or_insert(0) += 1;
-    }
-
-    if counts.is_empty() {
-        return None;
-    }
-
-    if counts.len() == 1 {
-        return counts.into_keys().next();
-    }
-
-    // Multiple workspaces — use window title to pick the focused one.
-    // VS Code title: "file.rs - ProjectName - Visual Studio Code"
-    if let Some(project) = project_name_from_title(title) {
-        let project_lower = project.to_lowercase();
-        for path in counts.keys() {
-            let basename = std::path::Path::new(path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            if basename == project_lower {
-                return Some(path.clone());
-            }
-        }
-    }
-
-    // Fallback: most common CWD
-    counts
-        .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(path, _)| path)
-}
-
-/// Paths that are never useful as workspace context.
-fn is_junk_path(path: &str, home: &str) -> bool {
-    path == home
-        || path == "/"
-        || path.starts_with("/proc")
-        || path.contains("/.vscode/extensions/")
-        || path.contains("/.cursor/extensions/")
-        || path.contains("/.local/share/")
-        || path.contains("/telemetry/")
-}
-
-/// Extract project name from IDE window title.
-/// "file.rs - ProjectName - Visual Studio Code" → "ProjectName"
-/// "ProjectName - Visual Studio Code" → "ProjectName"
-fn project_name_from_title(title: &str) -> Option<&str> {
-    let parts: Vec<&str> = title.split(" - ").collect();
-    if parts.len() >= 3 {
-        let project = parts[parts.len() - 2].trim();
-        if !project.is_empty() {
-            return Some(project);
-        }
-    }
-    if parts.len() == 2 {
-        let project = parts[0].trim().trim_start_matches('●').trim();
-        if !project.is_empty() {
-            return Some(project);
-        }
-    }
+    tracing::debug!("cwd::detect: no path in title '{}', returning None", title);
     None
 }
 
-/// Collect descendant PIDs of `root_pid`.
+/// Extract CWD from terminal window title.
 ///
-/// Optimized path: if `ide_exe` is known, only scan `/proc` entries whose
-/// `/proc/<pid>/exe` matches the same binary. This narrows ~500 entries
-/// down to ~20-50 for a typical IDE. Falls back to full scan if exe is None.
-fn collect_descendants(root_pid: u32, ide_exe: Option<&std::path::Path>) -> Vec<u32> {
-    let mut parent_map: HashMap<u32, Vec<u32>> = HashMap::new();
+/// Common formats:
+/// - `user@host:/path/to/dir`
+/// - `user@host:~/subdir` (expand ~ to $HOME)
+/// - `/path/to/dir` (some terminals set just the path)
+/// - `command — user@host:/path` (some terminals append command info)
+/// - `user@host:/path/with spaces/dir` (paths containing spaces)
+fn cwd_from_title(title: &str, home: &str) -> Option<String> {
+    // Try "user@host:/path" pattern — look for `:` after `@`
+    if let Some(at_pos) = title.find('@') {
+        // Find the first `:` after the `@`
+        let after_at = &title[at_pos..];
+        if let Some(colon_offset) = after_at.find(':') {
+            let path_start = at_pos + colon_offset + 1;
+            let path = title[path_start..].trim();
+            // Trim trailing shell prompt chars ($ %) and whitespace
+            let path = path.trim_end_matches(['$', '%', ' ']);
+            if let Some(resolved) = resolve_path_progressive(path, home) {
+                return Some(resolved);
+            }
+        }
+    }
 
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return Vec::new();
+    // Try bare path at the start of the title
+    // Take everything up to common delimiters that aren't part of paths
+    let bare = title.trim();
+    if bare.starts_with('/') || bare.starts_with('~') {
+        let path = bare.split(['\t', '$', '%']).next().unwrap_or(bare).trim();
+        if let Some(resolved) = resolve_path_progressive(path, home) {
+            return Some(resolved);
+        }
+    }
+
+    None
+}
+
+/// Try to resolve a path, progressively trimming trailing segments
+/// to handle cases where extra text follows the path (e.g. prompts, commands).
+fn resolve_path_progressive(path: &str, home: &str) -> Option<String> {
+    // First try the full path
+    if let Some(resolved) = resolve_path(path, home) {
+        return Some(resolved);
+    }
+
+    // Progressively trim from the end at whitespace boundaries
+    // This handles "~/My Projects/app some extra text"
+    let mut candidate = path;
+    while let Some(last_space) = candidate.rfind(' ') {
+        candidate = &candidate[..last_space];
+        if let Some(resolved) = resolve_path(candidate, home) {
+            return Some(resolved);
+        }
+    }
+
+    None
+}
+
+/// Resolve a path string, expanding `~` and validating it exists.
+/// Returns None for $HOME or non-existent paths.
+fn resolve_path(path: &str, home: &str) -> Option<String> {
+    let expanded = if path.starts_with("~/") {
+        format!("{}{}", home, &path[1..])
+    } else if path == "~" {
+        return None; // $HOME is not useful
+    } else {
+        path.to_string()
     };
 
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
-            continue;
-        };
-
-        // Fast filter: skip processes that don't share the IDE's executable
-        if let Some(exe) = ide_exe {
-            if let Ok(proc_exe) = fs::read_link(format!("/proc/{pid}/exe")) {
-                if proc_exe != exe {
-                    continue;
-                }
-            } else {
-                continue;
-            }
-        }
-
-        // Read PPid from /proc/<pid>/status
-        if let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) {
-            for line in status.lines() {
-                if let Some(ppid_str) = line.strip_prefix("PPid:\t") {
-                    if let Ok(ppid) = ppid_str.trim().parse::<u32>() {
-                        parent_map.entry(ppid).or_default().push(pid);
-                    }
-                    break;
-                }
-            }
-        }
+    if expanded == home {
+        return None;
     }
 
-    // BFS from root_pid
-    let mut result = Vec::new();
-    let mut queue = vec![root_pid];
-    while let Some(pid) = queue.pop() {
-        if let Some(children) = parent_map.get(&pid) {
-            for &child in children {
-                result.push(child);
-                queue.push(child);
-            }
-        }
+    let p = std::path::Path::new(&expanded);
+    if p.is_absolute() && p.is_dir() {
+        Some(expanded)
+    } else {
+        None
     }
-    result
-}
-
-/// Find the foreground child process of a terminal.
-///
-/// Walk the process tree: terminal -> shell -> possibly a running command.
-/// Returns the deepest child with a readable CWD.
-fn find_foreground_child(pid: u32) -> Option<u32> {
-    let children = get_children(pid);
-
-    if children.is_empty() {
-        return Some(pid);
-    }
-
-    for &child in &children {
-        if fs::read_link(format!("/proc/{child}/cwd")).is_ok() {
-            if let Some(deep_pid) = find_foreground_child(child)
-                && fs::read_link(format!("/proc/{deep_pid}/cwd")).is_ok()
-            {
-                return Some(deep_pid);
-            }
-            return Some(child);
-        }
-    }
-
-    Some(pid)
-}
-
-/// Get direct child PIDs of a process via `/proc/<pid>/task/<pid>/children`.
-fn get_children(pid: u32) -> Vec<u32> {
-    let path = PathBuf::from(format!("/proc/{pid}/task/{pid}/children"));
-    fs::read_to_string(&path)
-        .unwrap_or_default()
-        .split_whitespace()
-        .filter_map(|s| s.parse::<u32>().ok())
-        .collect()
 }

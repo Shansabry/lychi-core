@@ -4,18 +4,22 @@
 //! the completions pipeline and AI routing to make Lychi context-aware.
 //!
 //! Detects: active window, terminal CWD, git state, project type, Docker.
-//! Refreshed on each summon, cached with 5s TTL.
+//! Refreshed on each summon. Window stack scanning finds the nearest
+//! terminal even when an IDE has focus.
 
 pub mod active_window;
+pub mod cache;
 pub mod cwd;
 pub mod docker;
 pub mod git;
+pub mod ide;
 pub mod project;
 pub mod suggestions;
+pub mod window_stack;
 
-use std::sync::Mutex;
 use std::time::Instant;
 
+use chrono::Timelike;
 use serde::{Deserialize, Serialize};
 
 /// The complete environmental context, refreshed on each summon.
@@ -23,9 +27,21 @@ use serde::{Deserialize, Serialize};
 pub struct EnvironmentContext {
     pub active_window: Option<WindowContext>,
     pub cwd: Option<String>,
+    /// CWD from the most recently focused terminal (if different from `cwd`).
+    /// Set when an IDE has focus but a terminal was recently used.
+    /// Shell commands prefer this over `cwd` when available.
+    #[serde(default)]
+    pub terminal_cwd: Option<String>,
+    /// WM class of the detected terminal emulator (from active window or stack).
+    /// Used to launch `run` commands in the same terminal the user already uses.
+    #[serde(default)]
+    pub terminal_class: Option<String>,
     pub git: Option<GitContext>,
     pub project: Option<ProjectContext>,
     pub docker: Option<DockerContext>,
+    /// Current hour (0-23) for time-aware suggestion ranking.
+    #[serde(default)]
+    pub hour: u8,
     /// Milliseconds taken to gather context.
     pub gather_ms: u64,
 }
@@ -36,6 +52,8 @@ pub struct WindowContext {
     pub wm_class: String,
     pub pid: u32,
     pub is_terminal: bool,
+    #[serde(default)]
+    pub is_ide: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,19 +70,35 @@ pub enum ProjectKind {
     Node,
     Python,
     Go,
+    Flutter,
     Docker,
-    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectScript {
+    /// Command runner (e.g. "npm run", "make", "just").
+    pub runner: String,
+    /// Script/target name.
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectContext {
     pub root: String,
     pub kind: ProjectKind,
+    /// Whether a `docker-compose.yml` or `compose.yml` exists in the project root.
+    #[serde(default)]
+    pub has_compose: bool,
+    /// Discovered project scripts/targets (npm scripts, Makefile targets, Justfile recipes).
+    #[serde(default)]
+    pub scripts: Vec<ProjectScript>,
+    /// Detected package manager for Node projects (npm, pnpm, yarn, bun).
+    #[serde(default)]
+    pub package_manager: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DockerContext {
-    pub daemon_running: bool,
     pub containers: Vec<ContainerInfo>,
 }
 
@@ -84,16 +118,20 @@ impl EnvironmentContext {
         if let Some(ref cwd) = self.cwd {
             lines.push(format!("- Working directory: {cwd}"));
         }
+        if let Some(ref tcwd) = self.terminal_cwd {
+            lines.push(format!("- Terminal CWD: {tcwd}"));
+        }
         if let Some(ref git) = self.git {
             let dirty_flag = if git.dirty { " (dirty)" } else { "" };
             lines.push(format!("- Git branch: {}{dirty_flag}", git.branch));
         }
         if let Some(ref proj) = self.project {
             lines.push(format!("- Project type: {:?}", proj.kind));
+            if let Some(ref pm) = proj.package_manager {
+                lines.push(format!("- Package manager: {pm}"));
+            }
         }
-        if let Some(ref docker) = self.docker
-            && docker.daemon_running
-        {
+        if let Some(ref docker) = self.docker {
             let n = docker.containers.len();
             lines.push(format!("- Docker: {n} running container(s)"));
         }
@@ -111,13 +149,18 @@ impl EnvironmentContext {
     }
 }
 
-static CONTEXT_CACHE: Mutex<Option<(EnvironmentContext, Instant)>> = Mutex::new(None);
-const CACHE_TTL_SECS: u64 = 5;
+/// Detect session type from XDG_SESSION_TYPE.
+#[cfg(target_os = "linux")]
+pub fn is_wayland() -> bool {
+    std::env::var("XDG_SESSION_TYPE")
+        .map(|v| v == "wayland")
+        .unwrap_or(false)
+}
 
 /// Snapshot the active window right now (before Lychi steals focus).
 ///
 /// Call this **before** `show_window()`, then pass the result to
-/// `gather_with_window()` inside `spawn_blocking`.
+/// `gather()` inside `spawn_blocking`.
 pub fn snapshot_active_window() -> Option<WindowContext> {
     active_window::detect()
 }
@@ -125,60 +168,163 @@ pub fn snapshot_active_window() -> Option<WindowContext> {
 /// Gather all context. Called on summon via `spawn_blocking`.
 ///
 /// Each detector is fail-safe — returns `None` on any error.
-/// Results are cached for 5 seconds to avoid redundant work on rapid summons.
+/// Refreshed on every summon (no caching).
 ///
 /// `pre_captured` should be the window snapshot taken **before** Lychi was shown.
 /// If `None`, falls back to detecting the current active window (which may be Lychi itself).
+///
+/// When the focused window is NOT a terminal, a parallel window-stack scan
+/// finds the most recently focused terminal and extracts its CWD into
+/// `terminal_cwd`. Shell commands prefer this over the IDE-derived `cwd`.
 pub fn gather(pre_captured: Option<WindowContext>) -> EnvironmentContext {
-    // Check cache first
-    if let Ok(guard) = CONTEXT_CACHE.lock()
-        && let Some((ref ctx, ref ts)) = *guard
-        && ts.elapsed().as_secs() < CACHE_TTL_SECS
-    {
-        return ctx.clone();
-    }
-
     let start = Instant::now();
+
+    tracing::debug!(
+        "gather: pre_captured={:?}",
+        pre_captured
+            .as_ref()
+            .map(|w| format!("{}(pid={},term={})", w.wm_class, w.pid, w.is_terminal))
+    );
 
     let window = pre_captured.or_else(active_window::detect);
 
-    let cwd = window
+    tracing::debug!(
+        "gather: window={:?}",
+        window
+            .as_ref()
+            .map(|w| format!("{}(pid={},term={})", w.wm_class, w.pid, w.is_terminal))
+    );
+
+    // Run window-stack scan in parallel with CWD/git/project/docker detection.
+    // The stack scan involves D-Bus (KWin) or X11 calls that can take 50-200ms,
+    // so we overlap it with the other detections.
+    let (main_result, stack_terminal) = std::thread::scope(|s| {
+        // Spawn the window-stack scan
+        let window_ref = window.as_ref();
+        let stack_handle = s.spawn(move || window_stack::find_recent_terminal(window_ref));
+
+        // Main thread: CWD + git + project + docker (sequential chain)
+        let cwd = window.as_ref().and_then(|w| {
+            if w.is_terminal {
+                cwd::detect(w.pid, &w.wm_class, &w.title)
+            } else if w.is_ide {
+                ide::detect_workspace(&w.title, &w.wm_class)
+            } else {
+                None
+            }
+        });
+
+        let git_ctx = cwd.as_ref().and_then(|dir| {
+            // Check cache first — avoids spawning `git status` subprocess
+            if let Some(cached) = cache::get_git(dir) {
+                tracing::debug!("gather: git cache hit for {dir}");
+                return cached;
+            }
+            let result = git::detect(dir);
+            cache::set_git(dir, &result);
+            result
+        });
+
+        let project_ctx = cwd
+            .as_ref()
+            .and_then(|dir| {
+                if let Some(cached) = cache::get_project(dir) {
+                    tracing::debug!("gather: project cache hit for {dir}");
+                    return cached;
+                }
+                let result = project::detect(dir)
+                    .or_else(|| git_ctx.as_ref().and_then(|g| project::detect(&g.repo_root)));
+                cache::set_project(&result);
+                result
+            })
+            .or_else(|| git_ctx.as_ref().and_then(|g| project::detect(&g.repo_root)));
+
+        let docker_ctx = if let Some(cached) = cache::get_docker() {
+            tracing::debug!("gather: docker cache hit");
+            cached
+        } else {
+            let result = docker::detect();
+            cache::set_docker(&result);
+            result
+        };
+
+        let main = (cwd, git_ctx, project_ctx, docker_ctx);
+        let stack = stack_handle.join().ok().flatten();
+
+        (main, stack)
+    });
+
+    let (cwd, git_ctx, project_ctx, docker_ctx) = main_result;
+
+    tracing::debug!(
+        "gather: stack_terminal={:?}, cwd={:?}",
+        stack_terminal
+            .as_ref()
+            .map(|w| format!("{}(pid={})", w.wm_class, w.pid)),
+        cwd.as_deref()
+    );
+
+    // Derive terminal_cwd from the stack-detected terminal
+    let terminal_cwd = stack_terminal
+        .as_ref()
+        .and_then(|t| cwd::detect(t.pid, &t.wm_class, &t.title));
+
+    tracing::debug!("gather: terminal_cwd={:?}", terminal_cwd.as_deref());
+
+    // When terminal_cwd is available AND the focused window is NOT an IDE,
+    // re-derive git/project from the terminal CWD (more specific than the
+    // non-terminal/non-IDE window). When an IDE is focused, the IDE workspace
+    // is the primary context — the background terminal is supplementary info only.
+    let focused_is_ide = window.as_ref().is_some_and(|w| w.is_ide);
+    let (git_ctx, project_ctx) = if let Some(ref tcwd) = terminal_cwd
+        && !focused_is_ide
+        && cwd.as_deref() != Some(tcwd.as_str())
+    {
+        let git = if let Some(cached) = cache::get_git(tcwd) {
+            tracing::debug!("gather: git cache hit for terminal_cwd {tcwd}");
+            cached
+        } else {
+            let result = git::detect(tcwd);
+            cache::set_git(tcwd, &result);
+            result
+        };
+        let proj = if let Some(cached) = cache::get_project(tcwd) {
+            tracing::debug!("gather: project cache hit for terminal_cwd {tcwd}");
+            cached
+        } else {
+            let result = project::detect(tcwd)
+                .or_else(|| git.as_ref().and_then(|g| project::detect(&g.repo_root)));
+            cache::set_project(&result);
+            result
+        };
+        tracing::debug!(
+            "gather: re-derived from terminal_cwd: git={:?}, project={:?}",
+            git.as_ref().map(|g| g.branch.as_str()),
+            proj.as_ref().map(|p| format!("{:?}", p.kind))
+        );
+        (git, proj)
+    } else {
+        (git_ctx, project_ctx)
+    };
+
+    // Detect terminal emulator class: from focused window (if terminal) or stack
+    let terminal_class = window
         .as_ref()
         .filter(|w| w.is_terminal)
-        .and_then(|w| cwd::detect(w.pid, &w.wm_class, &w.title));
+        .map(|w| w.wm_class.clone())
+        .or_else(|| stack_terminal.as_ref().map(|t| t.wm_class.clone()));
 
-    let git_ctx = cwd.as_ref().and_then(|dir| git::detect(dir));
-
-    let project_ctx = cwd
-        .as_ref()
-        .and_then(|dir| project::detect(dir))
-        .or_else(|| git_ctx.as_ref().and_then(|g| project::detect(&g.repo_root)));
-
-    let docker_ctx = docker::detect();
-
-    let ctx = EnvironmentContext {
+    EnvironmentContext {
         active_window: window,
         cwd,
+        terminal_cwd,
+        terminal_class,
         git: git_ctx,
         project: project_ctx,
         docker: docker_ctx,
+        hour: chrono::Local::now().hour() as u8,
         gather_ms: start.elapsed().as_millis() as u64,
-    };
-
-    // Update cache
-    if let Ok(mut guard) = CONTEXT_CACHE.lock() {
-        *guard = Some((ctx.clone(), Instant::now()));
     }
-
-    ctx
-}
-
-/// Get cached context without refreshing.
-pub fn cached() -> Option<EnvironmentContext> {
-    CONTEXT_CACHE
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|(ctx, _)| ctx.clone()))
 }
 
 #[cfg(test)]
@@ -222,11 +368,7 @@ mod tests {
         // Test Docker
         println!("\n=== Docker ===");
         if let Some(ref d) = docker::detect() {
-            println!(
-                "  daemon={}, containers={}",
-                d.daemon_running,
-                d.containers.len()
-            );
+            println!("  containers={}", d.containers.len());
             for c in &d.containers {
                 println!("    {} ({}) — {}", c.name, c.image, c.status);
             }
@@ -253,6 +395,7 @@ mod tests {
             project: project::detect(this_dir),
             docker: docker::detect(),
             gather_ms: 0,
+            ..Default::default()
         };
         for item in suggestions::suggest(&test_ctx) {
             println!(

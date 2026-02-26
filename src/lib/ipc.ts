@@ -24,6 +24,8 @@ export interface CompletionItem {
 	icon_path: string | null;
 	score: number;
 	description?: string | null;
+	/** Provenance — why this was suggested. Set by context suggestions only. */
+	reason?: string | null;
 }
 
 function isTauri(): boolean {
@@ -168,6 +170,7 @@ export async function getAllSettings(): Promise<AllSettings> {
 				default_search_engine: "https://www.google.com/search?q=",
 				youtube_url: "https://www.youtube.com/results?search_query=",
 				shell: "/bin/bash",
+				terminal: "",
 			},
 			projects: { directories: [] },
 			privacy: { allow_ip_geolocation: false, allow_public_ip: false },
@@ -247,6 +250,7 @@ export interface CommandsConfig {
 	default_search_engine: string;
 	youtube_url: string;
 	shell: string;
+	terminal: string;
 }
 
 export async function getCommandsConfig(): Promise<CommandsConfig> {
@@ -255,6 +259,7 @@ export async function getCommandsConfig(): Promise<CommandsConfig> {
 			default_search_engine: "https://www.google.com/search?q=",
 			youtube_url: "https://www.youtube.com/results?search_query=",
 			shell: "/bin/bash",
+			terminal: "",
 		};
 	return invoke<CommandsConfig>("get_commands_config");
 }
@@ -627,6 +632,7 @@ export interface WindowContext {
 	wm_class: string;
 	pid: number;
 	is_terminal: boolean;
+	is_ide: boolean;
 }
 
 export interface GitContext {
@@ -636,9 +642,16 @@ export interface GitContext {
 	remote: string | null;
 }
 
+export interface ProjectScript {
+	runner: string;
+	name: string;
+}
+
 export interface ProjectContext {
 	root: string;
 	kind: string;
+	has_compose: boolean;
+	scripts: ProjectScript[];
 }
 
 export interface ContainerInfo {
@@ -649,16 +662,17 @@ export interface ContainerInfo {
 }
 
 export interface DockerContext {
-	daemon_running: boolean;
 	containers: ContainerInfo[];
 }
 
 export interface EnvironmentContext {
 	active_window: WindowContext | null;
 	cwd: string | null;
+	terminal_cwd: string | null;
 	git: GitContext | null;
 	project: ProjectContext | null;
 	docker: DockerContext | null;
+	hour: number;
 	gather_ms: number;
 }
 

@@ -56,6 +56,46 @@ pub struct ActionResult {
     pub executed_args: Option<String>,
 }
 
+impl ActionResult {
+    /// Successful result with output text.
+    pub fn ok(output: impl Into<String>, output_type: OutputType) -> Self {
+        Self {
+            success: true,
+            output: Some(output.into()),
+            error: None,
+            duration_ms: 0,
+            routed_by: None,
+            open_url: None,
+            needs_confirmation: None,
+            risk_level: None,
+            output_type: Some(output_type),
+            executed_args: None,
+        }
+    }
+
+    /// Failed result with an error message.
+    pub fn err(error: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            output: None,
+            error: Some(error.into()),
+            duration_ms: 0,
+            routed_by: None,
+            open_url: None,
+            needs_confirmation: None,
+            risk_level: None,
+            output_type: None,
+            executed_args: None,
+        }
+    }
+
+    /// Set risk level (builder-style).
+    pub fn with_risk(mut self, risk: RiskLevel) -> Self {
+        self.risk_level = Some(risk);
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionItem {
     pub label: String,
@@ -63,6 +103,10 @@ pub struct CompletionItem {
     pub score: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Provenance — why this was suggested. Set by context suggestions,
+    /// `None` for non-context completions (app search, emoji, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Trait for action handlers. Each handler has a unique ID (e.g. "open", "web", "run")

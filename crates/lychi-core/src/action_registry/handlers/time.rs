@@ -529,6 +529,7 @@ impl ActionHandler for TimeHandler {
                         icon_path: Some("__none__".to_string()),
                         score: 90,
                         description: Some(format!("{time_str} {abbr}{dst_tag} · {offset}")),
+                        reason: None,
                     });
                 }
             }
@@ -551,6 +552,7 @@ impl ActionHandler for TimeHandler {
                     icon_path: Some("__none__".to_string()),
                     score,
                     description: Some(format!("{time_str} {abbr}{dst_tag} · {offset}")),
+                    reason: None,
                 });
             }
         }
@@ -570,6 +572,7 @@ impl ActionHandler for TimeHandler {
                     icon_path: Some("__none__".to_string()),
                     score,
                     description: Some(format!("{time_str}{dst_tag} · {offset}")),
+                    reason: None,
                 });
             }
         }

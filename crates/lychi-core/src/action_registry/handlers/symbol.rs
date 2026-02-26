@@ -1386,6 +1386,7 @@ impl ActionHandler for SymbolHandler {
                         icon_path: Some("__none__".to_string()),
                         score: (POPULAR_INDICES.len() - i) as u16,
                         description: Some(s.category.to_string()),
+                        reason: None,
                     })
                 })
                 .collect();
@@ -1426,6 +1427,7 @@ impl ActionHandler for SymbolHandler {
                 icon_path: Some("__none__".to_string()),
                 score,
                 description: Some(sym.category.to_string()),
+                reason: None,
             })
             .collect()
     }

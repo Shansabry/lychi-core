@@ -110,7 +110,12 @@ let initialNotesTab: "notes" | "todos" | "reminders" | "timers" | "snippets" | u
 let mediaPlayers: TrackInfo[] = $state([]);
 let envContext: EnvironmentContext | null = $state(null);
 let contextPill = $derived.by(() => {
-	const folder = envContext?.cwd?.split("/").pop();
+	// When IDE is focused, use IDE workspace (cwd). Otherwise prefer terminal_cwd.
+	const ideIsFocused = envContext?.active_window?.is_ide ?? false;
+	const cwd = ideIsFocused
+		? (envContext?.cwd ?? envContext?.terminal_cwd)
+		: (envContext?.terminal_cwd ?? envContext?.cwd);
+	const folder = cwd?.split("/").pop();
 	if (!folder) return "";
 	const branch = envContext?.git?.branch;
 	if (branch) return `${folder} · ${branch}`;
@@ -305,7 +310,7 @@ function handleInput(val: string) {
 	atStart = -1;
 
 	const trimmed = val.trim();
-	if (trimmed.length < 2) {
+	if (trimmed.length < 1 && !envContext) {
 		completionGen++;
 		completions = [];
 		completionIndex = -1;
@@ -402,6 +407,16 @@ onMount(() => {
 		// Listen for context-ready event from async context gathering
 		const unlistenContext = await win.listen<EnvironmentContext>("lychi://context-ready", (e) => {
 			envContext = e.payload;
+			// Fetch context suggestions if input is empty
+			const input = document.querySelector<HTMLInputElement>(".input-container input");
+			if (input && input.value.trim().length < 1) {
+				getCompletions("")
+					.then((results) => {
+						completions = results;
+						completionIndex = results.length > 0 ? 0 : -1;
+					})
+					.catch(() => {});
+			}
 		});
 		unlisteners.push(unlistenContext);
 
@@ -525,7 +540,9 @@ onMount(() => {
 
 async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 	const trimmed = inputValue.trim();
-	if (!trimmed || isExecuting || !backendReady) return;
+	// Allow submit when input is empty but a context suggestion is selected
+	const hasSelectedCompletion = completions.length > 0 && completionIndex >= 0;
+	if ((!trimmed && !hasSelectedCompletion) || isExecuting || !backendReady) return;
 
 	// If a plan is showing and user presses Enter, execute it
 	if (pendingPlan) return;
@@ -702,6 +719,9 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 			} else if (KNOWN_PREFIXES.has(lower)) {
 				// Input is a bare prefix (e.g. "clip", "focus") — send prefix + selected label
 				await runCommand(`${lower} ${selected.label}`);
+			} else if (selected.icon_path === "__context__") {
+				// Context suggestion — label is a complete command (e.g. "git commit", "run cargo build")
+				await runCommand(selected.label);
 			} else if (selected.label.toLowerCase() === lower) {
 				// Completion matches input exactly (e.g. "mem" → sysinfo "mem")
 				// Let the backend router handle it directly
@@ -946,11 +966,19 @@ function handleCompletionSelect(label: string, forceOpen?: boolean) {
 		return;
 	}
 
+	// Find the item by label (click passes label directly, may not match completionIndex)
+	const item = completions.find((c) => c.label === label) ?? completions[completionIndex];
+
 	// "Did you mean: X?" typo suggestion — fill input with corrected text
-	const item = completions[completionIndex];
 	if (item?.description && label.startsWith("Did you mean:")) {
 		inputValue = item.description;
 		handleInput(inputValue);
+		return;
+	}
+
+	// Context suggestion — label is a complete command (e.g. "git commit", "run cargo build")
+	if (item?.icon_path === "__context__") {
+		runCommand(label);
 		return;
 	}
 

@@ -396,6 +396,7 @@ impl ActionHandler for SystemCommand {
                 icon_path: None,
                 score: if name.starts_with(&lower) { 100 } else { 50 },
                 description: Some(desc.to_string()),
+                reason: None,
             })
             .collect()
     }

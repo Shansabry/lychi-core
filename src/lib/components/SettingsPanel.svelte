@@ -13,7 +13,6 @@ import {
 	Sun,
 	X,
 } from "lucide-svelte";
-import LychiIcon from "./LychiIcon.svelte";
 import { onMount } from "svelte";
 import type {
 	AiConfig,
@@ -49,6 +48,7 @@ import {
 	loadKeybindings,
 } from "$lib/keybindings";
 import { invalidateSettings, preloadSettings } from "$lib/preloadCache";
+import LychiIcon from "./LychiIcon.svelte";
 import Select from "./Select.svelte";
 
 let { ondismiss }: { ondismiss: () => void } = $props();
@@ -79,6 +79,7 @@ let commandsConfig: CommandsConfig = $state({
 	default_search_engine: "https://www.google.com/search?q=",
 	youtube_url: "https://www.youtube.com/results?search_query=",
 	shell: "/bin/bash",
+	terminal: "",
 });
 
 let privacyConfig: PrivacyConfig = $state({
@@ -417,6 +418,17 @@ async function handleShellChange(val: string) {
 	}
 }
 
+async function handleTerminalChange(val: string) {
+	if (!val.trim()) return;
+	commandsConfig.terminal = val.trim();
+	try {
+		await saveCommandsConfig(commandsConfig);
+	} catch (err) {
+		console.error("[settings] Failed to save terminal config:", err);
+		saveError = `Failed to save: ${err}`;
+	}
+}
+
 async function saveProjectDirs() {
 	try {
 		await saveProjectsConfig({ directories: projectDirs });
@@ -674,6 +686,20 @@ function handleKeydown(e: KeyboardEvent) {
 						onchange={handleShellSelect}
 					/>
 				{/if}
+			</div>
+			<div class="field">
+				<label for="terminal-input">Terminal</label>
+				<div class="key-row">
+					<input
+						id="terminal-input"
+						type="text"
+						bind:value={commandsConfig.terminal}
+						spellcheck="false"
+						placeholder="auto-detected"
+						onkeydown={(e) => { if (e.key === "Enter") { e.preventDefault(); handleTerminalChange(commandsConfig.terminal); } }}
+					/>
+					<button class="set-btn" onclick={() => handleTerminalChange(commandsConfig.terminal)}>Set</button>
+				</div>
 			</div>
 			<div class="section-label">Privacy</div>
 			<div class="field">

@@ -461,6 +461,7 @@ impl ActionHandler for WeatherHandler {
                 icon_path: None,
                 score: 100,
                 description: Some("Detect current location".to_string()),
+                reason: None,
             });
         }
         items

@@ -558,6 +558,7 @@ impl ActionHandler for TimerHandler {
                     icon_path: None,
                     score: 200,
                     description: Some(desc),
+                    reason: None,
                 });
             }
         }
@@ -570,6 +571,7 @@ impl ActionHandler for TimerHandler {
                     icon_path: None,
                     score: if cmd.starts_with(&lower) { 100 } else { 50 },
                     description: Some(desc.to_string()),
+                    reason: None,
                 });
             }
         }

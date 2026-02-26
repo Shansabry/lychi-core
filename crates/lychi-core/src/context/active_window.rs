@@ -5,7 +5,7 @@
 
 use super::WindowContext;
 
-/// Known terminal emulator WM classes.
+/// Known terminal emulator WM classes (real terminals only, not IDEs).
 const TERMINALS: &[&str] = &[
     "alacritty",
     "kitty",
@@ -33,45 +33,52 @@ const TERMINALS: &[&str] = &[
     "ptyxis",
 ];
 
-/// Editors/IDEs with integrated terminals — treated as terminal-like
-/// for CWD detection (their process CWD is the workspace root).
-const IDE_TERMINALS: &[&str] = &[
-    "code",
-    "code-oss",
-    "codium",
-    "vscodium",
-    "code-insiders",
-    "cursor",
-    "windsurf",
-    "zed",
-    "jetbrains-idea",
-    "jetbrains-clion",
-    "jetbrains-pycharm",
-    "jetbrains-webstorm",
-    "jetbrains-goland",
-    "jetbrains-rider",
-    "jetbrains-rustrover",
-    "jetbrains-fleet",
-];
-
 /// Detect the currently focused window.
 pub fn detect() -> Option<WindowContext> {
-    if is_wayland() {
+    let result = if super::is_wayland() {
         detect_kwin()
     } else {
         detect_x11()
-    }
+    };
+    tracing::debug!(
+        "active_window::detect: {:?}",
+        result.as_ref().map(|w| format!(
+            "{}(pid={},term={},ide={},title={})",
+            w.wm_class, w.pid, w.is_terminal, w.is_ide, w.title
+        ))
+    );
+    result
 }
 
-fn is_wayland() -> bool {
-    std::env::var("XDG_SESSION_TYPE")
-        .map(|v| v == "wayland")
-        .unwrap_or(false)
+/// Check if a wm_class is a terminal emulator.
+pub fn is_terminal_class(wm_class: &str) -> bool {
+    let lower = wm_class.to_lowercase();
+    TERMINALS.iter().any(|t| lower.contains(t))
 }
 
-fn is_terminal(wm_class: &str) -> bool {
-    TERMINALS.iter().any(|t| wm_class.contains(t))
-        || IDE_TERMINALS.iter().any(|t| wm_class.contains(t))
+/// Known IDE WM classes.
+const IDES: &[&str] = &[
+    "code",
+    "code - oss",
+    "vscodium",
+    "cursor",
+    "windsurf",
+    "jetbrains-idea",
+    "jetbrains-pycharm",
+    "jetbrains-webstorm",
+    "jetbrains-clion",
+    "jetbrains-goland",
+    "jetbrains-rustrover",
+    "jetbrains-rider",
+    "jetbrains-phpstorm",
+    "jetbrains-datagrip",
+    "zed",
+];
+
+/// Check if a wm_class is an IDE.
+pub fn is_ide_class(wm_class: &str) -> bool {
+    let lower = wm_class.to_lowercase();
+    IDES.iter().any(|t| lower.contains(t))
 }
 
 // ── X11 ─────────────────────────────────────────────────────────────────
@@ -174,7 +181,8 @@ fn detect_x11() -> Option<WindowContext> {
     }
 
     Some(WindowContext {
-        is_terminal: is_terminal(&wm_class),
+        is_terminal: is_terminal_class(&wm_class),
+        is_ide: is_ide_class(&wm_class),
         title,
         wm_class,
         pid,
@@ -187,7 +195,7 @@ fn detect_x11() -> Option<WindowContext> {
 }
 
 /// Parse WM_CLASS: "instance\0class\0" → class (lowercase).
-fn parse_wm_class(data: &[u8]) -> String {
+pub(super) fn parse_wm_class(data: &[u8]) -> String {
     let parts: Vec<&[u8]> = data.split(|&b| b == 0).filter(|p| !p.is_empty()).collect();
     if parts.len() >= 2 {
         String::from_utf8_lossy(parts[1]).to_lowercase()
@@ -309,7 +317,8 @@ if (w && w.caption && w.pid > 0) {{
     }
 
     Some(WindowContext {
-        is_terminal: is_terminal(&wm_class),
+        is_terminal: is_terminal_class(&wm_class),
+        is_ide: is_ide_class(&wm_class),
         title,
         wm_class,
         pid,

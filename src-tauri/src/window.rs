@@ -55,19 +55,35 @@ pub fn show_window(window: &WebviewWindow) {
     // Tell frontend to reset state (clear input, refocus input element)
     let _ = window.emit("lychi://summon", ());
 
-    // Gather environment context asynchronously (never blocks summon).
-    // Result is stored in Executor.context and emitted to frontend.
+    // Fast path: emit last-known context immediately so suggestions appear
+    // before the fresh gather completes (typically saves 50-200ms).
+    {
+        let state = window.app_handle().state::<AppState>();
+        if let Ok(executor) = state.executor.try_read()
+            && let Some(ref cached_ctx) = executor.context
+        {
+            tracing::debug!(
+                "Fast path: emitting cached context ({}ms old)",
+                cached_ctx.gather_ms
+            );
+            let _ = window.emit("lychi://context-ready", cached_ctx);
+        }
+    }
+
+    // Gather fresh context asynchronously (never blocks summon).
+    // Result replaces the cached context and is re-emitted to frontend.
     let ctx_handle = window.app_handle().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let ctx = lychi_core::context::gather(pre_window);
         tracing::info!(
-            "Context gathered in {}ms: window={}, cwd={}, git={}, project={}, docker={}",
+            "Context gathered in {}ms: window={}, cwd={}, terminal_cwd={}, git={}, project={}, docker={}",
             ctx.gather_ms,
             ctx.active_window
                 .as_ref()
                 .map(|w| w.wm_class.as_str())
                 .unwrap_or("none"),
             ctx.cwd.as_deref().unwrap_or("none"),
+            ctx.terminal_cwd.as_deref().unwrap_or("none"),
             ctx.git
                 .as_ref()
                 .map(|g| g.branch.as_str())

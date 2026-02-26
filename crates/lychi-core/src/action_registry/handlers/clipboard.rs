@@ -152,6 +152,7 @@ impl ActionHandler for ClipboardHandler {
                 icon_path: None,
                 score: 0,
                 description: None,
+                reason: None,
             }];
         }
 
@@ -165,6 +166,7 @@ impl ActionHandler for ClipboardHandler {
                     icon_path: None,
                     score: (1000 - i as u16).max(1),
                     description: Some(Self::format_age(entry.created_at)),
+                    reason: None,
                 })
                 .collect();
         }
@@ -186,6 +188,7 @@ impl ActionHandler for ClipboardHandler {
                 icon_path: None,
                 score: (1000 - rank as u16).max(1),
                 description: Some(Self::format_age(entry.created_at)),
+                reason: None,
             })
             .collect()
     }

@@ -310,6 +310,7 @@ impl ActionHandler for BookmarkHandler {
                     icon_path: None,
                     score: (20 - i) as u16,
                     description: Some(Self::truncate_url(&bm.url, 60)),
+                    reason: None,
                 })
                 .collect();
         }
@@ -350,6 +351,7 @@ impl ActionHandler for BookmarkHandler {
                     icon_path: None,
                     score,
                     description: Some(Self::truncate_url(&bm.url, 60)),
+                    reason: None,
                 })
             })
             .collect()

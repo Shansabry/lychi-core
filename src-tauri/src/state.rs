@@ -12,6 +12,7 @@ use lychi_core::action_registry::handlers::bookmarks::BookmarkHandler;
 use lychi_core::action_registry::handlers::browse::BrowseHandler;
 use lychi_core::action_registry::handlers::calc::CalcHandler;
 use lychi_core::action_registry::handlers::clipboard::ClipboardHandler;
+use lychi_core::action_registry::handlers::context_debug::ContextDebugHandler;
 use lychi_core::action_registry::handlers::emoji::EmojiHandler;
 use lychi_core::action_registry::handlers::file_open::FileOpen;
 #[cfg(feature = "mpris")]
@@ -139,6 +140,10 @@ impl AppState {
         registry.register(Box::new(ShellExec::with_shell(
             config.commands.shell.clone(),
         )));
+        // Set the terminal emulator for `run` commands that open a real terminal window
+        lychi_core::action_registry::handlers::shell_exec::set_terminal(Some(
+            config.commands.terminal.clone(),
+        ));
         registry.register(Box::new(CalcHandler::new()));
         registry.register(Box::new(ClipboardHandler::new(db.clone())));
         registry.register(Box::new(FileOpen::new(db.clone())));
@@ -162,6 +167,7 @@ impl AppState {
         registry.register(Box::new(RemindersHandler::new(db.clone())));
         registry.register(Box::new(SnippetsHandler::new(db.clone())));
         registry.register(Box::new(BrowseHandler::new()));
+        registry.register(Box::new(ContextDebugHandler::new()));
         let weather_handler = Arc::new(WeatherHandler::new(
             config.weather.unit.clone(),
             config.weather.default_location.clone(),

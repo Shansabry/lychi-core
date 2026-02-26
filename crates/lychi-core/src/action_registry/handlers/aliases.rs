@@ -172,6 +172,7 @@ impl ActionHandler for AliasHandler {
                     icon_path: None,
                     score: 100,
                     description: None,
+                    reason: None,
                 })
                 .collect();
 
@@ -185,6 +186,7 @@ impl ActionHandler for AliasHandler {
                             icon_path: None,
                             score: 80,
                             description: Some(format!("→ {}", alias.command)),
+                            reason: None,
                         });
                     }
                 }
@@ -210,6 +212,7 @@ impl ActionHandler for AliasHandler {
                         icon_path: None,
                         score: 90,
                         description: Some(format!("→ {}", a.command)),
+                        reason: None,
                     })
                     .collect();
             }

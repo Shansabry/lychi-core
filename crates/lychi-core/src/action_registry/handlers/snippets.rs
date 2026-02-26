@@ -305,6 +305,7 @@ impl ActionHandler for SnippetsHandler {
                 icon_path: None,
                 score: if cmd.starts_with(&lower) { 100 } else { 50 },
                 description: Some(desc.to_string()),
+                reason: None,
             })
             .collect();
 
@@ -324,6 +325,7 @@ impl ActionHandler for SnippetsHandler {
                                 40
                             },
                             description: Some(Self::truncate_body(&s.body, 40).to_string()),
+                            reason: None,
                         });
                     }
                 }

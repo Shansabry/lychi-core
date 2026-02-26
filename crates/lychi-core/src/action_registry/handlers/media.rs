@@ -182,6 +182,7 @@ fn media_completions(partial: &str) -> Vec<CompletionItem> {
             icon_path: None,
             score: if s.starts_with(&lower) { 100 } else { 50 },
             description: None,
+            reason: None,
         })
         .collect()
 }
@@ -243,6 +244,7 @@ fn state_aware_actions(players: &[TrackInfo], partial: &str) -> Vec<CompletionIt
                 icon_path: None,
                 score: 70,
                 description: Some(format!("{}: {}", p.player_name, p.title)),
+                reason: None,
             })
         })
         .collect()
@@ -289,6 +291,7 @@ impl MediaHandler {
                 icon_path: None,
                 score: 100,
                 description: Some("Player not running".to_string()),
+                reason: None,
             }],
             Some(p) => {
                 let lower = partial.to_lowercase();
@@ -312,6 +315,7 @@ impl MediaHandler {
                         icon_path: None,
                         score: 100,
                         description: Some(desc.clone()),
+                        reason: None,
                     })
                     .collect()
             }
@@ -385,6 +389,7 @@ impl ActionHandler for MediaHandler {
                     80
                 },
                 description: Some(description),
+                reason: None,
             });
         }
 
@@ -395,6 +400,7 @@ impl ActionHandler for MediaHandler {
                 icon_path: None,
                 score: 60,
                 description: Some(format!("{} players active", players.len())),
+                reason: None,
             });
         }
 

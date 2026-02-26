@@ -301,6 +301,7 @@ impl ActionHandler for AppLauncher {
                     icon_path,
                     score: blended,
                     description: None,
+                    reason: None,
                 }
             })
             .collect();

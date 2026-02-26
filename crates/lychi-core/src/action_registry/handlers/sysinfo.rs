@@ -157,6 +157,7 @@ impl ActionHandler for SysInfoHandler {
                 icon_path: None,
                 score: if s.starts_with(&lower) { 100 } else { 50 },
                 description: None,
+                reason: None,
             })
             .collect()
     }

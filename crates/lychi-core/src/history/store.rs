@@ -186,6 +186,7 @@ impl HistoryStore {
                     icon_path: Some("__history__".to_string()),
                     score: blended,
                     description: None,
+                    reason: None,
                 }
             })
             .collect();

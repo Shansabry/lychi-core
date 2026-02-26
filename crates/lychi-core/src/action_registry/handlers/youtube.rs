@@ -39,6 +39,7 @@ impl ActionHandler for YouTube {
             icon_path: Some("__none__".to_string()),
             score: 100,
             description: Some("Enter to search".to_string()),
+            reason: None,
         }]
     }
 

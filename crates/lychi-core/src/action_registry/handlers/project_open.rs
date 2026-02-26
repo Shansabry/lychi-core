@@ -474,6 +474,7 @@ impl ActionHandler for ProjectOpen {
                 icon_path: None,
                 score,
                 description: None,
+                reason: None,
             })
             .collect()
     }

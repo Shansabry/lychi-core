@@ -1,4 +1,3 @@
-use std::process::Command;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -48,14 +47,6 @@ struct WindowCache {
 static WINDOW_CACHE: Mutex<Option<WindowCache>> = Mutex::new(None);
 const CACHE_TTL_SECS: u64 = 2;
 
-/// Detect session type from XDG_SESSION_TYPE.
-#[cfg(target_os = "linux")]
-fn is_wayland() -> bool {
-    std::env::var("XDG_SESSION_TYPE")
-        .map(|v| v == "wayland")
-        .unwrap_or(false)
-}
-
 /// Get the list of running windows, using cache if fresh.
 fn get_windows() -> Vec<RunningWindow> {
     if let Ok(cache) = WINDOW_CACHE.lock()
@@ -82,7 +73,7 @@ fn get_windows() -> Vec<RunningWindow> {
 /// X11 → native EWMH protocol via x11rb.
 #[cfg(target_os = "linux")]
 fn enumerate_windows() -> Vec<RunningWindow> {
-    let wayland = is_wayland();
+    let wayland = crate::context::is_wayland();
     tracing::info!("appctl: enumerate_windows (wayland={wayland})");
     if wayland {
         kwin_windows::enumerate_windows()
@@ -155,7 +146,7 @@ fn parse_verb_and_target(args: &str) -> (&str, &str) {
 /// Focus a window natively.
 #[cfg(target_os = "linux")]
 fn do_focus(window: &RunningWindow) -> Result<(), String> {
-    if is_wayland() {
+    if crate::context::is_wayland() {
         kwin_windows::focus_window(&window.wm_class)
     } else if let Some(wid) = window.window_id {
         x11_windows::focus_window(wid)
@@ -172,7 +163,7 @@ fn do_focus(_window: &RunningWindow) -> Result<(), String> {
 /// Gracefully close a window natively.
 #[cfg(target_os = "linux")]
 fn do_close(window: &RunningWindow) -> Result<(), String> {
-    if is_wayland() {
+    if crate::context::is_wayland() {
         kwin_windows::close_window(&window.wm_class)
     } else if let Some(wid) = window.window_id {
         x11_windows::close_window(wid)
@@ -204,141 +195,121 @@ impl ActionHandler for AppControlHandler {
         let (verb, target) = parse_verb_and_target(args);
 
         if target.is_empty() {
-            return Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some(format!(
-                    "Usage: {verb} <app name>. Try 'focus firefox' or 'quit code'."
-                )),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-            });
+            return Ok(ActionResult::err(format!(
+                "Usage: {verb} <app name>. Try 'focus firefox' or 'quit code'."
+            )));
+        }
+
+        // For kill: try process-level matching first (tracked + system /proc scan)
+        // before falling through to window kill, which would nuke an entire terminal.
+        if verb == "kill" {
+            // Tier 1: Lychi-tracked processes (also handles PID input for tracked procs)
+            if let Ok(msg) = crate::process_tracker::kill_by(target) {
+                return Ok(ActionResult::ok(msg, OutputType::Status).with_risk(RiskLevel::Medium));
+            }
+
+            // Tier 1.5: direct PID kill (from completion selection or user typing a PID)
+            if let Ok(pid) = target.parse::<u32>() {
+                return Ok(match crate::process_tracker::kill_system_pid(pid) {
+                    Ok(msg) => {
+                        ActionResult::ok(msg, OutputType::Status).with_risk(RiskLevel::Medium)
+                    }
+                    Err(e) => ActionResult::err(e),
+                });
+            }
+
+            // Tier 2: system processes via /proc scan
+            let system_matches = crate::process_tracker::scan_system(target);
+            match system_matches.len() {
+                1 => {
+                    return Ok(
+                        match crate::process_tracker::kill_system_pid(system_matches[0].pid) {
+                            Ok(msg) => ActionResult::ok(msg, OutputType::Status)
+                                .with_risk(RiskLevel::Medium),
+                            Err(e) => ActionResult::err(e),
+                        },
+                    );
+                }
+                n if n > 1 => {
+                    // Prefer exact comm match to avoid ambiguity
+                    let target_lower = target.to_lowercase();
+                    let exact: Vec<_> = system_matches
+                        .iter()
+                        .filter(|p| p.comm.to_lowercase() == target_lower)
+                        .collect();
+                    if exact.len() == 1 {
+                        return Ok(
+                            match crate::process_tracker::kill_system_pid(exact[0].pid) {
+                                Ok(msg) => ActionResult::ok(msg, OutputType::Status)
+                                    .with_risk(RiskLevel::Medium),
+                                Err(e) => ActionResult::err(e),
+                            },
+                        );
+                    }
+                    let names: Vec<String> = system_matches
+                        .iter()
+                        .map(|p| format!("  {} (pid={})", p.comm, p.pid))
+                        .collect();
+                    return Ok(ActionResult::err(format!(
+                        "Multiple matches ({n}), specify PID:\n{}",
+                        names.join("\n")
+                    )));
+                }
+                _ => {} // 0 matches — fall through to window kill
+            }
         }
 
         let windows = get_windows();
         let window = match find_window(&windows, target) {
             Some(w) => w,
             None => {
-                return Ok(ActionResult {
-                    success: false,
-                    output: None,
-                    error: Some(format!("No running window matching '{target}'")),
-                    duration_ms: 0,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: None,
-                    executed_args: None,
-                });
+                let msg = if verb == "kill" {
+                    format!("No running process matching '{target}'")
+                } else {
+                    format!("No running window matching '{target}'")
+                };
+                return Ok(ActionResult::err(msg));
             }
         };
 
         match verb {
             "focus" => match do_focus(window) {
-                Ok(()) => Ok(ActionResult {
-                    success: true,
-                    output: Some(format!("Focused: {}", window.title)),
-                    error: None,
-                    duration_ms: 0,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: Some(OutputType::Status),
-                    executed_args: None,
-                }),
-                Err(e) => Ok(ActionResult {
-                    success: false,
-                    output: None,
-                    error: Some(format!("Failed to focus '{}': {e}", window.title)),
-                    duration_ms: 0,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: None,
-                    executed_args: None,
-                }),
+                Ok(()) => Ok(ActionResult::ok(
+                    format!("Focused: {}", window.title),
+                    OutputType::Status,
+                )),
+                Err(e) => Ok(ActionResult::err(format!(
+                    "Failed to focus '{}': {e}",
+                    window.title
+                ))),
             },
             "quit" | "close" => match do_close(window) {
-                Ok(()) => Ok(ActionResult {
-                    success: true,
-                    output: Some(format!("Closed: {}", window.title)),
-                    error: None,
-                    duration_ms: 0,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: Some(OutputType::Status),
-                    executed_args: None,
-                }),
-                Err(e) => Ok(ActionResult {
-                    success: false,
-                    output: None,
-                    error: Some(format!("Failed to close '{}': {e}", window.title)),
-                    duration_ms: 0,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: None,
-                    executed_args: None,
-                }),
+                Ok(()) => Ok(ActionResult::ok(
+                    format!("Closed: {}", window.title),
+                    OutputType::Status,
+                )),
+                Err(e) => Ok(ActionResult::err(format!(
+                    "Failed to close '{}': {e}",
+                    window.title
+                ))),
             },
             "kill" => {
-                let status = Command::new("kill")
-                    .args(["-9", &window.pid.to_string()])
-                    .status();
-
-                match status {
-                    Ok(s) if s.success() => Ok(ActionResult {
-                        success: true,
-                        output: Some(format!("Killed: {} (PID {})", window.title, window.pid)),
-                        error: None,
-                        duration_ms: 0,
-                        routed_by: None,
-                        open_url: None,
-                        needs_confirmation: None,
-                        risk_level: Some(RiskLevel::Medium),
-                        output_type: Some(OutputType::Status),
-                        executed_args: None,
-                    }),
-                    _ => Ok(ActionResult {
-                        success: false,
-                        output: None,
-                        error: Some(format!(
-                            "Failed to kill '{}' (PID {})",
-                            window.title, window.pid
-                        )),
-                        duration_ms: 0,
-                        routed_by: None,
-                        open_url: None,
-                        needs_confirmation: None,
-                        risk_level: None,
-                        output_type: None,
-                        executed_args: None,
-                    }),
+                // Graceful kill via SIGTERM → SIGKILL (reuse process_tracker logic)
+                match crate::process_tracker::kill_system_pid(window.pid) {
+                    Ok(_) => Ok(ActionResult::ok(
+                        format!("Killed: {} (PID {})", window.title, window.pid),
+                        OutputType::Status,
+                    )
+                    .with_risk(RiskLevel::Medium)),
+                    Err(e) => Ok(ActionResult::err(format!(
+                        "Failed to kill '{}' (PID {}): {e}",
+                        window.title, window.pid
+                    ))),
                 }
             }
-            _ => Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some(format!("Unknown verb '{verb}'. Use focus, quit, or kill.")),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-            }),
+            _ => Ok(ActionResult::err(format!(
+                "Unknown verb '{verb}'. Use focus, quit, or kill."
+            ))),
         }
     }
 
@@ -353,18 +324,21 @@ impl ActionHandler for AppControlHandler {
                     icon_path: None,
                     score: 900,
                     description: Some("Bring window to front".to_string()),
+                    reason: None,
                 },
                 CompletionItem {
                     label: "quit <app>".to_string(),
                     icon_path: None,
                     score: 800,
                     description: Some("Gracefully close".to_string()),
+                    reason: None,
                 },
                 CompletionItem {
                     label: "kill <app>".to_string(),
                     icon_path: None,
                     score: 700,
                     description: Some("Force-kill process".to_string()),
+                    reason: None,
                 },
             ];
         }
@@ -388,6 +362,7 @@ impl ActionHandler for AppControlHandler {
                         icon_path: None,
                         score: (1000 - i as u16).max(1),
                         description: Some(truncate(&w.title, 50)),
+                        reason: None,
                     }
                 })
                 .collect();
@@ -395,9 +370,12 @@ impl ActionHandler for AppControlHandler {
 
         // Fuzzy filter
         let target_lower = target.to_lowercase();
-        windows
+        let matched_windows: Vec<&RunningWindow> = windows
             .iter()
             .filter(|w| matches_window(w, &target_lower))
+            .collect();
+        let mut items: Vec<CompletionItem> = matched_windows
+            .iter()
             .enumerate()
             .map(|(i, w)| {
                 let display_name = if w.wm_class.is_empty() {
@@ -410,9 +388,69 @@ impl ActionHandler for AppControlHandler {
                     icon_path: None,
                     score: (1000 - i as u16).max(1),
                     description: Some(truncate(&w.title, 50)),
+                    reason: None,
                 }
             })
-            .collect()
+            .collect();
+
+        // For kill verb, also show tracked processes and system processes
+        if verb == "kill" {
+            // Seed seen_pids with window PIDs to avoid duplicate completions
+            let mut seen_pids: std::collections::HashSet<u32> =
+                matched_windows.iter().map(|w| w.pid).collect();
+
+            // Tier 2: Lychi-spawned processes (highest priority)
+            let tracked = crate::process_tracker::list();
+            for proc in tracked {
+                let matches =
+                    target.is_empty() || proc.command.to_lowercase().contains(&target_lower);
+                if matches {
+                    seen_pids.insert(proc.pid);
+                    let elapsed = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                        .saturating_sub(proc.started_at);
+                    let duration = if elapsed < 60 {
+                        format!("{elapsed}s")
+                    } else {
+                        format!("{}m", elapsed / 60)
+                    };
+                    items.push(CompletionItem {
+                        label: proc.command.clone(),
+                        icon_path: Some("__terminal__".to_string()),
+                        score: 950,
+                        description: Some(format!("pid={} running {duration}", proc.pid)),
+                        reason: None,
+                    });
+                }
+            }
+
+            // Tier 3: system processes from /proc scan (cached)
+            // Use PID as label so each completion maps to a unique process.
+            // When selected, `kill <pid>` is sent which parses directly as a PID.
+            if !target.is_empty() {
+                let system = crate::process_tracker::scan_system(&target_lower);
+                for proc in system {
+                    if seen_pids.contains(&proc.pid) {
+                        continue;
+                    }
+                    items.push(CompletionItem {
+                        label: proc.pid.to_string(),
+                        icon_path: Some("__terminal__".to_string()),
+                        score: 900,
+                        description: Some(format!(
+                            "{} — {}",
+                            proc.comm,
+                            truncate(&proc.cmdline, 60)
+                        )),
+                        reason: None,
+                    });
+                }
+            }
+        }
+
+        items
     }
 }
 
