@@ -421,6 +421,7 @@ impl ActionHandler for WeatherHandler {
                 risk_level: None,
                 output_type: Some(OutputType::Weather),
                 executed_args: None,
+                launch_desktop: None,
             });
         }
 
@@ -449,6 +450,7 @@ impl ActionHandler for WeatherHandler {
             risk_level: None,
             output_type: Some(OutputType::Weather),
             executed_args: None,
+            launch_desktop: None,
         })
     }
 

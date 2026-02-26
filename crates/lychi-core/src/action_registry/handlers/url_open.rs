@@ -50,6 +50,7 @@ impl ActionHandler for UrlOpen {
                 risk_level: None,
                 output_type: None,
                 executed_args: None,
+                launch_desktop: None,
             });
         }
 
@@ -66,6 +67,7 @@ impl ActionHandler for UrlOpen {
             risk_level: None,
             output_type: None,
             executed_args: None,
+            launch_desktop: None,
         })
     }
 }

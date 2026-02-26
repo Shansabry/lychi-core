@@ -348,6 +348,7 @@ impl ShellExec {
             risk_level: None,
             output_type: Some(OutputType::Terminal),
             executed_args: Some(cmd.to_string()),
+            launch_desktop: None,
         })
     }
 
@@ -375,6 +376,7 @@ impl ShellExec {
             risk_level: None,
             output_type: Some(OutputType::Status),
             executed_args: Some(cmd.to_string()),
+            launch_desktop: None,
         })
     }
 }
@@ -407,6 +409,7 @@ impl ActionHandler for ShellExec {
                 risk_level: None,
                 output_type: None,
                 executed_args: None,
+                launch_desktop: None,
             });
         }
 

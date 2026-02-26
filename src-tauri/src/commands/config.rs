@@ -249,6 +249,18 @@ pub fn get_active_window_strategy(app: AppHandle) -> String {
     "x11".to_string()
 }
 
+/// Hide the launcher window.
+/// Called from frontend instead of window.hide() to keep hide logic centralised.
+#[tauri::command]
+pub fn hide_launcher(app: AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.hide();
+    }
+    // Notify the focus watchdog to stop polling
+    use tauri::Emitter;
+    let _ = app.emit("lychi://hidden", ());
+}
+
 /// Change the global hotkey at runtime: unregister old, register new, persist to config.
 #[tauri::command]
 pub async fn set_hotkey(

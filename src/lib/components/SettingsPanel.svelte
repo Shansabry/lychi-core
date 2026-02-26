@@ -1066,7 +1066,7 @@ function handleKeydown(e: KeyboardEvent) {
 <style>
 	.settings-panel {
 		display: flex;
-		max-height: 50vh;
+		max-height: 65vh;
 		font-family: var(--font-mono);
 		font-size: 13px;
 		color: var(--fg);
@@ -1112,6 +1112,7 @@ function handleKeydown(e: KeyboardEvent) {
 		flex: 1;
 		min-width: 0;
 		padding: 12px 16px;
+		overflow-y: auto;
 	}
 
 	.field {
@@ -1564,7 +1565,7 @@ function handleKeydown(e: KeyboardEvent) {
 		flex-direction: column;
 		padding: 2px 0;
 		overflow-y: auto;
-		max-height: calc(50vh - 40px);
+		max-height: calc(65vh - 40px);
 	}
 
 	.guide-tab-bar {

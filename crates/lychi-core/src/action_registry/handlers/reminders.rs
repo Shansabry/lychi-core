@@ -37,6 +37,7 @@ fn ok_result(start: Instant, output: String) -> ActionResult {
         risk_level: None,
         output_type: Some(OutputType::Status),
         executed_args: None,
+        launch_desktop: None,
     }
 }
 
@@ -52,6 +53,7 @@ fn ok_text(start: Instant, output: String) -> ActionResult {
         risk_level: None,
         output_type: Some(OutputType::Text),
         executed_args: None,
+        launch_desktop: None,
     }
 }
 
@@ -67,6 +69,7 @@ fn err_result(start: Instant, error: String) -> ActionResult {
         risk_level: None,
         output_type: None,
         executed_args: None,
+        launch_desktop: None,
     }
 }
 

@@ -69,6 +69,7 @@ pub fn run() {
             commands::config::record_hotkey,
             commands::config::get_layer_shell_supported,
             commands::config::get_active_window_strategy,
+            commands::config::hide_launcher,
             commands::agent::get_agent_plan,
             commands::agent::store_agent_plan,
             commands::agent::execute_agent_plan,
@@ -113,6 +114,8 @@ pub fn run() {
             // Platform-specific window setup (layer-shell, skip-taskbar, etc.)
             if let Some(win) = app.get_webview_window("main") {
                 platform::init_window(&win, &window_strategy);
+                platform::setup_blur_dismiss(&win);
+                platform::start_focus_watchdog(&handle);
                 window::show_window(&win);
             }
 

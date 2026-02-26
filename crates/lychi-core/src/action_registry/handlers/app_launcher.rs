@@ -3,9 +3,7 @@ use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use std::collections::HashMap;
 use std::fs;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -21,8 +19,11 @@ use crate::error::LychiError;
 #[derive(Debug)]
 struct DesktopEntry {
     name: String,
+    #[allow(dead_code)] // kept to filter entries without Exec= during discovery
     exec: String,
     icon: Option<String>,
+    /// Absolute path to the .desktop file (used by `gio launch`)
+    desktop_path: String,
     /// Cached resolved icon filesystem path
     icon_path: OnceLock<Option<String>>,
 }
@@ -161,6 +162,7 @@ impl AppLauncher {
             name: name?,
             exec: exec?,
             icon,
+            desktop_path: path.to_string_lossy().into_owned(),
             icon_path: OnceLock::new(),
         })
     }
@@ -223,6 +225,7 @@ impl ActionHandler for AppLauncher {
                 risk_level: None,
                 output_type: None,
                 executed_args: None,
+                launch_desktop: None,
             });
         }
 
@@ -236,26 +239,15 @@ impl ActionHandler for AppLauncher {
             .next()
             .ok_or_else(|| LychiError::AppNotFound(query.to_string()))?;
 
-        // Split exec into command and args, spawn detached
-        let parts: Vec<&str> = entry.exec.split_whitespace().collect();
-        let (cmd, cmd_args) = parts.split_first().ok_or_else(|| {
-            LychiError::ExecutionFailed(format!("Invalid exec line: {}", entry.exec))
-        })?;
-
-        Command::new(cmd)
-            .args(cmd_args.iter())
-            .process_group(0)
-            .spawn()
-            .map_err(|e| {
-                LychiError::ExecutionFailed(format!("Failed to launch {}: {e}", entry.name))
-            })?;
-
         let duration_ms = start.elapsed().as_millis() as u64;
 
         // Record frecency access (fire-and-forget, don't block response)
         let key = entry.name.to_lowercase();
         let _ = frecency::record(&self.db, &key);
 
+        // Return launch_desktop so the Tauri side can launch via GIO DesktopAppInfo
+        // with proper GDK AppLaunchContext (handles working directory, D-Bus activation,
+        // quoted Exec args, Terminal=true, Wayland activation tokens, etc.).
         Ok(ActionResult {
             success: true,
             output: Some(format!("Launched {}", entry.name)),
@@ -267,6 +259,7 @@ impl ActionHandler for AppLauncher {
             risk_level: None,
             output_type: None,
             executed_args: None,
+            launch_desktop: Some(entry.desktop_path.clone()),
         })
     }
 

@@ -54,6 +54,9 @@ pub struct ActionResult {
     /// The actual args that were executed (set by executor, not by handlers).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executed_args: Option<String>,
+    /// If set, the Tauri side should launch this .desktop file via GIO DesktopAppInfo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub launch_desktop: Option<String>,
 }
 
 impl ActionResult {
@@ -70,6 +73,7 @@ impl ActionResult {
             risk_level: None,
             output_type: Some(output_type),
             executed_args: None,
+            launch_desktop: None,
         }
     }
 
@@ -86,6 +90,7 @@ impl ActionResult {
             risk_level: None,
             output_type: None,
             executed_args: None,
+            launch_desktop: None,
         }
     }
 

@@ -67,6 +67,7 @@ impl ActionHandler for SnippetsHandler {
                 risk_level: None,
                 output_type: None,
                 executed_args: None,
+                launch_desktop: None,
             });
         }
 
@@ -92,6 +93,7 @@ impl ActionHandler for SnippetsHandler {
                         risk_level: None,
                         output_type: None,
                         executed_args: None,
+                        launch_desktop: None,
                     });
                 }
 
@@ -111,6 +113,7 @@ impl ActionHandler for SnippetsHandler {
                     risk_level: None,
                     output_type: None,
                     executed_args: None,
+                    launch_desktop: None,
                 })
             }
             "list" | "ls" => {
@@ -127,6 +130,7 @@ impl ActionHandler for SnippetsHandler {
                         risk_level: None,
                         output_type: Some(OutputType::Text),
                         executed_args: None,
+                        launch_desktop: None,
                     });
                 }
                 let lines: Vec<String> = snippets
@@ -148,6 +152,7 @@ impl ActionHandler for SnippetsHandler {
                     risk_level: None,
                     output_type: Some(OutputType::Text),
                     executed_args: None,
+                    launch_desktop: None,
                 })
             }
             "delete" | "del" | "rm" | "remove" => {
@@ -163,6 +168,7 @@ impl ActionHandler for SnippetsHandler {
                         risk_level: None,
                         output_type: None,
                         executed_args: None,
+                        launch_desktop: None,
                     });
                 }
 
@@ -180,6 +186,7 @@ impl ActionHandler for SnippetsHandler {
                         risk_level: None,
                         output_type: None,
                         executed_args: None,
+                        launch_desktop: None,
                     });
                 }
 
@@ -196,6 +203,7 @@ impl ActionHandler for SnippetsHandler {
                     risk_level: None,
                     output_type: None,
                     executed_args: None,
+                    launch_desktop: None,
                 })
             }
             "edit" | "update" => {
@@ -216,6 +224,7 @@ impl ActionHandler for SnippetsHandler {
                         risk_level: None,
                         output_type: None,
                         executed_args: None,
+                        launch_desktop: None,
                     });
                 }
 
@@ -239,6 +248,7 @@ impl ActionHandler for SnippetsHandler {
                     risk_level: None,
                     output_type: None,
                     executed_args: None,
+                    launch_desktop: None,
                 })
             }
             // Default: search by name and copy to clipboard
@@ -261,6 +271,7 @@ impl ActionHandler for SnippetsHandler {
                             risk_level: None,
                             output_type: None,
                             executed_args: None,
+                            launch_desktop: None,
                         }),
                         Err(e) => Ok(ActionResult {
                             success: false,
@@ -273,6 +284,7 @@ impl ActionHandler for SnippetsHandler {
                             risk_level: None,
                             output_type: None,
                             executed_args: None,
+                            launch_desktop: None,
                         }),
                     }
                 } else {
@@ -287,6 +299,7 @@ impl ActionHandler for SnippetsHandler {
                         risk_level: None,
                         output_type: None,
                         executed_args: None,
+                        launch_desktop: None,
                     })
                 }
             }

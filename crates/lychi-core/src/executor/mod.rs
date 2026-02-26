@@ -110,6 +110,7 @@ impl Executor {
                 risk_level: Some(RiskLevel::High),
                 output_type: None,
                 executed_args: None,
+                launch_desktop: None,
             },
             ValidationDecision::Confirm { reason } if !confirmed => ActionResult {
                 success: false,
@@ -122,6 +123,7 @@ impl Executor {
                 risk_level: Some(handler.default_risk()),
                 output_type: None,
                 executed_args: None,
+                launch_desktop: None,
             },
             // Execute (or Confirm with confirmed=true)
             _ => {

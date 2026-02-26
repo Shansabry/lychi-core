@@ -474,6 +474,7 @@ impl ActionHandler for TimeHandler {
                 risk_level: None,
                 output_type: Some(OutputType::Status),
                 executed_args: None,
+                launch_desktop: None,
             }),
             Err(e) => Ok(ActionResult {
                 success: false,
@@ -486,6 +487,7 @@ impl ActionHandler for TimeHandler {
                 risk_level: None,
                 output_type: None,
                 executed_args: None,
+                launch_desktop: None,
             }),
         }
     }

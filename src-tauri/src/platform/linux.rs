@@ -249,12 +249,35 @@ pub fn reposition_to_monitor(window: &WebviewWindow, monitor: &gdk::Monitor) {
     // whether the compositor supports it). Respects the window_strategy override.
     use gtk_layer_shell::LayerShell;
     if gtk_win.is_layer_window() {
+        // Adaptive: wide landscape → 1070px with preview, narrow/portrait → 680px
+        const LAUNCHER_W: i32 = 680;
+        const PREVIEW_W: i32 = 390;
+        const WIDE_SURFACE_W: i32 = LAUNCHER_W + PREVIEW_W;
+        let wide_enough = geom.width() >= WIDE_SURFACE_W + 80 && geom.width() > geom.height();
+
+        let top_margin = (geom.height() as f64 * 0.18) as i32;
+        let max_height = (geom.height() as f64 * 0.75) as i32;
+
         // Must unmap → set_monitor → remap for compositor to honour the change
         gtk_win.hide();
         gtk_win.set_monitor(monitor);
+        gtk_win.set_layer_shell_margin(gtk_layer_shell::Edge::Top, top_margin);
+
+        if wide_enough {
+            gtk_win.set_anchor(gtk_layer_shell::Edge::Left, true);
+            gtk_win.set_anchor(gtk_layer_shell::Edge::Right, false);
+            let left_margin = (geom.width() - LAUNCHER_W) / 2;
+            gtk_win.set_layer_shell_margin(gtk_layer_shell::Edge::Left, left_margin);
+            gtk_win.set_size_request(WIDE_SURFACE_W, max_height);
+        } else {
+            gtk_win.set_anchor(gtk_layer_shell::Edge::Left, false);
+            gtk_win.set_anchor(gtk_layer_shell::Edge::Right, false);
+            gtk_win.set_layer_shell_margin(gtk_layer_shell::Edge::Left, 0);
+            gtk_win.set_size_request(LAUNCHER_W, max_height);
+        }
         gtk_win.show();
         tracing::debug!(
-            "Repositioned layer-shell to monitor at {},{} ({}x{})",
+            "Repositioned layer-shell to monitor at {},{} ({}x{}, wide: {wide_enough}, top_margin: {top_margin}, max_h: {max_height})",
             geom.x(),
             geom.y(),
             geom.width(),
@@ -322,13 +345,38 @@ pub fn init_window(window: &WebviewWindow, strategy: &str) {
             gtk_win.set_keyboard_mode(gtk_layer_shell::KeyboardMode::OnDemand);
             // Pin to the primary monitor so it doesn't drift to other displays
             gtk_win.set_monitor(&monitor);
-            // Anchor to all edges = fullscreen on the layer
+            // Adaptive surface sizing: wide monitors get side-by-side preview,
+            // narrow/portrait monitors get launcher-only (preview hidden by CSS).
+            // NOT fullscreen: avoids compositor blur/dim (I-001).
+            const LAUNCHER_W: i32 = 680;
+            const PREVIEW_W: i32 = 390; // 10 gap + 380 panel
+            const WIDE_SURFACE_W: i32 = LAUNCHER_W + PREVIEW_W; // 1070
+            // Need enough room for the surface + some breathing space (40px each side)
+            let wide_enough = geom.width() >= WIDE_SURFACE_W + 80 && geom.width() > geom.height(); // landscape only
+
             gtk_win.set_anchor(gtk_layer_shell::Edge::Top, true);
-            gtk_win.set_anchor(gtk_layer_shell::Edge::Bottom, true);
-            gtk_win.set_anchor(gtk_layer_shell::Edge::Left, true);
-            gtk_win.set_anchor(gtk_layer_shell::Edge::Right, true);
+            gtk_win.set_anchor(gtk_layer_shell::Edge::Bottom, false);
+            let top_margin = (geom.height() as f64 * 0.18) as i32;
+            gtk_win.set_layer_shell_margin(gtk_layer_shell::Edge::Top, top_margin);
+            let max_height = (geom.height() as f64 * 0.75) as i32;
+
+            if wide_enough {
+                // Wide landscape: Left anchor + manual centering of 680px bar
+                gtk_win.set_anchor(gtk_layer_shell::Edge::Left, true);
+                gtk_win.set_anchor(gtk_layer_shell::Edge::Right, false);
+                let left_margin = (geom.width() - LAUNCHER_W) / 2;
+                gtk_win.set_layer_shell_margin(gtk_layer_shell::Edge::Left, left_margin);
+                gtk_win.set_size_request(WIDE_SURFACE_W, max_height);
+            } else {
+                // Narrow or portrait: Top-only anchor, compositor centers 680px
+                gtk_win.set_anchor(gtk_layer_shell::Edge::Left, false);
+                gtk_win.set_anchor(gtk_layer_shell::Edge::Right, false);
+                gtk_win.set_size_request(LAUNCHER_W, max_height);
+            }
             gtk_win.set_namespace("lychi");
-            tracing::debug!("Layer shell initialized (strategy: {strategy})");
+            tracing::debug!(
+                "Layer shell initialized (strategy: {strategy}, top_margin: {top_margin}, max_h: {max_height})"
+            );
         } else {
             // X11 path — position on primary monitor with skip-taskbar hints
             gtk_win.move_(geom.x(), geom.y());
@@ -352,6 +400,96 @@ pub fn focus_window(window: &WebviewWindow) {
         gtk_win.set_keep_above(true);
         gtk_win.present();
     }
+}
+
+/// Set up GTK-level focus-out handler for reliable blur dismiss.
+/// Emits `lychi://gtk-blur` when the GTK window loses focus — catches cases
+/// where Tauri's JS-level `onFocusChanged` doesn't fire (bridge timing).
+/// Only active on layer-shell (X11 uses fullscreen overlay with its own dismiss).
+pub fn setup_blur_dismiss(window: &WebviewWindow) {
+    let gtk_win = match window.gtk_window() {
+        Ok(w) => w,
+        Err(_) => return,
+    };
+
+    use gtk_layer_shell::LayerShell;
+    if !gtk_win.is_layer_window() {
+        return;
+    }
+
+    let handle = window.app_handle().clone();
+    use gtk::prelude::WidgetExt;
+    gtk_win.connect_focus_out_event(move |_, _| {
+        use tauri::Emitter;
+        let _ = handle.emit("lychi://gtk-blur", ());
+        glib::Propagation::Proceed
+    });
+    tracing::debug!("GTK focus-out dismiss handler installed");
+}
+
+/// Start a focus watchdog that polls whether Lychi still has focus.
+/// Catches compositors (KDE/KWin) that don't reliably send `keyboard.leave`
+/// for layer-shell surfaces. Only polls while the launcher is visible.
+pub fn start_focus_watchdog(app: &tauri::AppHandle) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tauri::Emitter;
+
+    // Check if layer-shell is in use
+    let win = match app.get_webview_window("main") {
+        Some(w) => w,
+        None => return,
+    };
+    let gtk_win = match win.gtk_window() {
+        Ok(w) => w,
+        Err(_) => return,
+    };
+    use gtk_layer_shell::LayerShell;
+    if !gtk_win.is_layer_window() {
+        tracing::debug!("Focus watchdog skipped (not layer-shell)");
+        return;
+    }
+
+    let handle = app.clone();
+    let visible = Arc::new(AtomicBool::new(false));
+
+    // Listen for summon (start polling) and hidden (stop polling)
+    use tauri::Listener;
+
+    let vis_summon = visible.clone();
+    let handle_summon = handle.clone();
+    handle_summon.listen("lychi://summon", move |_| {
+        vis_summon.store(true, Ordering::Relaxed);
+    });
+
+    let vis_hidden = visible.clone();
+    let handle_hidden = handle.clone();
+    handle_hidden.listen("lychi://hidden", move |_| {
+        vis_hidden.store(false, Ordering::Relaxed);
+    });
+
+    // Poll every 250ms on the GLib main thread
+    let vis_poll = visible.clone();
+    let gtk_win_poll = gtk_win.clone();
+    glib::timeout_add_local(Duration::from_millis(250), move || {
+        if !vis_poll.load(Ordering::Relaxed) {
+            return glib::ControlFlow::Continue;
+        }
+
+        use gtk::prelude::GtkWindowExt;
+        let has_focus = gtk_win_poll.is_active();
+
+        if !has_focus {
+            tracing::debug!("Focus watchdog: window lost focus, emitting dismiss");
+            let _ = handle.emit("lychi://focus-watchdog-dismiss", ());
+            vis_poll.store(false, Ordering::Relaxed); // Stop polling until next summon
+        }
+
+        glib::ControlFlow::Continue
+    });
+
+    tracing::debug!("Focus watchdog started (250ms poll, layer-shell only)");
 }
 
 /// IPC socket path using XDG_RUNTIME_DIR.

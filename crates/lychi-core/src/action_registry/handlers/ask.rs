@@ -49,6 +49,7 @@ impl ActionHandler for AskHandler {
                 risk_level: None,
                 output_type: Some(OutputType::Text),
                 executed_args: None,
+                launch_desktop: None,
             });
         }
 
@@ -67,6 +68,7 @@ impl ActionHandler for AskHandler {
                 risk_level: None,
                 output_type: Some(OutputType::Text),
                 executed_args: None,
+                launch_desktop: None,
             });
         };
 
@@ -91,6 +93,7 @@ impl ActionHandler for AskHandler {
                 risk_level: None,
                 output_type: Some(OutputType::Text),
                 executed_args: None,
+                launch_desktop: None,
             }),
             Ok(Err(e)) => {
                 tracing::warn!("Ask AI failed: {e}, falling back to web search");
@@ -105,6 +108,7 @@ impl ActionHandler for AskHandler {
                     risk_level: None,
                     output_type: Some(OutputType::Text),
                     executed_args: None,
+                    launch_desktop: None,
                 })
             }
             Err(_) => {
@@ -122,6 +126,7 @@ impl ActionHandler for AskHandler {
                     risk_level: None,
                     output_type: Some(OutputType::Text),
                     executed_args: None,
+                    launch_desktop: None,
                 })
             }
         }

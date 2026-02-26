@@ -76,6 +76,14 @@ impl SuggestionReason {
 pub fn suggest(ctx: &EnvironmentContext) -> Vec<CompletionItem> {
     let mut items = Vec::new();
 
+    // Only show dev-context suggestions (git, project, docker) when a
+    // terminal or IDE is focused — don't leak background terminal context
+    // into browser/random-app sessions.
+    let in_dev_window = ctx
+        .active_window
+        .as_ref()
+        .is_some_and(|w| w.is_terminal || w.is_ide);
+
     // Detect feature branch once (used for git reason enrichment)
     let on_feature_branch = ctx.git.as_ref().and_then(|g| {
         let b = g.branch.as_str();
@@ -87,7 +95,7 @@ pub fn suggest(ctx: &EnvironmentContext) -> Vec<CompletionItem> {
     });
 
     // Git context suggestions
-    if let Some(ref git) = ctx.git {
+    if in_dev_window && let Some(ref git) = ctx.git {
         // Pick the most specific reason: feature branch > dirty/clean
         let dirty_reason = match &on_feature_branch {
             Some(branch) => SuggestionReason::GitFeatureBranch {
@@ -144,7 +152,7 @@ pub fn suggest(ctx: &EnvironmentContext) -> Vec<CompletionItem> {
     }
 
     // Project-specific install commands (not discoverable from config files)
-    if let Some(ref project) = ctx.project {
+    if in_dev_window && let Some(ref project) = ctx.project {
         let pm = project.package_manager.as_deref().unwrap_or("npm");
         if project.kind == ProjectKind::Node {
             let install_cmd = pm;
@@ -160,7 +168,7 @@ pub fn suggest(ctx: &EnvironmentContext) -> Vec<CompletionItem> {
 
     // Discovered project scripts (npm scripts, cargo commands, python scripts,
     // flutter/dart commands, go commands, Makefile targets, Justfile recipes, Taskfile tasks)
-    if let Some(ref project) = ctx.project {
+    if in_dev_window && let Some(ref project) = ctx.project {
         for (i, script) in project.scripts.iter().enumerate() {
             // Score descending so first scripts rank higher, all above Docker suggestions
             let score = 90u16.saturating_sub(i as u16);
@@ -182,7 +190,8 @@ pub fn suggest(ctx: &EnvironmentContext) -> Vec<CompletionItem> {
     }
 
     // Docker Compose suggestions (project-level)
-    if let Some(ref project) = ctx.project
+    if in_dev_window
+        && let Some(ref project) = ctx.project
         && project.has_compose
     {
         let reason = SuggestionReason::DockerCompose;
@@ -206,8 +215,9 @@ pub fn suggest(ctx: &EnvironmentContext) -> Vec<CompletionItem> {
         ));
     }
 
-    // Docker container suggestions
-    if let Some(ref docker) = ctx.docker
+    // Docker container suggestions — only when in a dev context (terminal or IDE)
+    if in_dev_window
+        && let Some(ref docker) = ctx.docker
         && !docker.containers.is_empty()
     {
         let reason = SuggestionReason::DockerRunning {

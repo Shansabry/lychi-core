@@ -57,6 +57,7 @@ impl ActionHandler for YouTube {
                 risk_level: None,
                 output_type: None,
                 executed_args: None,
+                launch_desktop: None,
             });
         }
 
@@ -73,6 +74,7 @@ impl ActionHandler for YouTube {
             risk_level: None,
             output_type: None,
             executed_args: None,
+            launch_desktop: None,
         })
     }
 }

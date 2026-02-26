@@ -399,6 +399,7 @@ impl ActionHandler for ProjectOpen {
                 risk_level: None,
                 output_type: None,
                 executed_args: None,
+                launch_desktop: None,
             });
         }
 
@@ -419,6 +420,7 @@ impl ActionHandler for ProjectOpen {
                 risk_level: None,
                 output_type: None,
                 executed_args: None,
+                launch_desktop: None,
             });
         }
 
@@ -454,6 +456,7 @@ impl ActionHandler for ProjectOpen {
             risk_level: None,
             output_type: None,
             executed_args: None,
+            launch_desktop: None,
         })
     }
 

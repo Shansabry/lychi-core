@@ -6,6 +6,7 @@ use crate::state::AppState;
 pub fn toggle_window(window: &WebviewWindow) {
     if window.is_visible().unwrap_or(false) {
         let _ = window.hide();
+        let _ = window.emit("lychi://hidden", ());
     } else {
         show_window(window);
     }
@@ -57,16 +58,26 @@ pub fn show_window(window: &WebviewWindow) {
 
     // Fast path: emit last-known context immediately so suggestions appear
     // before the fresh gather completes (typically saves 50-200ms).
+    // Skip if the active window changed — stale context causes a suggestion flash.
     {
         let state = window.app_handle().state::<AppState>();
         if let Ok(executor) = state.executor.try_read()
             && let Some(ref cached_ctx) = executor.context
         {
-            tracing::debug!(
-                "Fast path: emitting cached context ({}ms old)",
-                cached_ctx.gather_ms
-            );
-            let _ = window.emit("lychi://context-ready", cached_ctx);
+            let same_window = match (&pre_window, &cached_ctx.active_window) {
+                (Some(pre), Some(cached)) => pre.wm_class == cached.wm_class,
+                (None, None) => true,
+                _ => false,
+            };
+            if same_window {
+                tracing::debug!(
+                    "Fast path: emitting cached context ({}ms old)",
+                    cached_ctx.gather_ms
+                );
+                let _ = window.emit("lychi://context-ready", cached_ctx);
+            } else {
+                tracing::debug!("Fast path: skipped (window changed)");
+            }
         }
     }
 

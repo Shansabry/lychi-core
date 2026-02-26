@@ -78,6 +78,7 @@ impl ActionHandler for EmojiHandler {
                 risk_level: None,
                 output_type: None,
                 executed_args: None,
+                launch_desktop: None,
             });
         }
 
@@ -108,6 +109,7 @@ impl ActionHandler for EmojiHandler {
                         risk_level: None,
                         output_type: None,
                         executed_args: None,
+                        launch_desktop: None,
                     });
                 }
             }
@@ -125,6 +127,7 @@ impl ActionHandler for EmojiHandler {
                 risk_level: None,
                 output_type: Some(OutputType::Status),
                 executed_args: None,
+                launch_desktop: None,
             }),
             Err(e) => Ok(ActionResult {
                 success: false,
@@ -137,6 +140,7 @@ impl ActionHandler for EmojiHandler {
                 risk_level: None,
                 output_type: None,
                 executed_args: None,
+                launch_desktop: None,
             }),
         }
     }

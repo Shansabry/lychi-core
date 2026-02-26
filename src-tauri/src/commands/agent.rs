@@ -79,6 +79,7 @@ pub async fn execute_agent_plan(
                 risk_level: None,
                 output_type: None,
                 executed_args: None,
+                launch_desktop: None,
             },
         };
 

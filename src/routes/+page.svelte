@@ -1,4 +1,5 @@
 <script lang="ts">
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { onMount } from "svelte";
 import AgentPlanPanel from "$lib/components/AgentPlanPanel.svelte";
@@ -24,6 +25,7 @@ import type {
 import {
 	cancelFileSearch,
 	executeCommand,
+	getActiveWindowStrategy,
 	getAgentPlan,
 	getCompletions,
 	getContext,
@@ -97,6 +99,7 @@ let atPathContext = $derived.by(() => {
 let settingsOpen = $state(false);
 let hideOnBlur = $state(true);
 let blurEnabled = $state(false);
+let windowStrategy = $state("x11"); // "layer-shell" or "x11" — drives layout mode
 
 let pendingPlan: AgentPlan | null = $state(null);
 let planPanelRef: AgentPlanPanel | undefined = $state(undefined);
@@ -110,8 +113,10 @@ let initialNotesTab: "notes" | "todos" | "reminders" | "timers" | "snippets" | u
 let mediaPlayers: TrackInfo[] = $state([]);
 let envContext: EnvironmentContext | null = $state(null);
 let contextPill = $derived.by(() => {
-	// When IDE is focused, use IDE workspace (cwd). Otherwise prefer terminal_cwd.
-	const ideIsFocused = envContext?.active_window?.is_ide ?? false;
+	// Only show context pill for terminal/IDE — not browsers or random apps
+	const w = envContext?.active_window;
+	if (!w?.is_terminal && !w?.is_ide) return "";
+	const ideIsFocused = w?.is_ide ?? false;
 	const cwd = ideIsFocused
 		? (envContext?.cwd ?? envContext?.terminal_cwd)
 		: (envContext?.terminal_cwd ?? envContext?.cwd);
@@ -200,6 +205,12 @@ function resolveFullPath(label: string): string {
 function handleInput(val: string) {
 	// Skip completions until backend is ready — input still updates visually via bind:value
 	if (!backendReady) return;
+	// Close any open panel so CompletionsList renders
+	if (settingsOpen || notesOpen || mediaOpen) {
+		settingsOpen = false;
+		notesOpen = false;
+		mediaOpen = false;
+	}
 	historyOpen = false;
 	clearTimeout(debounceTimer);
 	atNoResults = false;
@@ -330,6 +341,9 @@ function handleInput(val: string) {
 }
 
 onMount(() => {
+	getActiveWindowStrategy().then((s) => {
+		windowStrategy = s;
+	});
 	getHideOnBlur().then((v) => {
 		hideOnBlur = v;
 	});
@@ -503,22 +517,52 @@ onMount(() => {
 			true,
 		);
 
-		// Hide on blur
-		const unlistenFocus = await win.onFocusChanged(({ payload: focused }) => {
-			if (!focused && hideOnBlur && blurEnabled && !settingsOpen && !notesOpen) {
-				// Clear search/browse state before hiding so preview panel is torn down
-				if (searchMode) {
-					cancelFileSearch();
-					searchMode = false;
-				}
-				completions = [];
-				completionIndex = -1;
-				atMode = false;
-				atStart = -1;
-				hideWindow();
+		// Hide on blur — dismiss when focus leaves the window (click outside, Alt+Tab, etc.).
+		let dismissing = false;
+		function handleBlurDismiss() {
+			if (dismissing || !hideOnBlur || !blurEnabled) return;
+			// If a panel is open, close it first instead of dismissing the whole launcher
+			if (settingsOpen || notesOpen) {
+				settingsOpen = false;
+				notesOpen = false;
+				return;
 			}
+			dismissing = true;
+			blurEnabled = false; // Prevent re-trigger during hide animation
+			// Hide immediately (no closing animation) — blur dismiss should feel instant.
+			// State cleanup happens after hide so the user never sees completions vanish first.
+			invoke("hide_launcher")
+				.then(() => {
+					if (searchMode) {
+						cancelFileSearch();
+						searchMode = false;
+					}
+					completions = [];
+					completionIndex = -1;
+					atMode = false;
+					atStart = -1;
+				})
+				.finally(() => {
+					dismissing = false;
+				});
+		}
+
+		const unlistenFocus = await win.onFocusChanged(({ payload: focused }) => {
+			if (!focused) handleBlurDismiss();
 		});
 		unlisteners.push(unlistenFocus);
+
+		// GTK-level focus-out — catches blur when Tauri's JS bridge misses it
+		const unlistenGtkBlur = await win.listen("lychi://gtk-blur", () => {
+			handleBlurDismiss();
+		});
+		unlisteners.push(unlistenGtkBlur);
+
+		// Focus watchdog — catches compositors that don't fire keyboard.leave
+		const unlistenWatchdog = await win.listen("lychi://focus-watchdog-dismiss", () => {
+			handleBlurDismiss();
+		});
+		unlisteners.push(unlistenWatchdog);
 
 		// Persist window position on move (debounced).
 		// Skip (0,0) — Wayland doesn't report real positions.
@@ -1117,7 +1161,7 @@ async function handleDismiss() {
 }
 </script>
 
-<div class="launcher-wrapper" role="presentation" onmousedown={(e) => { if (e.target === e.currentTarget) hideWindow(); }}>
+<div class="launcher-wrapper" class:layer-shell={windowStrategy === 'layer-shell'} role="presentation" onmousedown={(e) => { if (windowStrategy !== 'layer-shell' && e.target === e.currentTarget) hideWindow(); }}>
 	<div class="launcher-row">
 	<main>
 		<CommandInput
@@ -1290,6 +1334,21 @@ async function handleDismiss() {
 		justify-content: center;
 		padding-top: 18vh;
 		background: transparent;
+	}
+
+	/* Layer-shell: Rust sets surface width adaptively (1070px wide or 680px narrow).
+	   Use 100vw to fill whatever surface Rust provides. */
+	.launcher-wrapper.layer-shell {
+		width: 100vw;
+		height: auto;
+		padding-top: 0;
+		padding-bottom: 40px; /* room for box-shadow below the bar */
+		justify-content: flex-start; /* left-align so preview has room to the right */
+	}
+
+	/* Surface is already 60% of monitor height, so use full viewport */
+	.launcher-wrapper.layer-shell main {
+		max-height: calc(100vh - 40px);
 	}
 
 	.launcher-row {

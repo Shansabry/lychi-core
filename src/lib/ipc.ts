@@ -1,5 +1,4 @@
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 
 export interface CommandResult {
 	success: boolean;
@@ -56,7 +55,7 @@ export async function hideWindow(): Promise<void> {
 		main.classList.add("lychi-closing");
 		await new Promise((r) => setTimeout(r, 100));
 	}
-	await getCurrentWindow().hide();
+	await invoke("hide_launcher");
 	main?.classList.remove("lychi-closing");
 }
 

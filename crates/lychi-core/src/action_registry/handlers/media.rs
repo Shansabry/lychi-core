@@ -37,6 +37,7 @@ fn media_result(
         risk_level: None,
         output_type: None,
         executed_args: None,
+        launch_desktop: None,
     }
 }
 

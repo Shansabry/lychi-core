@@ -35,6 +35,33 @@ pub async fn execute_command(
         let _ = app.emit("lychi://notes-changed", ());
     }
 
+    // Launch desktop app via GIO DesktopAppInfo with GDK AppLaunchContext.
+    // This properly handles working directories, D-Bus activation, quoted Exec
+    // args, Terminal=true, and Wayland activation tokens.
+    if let Some(ref desktop_path) = exec.result.launch_desktop {
+        let path = desktop_path.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        glib::MainContext::default().invoke(move || {
+            use gio::prelude::*;
+            let result = (|| {
+                let app_info = gio::DesktopAppInfo::from_filename(&path)
+                    .ok_or_else(|| format!("Failed to load desktop file: {path}"))?;
+                let context: Option<gio::AppLaunchContext> = gdk::Display::default()
+                    .and_then(|d| d.app_launch_context())
+                    .map(|c| c.into());
+                app_info
+                    .launch(&[], context.as_ref())
+                    .map_err(|e| format!("launch() failed: {e}"))
+            })();
+            if let Err(e) = result {
+                tracing::error!("Failed to launch desktop app: {e}");
+            }
+            let _ = tx.send(());
+        });
+        // Wait for GLib to complete the launch before returning
+        let _ = rx.await;
+    }
+
     Ok(exec.result)
 }
 

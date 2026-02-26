@@ -271,13 +271,15 @@ pub fn gather(pre_captured: Option<WindowContext>) -> EnvironmentContext {
 
     tracing::debug!("gather: terminal_cwd={:?}", terminal_cwd.as_deref());
 
-    // When terminal_cwd is available AND the focused window is NOT an IDE,
-    // re-derive git/project from the terminal CWD (more specific than the
-    // non-terminal/non-IDE window). When an IDE is focused, the IDE workspace
-    // is the primary context — the background terminal is supplementary info only.
-    let focused_is_ide = window.as_ref().is_some_and(|w| w.is_ide);
+    // When terminal_cwd is available AND the focused window IS a terminal,
+    // re-derive git/project from the terminal CWD (handles multi-terminal setups
+    // where the stack terminal differs from the focused one).
+    // When an IDE is focused, the IDE workspace context (already computed above)
+    // is the primary context. When a non-dev window (browser, etc.) is focused,
+    // skip context entirely — don't leak background terminal context.
+    let focused_is_terminal = window.as_ref().is_some_and(|w| w.is_terminal);
     let (git_ctx, project_ctx) = if let Some(ref tcwd) = terminal_cwd
-        && !focused_is_ide
+        && focused_is_terminal
         && cwd.as_deref() != Some(tcwd.as_str())
     {
         let git = if let Some(cached) = cache::get_git(tcwd) {

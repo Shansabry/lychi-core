@@ -446,10 +446,29 @@ function formatRelativeTime(epoch: number): string {
 		opacity: 0.5;
 	}
 
-	/* Narrow/portrait screens: hide preview entirely — result list metadata is sufficient */
-	@media (max-width: 1100px), (orientation: portrait) {
+	/* Narrow viewport (680px surface or portrait): stack below launcher instead of side-by-side */
+	@media (max-width: 760px) {
 		.preview-panel {
-			display: none;
+			position: static;
+			width: 100%;
+			max-height: 40vh;
+			margin-top: 10px;
+			animation-name: preview-appear-below;
+		}
+
+		.image-container img {
+			max-height: calc(40vh - 24px);
+		}
+	}
+
+	@keyframes preview-appear-below {
+		from {
+			opacity: 0;
+			transform: translateY(-6px);
+		}
+		to {
+			opacity: 1;
+			transform: translateY(0);
 		}
 	}
 </style>

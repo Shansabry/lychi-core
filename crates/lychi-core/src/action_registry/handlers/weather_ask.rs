@@ -117,6 +117,7 @@ impl ActionHandler for WeatherAskHandler {
                 risk_level: None,
                 output_type: Some(OutputType::Text),
                 executed_args: None,
+                launch_desktop: None,
             });
         }
 
@@ -166,6 +167,7 @@ impl ActionHandler for WeatherAskHandler {
             risk_level: None,
             output_type: Some(OutputType::Text),
             executed_args: None,
+            launch_desktop: None,
         })
     }
 }
