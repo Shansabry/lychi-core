@@ -664,6 +664,23 @@ export interface DockerContext {
 	containers: ContainerInfo[];
 }
 
+export interface ClipboardContentType {
+	type: "Url" | "FilePath" | "IpAddress" | "Uuid" | "GitHash" | "Json" | "ErrorTrace" | "Plain";
+	value?: string;
+}
+
+export interface BrowserContext {
+	type: "GitHub" | "Localhost" | "StackOverflow" | "Documentation" | "Unknown";
+	owner?: string;
+	repo?: string;
+	port?: number;
+}
+
+export interface NetworkContext {
+	ssid: string | null;
+	vpn_active: boolean;
+}
+
 export interface EnvironmentContext {
 	active_window: WindowContext | null;
 	cwd: string | null;
@@ -672,6 +689,9 @@ export interface EnvironmentContext {
 	project: ProjectContext | null;
 	docker: DockerContext | null;
 	hour: number;
+	clipboard: ClipboardContentType | null;
+	browser: BrowserContext | null;
+	network: NetworkContext | null;
 	gather_ms: number;
 }
 

@@ -73,9 +73,11 @@ fn action_description(id: &str) -> &'static str {
             "System info — show IP address, CPU, memory, or disk usage. Subcommands: ip, cpu, mem, disk. Empty args shows a full overview"
         }
         "system" => {
-            "System power controls. Args: shutdown, reboot, suspend, hibernate, lock, logout"
+            "System controls. Args: shutdown, reboot, suspend, hibernate, lock, logout, mute, unmute, volume <up|down|0-100>, brightness <up|down|0-100>, wifi <on|off>, bluetooth <on|off>, connect bluetooth <device>, disconnect bluetooth <device>, shutdown in <duration> (e.g. 'shutdown in 30m'), cancel shutdown"
         }
-        "note" => "Quick sticky note. Args: text to save, or 'read' to view current note",
+        "note" => {
+            "Notes list (max 5). Args: text to add a note, 'read' to view all, 'delete <id>' to remove"
+        }
         "todo" => "Todo list. Args: 'add <text>', 'list', 'done <id>', 'delete <id>', 'summary'",
         "weather" => "Get current weather/forecast. Args: city name, or empty for default location",
         "weather-ask" => {
@@ -93,6 +95,13 @@ fn action_description(id: &str) -> &'static str {
         "reminder" => {
             "Set timed reminders with desktop notifications. Args: 'add <text> in/at <time>' (e.g. 'add buy milk in 30m', 'add standup at 9am', 'add meeting tomorrow 2pm'), 'list', 'delete <id>', 'clear'. Without 'add', infers from natural language"
         }
+        "appctl" => "Focus, quit, or kill a running application by name",
+        "bm" => "Search and open browser bookmarks by keyword",
+        "clip" => "Browse and paste from clipboard history",
+        "emoji" => "Search and copy an emoji by name or keyword",
+        "snip" => "Snippets — save and paste reusable text blocks",
+        "sym" => "Search and copy a symbol or special character by name",
+        "unicode" => "Search Unicode characters by name or codepoint",
         _ => "Unknown command",
     }
 }

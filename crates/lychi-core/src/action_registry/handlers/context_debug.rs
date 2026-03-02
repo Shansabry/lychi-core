@@ -150,6 +150,58 @@ fn format_context(ctx: &EnvironmentContext) -> String {
     // Time
     lines.push(format!("Hour: {}", ctx.hour));
 
+    // Clipboard
+    match &ctx.clipboard {
+        Some(clip) => {
+            use crate::context::clipboard_detect::ClipboardContentType;
+            let desc = match clip {
+                ClipboardContentType::Url(u) => format!("URL: {u}"),
+                ClipboardContentType::FilePath(p) => format!("File: {p}"),
+                ClipboardContentType::IpAddress(ip) => format!("IP: {ip}"),
+                ClipboardContentType::Json => "JSON".into(),
+                ClipboardContentType::GitHash(h) => format!("Git hash: {h}"),
+                ClipboardContentType::Uuid(u) => format!("UUID: {u}"),
+                ClipboardContentType::ErrorTrace => "Error/stack trace".into(),
+                ClipboardContentType::Plain => "Plain text".into(),
+            };
+            lines.push(format!("Clipboard: {desc}"));
+        }
+        None => lines.push("Clipboard: empty".to_string()),
+    }
+
+    // Browser context
+    if let Some(ref browser) = ctx.browser {
+        use crate::context::browser_context::BrowserContext;
+        let desc = match browser {
+            BrowserContext::GitHub { owner, repo } => format!("GitHub: {owner}/{repo}"),
+            BrowserContext::Localhost { port } => format!("Localhost: :{port}"),
+            BrowserContext::StackOverflow => "Stack Overflow".into(),
+            BrowserContext::Documentation => "Documentation".into(),
+            BrowserContext::Unknown => "Unknown".into(),
+        };
+        lines.push(format!("Browser: {desc}"));
+    }
+
+    // Network
+    match &ctx.network {
+        Some(net) => {
+            let ssid = net
+                .ssid
+                .as_deref()
+                .map(|s| format!("ssid={s}"))
+                .unwrap_or_else(|| "no WiFi".into());
+            let vpn = if net.vpn_active { " vpn=active" } else { "" };
+            lines.push(format!("Network: {ssid}{vpn}"));
+        }
+        None => lines.push("Network: none".to_string()),
+    }
+
+    // App class
+    if let Some(ref w) = ctx.active_window {
+        let app_class = crate::context::app_class::classify(&w.wm_class);
+        lines.push(format!("App class: {app_class:?}"));
+    }
+
     // Cache
     let cache_stats = crate::context::cache::stats();
     let fmt = |ms: Option<u64>, inv: Option<crate::context::cache::InvalidationReason>| {
@@ -163,14 +215,15 @@ fn format_context(ctx: &EnvironmentContext) -> String {
         }
     };
     lines.push(format!(
-        "Cache: git={}, docker={}, project={}",
+        "Cache: git={}, docker={}, project={}, network={}",
         fmt(cache_stats.git_age_ms, cache_stats.git_invalidation),
         fmt(cache_stats.docker_age_ms, cache_stats.docker_invalidation),
         fmt(cache_stats.project_age_ms, cache_stats.project_invalidation),
+        fmt(cache_stats.network_age_ms, cache_stats.network_invalidation),
     ));
 
     // Suggestions with provenance
-    let suggestions = crate::context::suggestions::suggest(ctx);
+    let suggestions = crate::context::suggestions::suggest(ctx, None);
     if !suggestions.is_empty() {
         lines.push(String::new());
         lines.push(format!("Suggestions: ({})", suggestions.len()));

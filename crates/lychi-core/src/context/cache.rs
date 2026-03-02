@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
+use super::network::NetworkContext;
 use super::{DockerContext, GitContext, ProjectContext};
 
 // ── Invalidation Reason ─────────────────────────────────────────────────
@@ -253,6 +254,50 @@ fn marker_mtime_for(kind: &super::ProjectKind, root: &str) -> Option<SystemTime>
         .and_then(|m| m.modified().ok())
 }
 
+// ── Network Cache ────────────────────────────────────────────────────────
+
+struct NetworkCacheEntry {
+    result: Option<NetworkContext>,
+    created: Instant,
+    last_invalidation: Option<InvalidationReason>,
+}
+
+static NETWORK_CACHE: Mutex<Option<NetworkCacheEntry>> = Mutex::new(None);
+
+const NETWORK_TTL: Duration = Duration::from_secs(10);
+
+/// Check network cache. Returns `Some(cached_result)` if valid, `None` if stale.
+pub fn get_network() -> Option<Option<NetworkContext>> {
+    let mut guard = NETWORK_CACHE.lock().ok()?;
+
+    let reason = match guard.as_ref() {
+        None => Some(InvalidationReason::Cold),
+        Some(entry) if entry.created.elapsed() > NETWORK_TTL => Some(InvalidationReason::Expired),
+        _ => None,
+    };
+
+    if let Some(reason) = reason {
+        if let Some(entry) = guard.as_mut() {
+            entry.last_invalidation = Some(reason);
+        }
+        return None;
+    }
+
+    Some(guard.as_ref().unwrap().result.clone())
+}
+
+/// Store a network detection result in the cache.
+pub fn set_network(result: &Option<NetworkContext>) {
+    if let Ok(mut guard) = NETWORK_CACHE.lock() {
+        let prev_invalidation = guard.as_ref().and_then(|e| e.last_invalidation);
+        *guard = Some(NetworkCacheEntry {
+            result: result.clone(),
+            created: Instant::now(),
+            last_invalidation: prev_invalidation,
+        });
+    }
+}
+
 // ── Cache stats (for ctx debug) ──────────────────────────────────────────
 
 /// Summary of cache state for debug display.
@@ -263,6 +308,8 @@ pub struct CacheStats {
     pub docker_invalidation: Option<InvalidationReason>,
     pub project_age_ms: Option<u64>,
     pub project_invalidation: Option<InvalidationReason>,
+    pub network_age_ms: Option<u64>,
+    pub network_invalidation: Option<InvalidationReason>,
 }
 
 /// Get current cache ages for the `ctx` debug command.
@@ -295,6 +342,16 @@ pub fn stats() -> CacheStats {
         .map(|(age, inv)| (Some(age), inv))
         .unwrap_or((None, None));
 
+    let (network_age_ms, network_invalidation) = NETWORK_CACHE
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref()
+                .map(|e| (e.created.elapsed().as_millis() as u64, e.last_invalidation))
+        })
+        .map(|(age, inv)| (Some(age), inv))
+        .unwrap_or((None, None));
+
     CacheStats {
         git_age_ms,
         git_invalidation,
@@ -302,5 +359,7 @@ pub fn stats() -> CacheStats {
         docker_invalidation,
         project_age_ms,
         project_invalidation,
+        network_age_ms,
+        network_invalidation,
     }
 }

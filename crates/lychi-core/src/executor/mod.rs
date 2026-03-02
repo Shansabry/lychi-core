@@ -196,7 +196,7 @@ impl Executor {
         if trimmed.len() <= 1
             && let Some(ref ctx) = self.context
         {
-            let ctx_items = crate::context::suggestions::suggest(ctx);
+            let ctx_items = crate::context::suggestions::suggest(ctx, Some(&self.db));
             if !ctx_items.is_empty() && trimmed.is_empty() {
                 return ctx_items;
             }

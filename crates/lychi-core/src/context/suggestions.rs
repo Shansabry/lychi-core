@@ -7,8 +7,16 @@
 //! it was suggested. The reason is serialized as a user-facing string on the
 //! `CompletionItem::reason` field for frontend display.
 
-use crate::action_registry::CompletionItem;
+use std::sync::Arc;
 
+use redb::Database;
+
+use crate::action_registry::CompletionItem;
+use crate::db::frecency;
+
+use super::app_class::{self, AppClass};
+use super::browser_context::{self, BrowserContext};
+use super::clipboard_detect::ClipboardContentType;
 use super::{EnvironmentContext, ProjectKind};
 
 // ── Suggestion Reason ───────────────────────────────────────────────────
@@ -34,6 +42,14 @@ pub enum SuggestionReason {
     DockerRunning { count: usize },
     /// User is deep in a project subdirectory.
     DirectoryDepth { project_name: String },
+    /// Clipboard contains actionable content.
+    ClipboardContent { content_type: String },
+    /// Command previously run in this workspace.
+    WorkspaceMemory { project: String },
+    /// Suggestion based on focused browser window.
+    BrowserContext { detail: String },
+    /// Generic app-class suggestion (media, file manager, etc.).
+    AppClassSuggestion { app: String },
 }
 
 impl SuggestionReason {
@@ -50,6 +66,10 @@ impl SuggestionReason {
                 format!("{count} container{}", if *count == 1 { "" } else { "s" })
             }
             Self::DirectoryDepth { project_name } => format!("In {project_name}/"),
+            Self::ClipboardContent { content_type } => format!("Clipboard: {content_type}"),
+            Self::WorkspaceMemory { project } => format!("Recent in {project}"),
+            Self::BrowserContext { detail } => detail.clone(),
+            Self::AppClassSuggestion { app } => app.clone(),
         }
     }
 
@@ -66,6 +86,12 @@ impl SuggestionReason {
             Self::DirectoryDepth { project_name } => {
                 format!("cwd depth>=1 in {project_name}")
             }
+            Self::ClipboardContent { content_type } => {
+                format!("clipboard.type={content_type}")
+            }
+            Self::WorkspaceMemory { project } => format!("workspace={project}"),
+            Self::BrowserContext { detail } => format!("browser={detail}"),
+            Self::AppClassSuggestion { app } => format!("app_class={app}"),
         }
     }
 }
@@ -73,16 +99,127 @@ impl SuggestionReason {
 /// Generate contextual completions based on current environment.
 ///
 /// Returns up to 20 suggestions based on detected context.
-pub fn suggest(ctx: &EnvironmentContext) -> Vec<CompletionItem> {
+/// Pass `db` to enable workspace-local command memory (None in tests).
+pub fn suggest(ctx: &EnvironmentContext, db: Option<&Arc<Database>>) -> Vec<CompletionItem> {
     let mut items = Vec::new();
 
-    // Only show dev-context suggestions (git, project, docker) when a
-    // terminal or IDE is focused — don't leak background terminal context
-    // into browser/random-app sessions.
+    // Determine if we're in a dev window (terminal/IDE)
     let in_dev_window = ctx
         .active_window
         .as_ref()
         .is_some_and(|w| w.is_terminal || w.is_ide);
+
+    // ── 1. Clipboard suggestions (universal — all window types) ─────────
+    suggest_clipboard(ctx, &mut items);
+
+    // ── 2. Dev-window suggestions (git, project, docker, workspace memory) ──
+    if in_dev_window {
+        suggest_dev(ctx, db, &mut items);
+    } else {
+        // ── 3. App-class suggestions (browser, media, file manager) ─────
+        suggest_for_app_class(ctx, &mut items);
+    }
+
+    // Sort by score descending, then truncate to 20 most relevant
+    items.sort_by(|a, b| b.score.cmp(&a.score));
+    items.truncate(20);
+    items
+}
+
+// ── Clipboard Suggestions ───────────────────────────────────────────────
+
+fn suggest_clipboard(ctx: &EnvironmentContext, items: &mut Vec<CompletionItem>) {
+    let Some(ref clip_type) = ctx.clipboard else {
+        return;
+    };
+
+    match clip_type {
+        ClipboardContentType::Url(url) => {
+            // Truncate display URL for readability
+            let display = if url.len() > 60 {
+                format!("{}…", &url[..57])
+            } else {
+                url.clone()
+            };
+            let reason = SuggestionReason::ClipboardContent {
+                content_type: "URL".into(),
+            };
+            items.push(completion(
+                &format!("open {url}"),
+                &format!("Open {display}"),
+                70,
+                &reason,
+            ));
+        }
+        ClipboardContentType::FilePath(path) => {
+            let name = path.rsplit('/').next().unwrap_or(path);
+            let reason = SuggestionReason::ClipboardContent {
+                content_type: "file path".into(),
+            };
+            items.push(completion(
+                &format!("open {path}"),
+                &format!("Open {name}"),
+                70,
+                &reason,
+            ));
+        }
+        ClipboardContentType::IpAddress(ip) => {
+            let reason = SuggestionReason::ClipboardContent {
+                content_type: "IP address".into(),
+            };
+            items.push(completion(
+                &format!("run ping -c 4 {ip}"),
+                &format!("Ping {ip}"),
+                65,
+                &reason,
+            ));
+        }
+        ClipboardContentType::GitHash(hash) => {
+            // Only suggest git show if we have git context
+            if ctx.git.is_some() {
+                let short = &hash[..7.min(hash.len())];
+                let reason = SuggestionReason::ClipboardContent {
+                    content_type: "git hash".into(),
+                };
+                items.push(completion(
+                    &format!("run git show {hash}"),
+                    &format!("Show commit {short}"),
+                    65,
+                    &reason,
+                ));
+            }
+        }
+        ClipboardContentType::ErrorTrace => {
+            let reason = SuggestionReason::ClipboardContent {
+                content_type: "error".into(),
+            };
+            items.push(completion(
+                "web clipboard error",
+                "Search this error",
+                65,
+                &reason,
+            ));
+        }
+        ClipboardContentType::Json => {
+            let reason = SuggestionReason::ClipboardContent {
+                content_type: "JSON".into(),
+            };
+            items.push(completion("clip", "Clipboard contains JSON", 60, &reason));
+        }
+        // UUID and Plain don't have useful contextual actions
+        ClipboardContentType::Uuid(_) | ClipboardContentType::Plain => {}
+    }
+}
+
+// ── Dev-Window Suggestions ──────────────────────────────────────────────
+
+fn suggest_dev(
+    ctx: &EnvironmentContext,
+    db: Option<&Arc<Database>>,
+    items: &mut Vec<CompletionItem>,
+) {
+    // Track labels we add so workspace memory can dedup
+    let mut added_labels: Vec<String> = Vec::new();
 
     // Detect feature branch once (used for git reason enrichment)
     let on_feature_branch = ctx.git.as_ref().and_then(|g| {
@@ -95,8 +232,7 @@ pub fn suggest(ctx: &EnvironmentContext) -> Vec<CompletionItem> {
     });
 
     // Git context suggestions
-    if in_dev_window && let Some(ref git) = ctx.git {
-        // Pick the most specific reason: feature branch > dirty/clean
+    if let Some(ref git) = ctx.git {
         let dirty_reason = match &on_feature_branch {
             Some(branch) => SuggestionReason::GitFeatureBranch {
                 branch: branch.clone(),
@@ -111,66 +247,40 @@ pub fn suggest(ctx: &EnvironmentContext) -> Vec<CompletionItem> {
         };
 
         if git.dirty {
-            items.push(completion(
-                "git commit",
-                "Commit staged changes",
-                100,
-                &dirty_reason,
-            ));
-            items.push(completion(
-                "git diff",
-                "View uncommitted changes",
-                95,
-                &dirty_reason,
-            ));
-            items.push(completion(
-                "git status",
-                "Show working tree status",
-                88,
-                &dirty_reason,
-            ));
-            items.push(completion(
-                "git stash",
-                "Stash current changes",
-                85,
-                &dirty_reason,
-            ));
+            for (label, desc, score) in [
+                ("git commit", "Commit staged changes", 100u16),
+                ("git diff", "View uncommitted changes", 95),
+                ("git status", "Show working tree status", 88),
+                ("git stash", "Stash current changes", 85),
+            ] {
+                added_labels.push(label.to_string());
+                items.push(completion(label, desc, score, &dirty_reason));
+            }
         } else {
-            items.push(completion(
-                "git pull",
-                "Pull latest changes",
-                100,
-                &clean_reason,
-            ));
-            items.push(completion(
-                "git push",
-                "Push commits to remote",
-                95,
-                &clean_reason,
-            ));
+            for (label, desc, score) in [
+                ("git pull", "Pull latest changes", 100u16),
+                ("git push", "Push commits to remote", 95),
+            ] {
+                added_labels.push(label.to_string());
+                items.push(completion(label, desc, score, &clean_reason));
+            }
         }
     }
 
-    // Project-specific install commands (not discoverable from config files)
-    if in_dev_window && let Some(ref project) = ctx.project {
+    // Project-specific install commands
+    if let Some(ref project) = ctx.project {
         let pm = project.package_manager.as_deref().unwrap_or("npm");
         if project.kind == ProjectKind::Node {
-            let install_cmd = pm;
+            let label = format!("run {pm} install");
             let reason = SuggestionReason::ProjectInstall { pm: pm.into() };
-            items.push(completion(
-                &format!("run {install_cmd} install"),
-                "Install dependencies",
-                86,
-                &reason,
-            ));
+            added_labels.push(label.clone());
+            items.push(completion(&label, "Install dependencies", 86, &reason));
         }
     }
 
-    // Discovered project scripts (npm scripts, cargo commands, python scripts,
-    // flutter/dart commands, go commands, Makefile targets, Justfile recipes, Taskfile tasks)
-    if in_dev_window && let Some(ref project) = ctx.project {
+    // Discovered project scripts
+    if let Some(ref project) = ctx.project {
         for (i, script) in project.scripts.iter().enumerate() {
-            // Score descending so first scripts rank higher, all above Docker suggestions
             let score = 90u16.saturating_sub(i as u16);
             let label = if script.name.is_empty() {
                 format!("run {}", script.runner)
@@ -185,54 +295,45 @@ pub fn suggest(ctx: &EnvironmentContext) -> Vec<CompletionItem> {
             let reason = SuggestionReason::ProjectScript {
                 runner: script.runner.clone(),
             };
+            added_labels.push(label.clone());
             items.push(completion(&label, &desc, score.max(84), &reason));
         }
     }
 
     // Docker Compose suggestions (project-level)
-    if in_dev_window
-        && let Some(ref project) = ctx.project
+    if let Some(ref project) = ctx.project
         && project.has_compose
     {
         let reason = SuggestionReason::DockerCompose;
-        items.push(completion(
-            "run docker compose up -d",
-            "Start all services",
-            82,
-            &reason,
-        ));
-        items.push(completion(
-            "run docker compose down",
-            "Stop all services",
-            80,
-            &reason,
-        ));
-        items.push(completion(
-            "run docker compose logs",
-            "View service logs",
-            78,
-            &reason,
-        ));
+        for (label, desc, score) in [
+            ("run docker compose up -d", "Start all services", 82u16),
+            ("run docker compose down", "Stop all services", 80),
+            ("run docker compose logs", "View service logs", 78),
+        ] {
+            added_labels.push(label.to_string());
+            items.push(completion(label, desc, score, &reason));
+        }
     }
 
-    // Docker container suggestions — only when in a dev context (terminal or IDE)
-    if in_dev_window
-        && let Some(ref docker) = ctx.docker
+    // Docker container suggestions
+    if let Some(ref docker) = ctx.docker
         && !docker.containers.is_empty()
     {
         let reason = SuggestionReason::DockerRunning {
             count: docker.containers.len(),
         };
+        added_labels.push("run docker ps".to_string());
         items.push(completion(
             "run docker ps",
             "List running containers",
             77,
             &reason,
         ));
-        // Suggest logs for first container
         if let Some(first) = docker.containers.first() {
+            let label = format!("run docker logs {}", first.name);
+            added_labels.push(label.clone());
             items.push(completion(
-                &format!("run docker logs {}", first.name),
+                &label,
                 &format!("Logs for {}", first.name),
                 76,
                 &reason,
@@ -240,7 +341,7 @@ pub fn suggest(ctx: &EnvironmentContext) -> Vec<CompletionItem> {
         }
     }
 
-    // Directory depth awareness: suggest opening project root when deep in subdirectories
+    // Directory depth awareness
     if let (Some(cwd), Some(project)) = (&ctx.cwd, &ctx.project)
         && depth_below_root(cwd, &project.root) >= 1
     {
@@ -248,19 +349,199 @@ pub fn suggest(ctx: &EnvironmentContext) -> Vec<CompletionItem> {
         let reason = SuggestionReason::DirectoryDepth {
             project_name: name.into(),
         };
+        let label = format!("open {}", project.root);
+        added_labels.push(label.clone());
         items.push(completion(
-            &format!("open {}", project.root),
+            &label,
             &format!("Open project root ({name})"),
             91,
             &reason,
         ));
     }
 
-    // Sort by score descending, then truncate to 20 most relevant
-    items.sort_by(|a, b| b.score.cmp(&a.score));
-    items.truncate(20);
-    items
+    // Workspace-local command memory (frecency-based)
+    if let Some(db) = db {
+        suggest_workspace_memory(ctx, db, &added_labels, items);
+    }
 }
+
+/// Add workspace memory suggestions — commands frequently run in this project.
+fn suggest_workspace_memory(
+    ctx: &EnvironmentContext,
+    db: &Arc<Database>,
+    already_added: &[String],
+    items: &mut Vec<CompletionItem>,
+) {
+    let project_root = ctx
+        .project
+        .as_ref()
+        .map(|p| p.root.as_str())
+        .or(ctx.cwd.as_deref());
+
+    let Some(root) = project_root else {
+        return;
+    };
+
+    let scores = frecency::get_workspace_scores(db, root);
+    if scores.is_empty() {
+        return;
+    }
+
+    let project_name = root.rsplit('/').next().unwrap_or("project");
+
+    // Sort by score descending, take top 5, skip already-suggested commands
+    let mut ranked: Vec<_> = scores.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut count = 0;
+    for (command, _score) in ranked {
+        if count >= 5 {
+            break;
+        }
+        // Dedup against commands already in the suggestion list
+        if already_added.contains(&command) {
+            continue;
+        }
+        let reason = SuggestionReason::WorkspaceMemory {
+            project: project_name.into(),
+        };
+        items.push(completion(
+            &command,
+            &command,
+            72u16.saturating_sub(count as u16),
+            &reason,
+        ));
+        count += 1;
+    }
+}
+
+// ── App-Class Suggestions ───────────────────────────────────────────────
+
+fn suggest_for_app_class(ctx: &EnvironmentContext, items: &mut Vec<CompletionItem>) {
+    let Some(ref window) = ctx.active_window else {
+        return;
+    };
+
+    let app_class = app_class::classify(&window.wm_class);
+
+    match app_class {
+        AppClass::Browser => suggest_browser(ctx, &window.title, items),
+        AppClass::MediaPlayer => suggest_media(items),
+        AppClass::FileManager => suggest_file_manager(items),
+        // Terminal and IDE are handled by suggest_dev; Communication and Unknown
+        // have no specific suggestions yet.
+        _ => {}
+    }
+}
+
+fn suggest_browser(ctx: &EnvironmentContext, title: &str, items: &mut Vec<CompletionItem>) {
+    let browser_ctx = browser_context::parse_title(title);
+
+    match browser_ctx {
+        BrowserContext::GitHub { owner, repo } => {
+            let reason = SuggestionReason::BrowserContext {
+                detail: format!("{owner}/{repo}"),
+            };
+            items.push(completion(
+                &format!("run git clone https://github.com/{owner}/{repo}.git"),
+                &format!("Clone {owner}/{repo}"),
+                75,
+                &reason,
+            ));
+            items.push(completion(
+                &format!("web https://github.com/{owner}/{repo}/issues"),
+                &format!("{owner}/{repo} issues"),
+                72,
+                &reason,
+            ));
+            items.push(completion(
+                &format!("web https://github.com/{owner}/{repo}/pulls"),
+                &format!("{owner}/{repo} pull requests"),
+                70,
+                &reason,
+            ));
+        }
+        BrowserContext::Localhost { port } => {
+            let reason = SuggestionReason::BrowserContext {
+                detail: format!("localhost:{port}"),
+            };
+            // If docker context is available, suggest container management
+            if let Some(ref docker) = ctx.docker
+                && !docker.containers.is_empty()
+            {
+                items.push(completion(
+                    "run docker ps",
+                    "List running containers",
+                    73,
+                    &reason,
+                ));
+                if let Some(first) = docker.containers.first() {
+                    items.push(completion(
+                        &format!("run docker logs {}", first.name),
+                        &format!("Logs for {}", first.name),
+                        71,
+                        &reason,
+                    ));
+                }
+            }
+            items.push(completion(
+                &format!("web http://localhost:{port}"),
+                &format!("Open localhost:{port}"),
+                70,
+                &reason,
+            ));
+        }
+        BrowserContext::StackOverflow => {
+            let reason = SuggestionReason::BrowserContext {
+                detail: "Stack Overflow".into(),
+            };
+            items.push(completion("web", "Search the web", 68, &reason));
+        }
+        BrowserContext::Documentation => {
+            let reason = SuggestionReason::BrowserContext {
+                detail: "Documentation".into(),
+            };
+            items.push(completion("web", "Search documentation", 68, &reason));
+        }
+        BrowserContext::Unknown => {
+            // Generic browser suggestions
+            let reason = SuggestionReason::AppClassSuggestion {
+                app: "Browser".into(),
+            };
+            items.push(completion("web", "Search the web", 65, &reason));
+        }
+    }
+}
+
+fn suggest_media(items: &mut Vec<CompletionItem>) {
+    let reason = SuggestionReason::AppClassSuggestion {
+        app: "Media".into(),
+    };
+    items.push(completion("media toggle", "Play / Pause", 68, &reason));
+    items.push(completion("media next", "Next track", 66, &reason));
+    items.push(completion("media prev", "Previous track", 64, &reason));
+}
+
+fn suggest_file_manager(items: &mut Vec<CompletionItem>) {
+    let reason = SuggestionReason::AppClassSuggestion {
+        app: "File manager".into(),
+    };
+    items.push(completion("open ~", "Open home directory", 68, &reason));
+    items.push(completion(
+        "open ~/Downloads",
+        "Open Downloads",
+        66,
+        &reason,
+    ));
+    items.push(completion(
+        "open ~/Documents",
+        "Open Documents",
+        64,
+        &reason,
+    ));
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────
 
 /// How many directory levels `cwd` is below `project_root`.
 fn depth_below_root(cwd: &str, project_root: &str) -> usize {

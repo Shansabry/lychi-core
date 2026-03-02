@@ -23,6 +23,22 @@ pub async fn execute_command(
         let _ = frecency::record(&state.db, &format!("history:{trimmed}"));
     }
 
+    // Record workspace-scoped frecency (command memory per project)
+    if !trimmed.is_empty() {
+        let executor_r = state.executor.read().await;
+        if let Some(ref ctx) = executor_r.context {
+            let project_root = ctx
+                .project
+                .as_ref()
+                .map(|p| p.root.as_str())
+                .or(ctx.cwd.as_deref());
+            if let Some(root) = project_root {
+                let _ = frecency::record_workspace(&state.db, root, trimmed);
+            }
+        }
+        drop(executor_r);
+    }
+
     // Run through executor pipeline: resolve → validate → execute
     let executor = state.executor.read().await;
     let privacy = state.config.read().await.privacy.clone();

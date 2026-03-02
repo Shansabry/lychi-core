@@ -363,14 +363,25 @@ impl MprisManager {
     }
 
     /// Send a control command to the first player matching a predicate (or any player).
+    /// Prefers the currently **playing** player among matches (via status-sorted list).
     pub async fn control_matching(
         &self,
         predicate: impl Fn(&str) -> bool,
         action: &str,
     ) -> Result<String, LychiError> {
-        let bus_name = self
-            .find_player_by_bus(predicate)
+        // get_all_status() returns players sorted: Playing > Paused > Stopped
+        let statuses = self.get_all_status().await;
+
+        // First matching player in priority order (playing first)
+        let target = statuses
+            .iter()
+            .find(|t| predicate(&t.bus_name))
+            .or_else(|| statuses.first());
+
+        let bus_name = target
+            .map(|t| t.bus_name.clone())
             .ok_or_else(|| LychiError::ExecutionFailed("No media players running".to_string()))?;
+
         self.control(&bus_name, action).await?;
         Ok(friendly_name(&bus_name))
     }

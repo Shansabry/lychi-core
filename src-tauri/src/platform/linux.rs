@@ -3,9 +3,26 @@ use tauri::Manager;
 use tauri::WebviewWindow;
 use tokio::sync::oneshot;
 
-/// Set the GLib application name. Called once at startup before Tauri builder.
+/// Set the GLib application/program name. Called once at startup before Tauri builder.
+/// `prgname` sets the Wayland app-id, which KDE uses to match .desktop files for
+/// the taskbar icon. Must match the .desktop file's filename or StartupWMClass.
 pub fn init_app() {
+    glib::set_prgname(Some("lychi-app"));
     glib::set_application_name("Lychi");
+}
+
+/// Detect KDE Plasma on Wayland (where layer-shell focus is unreliable).
+/// Uses `XDG_SESSION_DESKTOP` first (single-valued, more reliable), falls back
+/// to `XDG_CURRENT_DESKTOP`. Only triggers on Wayland sessions.
+pub fn is_kde_wayland() -> bool {
+    let is_wayland = std::env::var("XDG_SESSION_TYPE")
+        .map(|v| v == "wayland")
+        .unwrap_or(false);
+    let is_kde = std::env::var("XDG_SESSION_DESKTOP")
+        .or_else(|_| std::env::var("XDG_CURRENT_DESKTOP"))
+        .map(|v| v.to_uppercase().contains("KDE"))
+        .unwrap_or(false);
+    is_wayland && is_kde
 }
 
 /// Strip ANSI escape codes from kscreen-doctor output.
@@ -283,7 +300,19 @@ pub fn reposition_to_monitor(window: &WebviewWindow, monitor: &gdk::Monitor) {
             geom.width(),
             geom.height()
         );
+    } else if is_kde_wayland() {
+        // KDE toplevel: fullscreen container, CSS handles centering
+        gtk_win.move_(geom.x(), geom.y());
+        gtk_win.set_size_request(geom.width(), geom.height());
+        tracing::debug!(
+            "Repositioned KDE toplevel fullscreen to {},{} ({}x{})",
+            geom.x(),
+            geom.y(),
+            geom.width(),
+            geom.height()
+        );
     } else {
+        // X11 fullscreen overlay
         gtk_win.move_(geom.x(), geom.y());
         gtk_win.set_size_request(geom.width(), geom.height());
         tracing::debug!(
@@ -296,8 +325,8 @@ pub fn reposition_to_monitor(window: &WebviewWindow, monitor: &gdk::Monitor) {
     }
 }
 
-/// Configure the GTK window for Wayland layer-shell or X11 skip-taskbar.
-/// `strategy`: "auto" (detect), "layer-shell" (force Wayland), or "x11" (force X11 path).
+/// Configure the GTK window for Wayland layer-shell, KDE toplevel, or X11 skip-taskbar.
+/// `strategy`: "auto" (detect), "layer-shell" (force), "toplevel" (force KDE), or "x11" (force).
 pub fn init_window(window: &WebviewWindow, strategy: &str) {
     let gtk_win = match window.gtk_window() {
         Ok(w) => w,
@@ -320,8 +349,18 @@ pub fn init_window(window: &WebviewWindow, strategy: &str) {
                 false
             }
         }
-        "x11" => false,
-        _ => gtk_layer_shell::is_supported(), // "auto"
+        "x11" | "toplevel" => false,
+        _ => {
+            // "auto": use layer-shell UNLESS on KDE Wayland (focus bugs)
+            if is_kde_wayland() {
+                tracing::info!(
+                    "KDE Wayland detected — using toplevel window (layer-shell focus unreliable on KWin)"
+                );
+                false
+            } else {
+                gtk_layer_shell::is_supported()
+            }
+        }
     };
 
     // Gracefully handle missing screen/monitor instead of panicking
@@ -377,8 +416,32 @@ pub fn init_window(window: &WebviewWindow, strategy: &str) {
             tracing::debug!(
                 "Layer shell initialized (strategy: {strategy}, top_margin: {top_margin}, max_h: {max_height})"
             );
+        } else if strategy == "toplevel" || (strategy == "auto" && is_kde_wayland()) {
+            // KDE toplevel: fullscreen transparent container — CSS handles centering.
+            // Wayland xdg_toplevel ignores move_(), so we can't position a sized window.
+            // Instead, cover the monitor and let the frontend center the launcher UI.
+            // Normal GTK window — KWin's focus model works correctly here.
+            // NOTE: set_skip_taskbar_hint doesn't work on Wayland — it only sets
+            // X11 atoms. This is a known Tauri limitation (tauri#9829). The window
+            // will appear in KDE's taskbar. We set Utility hint so it at least
+            // behaves as a tool window (no alt-tab, stays above, etc).
+            gtk_win.set_type_hint(gdk::WindowTypeHint::Utility);
+            gtk_win.set_skip_taskbar_hint(true);
+            gtk_win.set_skip_pager_hint(true);
+            gtk_win.set_decorated(false);
+            gtk_win.set_keep_above(true);
+
+            gtk_win.move_(geom.x(), geom.y());
+            gtk_win.set_size_request(geom.width(), geom.height());
+            tracing::debug!(
+                "KDE toplevel window: fullscreen {}x{} at {},{} (strategy: {strategy})",
+                geom.width(),
+                geom.height(),
+                geom.x(),
+                geom.y()
+            );
         } else {
-            // X11 path — position on primary monitor with skip-taskbar hints
+            // X11 path — fullscreen overlay on primary monitor
             gtk_win.move_(geom.x(), geom.y());
             gtk_win.set_size_request(geom.width(), geom.height());
             gtk_win.set_skip_taskbar_hint(true);
@@ -399,97 +462,134 @@ pub fn focus_window(window: &WebviewWindow) {
         use gtk::prelude::GtkWindowExt;
         gtk_win.set_keep_above(true);
         gtk_win.present();
+        tracing::debug!(
+            "focus_window: is_active={}, has_toplevel_focus={}",
+            gtk_win.is_active(),
+            gtk_win.has_toplevel_focus()
+        );
     }
 }
 
-/// Set up GTK-level focus-out handler for reliable blur dismiss.
-/// Emits `lychi://gtk-blur` when the GTK window loses focus — catches cases
-/// where Tauri's JS-level `onFocusChanged` doesn't fire (bridge timing).
-/// Only active on layer-shell (X11 uses fullscreen overlay with its own dismiss).
-pub fn setup_blur_dismiss(window: &WebviewWindow) {
+/// Set up interaction-gated dismiss-on-blur.
+///
+/// Works on both layer-shell (wlroots) and KDE toplevel windows.
+/// On layer-shell: also switches keyboard mode to OnDemand on first interaction.
+/// On X11 fullscreen: returns early (frontend handles dismiss via click-on-backdrop).
+///
+///   show_window() → dismiss_armed=false
+///   key-press / button-press inside window → dismiss_armed=true
+///   focus-out (armed) → emit lychi://dismiss
+///   focus-out (not armed) → ignore (compositor churn)
+pub fn setup_dismiss_on_blur(
+    window: &WebviewWindow,
+    dismiss_armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    summon_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
     let gtk_win = match window.gtk_window() {
         Ok(w) => w,
         Err(_) => return,
     };
 
     use gtk_layer_shell::LayerShell;
-    if !gtk_win.is_layer_window() {
-        return;
+    let is_layer = gtk_win.is_layer_window();
+    let is_toplevel_kde = !is_layer && is_kde_wayland();
+
+    if !is_layer && !is_toplevel_kde {
+        return; // X11 fullscreen — frontend handles dismiss
+    }
+
+    use gtk::prelude::WidgetExt;
+    use std::sync::atomic::Ordering;
+
+    // key-press: user typed → arm dismiss (Escape handled separately)
+    {
+        let armed = dismiss_armed.clone();
+        let seq = summon_seq.clone();
+        gtk_win.connect_key_press_event(move |_, event| {
+            use gdk::keys::constants as key;
+            let keyval = event.keyval();
+            // Don't arm on Escape (handled by setup_escape_handler)
+            if keyval != key::Escape && !armed.load(Ordering::SeqCst) {
+                armed.store(true, Ordering::SeqCst);
+                tracing::info!(
+                    "[dismiss] seq={} key-press → armed=true",
+                    seq.load(Ordering::SeqCst)
+                );
+            }
+            glib::Propagation::Proceed // let key propagate to WebView
+        });
+    }
+
+    // button-press: user clicked inside → arm dismiss
+    {
+        let armed = dismiss_armed.clone();
+        let seq = summon_seq.clone();
+        gtk_win.connect_button_press_event(move |_, _| {
+            if !armed.load(Ordering::SeqCst) {
+                armed.store(true, Ordering::SeqCst);
+                tracing::info!(
+                    "[dismiss] seq={} button-press → armed=true",
+                    seq.load(Ordering::SeqCst)
+                );
+            }
+            glib::Propagation::Proceed
+        });
+    }
+
+    // focus-out: only dismiss if user interacted (armed)
+    let handle = window.app_handle().clone();
+    gtk_win.connect_focus_out_event(move |_, _| {
+        let seq = summon_seq.load(Ordering::SeqCst);
+        let armed = dismiss_armed.load(Ordering::SeqCst);
+        if armed {
+            tracing::info!("[dismiss] seq={seq} focus-out (armed) → DISMISS");
+            dismiss_armed.store(false, Ordering::SeqCst);
+            use tauri::Emitter;
+            let _ = handle.emit("lychi://dismiss", ());
+        } else {
+            tracing::info!("[dismiss] seq={seq} focus-out (not armed) → ignored");
+        }
+        glib::Propagation::Proceed
+    });
+    tracing::info!(
+        "[dismiss] interaction-gated dismiss handler installed (layer={is_layer}, kde_toplevel={is_toplevel_kde})"
+    );
+}
+
+/// GTK-level Escape key handler — catches Escape even when the WebView
+/// input doesn't have DOM focus. Emits `lychi://gtk-escape` for the frontend.
+/// Active on layer-shell and KDE toplevel (X11 handles Escape via fullscreen overlay click).
+pub fn setup_escape_handler(window: &WebviewWindow) {
+    let gtk_win = match window.gtk_window() {
+        Ok(w) => w,
+        Err(_) => return,
+    };
+
+    use gtk_layer_shell::LayerShell;
+    let is_layer = gtk_win.is_layer_window();
+    if !is_layer && !is_kde_wayland() {
+        return; // X11 fullscreen — frontend DOM handles Escape
     }
 
     let handle = window.app_handle().clone();
     use gtk::prelude::WidgetExt;
-    gtk_win.connect_focus_out_event(move |_, _| {
-        use tauri::Emitter;
-        let _ = handle.emit("lychi://gtk-blur", ());
-        glib::Propagation::Proceed
-    });
-    tracing::debug!("GTK focus-out dismiss handler installed");
-}
-
-/// Start a focus watchdog that polls whether Lychi still has focus.
-/// Catches compositors (KDE/KWin) that don't reliably send `keyboard.leave`
-/// for layer-shell surfaces. Only polls while the launcher is visible.
-pub fn start_focus_watchdog(app: &tauri::AppHandle) {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
-    use tauri::Emitter;
-
-    // Check if layer-shell is in use
-    let win = match app.get_webview_window("main") {
-        Some(w) => w,
-        None => return,
-    };
-    let gtk_win = match win.gtk_window() {
-        Ok(w) => w,
-        Err(_) => return,
-    };
-    use gtk_layer_shell::LayerShell;
-    if !gtk_win.is_layer_window() {
-        tracing::debug!("Focus watchdog skipped (not layer-shell)");
-        return;
-    }
-
-    let handle = app.clone();
-    let visible = Arc::new(AtomicBool::new(false));
-
-    // Listen for summon (start polling) and hidden (stop polling)
-    use tauri::Listener;
-
-    let vis_summon = visible.clone();
-    let handle_summon = handle.clone();
-    handle_summon.listen("lychi://summon", move |_| {
-        vis_summon.store(true, Ordering::Relaxed);
-    });
-
-    let vis_hidden = visible.clone();
-    let handle_hidden = handle.clone();
-    handle_hidden.listen("lychi://hidden", move |_| {
-        vis_hidden.store(false, Ordering::Relaxed);
-    });
-
-    // Poll every 250ms on the GLib main thread
-    let vis_poll = visible.clone();
-    let gtk_win_poll = gtk_win.clone();
-    glib::timeout_add_local(Duration::from_millis(250), move || {
-        if !vis_poll.load(Ordering::Relaxed) {
-            return glib::ControlFlow::Continue;
+    gtk_win.connect_key_press_event(move |_, event| {
+        use gdk::keys::constants as key;
+        let keyval = event.keyval();
+        let state = event.state();
+        // Bare Escape (no modifiers) → dismiss
+        let no_mods = !state.contains(gdk::ModifierType::CONTROL_MASK)
+            && !state.contains(gdk::ModifierType::MOD1_MASK)
+            && !state.contains(gdk::ModifierType::SHIFT_MASK)
+            && !state.contains(gdk::ModifierType::SUPER_MASK);
+        if keyval == key::Escape && no_mods {
+            tracing::info!("GTK Escape handler: emitting lychi://gtk-escape");
+            use tauri::Emitter;
+            let _ = handle.emit("lychi://gtk-escape", ());
         }
-
-        use gtk::prelude::GtkWindowExt;
-        let has_focus = gtk_win_poll.is_active();
-
-        if !has_focus {
-            tracing::debug!("Focus watchdog: window lost focus, emitting dismiss");
-            let _ = handle.emit("lychi://focus-watchdog-dismiss", ());
-            vis_poll.store(false, Ordering::Relaxed); // Stop polling until next summon
-        }
-
-        glib::ControlFlow::Continue
+        glib::Propagation::Proceed // Let it propagate to WebView too
     });
-
-    tracing::debug!("Focus watchdog started (250ms poll, layer-shell only)");
+    tracing::debug!("GTK Escape key handler installed");
 }
 
 /// IPC socket path using XDG_RUNTIME_DIR.

@@ -25,7 +25,7 @@ pub struct GeneralConfig {
     pub window_y: Option<i32>,
     /// Which monitor to open the launcher on: "cursor" or "primary"
     pub monitor_mode: String,
-    /// Window strategy: "auto", "layer-shell", or "x11"
+    /// Window strategy: "auto", "layer-shell", "toplevel", or "x11"
     pub window_strategy: String,
 }
 

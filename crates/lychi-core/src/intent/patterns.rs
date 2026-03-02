@@ -68,6 +68,7 @@ pub const KNOWN_PREFIXES: &[&str] = &[
     "remind",
     // System actions (routed via keyword patterns)
     "shutdown",
+    "cancel shutdown",
     "reboot",
     "hibernate",
     "logout",
@@ -408,6 +409,21 @@ fn try_keyword_route(input: &str) -> Option<Route> {
     let lower = input.to_lowercase();
 
     // --- system power commands ---
+    // Scheduled shutdown must match BEFORE the generic shutdown catch-all
+    if lower.starts_with("shutdown in ") || lower.starts_with("shut down in ") {
+        return Some(Route {
+            handler: "system",
+            args: lower.clone(),
+            explicit: false,
+        });
+    }
+    if lower == "cancel shutdown" || lower == "shutdown cancel" {
+        return Some(Route {
+            handler: "system",
+            args: "cancel shutdown".into(),
+            explicit: false,
+        });
+    }
     if lower.contains("shut down") || lower.contains("shutdown") || lower.contains("power off") {
         return Some(Route {
             handler: "system",
@@ -1006,6 +1022,49 @@ fn try_system_control(lower: &str) -> Option<Route> {
             args: "bluetooth off".into(),
             explicit: false,
         });
+    }
+
+    // --- Bluetooth connect/disconnect ---
+    for prefix in &[
+        "connect bluetooth ",
+        "connect bt ",
+        "bluetooth connect ",
+        "bt connect ",
+        "connect to bluetooth ",
+        "connect to bt ",
+        "connect to my ",
+    ] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let device = rest.trim();
+            if !device.is_empty() {
+                return Some(Route {
+                    handler: "system",
+                    args: format!("connect bluetooth {device}"),
+                    explicit: false,
+                });
+            }
+        }
+    }
+    for prefix in &[
+        "disconnect bluetooth ",
+        "disconnect bt ",
+        "bluetooth disconnect ",
+        "bt disconnect ",
+        "disconnect from bluetooth ",
+        "disconnect from bt ",
+        "disconnect from my ",
+        "disconnect my ",
+    ] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let device = rest.trim();
+            if !device.is_empty() {
+                return Some(Route {
+                    handler: "system",
+                    args: format!("disconnect bluetooth {device}"),
+                    explicit: false,
+                });
+            }
+        }
     }
 
     None

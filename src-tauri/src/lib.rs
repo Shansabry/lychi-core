@@ -113,9 +113,14 @@ pub fn run() {
 
             // Platform-specific window setup (layer-shell, skip-taskbar, etc.)
             if let Some(win) = app.get_webview_window("main") {
+                let app_state = app.state::<AppState>();
                 platform::init_window(&win, &window_strategy);
-                platform::setup_blur_dismiss(&win);
-                platform::start_focus_watchdog(&handle);
+                platform::setup_dismiss_on_blur(
+                    &win,
+                    app_state.dismiss_armed.clone(),
+                    app_state.summon_seq.clone(),
+                );
+                platform::setup_escape_handler(&win);
                 window::show_window(&win);
             }
 

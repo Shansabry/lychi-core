@@ -36,6 +36,8 @@ pub fn get_all_settings(
             use gtk_layer_shell::LayerShell;
             if gtk_win.is_layer_window() {
                 "layer-shell"
+            } else if crate::platform::is_kde_wayland() {
+                "toplevel"
             } else {
                 "x11"
             }
@@ -235,7 +237,7 @@ pub fn get_layer_shell_supported() -> bool {
 }
 
 /// Returns the window strategy that is currently active (what init_window chose).
-/// "layer-shell" if the main window is a layer-shell surface, "x11" otherwise.
+/// "layer-shell" | "toplevel" | "x11"
 #[tauri::command]
 pub fn get_active_window_strategy(app: AppHandle) -> String {
     if let Some(win) = app.get_webview_window("main")
@@ -246,19 +248,25 @@ pub fn get_active_window_strategy(app: AppHandle) -> String {
             return "layer-shell".to_string();
         }
     }
-    "x11".to_string()
+    if crate::platform::is_kde_wayland() {
+        "toplevel".to_string()
+    } else {
+        "x11".to_string()
+    }
 }
 
 /// Hide the launcher window.
 /// Called from frontend instead of window.hide() to keep hide logic centralised.
 #[tauri::command]
 pub fn hide_launcher(app: AppHandle) {
+    // Disarm dismiss so focus-out during hide doesn't re-trigger
+    let state = app.state::<AppState>();
+    state
+        .dismiss_armed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.hide();
     }
-    // Notify the focus watchdog to stop polling
-    use tauri::Emitter;
-    let _ = app.emit("lychi://hidden", ());
 }
 
 /// Change the global hotkey at runtime: unregister old, register new, persist to config.

@@ -8,11 +8,15 @@
 //! terminal even when an IDE has focus.
 
 pub mod active_window;
+pub mod app_class;
+pub mod browser_context;
 pub mod cache;
+pub mod clipboard_detect;
 pub mod cwd;
 pub mod docker;
 pub mod git;
 pub mod ide;
+pub mod network;
 pub mod project;
 pub mod suggestions;
 pub mod window_stack;
@@ -42,6 +46,15 @@ pub struct EnvironmentContext {
     /// Current hour (0-23) for time-aware suggestion ranking.
     #[serde(default)]
     pub hour: u8,
+    /// Detected clipboard content type (read on summon).
+    #[serde(default)]
+    pub clipboard: Option<clipboard_detect::ClipboardContentType>,
+    /// Parsed browser context (only set when a browser is focused).
+    #[serde(default)]
+    pub browser: Option<browser_context::BrowserContext>,
+    /// Network context (WiFi SSID, VPN status).
+    #[serde(default)]
+    pub network: Option<network::NetworkContext>,
     /// Milliseconds taken to gather context.
     pub gather_ms: u64,
 }
@@ -140,6 +153,27 @@ impl EnvironmentContext {
         {
             lines.push(format!("- Active window: {} ({})", win.title, win.wm_class));
         }
+        if let Some(ref clip) = self.clipboard {
+            let desc = match clip {
+                clipboard_detect::ClipboardContentType::Url(u) => format!("URL: {u}"),
+                clipboard_detect::ClipboardContentType::FilePath(p) => format!("File: {p}"),
+                clipboard_detect::ClipboardContentType::IpAddress(ip) => format!("IP: {ip}"),
+                clipboard_detect::ClipboardContentType::Json => "JSON content".into(),
+                clipboard_detect::ClipboardContentType::GitHash(h) => format!("Git hash: {h}"),
+                clipboard_detect::ClipboardContentType::Uuid(u) => format!("UUID: {u}"),
+                clipboard_detect::ClipboardContentType::ErrorTrace => "Error/stack trace".into(),
+                clipboard_detect::ClipboardContentType::Plain => "Plain text".into(),
+            };
+            lines.push(format!("- Clipboard: {desc}"));
+        }
+        if let Some(ref net) = self.network {
+            if let Some(ref ssid) = net.ssid {
+                lines.push(format!("- WiFi: {ssid}"));
+            }
+            if net.vpn_active {
+                lines.push("- VPN: active".into());
+            }
+        }
 
         if lines.is_empty() {
             None
@@ -195,13 +229,29 @@ pub fn gather(pre_captured: Option<WindowContext>) -> EnvironmentContext {
             .map(|w| format!("{}(pid={},term={})", w.wm_class, w.pid, w.is_terminal))
     );
 
-    // Run window-stack scan in parallel with CWD/git/project/docker detection.
-    // The stack scan involves D-Bus (KWin) or X11 calls that can take 50-200ms,
-    // so we overlap it with the other detections.
-    let (main_result, stack_terminal) = std::thread::scope(|s| {
+    // Run window-stack scan, clipboard detection, and network detection in parallel
+    // with CWD/git/project/docker detection. The stack scan involves D-Bus (KWin)
+    // or X11 calls that can take 50-200ms, and network detection spawns nmcli,
+    // so we overlap them with the other detections.
+    let (main_result, stack_terminal, clipboard_result, network_result) = std::thread::scope(|s| {
         // Spawn the window-stack scan
         let window_ref = window.as_ref();
         let stack_handle = s.spawn(move || window_stack::find_recent_terminal(window_ref));
+
+        // Spawn clipboard detection (arboard read, < 2ms)
+        let clipboard_handle =
+            s.spawn(|| clipboard_detect::detect().map(|(_text, content_type)| content_type));
+
+        // Spawn network detection (nmcli + /sys/class/net, 10-50ms)
+        let network_handle = s.spawn(|| {
+            if let Some(cached) = cache::get_network() {
+                tracing::debug!("gather: network cache hit");
+                return cached;
+            }
+            let result = network::detect();
+            cache::set_network(&result);
+            result
+        });
 
         // Main thread: CWD + git + project + docker (sequential chain)
         let cwd = window.as_ref().and_then(|w| {
@@ -250,8 +300,10 @@ pub fn gather(pre_captured: Option<WindowContext>) -> EnvironmentContext {
 
         let main = (cwd, git_ctx, project_ctx, docker_ctx);
         let stack = stack_handle.join().ok().flatten();
+        let clipboard = clipboard_handle.join().ok().flatten();
+        let net = network_handle.join().ok().flatten();
 
-        (main, stack)
+        (main, stack, clipboard, net)
     });
 
     let (cwd, git_ctx, project_ctx, docker_ctx) = main_result;
@@ -316,6 +368,20 @@ pub fn gather(pre_captured: Option<WindowContext>) -> EnvironmentContext {
         .map(|w| w.wm_class.clone())
         .or_else(|| stack_terminal.as_ref().map(|t| t.wm_class.clone()));
 
+    // Parse browser context when a browser is focused
+    let browser = window.as_ref().and_then(|w| {
+        if app_class::classify(&w.wm_class) == app_class::AppClass::Browser {
+            let ctx = browser_context::parse_title(&w.title);
+            if matches!(ctx, browser_context::BrowserContext::Unknown) {
+                None
+            } else {
+                Some(ctx)
+            }
+        } else {
+            None
+        }
+    });
+
     EnvironmentContext {
         active_window: window,
         cwd,
@@ -325,6 +391,9 @@ pub fn gather(pre_captured: Option<WindowContext>) -> EnvironmentContext {
         project: project_ctx,
         docker: docker_ctx,
         hour: chrono::Local::now().hour() as u8,
+        clipboard: clipboard_result,
+        browser,
+        network: network_result,
         gather_ms: start.elapsed().as_millis() as u64,
     }
 }
@@ -399,7 +468,7 @@ mod tests {
             gather_ms: 0,
             ..Default::default()
         };
-        for item in suggestions::suggest(&test_ctx) {
+        for item in suggestions::suggest(&test_ctx, None) {
             println!(
                 "  {} — {}",
                 item.label,

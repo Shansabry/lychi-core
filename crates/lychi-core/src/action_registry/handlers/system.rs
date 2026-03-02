@@ -103,6 +103,146 @@ fn simple_actions() -> &'static [SimpleAction] {
     ]
 }
 
+/// Parse a scheduled shutdown like "shutdown in 30 minutes", "shutdown in 1 hour".
+/// Returns the number of minutes, or None if not matched.
+fn parse_shutdown_in(input: &str) -> Option<u32> {
+    let lower = input.to_lowercase();
+    // Match: "shutdown in <n> [minutes|mins|min|m|hours|hour|hrs|hr|h]"
+    let rest = lower
+        .strip_prefix("shutdown in ")
+        .or_else(|| lower.strip_prefix("shut down in "))?;
+    let rest = rest.trim();
+
+    // Try "<n> <unit>" or just "<n>" (default minutes)
+    let (num_str, unit) = if let Some(pos) = rest.find(|c: char| !c.is_ascii_digit()) {
+        let (n, u) = rest.split_at(pos);
+        (n.trim(), u.trim())
+    } else {
+        (rest, "")
+    };
+
+    let n: u32 = num_str.parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+
+    let minutes = match unit {
+        "" | "m" | "min" | "mins" | "minute" | "minutes" => n,
+        "h" | "hr" | "hrs" | "hour" | "hours" => n.checked_mul(60)?,
+        _ => return None,
+    };
+
+    Some(minutes)
+}
+
+/// A paired Bluetooth device (MAC + name).
+struct BtDevice {
+    mac: String,
+    name: String,
+}
+
+/// List paired Bluetooth devices via `bluetoothctl devices Paired`.
+fn list_bt_devices() -> Vec<BtDevice> {
+    let output = match run_cmd_output("bluetoothctl", &["devices", "Paired"]) {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    // Each line: "Device AA:BB:CC:DD:EE:FF Device Name"
+    output
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("Device ")?;
+            let (mac, name) = rest.split_once(' ')?;
+            Some(BtDevice {
+                mac: mac.to_string(),
+                name: name.trim().to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Check if a device is currently connected.
+fn bt_device_connected(mac: &str) -> bool {
+    if let Ok(info) = run_cmd_output("bluetoothctl", &["info", mac]) {
+        info.lines()
+            .any(|l| l.trim().starts_with("Connected:") && l.contains("yes"))
+    } else {
+        false
+    }
+}
+
+/// Fuzzy match a device name (case-insensitive substring).
+fn find_bt_device<'a>(devices: &'a [BtDevice], query: &str) -> Option<&'a BtDevice> {
+    let q = query.to_lowercase();
+    // Exact match first
+    if let Some(d) = devices.iter().find(|d| d.name.to_lowercase() == q) {
+        return Some(d);
+    }
+    // Substring match
+    devices.iter().find(|d| d.name.to_lowercase().contains(&q))
+}
+
+/// Handle `connect bluetooth <device>` / `disconnect bluetooth <device>`.
+/// Returns `Some(Ok/Err)` if matched, `None` if not a bluetooth connect/disconnect command.
+fn try_bluetooth_connect(input: &str) -> Option<Result<String, String>> {
+    let lower = input.to_lowercase();
+
+    let (action, query) = if let Some(q) = lower
+        .strip_prefix("connect bluetooth ")
+        .or_else(|| lower.strip_prefix("connect bt "))
+        .or_else(|| lower.strip_prefix("bluetooth connect "))
+        .or_else(|| lower.strip_prefix("bt connect "))
+    {
+        ("connect", q.trim())
+    } else if let Some(q) = lower
+        .strip_prefix("disconnect bluetooth ")
+        .or_else(|| lower.strip_prefix("disconnect bt "))
+        .or_else(|| lower.strip_prefix("bluetooth disconnect "))
+        .or_else(|| lower.strip_prefix("bt disconnect "))
+    {
+        ("disconnect", q.trim())
+    } else {
+        return None;
+    };
+
+    if query.is_empty() {
+        return Some(Err(
+            "No device name specified. Try: connect bluetooth <device name>".into(),
+        ));
+    }
+
+    let devices = list_bt_devices();
+    if devices.is_empty() {
+        return Some(Err("No paired Bluetooth devices found".into()));
+    }
+
+    let device = match find_bt_device(&devices, query) {
+        Some(d) => d,
+        None => {
+            let names: Vec<&str> = devices.iter().map(|d| d.name.as_str()).collect();
+            return Some(Err(format!(
+                "No paired device matching '{}'. Available: {}",
+                query,
+                names.join(", ")
+            )));
+        }
+    };
+
+    let result = run_cmd("bluetoothctl", &[action, &device.mac]);
+    Some(match result {
+        Ok(()) => Ok(format!(
+            "{}ed {}",
+            if action == "connect" {
+                "Connect"
+            } else {
+                "Disconnect"
+            },
+            device.name
+        )),
+        Err(e) => Err(format!("Failed to {} {}: {}", action, device.name, e)),
+    })
+}
+
 /// Handle parameterized actions (volume/brightness with args).
 /// Returns `Some(Ok/Err)` if matched, `None` if not a parameterized action.
 fn try_parameterized(input: &str) -> Option<Result<String, String>> {
@@ -148,6 +288,31 @@ fn try_parameterized(input: &str) -> Option<Result<String, String>> {
                     .map(|()| format!("Brightness set to {n}%")),
             );
         }
+    }
+
+    // --- Scheduled shutdown ---
+    if let Some(minutes) = parse_shutdown_in(input) {
+        return Some(run_cmd("shutdown", &[&format!("+{minutes}")]).map(|()| {
+            if minutes >= 60 && minutes % 60 == 0 {
+                format!(
+                    "Shutdown scheduled in {} hour{}",
+                    minutes / 60,
+                    if minutes / 60 == 1 { "" } else { "s" }
+                )
+            } else {
+                format!(
+                    "Shutdown scheduled in {minutes} minute{}",
+                    if minutes == 1 { "" } else { "s" }
+                )
+            }
+        }));
+    }
+
+    // --- Cancel scheduled shutdown ---
+    if lower == "cancel shutdown" || lower == "shutdown cancel" {
+        return Some(
+            run_cmd("shutdown", &["-c"]).map(|()| "Scheduled shutdown cancelled".to_string()),
+        );
     }
 
     None
@@ -248,6 +413,8 @@ fn whoami() -> String {
 /// All action names for completions (simple + parameterized).
 const ALL_ACTION_NAMES: &[(&str, &str)] = &[
     ("shutdown", "Power off the system"),
+    ("shutdown in <n> minutes", "Schedule shutdown in n minutes"),
+    ("cancel shutdown", "Cancel a scheduled shutdown"),
     ("reboot", "Restart the system"),
     ("suspend", "Suspend (sleep) the system"),
     ("hibernate", "Hibernate the system"),
@@ -265,6 +432,14 @@ const ALL_ACTION_NAMES: &[(&str, &str)] = &[
     ("wifi off", "Disable WiFi"),
     ("bluetooth on", "Enable Bluetooth"),
     ("bluetooth off", "Disable Bluetooth"),
+    (
+        "connect bluetooth <device>",
+        "Connect to a paired Bluetooth device",
+    ),
+    (
+        "disconnect bluetooth <device>",
+        "Disconnect a Bluetooth device",
+    ),
 ];
 
 #[async_trait]
@@ -304,7 +479,40 @@ impl ActionHandler for SystemCommand {
             });
         }
 
-        // Try parameterized actions first (volume N, brightness N)
+        // Try bluetooth connect/disconnect
+        if let Some(result) = try_bluetooth_connect(input) {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            return match result {
+                Ok(msg) => Ok(ActionResult {
+                    success: true,
+                    output: Some(msg),
+                    error: None,
+                    duration_ms,
+                    routed_by: None,
+                    open_url: None,
+                    needs_confirmation: None,
+                    risk_level: None,
+                    output_type: Some(OutputType::Status),
+                    executed_args: None,
+                    launch_desktop: None,
+                }),
+                Err(e) => Ok(ActionResult {
+                    success: false,
+                    output: None,
+                    error: Some(e),
+                    duration_ms,
+                    routed_by: None,
+                    open_url: None,
+                    needs_confirmation: None,
+                    risk_level: None,
+                    output_type: None,
+                    executed_args: None,
+                    launch_desktop: None,
+                }),
+            };
+        }
+
+        // Try parameterized actions (volume N, brightness N, shutdown in N)
         if let Some(result) = try_parameterized(input) {
             let duration_ms = start.elapsed().as_millis() as u64;
             return match result {
@@ -394,7 +602,7 @@ impl ActionHandler for SystemCommand {
 
     async fn completions(&self, partial: &str) -> Vec<CompletionItem> {
         let lower = partial.to_lowercase();
-        ALL_ACTION_NAMES
+        let mut items: Vec<CompletionItem> = ALL_ACTION_NAMES
             .iter()
             .filter(|(name, _)| name.contains(&lower) || lower.is_empty())
             .map(|(name, desc)| CompletionItem {
@@ -404,7 +612,39 @@ impl ActionHandler for SystemCommand {
                 description: Some(desc.to_string()),
                 reason: None,
             })
-            .collect()
+            .collect();
+
+        // Show paired devices for bluetooth connect/disconnect queries
+        let bt_prefix = if lower.starts_with("connect bluetooth")
+            || lower.starts_with("connect bt")
+            || lower.starts_with("bluetooth connect")
+        {
+            Some("connect bluetooth")
+        } else if lower.starts_with("disconnect bluetooth")
+            || lower.starts_with("disconnect bt")
+            || lower.starts_with("bluetooth disconnect")
+        {
+            Some("disconnect bluetooth")
+        } else {
+            None
+        };
+
+        if let Some(action) = bt_prefix {
+            let devices = list_bt_devices();
+            for dev in &devices {
+                let connected = bt_device_connected(&dev.mac);
+                let status = if connected { "connected" } else { "paired" };
+                items.push(CompletionItem {
+                    label: format!("{action} {}", dev.name),
+                    icon_path: None,
+                    score: 90,
+                    description: Some(format!("{} ({})", dev.name, status)),
+                    reason: None,
+                });
+            }
+        }
+
+        items
     }
 }
 
@@ -476,5 +716,96 @@ mod tests {
         assert!(!DESTRUCTIVE_ACTIONS.contains(&"wifi on"));
         assert!(!DESTRUCTIVE_ACTIONS.contains(&"brightness up"));
         assert!(!DESTRUCTIVE_ACTIONS.contains(&"lock"));
+    }
+
+    #[test]
+    fn test_parse_shutdown_in() {
+        // Minutes
+        assert_eq!(parse_shutdown_in("shutdown in 30 minutes"), Some(30));
+        assert_eq!(parse_shutdown_in("shutdown in 30 mins"), Some(30));
+        assert_eq!(parse_shutdown_in("shutdown in 30 min"), Some(30));
+        assert_eq!(parse_shutdown_in("shutdown in 30m"), Some(30));
+        assert_eq!(parse_shutdown_in("shutdown in 30"), Some(30));
+        assert_eq!(parse_shutdown_in("shutdown in 1 minute"), Some(1));
+
+        // Hours
+        assert_eq!(parse_shutdown_in("shutdown in 1 hour"), Some(60));
+        assert_eq!(parse_shutdown_in("shutdown in 2 hours"), Some(120));
+        assert_eq!(parse_shutdown_in("shutdown in 1h"), Some(60));
+        assert_eq!(parse_shutdown_in("shutdown in 2hr"), Some(120));
+
+        // "shut down" variant
+        assert_eq!(parse_shutdown_in("shut down in 30 minutes"), Some(30));
+        assert_eq!(parse_shutdown_in("shut down in 1 hour"), Some(60));
+
+        // Case insensitive
+        assert_eq!(parse_shutdown_in("Shutdown In 30 Minutes"), Some(30));
+
+        // Edge cases
+        assert_eq!(parse_shutdown_in("shutdown in 0 minutes"), None); // 0 not allowed
+        assert_eq!(parse_shutdown_in("shutdown in abc"), None);
+        assert_eq!(parse_shutdown_in("shutdown"), None);
+        assert_eq!(parse_shutdown_in("shutdown in"), None);
+    }
+
+    #[test]
+    fn test_scheduled_shutdown_parameterized() {
+        // Scheduled shutdown should match as parameterized
+        assert!(try_parameterized("shutdown in 30 minutes").is_some());
+        assert!(try_parameterized("shutdown in 1 hour").is_some());
+        assert!(try_parameterized("shut down in 30 minutes").is_some());
+
+        // Cancel shutdown should match
+        assert!(try_parameterized("cancel shutdown").is_some());
+        assert!(try_parameterized("shutdown cancel").is_some());
+    }
+
+    #[test]
+    fn test_bluetooth_connect_parsing() {
+        // All prefix variants should match
+        assert!(try_bluetooth_connect("connect bluetooth speaker").is_some());
+        assert!(try_bluetooth_connect("connect bt speaker").is_some());
+        assert!(try_bluetooth_connect("bluetooth connect speaker").is_some());
+        assert!(try_bluetooth_connect("bt connect speaker").is_some());
+        assert!(try_bluetooth_connect("disconnect bluetooth speaker").is_some());
+        assert!(try_bluetooth_connect("disconnect bt speaker").is_some());
+        assert!(try_bluetooth_connect("bluetooth disconnect speaker").is_some());
+        assert!(try_bluetooth_connect("bt disconnect speaker").is_some());
+
+        // Empty device name should not match
+        assert!(try_bluetooth_connect("connect bluetooth ").is_some()); // gets "No device name" error
+        assert!(try_bluetooth_connect("mute").is_none());
+        assert!(try_bluetooth_connect("bluetooth on").is_none());
+    }
+
+    #[test]
+    fn test_find_bt_device() {
+        let devices = vec![
+            BtDevice {
+                mac: "AA:BB:CC:DD:EE:FF".into(),
+                name: "Mi Portable BT Speaker 16W".into(),
+            },
+            BtDevice {
+                mac: "11:22:33:44:55:66".into(),
+                name: "AirPods Pro".into(),
+            },
+        ];
+
+        // Exact match
+        let d = find_bt_device(&devices, "AirPods Pro");
+        assert!(d.is_some());
+        assert_eq!(d.unwrap().mac, "11:22:33:44:55:66");
+
+        // Substring match
+        let d = find_bt_device(&devices, "speaker");
+        assert!(d.is_some());
+        assert_eq!(d.unwrap().mac, "AA:BB:CC:DD:EE:FF");
+
+        // Case insensitive
+        let d = find_bt_device(&devices, "airpods");
+        assert!(d.is_some());
+
+        // No match
+        assert!(find_bt_device(&devices, "headphones").is_none());
     }
 }

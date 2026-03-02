@@ -90,6 +90,36 @@ pub fn record(db: &Arc<Database>, key: &str) -> Result<(), LychiError> {
     Ok(())
 }
 
+/// Record a workspace-scoped access.
+///
+/// Key format: `ws:<project_root>:<command>` — scoped frecency that tracks
+/// which commands are frequently used in which project directory.
+pub fn record_workspace(
+    db: &Arc<Database>,
+    project_root: &str,
+    command: &str,
+) -> Result<(), LychiError> {
+    let normalized = project_root.trim_end_matches('/');
+    let key = format!("ws:{normalized}:{command}");
+    record(db, &key)
+}
+
+/// Get workspace-scoped frecency scores for a specific project.
+///
+/// Returns a map of `command -> score` for commands previously run in this project.
+pub fn get_workspace_scores(db: &Arc<Database>, project_root: &str) -> HashMap<String, f64> {
+    let normalized = project_root.trim_end_matches('/');
+    let prefix = format!("ws:{normalized}:");
+    let all_scores = get_scores(db);
+    all_scores
+        .into_iter()
+        .filter_map(|(key, score)| {
+            key.strip_prefix(&prefix)
+                .map(|cmd| (cmd.to_string(), score))
+        })
+        .collect()
+}
+
 /// Get frecency scores for all tracked items.
 /// Returns a map of key -> score (0.0 to 1.0).
 pub fn get_scores(db: &Arc<Database>) -> HashMap<String, f64> {
@@ -149,6 +179,31 @@ mod tests {
             recent_timestamps: vec![],
         };
         assert_eq!(entry.score(1_700_000_000_000), 0.0);
+    }
+
+    #[test]
+    fn test_workspace_record_and_get() {
+        let db = crate::db::open_test_database();
+        let root = "/home/user/projects/lychi";
+
+        record_workspace(&db, root, "cargo build").unwrap();
+        record_workspace(&db, root, "cargo build").unwrap();
+        record_workspace(&db, root, "cargo test").unwrap();
+        record_workspace(&db, "/other/project", "npm run dev").unwrap();
+
+        let scores = get_workspace_scores(&db, root);
+        assert!(scores.contains_key("cargo build"));
+        assert!(scores.contains_key("cargo test"));
+        assert!(!scores.contains_key("npm run dev")); // different project
+        assert!(scores["cargo build"] > scores["cargo test"]); // more accesses
+    }
+
+    #[test]
+    fn test_workspace_trailing_slash() {
+        let db = crate::db::open_test_database();
+        record_workspace(&db, "/home/user/project/", "make").unwrap();
+        let scores = get_workspace_scores(&db, "/home/user/project");
+        assert!(scores.contains_key("make"));
     }
 
     #[test]

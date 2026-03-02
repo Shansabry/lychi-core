@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use tokio::sync::RwLock;
 
 use redb::Database;
@@ -54,6 +54,15 @@ pub struct AppState {
     pub pending_plan: Arc<RwLock<Option<AgentPlan>>>,
     pub active_file_search: Arc<AtomicU64>,
     pub timer_state: TimerState,
+    /// Dismiss-on-blur armed flag. Set true when the user interacts with the
+    /// launcher (key press, pointer click). Reset on hide. Focus-out only
+    /// dismisses if this is true, avoiding KWin's automatic focus revoke
+    /// (~9ms after show) from triggering a false dismiss.
+    pub dismiss_armed: Arc<AtomicBool>,
+    /// Monotonic summon sequence. Incremented at the start of each show_window().
+    /// Focus handlers check this to ignore stale events from previous summon
+    /// cycles (e.g. rapid double-summon).
+    pub summon_seq: Arc<AtomicU64>,
     #[cfg(feature = "mpris")]
     pub mpris: Arc<RwLock<Option<MprisManager>>>,
 }
@@ -215,6 +224,8 @@ impl AppState {
             pending_plan: Arc::new(RwLock::new(None)),
             active_file_search: Arc::new(AtomicU64::new(0)),
             timer_state,
+            dismiss_armed: Arc::new(AtomicBool::new(false)),
+            summon_seq: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "mpris")]
             mpris,
         }

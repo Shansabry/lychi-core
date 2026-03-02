@@ -98,7 +98,6 @@ let atPathContext = $derived.by(() => {
 
 let settingsOpen = $state(false);
 let hideOnBlur = $state(true);
-let blurEnabled = $state(false);
 let windowStrategy = $state("x11"); // "layer-shell" or "x11" — drives layout mode
 
 let pendingPlan: AgentPlan | null = $state(null);
@@ -365,11 +364,6 @@ onMount(() => {
 	// Guard: only attach Tauri listeners if running inside Tauri
 	if (!("__TAURI_INTERNALS__" in window)) return;
 
-	// Grace period — ignore blur events during startup (WMs can fire blur during show)
-	setTimeout(() => {
-		blurEnabled = true;
-	}, 500);
-
 	let unlisteners: (() => void)[] = [];
 
 	(async () => {
@@ -406,15 +400,15 @@ onMount(() => {
 			routingGeneration++;
 			isRouting = false;
 			cancelFileSearch();
-			// Re-arm blur after grace period on each summon
-			blurEnabled = false;
-			setTimeout(() => {
-				blurEnabled = true;
-			}, 300);
-			// Force focus the input (layer shell may not auto-focus DOM elements)
+			// Force focus the input (layer shell may not auto-focus DOM elements).
+			// Double-tap: rAF for immediate attempt, setTimeout for delayed retry
+			// in case the compositor grants surface focus slightly late.
 			requestAnimationFrame(() => {
 				document.querySelector<HTMLInputElement>(".input-container input")?.focus();
 			});
+			setTimeout(() => {
+				document.querySelector<HTMLInputElement>(".input-container input")?.focus();
+			}, 50);
 		});
 		unlisteners.push(unlistenSummon);
 
@@ -499,13 +493,6 @@ onMount(() => {
 		);
 		unlisteners.push(unlistenFileSearch);
 
-		// Ctrl+Shift+I: disable blur so devtools can open
-		window.addEventListener("keydown", (e) => {
-			if (e.ctrlKey && e.shiftKey && e.key === "I") {
-				blurEnabled = false;
-			}
-		});
-
 		// Prevent WebKitGTK from stealing tab_back for native focus navigation
 		window.addEventListener(
 			"keydown",
@@ -517,52 +504,33 @@ onMount(() => {
 			true,
 		);
 
-		// Hide on blur — dismiss when focus leaves the window (click outside, Alt+Tab, etc.).
-		let dismissing = false;
-		function handleBlurDismiss() {
-			if (dismissing || !hideOnBlur || !blurEnabled) return;
-			// If a panel is open, close it first instead of dismissing the whole launcher
+		// Dismiss on blur — Rust emits lychi://dismiss when GTK focus is lost
+		// and dismiss is armed. Single signal, no grace periods, no race conditions.
+		const unlistenDismiss = await win.listen("lychi://dismiss", () => {
+			if (!hideOnBlur) return;
 			if (settingsOpen || notesOpen) {
 				settingsOpen = false;
 				notesOpen = false;
 				return;
 			}
-			dismissing = true;
-			blurEnabled = false; // Prevent re-trigger during hide animation
-			// Hide immediately (no closing animation) — blur dismiss should feel instant.
-			// State cleanup happens after hide so the user never sees completions vanish first.
-			invoke("hide_launcher")
-				.then(() => {
-					if (searchMode) {
-						cancelFileSearch();
-						searchMode = false;
-					}
-					completions = [];
-					completionIndex = -1;
-					atMode = false;
-					atStart = -1;
-				})
-				.finally(() => {
-					dismissing = false;
-				});
-		}
-
-		const unlistenFocus = await win.onFocusChanged(({ payload: focused }) => {
-			if (!focused) handleBlurDismiss();
+			invoke("hide_launcher").then(() => {
+				if (searchMode) {
+					cancelFileSearch();
+					searchMode = false;
+				}
+				completions = [];
+				completionIndex = -1;
+				atMode = false;
+				atStart = -1;
+			});
 		});
-		unlisteners.push(unlistenFocus);
+		unlisteners.push(unlistenDismiss);
 
-		// GTK-level focus-out — catches blur when Tauri's JS bridge misses it
-		const unlistenGtkBlur = await win.listen("lychi://gtk-blur", () => {
-			handleBlurDismiss();
+		// GTK-level Escape — catches Escape even when WebView input lacks DOM focus
+		const unlistenGtkEscape = await win.listen("lychi://gtk-escape", () => {
+			handleDismiss();
 		});
-		unlisteners.push(unlistenGtkBlur);
-
-		// Focus watchdog — catches compositors that don't fire keyboard.leave
-		const unlistenWatchdog = await win.listen("lychi://focus-watchdog-dismiss", () => {
-			handleBlurDismiss();
-		});
-		unlisteners.push(unlistenWatchdog);
+		unlisteners.push(unlistenGtkEscape);
 
 		// Persist window position on move (debounced).
 		// Skip (0,0) — Wayland doesn't report real positions.
@@ -1161,7 +1129,7 @@ async function handleDismiss() {
 }
 </script>
 
-<div class="launcher-wrapper" class:layer-shell={windowStrategy === 'layer-shell'} role="presentation" onmousedown={(e) => { if (windowStrategy !== 'layer-shell' && e.target === e.currentTarget) hideWindow(); }}>
+<div class="launcher-wrapper" class:layer-shell={windowStrategy === 'layer-shell'} role="presentation" onmousedown={(e) => { if ((windowStrategy === 'x11' || windowStrategy === 'toplevel') && e.target === e.currentTarget) hideWindow(); }}>
 	<div class="launcher-row">
 	<main>
 		<CommandInput

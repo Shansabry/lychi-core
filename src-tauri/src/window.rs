@@ -1,12 +1,21 @@
+use std::sync::atomic::Ordering;
+
 use tauri::{Emitter, Manager, WebviewWindow};
 
 use crate::state::AppState;
 
+/// Short thread identifier for debug logs.
+fn tid() -> String {
+    std::thread::current().name().unwrap_or("?").to_string()
+}
+
 /// Toggle the launcher window visibility.
 pub fn toggle_window(window: &WebviewWindow) {
     if window.is_visible().unwrap_or(false) {
+        // Disarm dismiss so focus-out during hide doesn't re-trigger
+        let state = window.app_handle().state::<AppState>();
+        state.dismiss_armed.store(false, Ordering::SeqCst);
         let _ = window.hide();
-        let _ = window.emit("lychi://hidden", ());
     } else {
         show_window(window);
     }
@@ -23,38 +32,63 @@ pub fn show_window(window: &WebviewWindow) {
         state.config.blocking_read().general.monitor_mode.clone()
     };
 
+    // Increment summon sequence — makes stale focus events from previous
+    // summon cycles harmless (focus handlers compare against current seq).
+    let seq = {
+        let state = window.app_handle().state::<AppState>();
+        state.summon_seq.fetch_add(1, Ordering::SeqCst) + 1
+    };
+    tracing::info!("[show] === show_window BEGIN (seq={seq}, t={}) ===", tid());
+
+    // Reset dismiss armed — will be re-armed by user interaction (key/click).
+    {
+        let state = window.app_handle().state::<AppState>();
+        state.dismiss_armed.store(false, Ordering::SeqCst);
+    }
+    tracing::info!("[show] seq={seq} armed=false");
+
     // Snapshot the active window BEFORE we show Lychi (otherwise we'd detect ourselves).
     let pre_window = lychi_core::context::snapshot_active_window();
 
-    // Reposition the window to the target monitor BEFORE showing it.
-    // GDK/GTK calls must run on the GLib main thread, so dispatch via
-    // glib::MainContext and block until complete (same pattern as open_uri).
+    // Reposition + show + focus all run on the GLib main thread in one invoke.
     {
         let window_clone = window.clone();
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
         glib::MainContext::default().invoke(move || {
+            let t = std::thread::current().name().unwrap_or("?").to_string();
+
+            tracing::info!("[show] seq={seq} t={t} reposition BEGIN");
             if let Some(monitor) = crate::platform::get_monitor_for_mode(&monitor_mode) {
                 crate::platform::reposition_to_monitor(&window_clone, &monitor);
             }
-            let _ = tx.send(());
+            tracing::info!("[show] seq={seq} t={t} reposition END");
+
+            tracing::info!("[show] seq={seq} t={t} window.show()");
+            if let Err(e) = window_clone.show() {
+                tracing::error!("Failed to show window: {e}");
+                let _ = tx.send(false);
+                return;
+            }
+
+            tracing::info!("[show] seq={seq} t={t} focus_window()");
+            crate::platform::focus_window(&window_clone);
+
+            tracing::info!("[show] seq={seq} t={t} set_focus()");
+            if let Err(e) = window_clone.set_focus() {
+                tracing::error!("Failed to focus window: {e}");
+            }
+
+            let _ = tx.send(true);
         });
-        // Wait for GLib to complete the reposition before calling show()
-        let _ = rx.recv();
+        let ok = rx.recv().unwrap_or(false);
+        if !ok {
+            return;
+        }
     }
 
-    if let Err(e) = window.show() {
-        tracing::error!("Failed to show window: {e}");
-        return;
-    }
-
-    crate::platform::focus_window(window);
-
-    if let Err(e) = window.set_focus() {
-        tracing::error!("Failed to focus window: {e}");
-    }
-
-    // Tell frontend to reset state (clear input, refocus input element)
+    tracing::info!("[show] seq={seq} emitting lychi://summon");
     let _ = window.emit("lychi://summon", ());
+    tracing::info!("[show] === show_window END (seq={seq}) ===");
 
     // Fast path: emit last-known context immediately so suggestions appear
     // before the fresh gather completes (typically saves 50-200ms).
