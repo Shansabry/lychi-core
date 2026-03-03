@@ -2,6 +2,7 @@
 import { File, FileQuestion, FileText, Folder, Image, LoaderCircle } from "lucide-svelte";
 import { marked } from "marked";
 import { type FilePreviewData, getFilePreview } from "$lib/ipc";
+import { sanitizeMarkdown } from "$lib/sanitize";
 
 let {
 	filePath,
@@ -58,7 +59,7 @@ $effect(() => {
 // Render markdown to HTML
 let renderedMarkdown = $derived.by(() => {
 	if (preview && preview.kind === "Text" && preview.language === "markdown") {
-		return marked.parse(preview.content);
+		return sanitizeMarkdown(marked.parse(preview.content) as string);
 	}
 	return "";
 });

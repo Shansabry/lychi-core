@@ -78,6 +78,14 @@ pub async fn execute_command(
         let _ = rx.await;
     }
 
+    // Smart-open: focus the running window if the app was already open.
+    if let Some(ref wm_class) = exec.result.focus_app {
+        use lychi_core::action_registry::handlers::app_control;
+        if let Err(e) = app_control::focus_by_class(wm_class) {
+            tracing::warn!("[open] focus_by_class({wm_class}) failed: {e}");
+        }
+    }
+
     Ok(exec.result)
 }
 

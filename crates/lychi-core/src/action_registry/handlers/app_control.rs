@@ -27,13 +27,13 @@ impl AppControlHandler {
 
 /// A running window discovered from the window manager.
 #[derive(Debug, Clone)]
-struct RunningWindow {
+pub(crate) struct RunningWindow {
     /// X11 window ID (only set on X11 sessions)
     window_id: Option<u32>,
     /// Window title
     title: String,
     /// WM class or app name (lowercase)
-    wm_class: String,
+    pub(crate) wm_class: String,
     /// Process ID
     pid: u32,
 }
@@ -48,7 +48,7 @@ static WINDOW_CACHE: Mutex<Option<WindowCache>> = Mutex::new(None);
 const CACHE_TTL_SECS: u64 = 2;
 
 /// Get the list of running windows, using cache if fresh.
-fn get_windows() -> Vec<RunningWindow> {
+pub(crate) fn get_windows() -> Vec<RunningWindow> {
     if let Ok(cache) = WINDOW_CACHE.lock()
         && let Some(ref c) = *cache
         && c.fetched_at.elapsed().as_secs() < CACHE_TTL_SECS
@@ -110,7 +110,10 @@ fn matches_window(window: &RunningWindow, query: &str) -> bool {
 }
 
 /// Find the best matching window for a query.
-fn find_window<'a>(windows: &'a [RunningWindow], query: &str) -> Option<&'a RunningWindow> {
+pub(crate) fn find_window<'a>(
+    windows: &'a [RunningWindow],
+    query: &str,
+) -> Option<&'a RunningWindow> {
     let query_lower = query.to_lowercase();
 
     // Exact class match first
@@ -158,6 +161,15 @@ fn do_focus(window: &RunningWindow) -> Result<(), String> {
 #[cfg(not(target_os = "linux"))]
 fn do_focus(_window: &RunningWindow) -> Result<(), String> {
     Err("Window focus not supported on this platform".to_string())
+}
+
+/// Focus a running window by WM class. Used by smart-open in the Tauri bridge.
+/// Returns Ok(()) if a matching window was found and focused, Err otherwise.
+pub fn focus_by_class(wm_class: &str) -> Result<(), String> {
+    let windows = get_windows();
+    let window = find_window(&windows, wm_class)
+        .ok_or_else(|| format!("No running window with class '{wm_class}'"))?;
+    do_focus(window)
 }
 
 /// Gracefully close a window natively.

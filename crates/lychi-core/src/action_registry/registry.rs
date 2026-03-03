@@ -84,6 +84,7 @@ mod tests {
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             })
         }
     }

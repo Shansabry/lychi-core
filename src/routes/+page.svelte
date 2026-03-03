@@ -99,6 +99,9 @@ let atPathContext = $derived.by(() => {
 let settingsOpen = $state(false);
 let hideOnBlur = $state(true);
 let windowStrategy = $state("x11"); // "layer-shell" or "x11" — drives layout mode
+// Prevents stale-completions flash: kept false until summon clears state, so the
+// first compositor frame is always a clean empty launcher.
+let launcherReady = $state(false);
 
 let pendingPlan: AgentPlan | null = $state(null);
 let planPanelRef: AgentPlanPanel | undefined = $state(undefined);
@@ -383,6 +386,7 @@ onMount(() => {
 
 		// Listen for summon event from Rust (global shortcut / IPC toggle)
 		const unlistenSummon = await win.listen("lychi://summon", () => {
+			launcherReady = true;
 			inputValue = "";
 			lastResult = null;
 			historyOpen = false;
@@ -415,11 +419,15 @@ onMount(() => {
 		// Listen for context-ready event from async context gathering
 		const unlistenContext = await win.listen<EnvironmentContext>("lychi://context-ready", (e) => {
 			envContext = e.payload;
-			// Fetch context suggestions if input is empty
-			const input = document.querySelector<HTMLInputElement>(".input-container input");
-			if (input && input.value.trim().length < 1) {
+			// Fetch context suggestions only if the input is still empty.
+			// Use Svelte state (inputValue) not a DOM query — DOM can be stale when
+			// focus hasn't been granted yet. Guard with completionGen so a fast typist
+			// doesn't get their completions overwritten by the context response.
+			if (inputValue.trim().length < 1) {
+				const gen = ++completionGen;
 				getCompletions("")
 					.then((results) => {
+						if (gen !== completionGen) return;
 						completions = results;
 						completionIndex = results.length > 0 ? 0 : -1;
 					})
@@ -555,6 +563,12 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 	// Allow submit when input is empty but a context suggestion is selected
 	const hasSelectedCompletion = completions.length > 0 && completionIndex >= 0;
 	if ((!trimmed && !hasSelectedCompletion) || isExecuting || !backendReady) return;
+
+	// Ctrl+Enter: force web search regardless of completions or routing
+	if (opts?.ctrlKey && trimmed) {
+		await runCommand(`web ${trimmed}`);
+		return;
+	}
 
 	// If a plan is showing and user presses Enter, execute it
 	if (pendingPlan) return;
@@ -731,6 +745,12 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 			} else if (KNOWN_PREFIXES.has(lower)) {
 				// Input is a bare prefix (e.g. "clip", "focus") — send prefix + selected label
 				await runCommand(`${lower} ${selected.label}`);
+			} else if (selected.icon_path === "__web__" || selected.label.startsWith("Search web:")) {
+				// Web search completion — extract query and run directly
+				const query = selected.label.startsWith("Search web:")
+					? selected.label.slice("Search web:".length).trim()
+					: selected.label;
+				await runCommand(`web ${query}`);
 			} else if (selected.icon_path === "__context__") {
 				// Context suggestion — label is a complete command (e.g. "git commit", "run cargo build")
 				await runCommand(selected.label);
@@ -814,7 +834,7 @@ async function runCommand(command: string) {
 		// If the backend wants us to open a URI, use GDK (proper Wayland focus transfer)
 		// But if output is also present (e.g. "ask" handler), show inline result instead
 		if (lastResult.open_url && !lastResult.output) {
-			await hideWindow();
+			await hide();
 			await openUri(lastResult.open_url);
 		} else if (lastResult.output === "__media_panel__") {
 			mediaOpen = true;
@@ -869,7 +889,7 @@ async function runCommand(command: string) {
 			lastResult = null;
 			fetchAtCompletions(dir);
 		} else if (lastResult.success && !lastResult.output) {
-			await hideWindow();
+			await hide();
 		}
 	} catch (err) {
 		lastResult = {
@@ -899,10 +919,10 @@ async function handleConfirm() {
 		historyEntries = [...historyEntries, lastCommand];
 		inputValue = "";
 		if (lastResult.open_url && !lastResult.output) {
-			await hideWindow();
+			await hide();
 			await openUri(lastResult.open_url);
 		} else if (lastResult.success && !lastResult.output) {
-			await hideWindow();
+			await hide();
 		}
 	} catch (err) {
 		lastResult = { success: false, output: null, error: String(err), duration_ms: 0 };
@@ -923,7 +943,7 @@ async function openFileByLabel(label: string) {
 	completionIndex = -1;
 	cancelFileSearch();
 	inputValue = "";
-	await hideWindow();
+	await hide();
 	await openUri(`file://${label}`);
 }
 
@@ -985,6 +1005,15 @@ function handleCompletionSelect(label: string, forceOpen?: boolean) {
 	if (item?.description && label.startsWith("Did you mean:")) {
 		inputValue = item.description;
 		handleInput(inputValue);
+		return;
+	}
+
+	// Web search completion — extract query and run directly
+	if (item?.icon_path === "__web__" || label.startsWith("Search web:")) {
+		const query = label.startsWith("Search web:")
+			? label.slice("Search web:".length).trim()
+			: label;
+		runCommand(`web ${query}`);
 		return;
 	}
 
@@ -1119,17 +1148,22 @@ function handleArrowDown() {
 	}
 }
 
+async function hide() {
+	launcherReady = false;
+	await hideWindow();
+}
+
 async function handleDismiss() {
 	// C15: Cancel in-flight AI routing immediately on ESC
 	if (isRouting) {
 		routingGeneration++;
 		isRouting = false;
 	}
-	await hideWindow();
+	await hide();
 }
 </script>
 
-<div class="launcher-wrapper" class:layer-shell={windowStrategy === 'layer-shell'} role="presentation" onmousedown={(e) => { if ((windowStrategy === 'x11' || windowStrategy === 'toplevel') && e.target === e.currentTarget) hideWindow(); }}>
+<div class="launcher-wrapper" class:layer-shell={windowStrategy === 'layer-shell'} class:not-ready={!launcherReady} role="presentation" onmousedown={(e) => { if ((windowStrategy === 'x11' || windowStrategy === 'toplevel') && e.target === e.currentTarget) hide(); }}>
 	<div class="launcher-row">
 	<main>
 		<CommandInput
@@ -1262,7 +1296,7 @@ async function handleDismiss() {
 				onconfirm={handleConfirm} ondismiss={handleConfirmDismiss}
 				onopenurl={async () => {
 					if (lastResult?.open_url) {
-						await hideWindow();
+						await hide();
 						await openUri(lastResult.open_url);
 					}
 				}}
@@ -1302,6 +1336,12 @@ async function handleDismiss() {
 		justify-content: center;
 		padding-top: 18vh;
 		background: transparent;
+	}
+
+	/* Hide until summon event clears stale state — prevents flash of previous completions */
+	.launcher-wrapper.not-ready {
+		opacity: 0;
+		pointer-events: none;
 	}
 
 	/* Layer-shell: Rust sets surface width adaptively (1070px wide or 680px narrow).

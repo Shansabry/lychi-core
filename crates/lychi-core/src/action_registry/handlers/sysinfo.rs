@@ -132,6 +132,7 @@ impl ActionHandler for SysInfoHandler {
                 output_type: Some(OutputType::Terminal),
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             }),
             Err(e) => Ok(ActionResult {
                 success: false,
@@ -145,6 +146,7 @@ impl ActionHandler for SysInfoHandler {
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             }),
         }
     }

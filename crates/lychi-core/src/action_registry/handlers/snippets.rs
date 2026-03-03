@@ -68,6 +68,7 @@ impl ActionHandler for SnippetsHandler {
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             });
         }
 
@@ -94,6 +95,7 @@ impl ActionHandler for SnippetsHandler {
                         output_type: None,
                         executed_args: None,
                         launch_desktop: None,
+                        focus_app: None,
                     });
                 }
 
@@ -114,6 +116,7 @@ impl ActionHandler for SnippetsHandler {
                     output_type: None,
                     executed_args: None,
                     launch_desktop: None,
+                    focus_app: None,
                 })
             }
             "list" | "ls" => {
@@ -131,6 +134,7 @@ impl ActionHandler for SnippetsHandler {
                         output_type: Some(OutputType::Text),
                         executed_args: None,
                         launch_desktop: None,
+                        focus_app: None,
                     });
                 }
                 let lines: Vec<String> = snippets
@@ -153,6 +157,7 @@ impl ActionHandler for SnippetsHandler {
                     output_type: Some(OutputType::Text),
                     executed_args: None,
                     launch_desktop: None,
+                    focus_app: None,
                 })
             }
             "delete" | "del" | "rm" | "remove" => {
@@ -169,6 +174,7 @@ impl ActionHandler for SnippetsHandler {
                         output_type: None,
                         executed_args: None,
                         launch_desktop: None,
+                        focus_app: None,
                     });
                 }
 
@@ -187,6 +193,7 @@ impl ActionHandler for SnippetsHandler {
                         output_type: None,
                         executed_args: None,
                         launch_desktop: None,
+                        focus_app: None,
                     });
                 }
 
@@ -204,6 +211,7 @@ impl ActionHandler for SnippetsHandler {
                     output_type: None,
                     executed_args: None,
                     launch_desktop: None,
+                    focus_app: None,
                 })
             }
             "edit" | "update" => {
@@ -225,6 +233,7 @@ impl ActionHandler for SnippetsHandler {
                         output_type: None,
                         executed_args: None,
                         launch_desktop: None,
+                        focus_app: None,
                     });
                 }
 
@@ -249,6 +258,7 @@ impl ActionHandler for SnippetsHandler {
                     output_type: None,
                     executed_args: None,
                     launch_desktop: None,
+                    focus_app: None,
                 })
             }
             // Default: search by name and copy to clipboard
@@ -272,6 +282,7 @@ impl ActionHandler for SnippetsHandler {
                             output_type: None,
                             executed_args: None,
                             launch_desktop: None,
+                            focus_app: None,
                         }),
                         Err(e) => Ok(ActionResult {
                             success: false,
@@ -285,6 +296,7 @@ impl ActionHandler for SnippetsHandler {
                             output_type: None,
                             executed_args: None,
                             launch_desktop: None,
+                            focus_app: None,
                         }),
                     }
                 } else {
@@ -300,6 +312,7 @@ impl ActionHandler for SnippetsHandler {
                         output_type: None,
                         executed_args: None,
                         launch_desktop: None,
+                        focus_app: None,
                     })
                 }
             }

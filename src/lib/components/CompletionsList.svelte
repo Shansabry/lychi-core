@@ -46,11 +46,43 @@ const POOL_INDICES = Array.from({ length: POOL_SIZE }, (_, i) => i);
 
 let listEl: HTMLUListElement | undefined = $state();
 
-// Track icon paths that failed to load — show fallback instead of broken image
+// Track icon load state — preloaded via Image() probe to avoid <img> placeholder border
 let brokenIcons = $state(new Set<string>());
+let loadedIcons = $state(new Set<string>());
+
+function iconSrc(path: string | null): string | null {
+	if (!path) return null;
+	// Sentinel values are not file paths — never pass them to the asset protocol
+	if (path.startsWith("__")) return null;
+	if ("__TAURI_INTERNALS__" in window) {
+		return convertFileSrc(path);
+	}
+	return path;
+}
+
+function preloadIcon(path: string | null | undefined) {
+	if (!path) return;
+	const src = iconSrc(path);
+	if (!src || brokenIcons.has(path) || loadedIcons.has(path)) return;
+	const probe = new Image();
+	probe.onload = () => {
+		loadedIcons = new Set(loadedIcons).add(path);
+	};
+	probe.onerror = () => {
+		brokenIcons = new Set(brokenIcons).add(path);
+	};
+	probe.src = src;
+}
 
 // Count non-item rows above the list items for scroll offset
 let headerRows = $derived((pathContext ? 1 : 0) + (scopeTabs.length > 1 ? 1 : 0));
+
+// Preload icons whenever items change — must be in $effect so loadedIcons update triggers re-render
+$effect(() => {
+	for (const item of items) {
+		preloadIcon(item.icon_path);
+	}
+});
 
 // Scroll selected item into view when selection changes
 $effect(() => {
@@ -59,14 +91,6 @@ $effect(() => {
 		item?.scrollIntoView({ block: "nearest" });
 	}
 });
-
-function iconSrc(path: string | null): string | null {
-	if (!path) return null;
-	if ("__TAURI_INTERNALS__" in window) {
-		return convertFileSrc(path);
-	}
-	return path;
-}
 
 function displayName(label: string): string {
 	const lastSlash = label.lastIndexOf("/");
@@ -166,13 +190,15 @@ function formatSize(bytes: number | null | undefined): string {
 		{@const isWarning = item?.icon_path === "__warning__"}
 		{@const isContext = item?.icon_path === "__context__"}
 		{@const isTerminal = item?.icon_path === "__terminal__"}
-		{@const hideIcon = item?.icon_path === "__none__" || isSeparator}
-		{@const hasCustomIcon = !!(item?.icon_path && item.icon_path !== "__folder__" && item.icon_path !== "__none__" && item.icon_path !== "__history__" && item.icon_path !== "__separator__" && item.icon_path !== "__warning__" && item.icon_path !== "__context__" && item.icon_path !== "__terminal__")}
+		{@const isWeb = item?.label?.startsWith("Search web:")}
+		{@const hideIcon = item?.icon_path === "__none__" || item?.icon_path === "__web__" || isWeb || isSeparator}
+		{@const hasCustomIcon = !!(item?.icon_path && item.icon_path !== "__folder__" && item.icon_path !== "__none__" && item.icon_path !== "__web__" && item.icon_path !== "__history__" && item.icon_path !== "__separator__" && item.icon_path !== "__warning__" && item.icon_path !== "__context__" && item.icon_path !== "__terminal__")}
 		{@const noIcon = !item?.icon_path}
 		{@const iconKey = item?.icon_path ?? ""}
 		{@const iconBroken = hasCustomIcon && brokenIcons.has(iconKey)}
-		{@const showImg = hasCustomIcon && !iconBroken}
-		{@const showFallback = (noIcon || iconBroken) && !hideIcon}
+		{@const iconLoaded = hasCustomIcon && loadedIcons.has(iconKey)}
+		{@const showImg = hasCustomIcon && iconLoaded && !iconBroken}
+		{@const showFallback = (noIcon || iconBroken || (hasCustomIcon && !iconLoaded)) && !hideIcon}
 		{@const search = searchDisplayName(label)}
 		{@const meta = metaMap?.get(label)}
 		{@const timeStr = relativeTime(meta?.modified_secs)}
@@ -212,13 +238,12 @@ function formatSize(bytes: number | null | undefined): string {
 				<span style:visibility={isTerminal ? "visible" : "hidden"} class="icon-slot">
 					<Terminal size={20} strokeWidth={1.5} class="icon-terminal" />
 				</span>
-				<span style:visibility={showImg ? "visible" : "hidden"} class="icon-slot">
-					<img
-						src={showImg ? (iconSrc(item.icon_path) ?? "") : "data:,"}
-						alt="" width={showImg ? 24 : 0} height={showImg ? 24 : 0} decoding="async"
-						onerror={() => { if (item?.icon_path) brokenIcons.add(item.icon_path); brokenIcons = brokenIcons; }}
-					/>
-				</span>
+				<span
+					class="icon-slot icon-img-slot"
+					style:visibility={showImg ? "visible" : "hidden"}
+					style:background-image={showImg ? `url('${iconSrc(item.icon_path)}')` : "none"}
+					aria-hidden="true"
+				></span>
 				<span style:visibility={showFallback ? "visible" : "hidden"} class="icon-slot">
 					<AppWindow size={20} strokeWidth={1.5} class="icon-fallback" />
 				</span>
@@ -234,8 +259,14 @@ function formatSize(bytes: number | null | undefined): string {
 			</div>
 			<!-- Normal-mode label group -->
 			<div class="label-group" class:label-hidden={isSearchMode || isSeparator}>
-				<span class="label">{pathContext ? displayName(label) : label}</span>
-				<span class="description" class:reason-highlight={isContext} style:visibility={item?.description ? "visible" : "hidden"}>{item?.description ?? "\u00A0"}</span>
+				<span class="label" class:label-history={isHistory}>{pathContext ? displayName(label) : label}</span>
+				<span
+					class="description"
+					class:reason-highlight={isContext}
+					class:confidence-badge={!isContext && !isWeb && !!item?.description}
+					class:web-hint={isWeb && !!item?.description}
+					style:visibility={item?.description ? "visible" : "hidden"}
+				>{item?.description ?? "\u00A0"}</span>
 			</div>
 		</li>
 	{/each}
@@ -452,14 +483,10 @@ function formatSize(bytes: number | null | undefined): string {
 		justify-content: center;
 	}
 
-	.icon img {
-		object-fit: contain;
-		border: none;
-		outline: none;
-		background: transparent;
-		color: transparent; /* hides alt text and broken-image glyph */
-		appearance: none;
-		-webkit-appearance: none;
+	.icon-img-slot {
+		background-size: contain;
+		background-repeat: no-repeat;
+		background-position: center;
 	}
 
 	.icon :global(.icon-fallback) {
@@ -536,6 +563,29 @@ function formatSize(bytes: number | null | undefined): string {
 		padding: 1px 8px;
 		border-radius: 8px;
 		opacity: 0.6;
+	}
+
+	/* App match confidence badge — "Open app?" / "Open app" */
+	.description.confidence-badge {
+		font-size: 10px;
+		border: 1px solid var(--border);
+		padding: 1px 8px;
+		border-radius: 8px;
+		opacity: 0.5;
+		margin-left: auto;
+	}
+
+	/* Web search hint — "Enter to search" */
+	.description.web-hint {
+		font-size: 10px;
+		color: var(--accent-blue);
+		opacity: 0.65;
+		margin-left: auto;
+	}
+
+	/* History item labels dimmed vs live results */
+	.label.label-history {
+		opacity: 0.65;
 	}
 
 	.search-meta {

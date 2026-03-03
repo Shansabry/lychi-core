@@ -71,7 +71,7 @@ const CODE_TO_KEY: Record<string, string> = {
 	ArrowRight: "arrowright",
 };
 
-function normalizeKey(key: string, code?: string): string {
+export function normalizeKey(key: string, code?: string): string {
 	if (key === "Unidentified" && code) {
 		return CODE_TO_KEY[code] ?? code.toLowerCase();
 	}

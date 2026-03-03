@@ -160,15 +160,26 @@ impl HistoryStore {
             false,
         );
 
+        // Minimum score to accept a fuzzy match — prevents low-quality matches from
+        // getting boosted to the top by frecency (e.g. "project" matching "whats my system memory?")
+        const MIN_SCORE: u16 = 30;
+
         let mut scored: Vec<(&str, u16)> = entries
             .iter()
             .filter_map(|cmd| {
                 let mut buf = Vec::new();
                 let haystack = Utf32Str::new(cmd, &mut buf);
                 let score = pattern.score(haystack, matcher)?;
+                if score < MIN_SCORE {
+                    return None;
+                }
                 Some((cmd.as_str(), score))
             })
             .collect();
+
+        // Sort by nucleo score descending before taking top-N, so frecency boost
+        // only affects items that are already strong fuzzy matches.
+        scored.sort_unstable_by(|a, b| b.1.cmp(&a.1));
 
         // Blend with frecency
         let frecency_scores = frecency::get_scores(db);

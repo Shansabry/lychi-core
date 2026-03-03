@@ -6,6 +6,7 @@ pub mod typo_suggest;
 use crate::action_registry::registry::ActionRegistry;
 use crate::providers::{AgentPlan, AiResponse};
 use ai_router::AiRouter;
+use patterns::PatternResult;
 
 /// How the intent was resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,17 +22,6 @@ pub struct ResolvedIntent {
     pub action_id: String,
     pub args: String,
     pub routing: RoutingMethod,
-}
-
-/// Check if input looks like a natural language question.
-/// Used as a no-AI fallback — routes questions to web search instead of app launcher.
-fn looks_like_question(input: &str) -> bool {
-    let lower = input.trim_start().to_lowercase();
-    const QUESTION_WORDS: &[&str] = &[
-        "what ", "who ", "how ", "why ", "when ", "where ", "which ", "is ", "are ", "can ",
-        "does ", "do ", "will ", "should ", "explain ", "define ",
-    ];
-    QUESTION_WORDS.iter().any(|w| lower.starts_with(w)) || lower.ends_with('?')
 }
 
 /// Intent Resolver — converts raw user input into structured intents.
@@ -63,38 +53,53 @@ impl IntentResolver {
 
     /// Resolve raw input into a structured intent.
     ///
-    /// Priority:
-    /// 1. Explicit prefix / trigger character → dispatch immediately
-    /// 2. Pattern detection (file path, URL, math) → dispatch
-    /// 3. Default "open" + AI available → ask AI
-    /// 4. Question fallback (no AI) → web search
-    /// 5. Fallback: "open" handler
+    /// Three-phase pipeline:
+    /// 1. Deterministic match (explicit prefix, URL, file, math, etc.) → dispatch immediately
+    /// 2. No match + AI available → ask AI
+    /// 3. No match + AI unavailable → try "open" (executor falls back to web if app not found)
     pub async fn resolve(&self, raw: &str, registry: &ActionRegistry) -> ResolvedIntent {
-        let route = patterns::route(raw);
+        // Phase 1: Deterministic match — patterns.rs is confident, dispatch immediately
+        let no_match_input = match patterns::route(raw) {
+            PatternResult::Match(route) => {
+                tracing::debug!(
+                    phase = "pattern",
+                    action = route.handler,
+                    explicit = route.explicit,
+                    "[resolve] phase=pattern action={} explicit={}",
+                    route.handler,
+                    route.explicit
+                );
+                return ResolvedIntent {
+                    action_id: route.handler.to_string(),
+                    args: route.args,
+                    routing: if route.explicit {
+                        RoutingMethod::Explicit
+                    } else {
+                        RoutingMethod::Pattern
+                    },
+                };
+            }
+            PatternResult::NoMatch { input } => input,
+        };
 
-        // Explicit or pattern-detected: no AI needed
-        if route.explicit {
-            return ResolvedIntent {
-                action_id: route.handler.to_string(),
-                args: route.args,
-                routing: RoutingMethod::Explicit,
-            };
-        }
-
-        if route.handler != "open" {
-            return ResolvedIntent {
-                action_id: route.handler.to_string(),
-                args: route.args,
-                routing: RoutingMethod::Pattern,
-            };
-        }
-
-        // Default "open" fallback — try AI first if available
+        // Phase 2: No deterministic match — try AI
         if let Some(ai) = &self.ai_router {
-            let known: Vec<&str> = registry.list_ids();
+            // Exclude "open" from known IDs — it's the no-match fallback, not a real intent.
+            let known: Vec<&str> = registry
+                .list_ids()
+                .into_iter()
+                .filter(|id| *id != "open")
+                .collect();
             if let Ok(Some(ai_route)) = ai.try_route(raw, &known).await
                 && registry.has(&ai_route.action_id)
+                && ai_route.action_id != "open"
             {
+                tracing::debug!(
+                    phase = "ai",
+                    action = %ai_route.action_id,
+                    "[resolve] phase=ai action={}",
+                    ai_route.action_id
+                );
                 return ResolvedIntent {
                     action_id: ai_route.action_id,
                     args: ai_route.args,
@@ -103,31 +108,63 @@ impl IntentResolver {
             }
         }
 
-        // AI unavailable or failed — if it looks like a question, fall back to
-        // web search instead of trying to open it as an app name.
-        if looks_like_question(raw) {
-            return ResolvedIntent {
-                action_id: "web".to_string(),
-                args: route.args,
-                routing: RoutingMethod::Pattern,
-            };
-        }
-
-        // Fallback to "open"
-        ResolvedIntent {
-            action_id: route.handler.to_string(),
-            args: route.args,
-            routing: RoutingMethod::Pattern,
+        // Phase 3: No match, AI unavailable or inconclusive.
+        // Ask AppIndex for a confident app match (score ≥ AUTO_LAUNCH_THRESHOLD).
+        // If found → route to "open" with the stable desktop_path as args (fast-path launch).
+        // Otherwise → route directly to "web" (skip the open→web detour).
+        let app_match = crate::desktop_apps::app_index().best_match(&no_match_input);
+        match app_match {
+            Some((id, score)) if score >= crate::desktop_apps::AUTO_LAUNCH_THRESHOLD => {
+                let entry = crate::desktop_apps::app_index().entry(id);
+                tracing::debug!(
+                    phase = "fallback",
+                    action = "open",
+                    app_score = score,
+                    desktop = %entry.desktop_path,
+                    "[resolve] phase=fallback action=open score={:.2} desktop={}",
+                    score,
+                    entry.desktop_path
+                );
+                ResolvedIntent {
+                    action_id: "open".to_string(),
+                    args: entry.desktop_path.clone(),
+                    routing: RoutingMethod::Pattern,
+                }
+            }
+            Some((_, score)) => {
+                tracing::debug!(
+                    phase = "fallback",
+                    action = "web",
+                    app_score = score,
+                    "[resolve] phase=fallback action=web (best app score={:.2} below threshold)",
+                    score
+                );
+                ResolvedIntent {
+                    action_id: "web".to_string(),
+                    args: no_match_input,
+                    routing: RoutingMethod::Pattern,
+                }
+            }
+            None => {
+                tracing::debug!(
+                    phase = "fallback",
+                    action = "web",
+                    "[resolve] phase=fallback action=web (no app candidates)"
+                );
+                ResolvedIntent {
+                    action_id: "web".to_string(),
+                    args: no_match_input,
+                    routing: RoutingMethod::Pattern,
+                }
+            }
         }
     }
 
     /// Ask AI for a multi-step plan. Returns `None` if AI is unavailable
     /// or the input resolves to a single-shot route.
     pub async fn try_plan(&self, raw: &str, registry: &ActionRegistry) -> Option<AgentPlan> {
-        let route = patterns::route(raw);
-
-        // Explicit routes never produce plans
-        if route.explicit || route.handler != "open" {
+        // Only unmatched inputs can produce plans — deterministic matches are final
+        if let PatternResult::Match(_) = patterns::route(raw) {
             return None;
         }
 

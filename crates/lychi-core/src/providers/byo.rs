@@ -174,7 +174,12 @@ impl AiProvider for BYOClient {
             BYOProvider::Anthropic => self.call_anthropic(&sys_prompt, input).await?,
         };
 
-        tracing::debug!("AI response: {response}");
+        tracing::debug!(
+            prompt_version = prompt::PROMPT_VERSION,
+            provider = self.name(),
+            model = %self.model,
+            "[ai] raw response: {response}"
+        );
         prompt::parse_ai_response(&response, known_actions, input)
     }
 

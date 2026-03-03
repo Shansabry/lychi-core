@@ -50,6 +50,12 @@ pub fn show_window(window: &WebviewWindow) {
     // Snapshot the active window BEFORE we show Lychi (otherwise we'd detect ourselves).
     let pre_window = lychi_core::context::snapshot_active_window();
 
+    // Clear frontend state before the window becomes visible so there is no
+    // stale-completions flash. The WebView is already loaded (just hidden) and
+    // can process the event before the compositor paints the first frame.
+    tracing::info!("[show] seq={seq} emitting lychi://summon (pre-show)");
+    let _ = window.emit("lychi://summon", ());
+
     // Reposition + show + focus all run on the GLib main thread in one invoke.
     {
         let window_clone = window.clone();
@@ -86,8 +92,6 @@ pub fn show_window(window: &WebviewWindow) {
         }
     }
 
-    tracing::info!("[show] seq={seq} emitting lychi://summon");
-    let _ = window.emit("lychi://summon", ());
     tracing::info!("[show] === show_window END (seq={seq}) ===");
 
     // Fast path: emit last-known context immediately so suggestions appear

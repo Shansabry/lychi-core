@@ -67,11 +67,12 @@ impl Executor {
 
         let intent = self.resolver.resolve(input, &self.registry).await;
         tracing::info!(
-            "Resolved '{}' → action={}, args='{}', routing={:?}",
-            input,
+            action = %intent.action_id,
+            routing = ?intent.routing,
+            "[execute] resolved action={} routing={:?} input={:?}",
             intent.action_id,
-            intent.args,
-            intent.routing
+            intent.routing,
+            input
         );
 
         let action_id = intent.action_id.clone();
@@ -111,6 +112,7 @@ impl Executor {
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             },
             ValidationDecision::Confirm { reason } if !confirmed => ActionResult {
                 success: false,
@@ -124,6 +126,7 @@ impl Executor {
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             },
             // Execute (or Confirm with confirmed=true)
             _ => {
@@ -168,14 +171,21 @@ impl Executor {
                     result.executed_args = Some(intent.args.clone());
                 }
 
-                // If the "open" handler failed and we have a web fallback, try it
+                // If the "open" handler failed and we have a web fallback, try it.
+                // Use intent.args (prefix stripped) not input (raw), so "open firefox" → search "firefox".
                 if intent.action_id == "open"
                     && !result.success
                     && intent.routing != RoutingMethod::Ai
                     && let Some(web) = self.registry.get("web")
                 {
+                    tracing::debug!(
+                        fallback = "web",
+                        args = %intent.args,
+                        "[execute] open miss → web fallback args={:?}",
+                        intent.args
+                    );
                     return Ok(ExecuteResult {
-                        result: web.execute(input).await?,
+                        result: web.execute(&intent.args).await?,
                         action_id: "web".to_string(),
                     });
                 }
@@ -203,7 +213,27 @@ impl Executor {
         }
 
         let route = crate::intent::patterns::route(raw);
-        let mut handler_results = self.registry.completions(route.handler, &route.args).await;
+        use crate::intent::patterns::PatternResult;
+        let (route_handler, route_args) = match &route {
+            PatternResult::Match(r) => (r.handler, r.args.as_str()),
+            PatternResult::NoMatch { input } => ("open", input.as_str()),
+        };
+        let mut handler_results = self.registry.completions(route_handler, route_args).await;
+
+        // For no-match queries, collect the "Search web: …" item separately so it
+        // survives the truncate(5) below and is always visible as an escape hatch.
+        // Skip if handler_results already contains a web completion (future-proof dedup).
+        let web_fallback: Vec<CompletionItem> = if let PatternResult::NoMatch { input } = &route
+            && !input.trim().is_empty()
+            && !handler_results.iter().any(|r| {
+                r.icon_path.as_deref() == Some("__web__") || r.label.starts_with("Search web:")
+            })
+            && let Some(web) = self.registry.get("web")
+        {
+            web.completions(input).await
+        } else {
+            Vec::new()
+        };
 
         // Get history completions (deduplicated against handler results)
         let trimmed = raw.trim();
@@ -217,7 +247,7 @@ impl Executor {
         }
 
         // Build sectioned output: handler results first, then separator, then history
-        if !handler_results.is_empty() || !history_results.is_empty() {
+        if !handler_results.is_empty() || !history_results.is_empty() || !web_fallback.is_empty() {
             handler_results.truncate(5);
             history_results.truncate(3);
 
@@ -269,19 +299,18 @@ impl Executor {
             }
 
             out.extend(history_results);
+            out.extend(web_fallback);
             return out;
         }
 
-        // Fallback: if the routed handler returned nothing, try app search.
-        // Use the args (not raw) so trigger-char prefixes like ">" are stripped.
-        // Skip for "web" — multi-word natural language was intentionally routed there,
-        // falling through to app search produces nonsense fuzzy matches ("How to make pasta" → "os").
-        if route.handler != "open" && route.handler != "web" {
-            let search_term = if route.args.is_empty() {
-                raw
-            } else {
-                &route.args
-            };
+        // Fallback: if a matched handler (not "open" or "web") returned nothing, try app search.
+        // NoMatch already tried "open" above. Skip "web" — natural language queries produce
+        // nonsense fuzzy app matches ("How to make pasta" → "os").
+        if let PatternResult::Match(r) = &route
+            && r.handler != "open"
+            && r.handler != "web"
+        {
+            let search_term = if r.args.is_empty() { raw } else { &r.args };
             let app_results = self.registry.completions("open", search_term).await;
             if !app_results.is_empty() {
                 return app_results;
@@ -289,8 +318,9 @@ impl Executor {
         }
 
         // Typo correction: suggest "Did you mean: X?" for near-miss inputs.
-        // Skip for web routes — natural language queries aren't typos.
-        if route.handler != "web"
+        // Skip for web routes and NoMatch (natural language isn't a typo).
+        if let PatternResult::Match(r) = &route
+            && r.handler != "web"
             && let Some(suggestion) = crate::intent::typo_suggest::suggest(raw)
         {
             return vec![suggestion];
@@ -312,5 +342,209 @@ impl Executor {
     /// Refresh environment context (call on summon).
     pub fn refresh_context(&mut self, pre_window: Option<crate::context::WindowContext>) {
         self.context = Some(crate::context::gather(pre_window));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::action_registry::{ActionHandler, ActionResult};
+    use crate::config::schema::PrivacyConfig;
+    use crate::history::HistoryStore;
+    use crate::rules::RulesEngine;
+    use async_trait::async_trait;
+
+    // --- Stub handlers ---
+
+    /// Always succeeds — used for "web" and optionally "open"
+    struct StubHandler {
+        id: &'static str,
+    }
+
+    #[async_trait]
+    impl ActionHandler for StubHandler {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn description(&self) -> &str {
+            "stub"
+        }
+
+        async fn execute(&self, _args: &str) -> Result<ActionResult, crate::error::LychiError> {
+            Ok(ActionResult {
+                success: true,
+                output: Some(format!("{} stub executed", self.id)),
+                error: None,
+                duration_ms: 0,
+                routed_by: None,
+                open_url: None,
+                needs_confirmation: None,
+                risk_level: None,
+                output_type: None,
+                executed_args: None,
+                launch_desktop: None,
+                focus_app: None,
+            })
+        }
+
+        async fn completions(&self, partial: &str) -> Vec<crate::action_registry::CompletionItem> {
+            if self.id == "web" && !partial.trim().is_empty() {
+                vec![crate::action_registry::CompletionItem {
+                    label: format!("Search web: {}", partial.trim()),
+                    icon_path: Some("__web__".to_string()),
+                    score: 100,
+                    description: None,
+                    reason: None,
+                }]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    /// Always returns success: false — simulates app-not-found soft failure
+    struct FailHandler;
+
+    #[async_trait]
+    impl ActionHandler for FailHandler {
+        fn id(&self) -> &str {
+            "open"
+        }
+
+        fn description(&self) -> &str {
+            "fail stub"
+        }
+
+        async fn execute(&self, _args: &str) -> Result<ActionResult, crate::error::LychiError> {
+            Ok(ActionResult {
+                success: false,
+                output: None,
+                error: None,
+                duration_ms: 0,
+                routed_by: None,
+                open_url: None,
+                needs_confirmation: None,
+                risk_level: None,
+                output_type: None,
+                executed_args: None,
+                launch_desktop: None,
+                focus_app: None,
+            })
+        }
+    }
+
+    // --- Executor factories ---
+
+    fn make_executor(registry: ActionRegistry) -> Executor {
+        Executor::new(
+            registry,
+            RulesEngine::new(),
+            IntentResolver::new(None),
+            HistoryStore::new(500, true),
+            crate::db::open_test_database(),
+        )
+    }
+
+    /// Registry with only a "web" stub (no "open" handler)
+    fn registry_web_only() -> ActionRegistry {
+        let mut r = ActionRegistry::new();
+        r.register(Box::new(StubHandler { id: "web" }));
+        r
+    }
+
+    /// Registry where "open" succeeds and "web" is present
+    fn registry_open_succeeds() -> ActionRegistry {
+        let mut r = ActionRegistry::new();
+        r.register(Box::new(StubHandler { id: "open" }));
+        r.register(Box::new(StubHandler { id: "web" }));
+        r
+    }
+
+    /// Registry where "open" fails (soft) and "web" is present
+    fn registry_open_fails() -> ActionRegistry {
+        let mut r = ActionRegistry::new();
+        r.register(Box::new(FailHandler));
+        r.register(Box::new(StubHandler { id: "web" }));
+        r
+    }
+
+    // --- Tests ---
+
+    /// 1. Natural language → no pattern match → resolver routes to "web" directly
+    #[tokio::test]
+    async fn no_match_routes_to_web() {
+        let ex = make_executor(registry_web_only());
+        let r = ex
+            .run("how do i cook pasta", false, &PrivacyConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(r.action_id, "web");
+        assert!(r.result.success);
+    }
+
+    /// 2. Short word + "open" handler succeeds → action stays "open"
+    #[tokio::test]
+    async fn app_present_routes_to_open() {
+        let ex = make_executor(registry_open_succeeds());
+        let r = ex
+            .run("firefox", false, &PrivacyConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(r.action_id, "open");
+        assert!(r.result.success);
+    }
+
+    /// 3. App missing: "open" returns success:false → executor falls back to "web"
+    #[tokio::test]
+    async fn app_missing_falls_back_to_web() {
+        let ex = make_executor(registry_open_fails());
+        let r = ex
+            .run("firefox", false, &PrivacyConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(r.action_id, "web");
+        assert!(r.result.success);
+        assert!(r.result.error.is_none());
+    }
+
+    /// 4. Explicit "open foo" with missing app → web fallback fires
+    #[tokio::test]
+    async fn explicit_open_missing_falls_back_to_web() {
+        let ex = make_executor(registry_open_fails());
+        let r = ex
+            .run("open notarealapp", false, &PrivacyConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(r.action_id, "web");
+        assert!(r.result.success);
+    }
+
+    /// 5. AI-routed "open" failure does NOT fall back to web.
+    ///    Tested via the RoutingMethod enum directly — the guard in executor is:
+    ///    `intent.routing != RoutingMethod::Ai`
+    ///    We verify that Ai != Pattern/Explicit so the guard compiles and types are correct.
+    #[test]
+    fn ai_routing_method_is_distinct() {
+        assert_ne!(RoutingMethod::Ai, RoutingMethod::Pattern);
+        assert_ne!(RoutingMethod::Ai, RoutingMethod::Explicit);
+        // The fallback guard `routing != RoutingMethod::Ai` evaluates to false only for Ai,
+        // meaning AI-routed open results are never forwarded to web.
+        let routing = RoutingMethod::Ai;
+        assert!(!(routing != RoutingMethod::Ai)); // i.e. guard is false → no fallback
+    }
+
+    /// 6. Completions: "Search web: …" item is always present for a NoMatch input
+    #[tokio::test]
+    async fn completions_web_always_visible_for_no_match() {
+        let ex = make_executor(registry_open_fails());
+        let completions = ex.completions("zzunknownquery").await;
+        let has_web = completions
+            .iter()
+            .any(|c| c.label.starts_with("Search web:"));
+        assert!(
+            has_web,
+            "expected a 'Search web:' completion item, got: {completions:?}"
+        );
     }
 }

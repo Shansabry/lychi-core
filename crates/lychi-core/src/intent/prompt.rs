@@ -3,6 +3,10 @@ use crate::error::LychiError;
 use crate::providers::{AgentPlan, AgentStep, AiResponse, AiRoute, generate_plan_id};
 use crate::rules::shell::ShellRules;
 
+/// Bump this when the system prompt changes in a semantically meaningful way.
+/// Included in debug logs so bad routes can be tied to the prompt that produced them.
+pub const PROMPT_VERSION: &str = "v2";
+
 /// Build the system prompt for intent routing.
 ///
 /// If `context_hint` is provided, it's appended to help the AI make
@@ -44,7 +48,9 @@ Rules:
 - When uncertain between two handlers, prefer the more specific one.
 - Extract clean arguments — strip filler words ("please", "can you", "I want to").
 - Respond with ONLY valid JSON. No extra text.
-- Fallback: question → "ask", non-question → "web".{context_section}"#
+- Fallback: question → "ask", non-question → "web".{context_section}
+
+<!-- prompt_version={PROMPT_VERSION} -->"#
     )
 }
 
@@ -137,6 +143,17 @@ fn validate_step_risk(step: &AgentStep) -> RiskLevel {
     }
 }
 
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Null => "null",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 /// Parse an AI response into either a single route or a multi-step plan.
 pub fn parse_ai_response(
     response: &str,
@@ -147,6 +164,14 @@ pub fn parse_ai_response(
 
     let json: serde_json::Value = serde_json::from_str(cleaned)
         .map_err(|e| LychiError::Ai(format!("Failed to parse AI response as JSON: {e}")))?;
+
+    // Response must be a JSON object — arrays and primitives are invalid
+    if !json.is_object() {
+        return Err(LychiError::Ai(format!(
+            "AI response must be a JSON object, got: {}",
+            json_type_name(&json)
+        )));
+    }
 
     // Check if response has "steps" array (multi-step plan)
     if let Some(steps_val) = json.get("steps") {
@@ -346,5 +371,166 @@ mod tests {
         assert!(prompt.contains("User's current context:"));
         assert!(prompt.contains("Git branch: main"));
         assert!(prompt.contains("Rust"));
+    }
+
+    #[test]
+    fn system_prompt_contains_version() {
+        let prompt = system_prompt(&["web"], None);
+        assert!(
+            prompt.contains(PROMPT_VERSION),
+            "system prompt must embed PROMPT_VERSION"
+        );
+    }
+
+    // --- Adversarial response tests ---
+
+    #[test]
+    fn adversarial_empty_string() {
+        let known = &["web", "run"];
+        assert!(parse_ai_response("", known, "test").is_err());
+    }
+
+    #[test]
+    fn adversarial_whitespace_only() {
+        let known = &["web"];
+        assert!(parse_ai_response("   \n\t  ", known, "test").is_err());
+    }
+
+    #[test]
+    fn adversarial_plain_text_no_json() {
+        let known = &["web", "run"];
+        assert!(parse_ai_response("Sure! I'll open Firefox for you.", known, "test").is_err());
+    }
+
+    #[test]
+    fn adversarial_truncated_json() {
+        let known = &["web"];
+        assert!(parse_ai_response(r#"{"action_id": "web", "args":"#, known, "test").is_err());
+    }
+
+    #[test]
+    fn adversarial_empty_action_id() {
+        let known = &["web", "run"];
+        // Empty string is not in known_actions → should be rejected
+        let result = parse_ai_response(r#"{"action_id": "", "args": "foo"}"#, known, "test");
+        assert!(result.is_err(), "empty action_id must be rejected");
+    }
+
+    #[test]
+    fn adversarial_unknown_action_id() {
+        let known = &["web", "run"];
+        let result = parse_ai_response(
+            r#"{"action_id": "rm_everything", "args": "-rf /"}"#,
+            known,
+            "test",
+        );
+        assert!(result.is_err(), "unknown action_id must be rejected");
+    }
+
+    #[test]
+    fn adversarial_missing_action_id_field() {
+        let known = &["web"];
+        // Valid JSON but missing action_id field — serde should fail
+        let result = parse_ai_response(r#"{"args": "foo"}"#, known, "test");
+        assert!(result.is_err(), "missing action_id field must be rejected");
+    }
+
+    #[test]
+    fn adversarial_null_fields() {
+        let known = &["web"];
+        let result = parse_ai_response(r#"{"action_id": null, "args": null}"#, known, "test");
+        assert!(result.is_err(), "null action_id must be rejected");
+    }
+
+    #[test]
+    fn adversarial_oversized_args() {
+        // 10KB args string — parse should succeed (we don't truncate at parse time)
+        // but the action_id must still be valid
+        let known = &["run"];
+        let big_args = "x".repeat(10_000);
+        let json = format!(r#"{{"action_id": "run", "args": "{big_args}"}}"#);
+        let result = parse_ai_response(&json, known, "test");
+        // Oversized args: parse succeeds but callers should apply their own limits
+        assert!(result.is_ok(), "oversized args should parse without panic");
+        if let Ok(AiResponse::SingleRoute(route)) = result {
+            assert_eq!(route.args.len(), 10_000);
+        }
+    }
+
+    #[test]
+    fn adversarial_prompt_injection_in_args() {
+        // Prompt injection attempt in args field — parse_ai_response only validates
+        // action_id against known list; the args value is passed through as-is.
+        // This test documents current behavior: args are NOT sanitized here
+        // (sanitization is the rules engine's job).
+        let known = &["run"];
+        let injection = r#"{"action_id": "run", "args": "ls; rm -rf ~"}"#;
+        let result = parse_ai_response(injection, known, "test");
+        assert!(
+            result.is_ok(),
+            "injection in args parses (rules engine sanitizes later)"
+        );
+        if let Ok(AiResponse::SingleRoute(route)) = result {
+            assert!(
+                route.args.contains("rm -rf"),
+                "args pass through unmodified"
+            );
+        }
+    }
+
+    #[test]
+    fn adversarial_prompt_injection_in_action_id() {
+        // Injection attempt in action_id itself — must be rejected as unknown
+        let known = &["run", "web"];
+        let result = parse_ai_response(
+            r#"{"action_id": "run\"; system(\"reboot", "args": ""}"#,
+            known,
+            "test",
+        );
+        assert!(
+            result.is_err(),
+            "injected action_id must be rejected as unknown"
+        );
+    }
+
+    #[test]
+    fn adversarial_array_instead_of_object() {
+        let known = &["web"];
+        assert!(parse_ai_response(r#"["web", "rust"]"#, known, "test").is_err());
+    }
+
+    #[test]
+    fn adversarial_nested_object_in_action_id() {
+        let known = &["web"];
+        let result = parse_ai_response(
+            r#"{"action_id": {"nested": "web"}, "args": "foo"}"#,
+            known,
+            "test",
+        );
+        assert!(result.is_err(), "object in action_id must be rejected");
+    }
+
+    #[test]
+    fn adversarial_empty_steps_array() {
+        let known = &["run"];
+        let result = parse_ai_response(r#"{"steps": []}"#, known, "test");
+        assert!(result.is_err(), "empty steps array must be rejected");
+    }
+
+    #[test]
+    fn adversarial_steps_with_unknown_action() {
+        let known = &["run"];
+        let result = parse_ai_response(
+            r#"{"steps": [
+                {"action_id": "run", "args": "ls", "label": "List", "risk": "low"},
+                {"action_id": "delete_system", "args": "/", "label": "Nuke", "risk": "low"}
+            ]}"#,
+            known,
+            "test",
+        );
+        assert!(
+            result.is_err(),
+            "unknown action in steps must reject entire plan"
+        );
     }
 }

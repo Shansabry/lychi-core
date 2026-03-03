@@ -1,7 +1,7 @@
 <script lang="ts">
 import { LoaderCircle } from "lucide-svelte";
 import { fuzzyRank } from "$lib/fuzzy";
-import { matchesAction } from "$lib/keybindings";
+import { matchesAction, normalizeKey } from "$lib/keybindings";
 
 let {
 	value = $bindable(""),
@@ -266,9 +266,12 @@ function handleKeydown(e: KeyboardEvent) {
 	) {
 		e.preventDefault();
 		acceptGhost();
+	} else if (normalizeKey(e.key, e.code) === "enter" && (e.ctrlKey || e.metaKey)) {
+		e.preventDefault();
+		onsubmit({ ctrlKey: true });
 	} else if (matchesAction(e, "submit") && !e.shiftKey) {
 		e.preventDefault();
-		onsubmit({ ctrlKey: e.ctrlKey || e.metaKey });
+		onsubmit({ ctrlKey: false });
 	} else if (e.key === "ArrowUp") {
 		e.preventDefault();
 		onarrowup();

@@ -80,6 +80,7 @@ pub async fn execute_agent_plan(
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             },
         };
 

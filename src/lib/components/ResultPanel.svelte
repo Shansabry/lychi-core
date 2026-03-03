@@ -2,6 +2,7 @@
 import AnsiToHtml from "ansi-to-html";
 import type { CommandResult } from "$lib/ipc";
 import { matchesAction } from "$lib/keybindings";
+import { sanitizeTerminal } from "$lib/sanitize";
 import WeatherCard from "./WeatherCard.svelte";
 
 let {
@@ -83,8 +84,10 @@ let converter = $derived(
 );
 
 // Only convert ANSI for terminal output and errors
-let outputHtml = $derived(isTerminal && result.output ? converter.toHtml(result.output) : "");
-let errorHtml = $derived(result.error ? converter.toHtml(result.error) : "");
+let outputHtml = $derived(
+	isTerminal && result.output ? sanitizeTerminal(converter.toHtml(result.output)) : "",
+);
+let errorHtml = $derived(result.error ? sanitizeTerminal(converter.toHtml(result.error)) : "");
 
 // --- Clickable filenames in ls output ---
 
@@ -147,7 +150,9 @@ let lsDirectory = $derived(
 	isTerminal && result.executed_args ? extractLsDirectory(result.executed_args) : null,
 );
 let processedHtml = $derived(
-	outputHtml && lsDirectory ? linkifyLsOutput(outputHtml, lsDirectory) : outputHtml,
+	outputHtml && lsDirectory
+		? sanitizeTerminal(linkifyLsOutput(outputHtml, lsDirectory))
+		: outputHtml,
 );
 
 let isHighRisk = $derived(result.risk_level === "high");

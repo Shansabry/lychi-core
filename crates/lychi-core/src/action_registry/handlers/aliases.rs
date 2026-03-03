@@ -54,6 +54,7 @@ impl ActionHandler for AliasHandler {
                     output_type: Some(OutputType::Text),
                     executed_args: None,
                     launch_desktop: None,
+                    focus_app: None,
                 });
             }
             let lines: Vec<String> = aliases
@@ -77,6 +78,7 @@ impl ActionHandler for AliasHandler {
                 output_type: Some(OutputType::Text),
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             });
         }
 
@@ -99,6 +101,7 @@ impl ActionHandler for AliasHandler {
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             });
         }
 
@@ -122,6 +125,7 @@ impl ActionHandler for AliasHandler {
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             });
         }
 
@@ -144,6 +148,7 @@ impl ActionHandler for AliasHandler {
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             });
         }
 
@@ -162,6 +167,7 @@ impl ActionHandler for AliasHandler {
             output_type: None,
             executed_args: None,
             launch_desktop: None,
+            focus_app: None,
         })
     }
 

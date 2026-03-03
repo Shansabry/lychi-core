@@ -58,6 +58,7 @@ impl ActionHandler for YouTube {
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             });
         }
 
@@ -75,6 +76,7 @@ impl ActionHandler for YouTube {
             output_type: None,
             executed_args: None,
             launch_desktop: None,
+            focus_app: None,
         })
     }
 }

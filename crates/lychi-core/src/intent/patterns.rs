@@ -1,11 +1,10 @@
-//! Smart input router — Alfred-style hybrid routing.
+//! Smart input router — deterministic pre-filter for intent routing.
 //!
 //! Routes user input to the appropriate handler based on:
-//! 1. Explicit prefixes (`web `, `yt `, `run `, `open `, `calc `)
-//! 2. Trigger characters (`=` for calc, `>` for shell)
-//! 3. Pattern detection (file paths, URLs, math expressions)
-//! 4. Keyword detection (natural language → deterministic routing)
-//! 5. Default: app search → web search fallback
+//! 1. Explicit prefixes (`web `, `yt `, `run `, `open `, `calc `, etc.)
+//! 2. Trigger characters (`?` web search, `=` calc, `>` shell)
+//! 3. Pattern detection (file paths, URLs, math/conversion expressions)
+//! 4. No match: `PatternResult::NoMatch` — IntentResolver uses AI, falls back to open→web
 
 /// Known handler prefixes — single source of truth for all keyword recognition.
 /// Used by: pattern routing, typo correction, frontend completion handling.
@@ -66,12 +65,17 @@ pub const KNOWN_PREFIXES: &[&str] = &[
     "stopwatch",
     "reminder",
     "remind",
-    // System actions (routed via keyword patterns)
+    // System power commands — explicit single-word triggers
     "shutdown",
-    "cancel shutdown",
+    "poweroff",
     "reboot",
+    "restart",
     "hibernate",
+    "lock",
+    "suspend",
+    "sleep",
     "logout",
+    "signout",
     "mute",
     "unmute",
     "volume",
@@ -92,14 +96,44 @@ const TLDS: &[&str] = &[
     ".ly", ".ai", ".gg", ".tv", ".cc",
 ];
 
+/// A deterministically matched route from patterns.rs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
-    /// Handler prefix to dispatch to (e.g. "open", "web", "calc", "run", "file", "url")
+    /// Handler to dispatch to (e.g. "web", "calc", "run", "file", "url")
     pub handler: &'static str,
     /// Arguments to pass to the handler
     pub args: String,
     /// Whether this route was explicitly triggered (prefix or trigger char)
     pub explicit: bool,
+}
+
+/// Result of deterministic pattern matching.
+///
+/// `Match` means patterns.rs is confident — dispatch immediately, no AI needed.
+/// `NoMatch` means no structural pattern found — IntentResolver should try AI,
+/// then fall back to AppIndex → web search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatternResult {
+    Match(Route),
+    NoMatch { input: String },
+}
+
+impl PatternResult {
+    /// Returns true if this is a deterministic match.
+    pub fn is_match(&self) -> bool {
+        matches!(self, PatternResult::Match(_))
+    }
+
+    /// Unwrap the inner Route, panicking if this is NoMatch. For tests only.
+    #[cfg(test)]
+    pub fn unwrap(self) -> Route {
+        match self {
+            PatternResult::Match(r) => r,
+            PatternResult::NoMatch { input } => {
+                panic!("called unwrap() on PatternResult::NoMatch {{ input: {input:?} }}")
+            }
+        }
+    }
 }
 
 /// Check if a word is a known handler prefix (used by typo_suggest to skip exact matches).
@@ -108,23 +142,21 @@ pub fn is_known_prefix(word: &str) -> bool {
 }
 
 /// Route raw user input to the appropriate handler.
-pub fn route(raw: &str) -> Route {
+pub fn route(raw: &str) -> PatternResult {
     route_inner(raw, true)
 }
 
-fn route_inner(raw: &str, check_aliases: bool) -> Route {
+fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Route {
-            handler: "open",
-            args: String::new(),
-            explicit: false,
+        return PatternResult::NoMatch {
+            input: String::new(),
         };
     }
 
     // 1. Explicit prefix — first word matches a known handler
     if let Some(r) = try_explicit_prefix(trimmed) {
-        return r;
+        return PatternResult::Match(r);
     }
 
     // 2. Trigger characters & shorthand colon-prefixes
@@ -156,70 +188,89 @@ fn route_inner(raw: &str, check_aliases: bool) -> Route {
     ];
     for &(prefix, handler) in COLON_TRIGGERS {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
-            return Route {
+            return PatternResult::Match(Route {
                 handler,
                 args: rest.trim().to_string(),
                 explicit: true,
-            };
+            });
         }
     }
+    if let Some(query) = trimmed.strip_prefix('?') {
+        return PatternResult::Match(Route {
+            handler: "web",
+            args: query.trim().to_string(),
+            explicit: true,
+        });
+    }
     if let Some(expr) = trimmed.strip_prefix('=') {
-        return Route {
+        return PatternResult::Match(Route {
             handler: "calc",
             args: expr.trim().to_string(),
             explicit: true,
-        };
+        });
     }
     if let Some(cmd) = trimmed.strip_prefix('>') {
-        return Route {
+        return PatternResult::Match(Route {
             handler: "run",
             args: cmd.trim().to_string(),
             explicit: true,
-        };
+        });
     }
 
     // 3. File path
     if trimmed.starts_with('/') || trimmed.starts_with("~/") || trimmed.starts_with("./") {
-        return Route {
+        return PatternResult::Match(Route {
             handler: "file",
             args: trimmed.to_string(),
             explicit: false,
-        };
+        });
     }
 
     // 4. URL
     if looks_like_url(trimmed) {
-        return Route {
+        return PatternResult::Match(Route {
             handler: "url",
             args: trimmed.to_string(),
             explicit: false,
-        };
+        });
     }
 
     // 5. Math expression (digits + operators only, no letters)
     if is_math_expression(trimmed) {
-        return Route {
+        return PatternResult::Match(Route {
             handler: "calc",
             args: trimmed.to_string(),
             explicit: false,
-        };
+        });
     }
 
     // 5b. Unit/currency conversion (e.g. "5 kg to lb", "100 usd to eur")
     if crate::action_registry::handlers::calc::is_conversion_expression(trimmed) {
-        return Route {
+        return PatternResult::Match(Route {
             handler: "calc",
             args: trimmed.to_string(),
             explicit: false,
-        };
+        });
     }
 
-    // 6. Keyword routing — common natural language patterns
-    if let Some(r) = try_keyword_route(trimmed) {
-        return r;
+    // 5c. Structured power phrases — unambiguous, handle before AI fallback
+    let lower = trimmed.to_lowercase();
+    if lower.starts_with("shutdown in ") || lower.starts_with("shut down in ") {
+        return PatternResult::Match(Route {
+            handler: "system",
+            args: lower,
+            explicit: false,
+        });
+    }
+    if lower == "cancel shutdown" || lower == "shutdown cancel" {
+        return PatternResult::Match(Route {
+            handler: "system",
+            args: "cancel shutdown".to_string(),
+            explicit: false,
+        });
     }
 
-    // 6b. Alias resolution — check if first word matches a stored alias.
+    // 6. Alias resolution — check if first word matches a stored alias.
     //      Only on the first pass (check_aliases=true) to prevent infinite recursion
     //      if an alias expands to another alias name.
     if check_aliases {
@@ -241,46 +292,20 @@ fn route_inner(raw: &str, check_aliases: bool) -> Route {
     {
         let candidate = home.join(trimmed);
         if candidate.exists() {
-            return Route {
+            return PatternResult::Match(Route {
                 handler: "file",
                 args: format!("~/{trimmed}"),
                 explicit: false,
-            };
+            });
         }
     }
 
-    // 8. Default — app search for single-word inputs, web search for multi-word.
-    //    Single words are likely app names ("firefox", "spotify").
-    //    Multi-word phrases are natural language ("reduce the audio", "play some jazz")
-    //    — web search is far more useful than "App not found".
-    if looks_like_app_name(trimmed) {
-        Route {
-            handler: "open",
-            args: trimmed.to_string(),
-            explicit: false,
-        }
-    } else {
-        Route {
-            handler: "web",
-            args: trimmed.to_string(),
-            explicit: false,
-        }
+    // 8. No structural match found.
+    //    IntentResolver will try AI, then fall back to AppIndex → web search.
+    PatternResult::NoMatch {
+        input: trimmed.to_string(),
     }
 }
-
-/// Heuristic: does this input look like an app name?
-///
-/// App names are typically 1-2 words ("firefox", "visual studio", "vs code").
-/// Multi-word natural language phrases (3+ words) are almost never app names.
-fn looks_like_app_name(input: &str) -> bool {
-    let words: Vec<&str> = input.split_whitespace().collect();
-    words.len() <= 2
-}
-
-/// Words that indicate natural language rather than a direct command argument.
-const FILLER_WORDS: &[&str] = &[
-    "the", "my", "a", "an", "this", "that", "please", "can", "you",
-];
 
 fn try_explicit_prefix(input: &str) -> Option<Route> {
     let first_word = input.split_whitespace().next()?;
@@ -288,15 +313,6 @@ fn try_explicit_prefix(input: &str) -> Option<Route> {
 
     if KNOWN_PREFIXES.contains(&lower.as_str()) {
         let args = input[first_word.len()..].trim_start().to_string();
-
-        // For "open", check if the args look like natural language rather than
-        // a direct app name. e.g. "open the download folder" → AI, "open firefox" → explicit.
-        if lower == "open" && !args.is_empty() {
-            let second_word = args.split_whitespace().next().unwrap_or("");
-            if FILLER_WORDS.contains(&second_word.to_lowercase().as_str()) {
-                return None; // Let it fall through to AI routing
-            }
-        }
 
         // Map the prefix string to a static str
         let (handler, args) = match lower.as_str() {
@@ -363,6 +379,23 @@ fn try_explicit_prefix(input: &str) -> Option<Route> {
             "ip" | "cpu" | "mem" | "disk" | "temp" | "gpu" | "battery" | "net" | "audio"
             | "display" | "os" | "speedtest" => ("sysinfo", lower.clone()),
             "ctx" => ("ctx", args),
+            // Power commands — single-word, unambiguous, no AI needed.
+            // "shutdown in N" has trailing args — let it fall through to structured phrase handler.
+            "shutdown" | "poweroff" => {
+                if args.is_empty() {
+                    ("system", "shutdown".to_string())
+                } else {
+                    return None; // "shutdown in 10m" — handled by structured phrase step
+                }
+            }
+            "reboot" | "restart" => ("system", "reboot".to_string()),
+            "lock" => ("system", "lock".to_string()),
+            "suspend" | "sleep" => ("system", "suspend".to_string()),
+            "hibernate" => ("system", "hibernate".to_string()),
+            "logout" | "signout" => ("system", "logout".to_string()),
+            // Common bare-word controls
+            "mute" => ("system", "mute".to_string()),
+            "unmute" => ("system", "unmute".to_string()),
             _ => return None,
         };
         Some(Route {
@@ -403,830 +436,6 @@ fn looks_like_url(input: &str) -> bool {
     false
 }
 
-/// Keyword-based routing for common natural language patterns.
-/// Catches phrases that would otherwise fall through to AI, saving tokens and latency.
-fn try_keyword_route(input: &str) -> Option<Route> {
-    let lower = input.to_lowercase();
-
-    // --- system power commands ---
-    // Scheduled shutdown must match BEFORE the generic shutdown catch-all
-    if lower.starts_with("shutdown in ") || lower.starts_with("shut down in ") {
-        return Some(Route {
-            handler: "system",
-            args: lower.clone(),
-            explicit: false,
-        });
-    }
-    if lower == "cancel shutdown" || lower == "shutdown cancel" {
-        return Some(Route {
-            handler: "system",
-            args: "cancel shutdown".into(),
-            explicit: false,
-        });
-    }
-    if lower.contains("shut down") || lower.contains("shutdown") || lower.contains("power off") {
-        return Some(Route {
-            handler: "system",
-            args: "shutdown".into(),
-            explicit: false,
-        });
-    }
-    if lower == "reboot" || lower.contains("restart") || lower.starts_with("reboot ") {
-        return Some(Route {
-            handler: "system",
-            args: "reboot".into(),
-            explicit: false,
-        });
-    }
-    if lower.contains("lock screen") || lower.contains("lock my screen") || lower == "lock" {
-        return Some(Route {
-            handler: "system",
-            args: "lock".into(),
-            explicit: false,
-        });
-    }
-    if (lower.contains("sleep") || lower.contains("suspend"))
-        && (lower.contains("computer") || lower.contains("pc") || lower.contains("put"))
-    {
-        return Some(Route {
-            handler: "system",
-            args: "suspend".into(),
-            explicit: false,
-        });
-    }
-    if lower.contains("log out") || lower.contains("logout") || lower.contains("sign out") {
-        return Some(Route {
-            handler: "system",
-            args: "logout".into(),
-            explicit: false,
-        });
-    }
-    if lower == "hibernate" || (lower.contains("hibernate") && lower.contains("computer")) {
-        return Some(Route {
-            handler: "system",
-            args: "hibernate".into(),
-            explicit: false,
-        });
-    }
-
-    // --- media playback (provider-aware) ---
-    const MEDIA_PROVIDERS: &[(&str, &str)] = &[
-        ("spotify", "spotify"),
-        ("youtube", "yt"),
-        // Future: ("soundcloud", "soundcloud"), ("apple music", "apple"), etc.
-    ];
-    for (keyword, provider) in MEDIA_PROVIDERS {
-        if lower.contains(keyword) && has_media_verb(&lower) {
-            let verb = extract_media_verb(&lower);
-            return Some(Route {
-                handler: "media",
-                args: format!("{provider} {verb}"),
-                explicit: false,
-            });
-        }
-    }
-    if lower.contains("pause everything")
-        || lower.contains("stop all")
-        || lower.contains("pause all")
-    {
-        return Some(Route {
-            handler: "media",
-            args: "pause all".into(),
-            explicit: false,
-        });
-    }
-    if is_media_phrase(&lower) {
-        let verb = extract_media_verb(&lower);
-        return Some(Route {
-            handler: "media",
-            args: verb.into(),
-            explicit: false,
-        });
-    }
-
-    // --- system controls (audio, brightness, wifi, bluetooth) ---
-    // Must be checked BEFORE sysinfo to distinguish control actions from info queries.
-    if let Some(r) = try_system_control(&lower) {
-        return Some(r);
-    }
-
-    // --- sysinfo ---
-    if lower.contains("ip address") || lower.contains("my ip") {
-        return Some(Route {
-            handler: "sysinfo",
-            args: "ip".into(),
-            explicit: false,
-        });
-    }
-    if lower.contains("ram") || lower.contains("memory usage") || lower.contains("how much memory")
-    {
-        return Some(Route {
-            handler: "sysinfo",
-            args: "mem".into(),
-            explicit: false,
-        });
-    }
-    if lower.contains("cpu usage") || lower.contains("cpu info") || lower.contains("processor") {
-        return Some(Route {
-            handler: "sysinfo",
-            args: "cpu".into(),
-            explicit: false,
-        });
-    }
-    if lower.contains("disk usage")
-        || lower.contains("disk space")
-        || lower.contains("storage space")
-    {
-        return Some(Route {
-            handler: "sysinfo",
-            args: "disk".into(),
-            explicit: false,
-        });
-    }
-    if lower.contains("temperature")
-        || lower.contains("how hot")
-        || lower.contains("sensor")
-        || lower.contains("thermals")
-    {
-        return Some(Route {
-            handler: "sysinfo",
-            args: "temp".into(),
-            explicit: false,
-        });
-    }
-    if lower.contains("gpu") || lower.contains("graphics card") || lower.contains("video card") {
-        return Some(Route {
-            handler: "sysinfo",
-            args: "gpu".into(),
-            explicit: false,
-        });
-    }
-    if lower.contains("battery") || lower.contains("charge level") || lower.contains("power level")
-    {
-        return Some(Route {
-            handler: "sysinfo",
-            args: "battery".into(),
-            explicit: false,
-        });
-    }
-    if lower.contains("wifi")
-        || lower.contains("wi-fi")
-        || lower.contains("network info")
-        || lower.contains("connection info")
-        || lower.contains("public ip")
-        || lower.contains("internet")
-    {
-        return Some(Route {
-            handler: "sysinfo",
-            args: "net".into(),
-            explicit: false,
-        });
-    }
-    if lower.contains("volume")
-        || lower.contains("audio")
-        || lower.contains("sound")
-        || lower.contains("speaker")
-    {
-        return Some(Route {
-            handler: "sysinfo",
-            args: "audio".into(),
-            explicit: false,
-        });
-    }
-    if lower.contains("monitor")
-        || lower.contains("screen resolution")
-        || lower.contains("display info")
-        || lower.contains("refresh rate")
-    {
-        return Some(Route {
-            handler: "sysinfo",
-            args: "display".into(),
-            explicit: false,
-        });
-    }
-    if lower.contains("what os")
-        || lower.contains("which distro")
-        || lower.contains("kernel version")
-        || lower.contains("linux version")
-    {
-        return Some(Route {
-            handler: "sysinfo",
-            args: "os".into(),
-            explicit: false,
-        });
-    }
-    if lower.contains("speed test")
-        || lower.contains("internet speed")
-        || lower.contains("download speed")
-        || lower.contains("upload speed")
-        || lower.contains("bandwidth")
-        || lower.contains("how fast is my")
-    {
-        return Some(Route {
-            handler: "sysinfo",
-            args: "speedtest".into(),
-            explicit: false,
-        });
-    }
-
-    // --- time / timezone ---
-    if let Some(r) = try_time_route(&lower, input) {
-        return Some(r);
-    }
-
-    // --- weather (structured queries → weather, conversational → weather-ask) ---
-    if let Some(r) = try_weather_route(&lower, input) {
-        return Some(r);
-    }
-
-    // --- reminders ---
-    if lower.starts_with("remind me to ") || lower.starts_with("remind me ") {
-        let text = if lower.starts_with("remind me to ") {
-            input["remind me to ".len()..].trim()
-        } else {
-            input["remind me ".len()..].trim()
-        };
-        return Some(Route {
-            handler: "reminder",
-            args: format!("add {text}"),
-            explicit: false,
-        });
-    }
-    if lower.starts_with("set a reminder") || lower.starts_with("set reminder") {
-        let rest = lower
-            .trim_start_matches("set a reminder")
-            .trim_start_matches("set reminder")
-            .trim_start_matches(" for ")
-            .trim_start_matches(" to ")
-            .trim();
-        let rest = if rest.is_empty() {
-            String::new()
-        } else {
-            let original_rest = &input[input.len() - rest.len()..];
-            format!("add {original_rest}")
-        };
-        return Some(Route {
-            handler: "reminder",
-            args: rest,
-            explicit: false,
-        });
-    }
-
-    // --- todo / task management ---
-    if lower.starts_with("add to my list") {
-        let text = input.get("add to my list".len()..).unwrap_or("").trim();
-        let text = text.strip_prefix(':').unwrap_or(text).trim();
-        return Some(Route {
-            handler: "todo",
-            args: format!("add {text}"),
-            explicit: false,
-        });
-    }
-    if lower.contains("on my plate")
-        || lower.contains("left to do")
-        || lower.contains("did i forget")
-    {
-        return Some(Route {
-            handler: "todo",
-            args: "summary".into(),
-            explicit: false,
-        });
-    }
-    if lower == "show my todos" || lower == "my todos" {
-        return Some(Route {
-            handler: "todo",
-            args: "list".into(),
-            explicit: false,
-        });
-    }
-
-    // --- notes ---
-    for prefix in &["jot down", "write down", "note down"] {
-        if lower.starts_with(prefix) {
-            let rest = input[prefix.len()..].trim();
-            let rest = rest.strip_prefix(':').unwrap_or(rest).trim();
-            if !rest.is_empty() {
-                return Some(Route {
-                    handler: "note",
-                    args: rest.to_string(),
-                    explicit: false,
-                });
-            }
-        }
-    }
-    if lower.contains("what did i write") || lower == "read my note" || lower == "read my notes" {
-        return Some(Route {
-            handler: "note",
-            args: "read".into(),
-            explicit: false,
-        });
-    }
-
-    // --- clipboard ---
-    if lower.contains("clipboard history")
-        || lower.contains("paste history")
-        || lower.contains("what did i copy")
-        || lower.contains("recent copies")
-    {
-        return Some(Route {
-            handler: "clip",
-            args: String::new(),
-            explicit: false,
-        });
-    }
-
-    // --- timer / stopwatch ---
-    if lower.starts_with("set a timer")
-        || lower.starts_with("start a timer")
-        || lower.starts_with("set timer")
-        || lower.starts_with("start timer")
-    {
-        // Extract duration from "set a timer for 25 minutes" etc.
-        let rest = lower
-            .trim_start_matches("set a timer")
-            .trim_start_matches("start a timer")
-            .trim_start_matches("set timer")
-            .trim_start_matches("start timer")
-            .trim_start_matches(" for ")
-            .trim_start_matches(" of ")
-            .trim();
-        return Some(Route {
-            handler: "timer",
-            args: if rest.is_empty() {
-                String::new()
-            } else {
-                format!("start {rest}")
-            },
-            explicit: false,
-        });
-    }
-    if lower == "pomodoro" || lower.starts_with("pomodoro ") {
-        let rest = lower.strip_prefix("pomodoro").unwrap_or("").trim();
-        let duration = if rest.is_empty() { "25m" } else { rest };
-        return Some(Route {
-            handler: "timer",
-            args: format!("start Pomodoro {duration}"),
-            explicit: false,
-        });
-    }
-    if lower == "stop timer" || lower == "cancel timer" {
-        return Some(Route {
-            handler: "timer",
-            args: "stop".into(),
-            explicit: false,
-        });
-    }
-    if lower == "pause timer" {
-        return Some(Route {
-            handler: "timer",
-            args: "pause".into(),
-            explicit: false,
-        });
-    }
-    if lower == "resume timer" {
-        return Some(Route {
-            handler: "timer",
-            args: "resume".into(),
-            explicit: false,
-        });
-    }
-    if lower.starts_with("countdown ") {
-        let rest = input["countdown ".len()..].trim();
-        return Some(Route {
-            handler: "timer",
-            args: format!("start {rest}"),
-            explicit: false,
-        });
-    }
-    if lower == "start stopwatch" || lower == "start a stopwatch" || lower == "start the stopwatch"
-    {
-        return Some(Route {
-            handler: "timer",
-            args: "stopwatch".into(),
-            explicit: false,
-        });
-    }
-    if lower.starts_with("start stopwatch ") {
-        let name = input["start stopwatch ".len()..].trim();
-        return Some(Route {
-            handler: "timer",
-            args: format!("stopwatch {name}"),
-            explicit: false,
-        });
-    }
-    if lower == "stop stopwatch" || lower == "stop the stopwatch" {
-        return Some(Route {
-            handler: "timer",
-            args: "stopwatch stop".into(),
-            explicit: false,
-        });
-    }
-
-    // --- app control ---
-    if lower.starts_with("switch to ") {
-        let target = input["switch to ".len()..].trim();
-        if !target.is_empty() {
-            return Some(Route {
-                handler: "appctl",
-                args: format!("focus {target}"),
-                explicit: false,
-            });
-        }
-    }
-
-    // --- bookmarks ---
-    if lower.contains("bookmarks") || lower.contains("search bookmarks") {
-        return Some(Route {
-            handler: "bm",
-            args: String::new(),
-            explicit: false,
-        });
-    }
-
-    // --- ask — only unambiguous question starters ---
-    // Broad "what/how/who" matching is too risky (grabs file queries, commands, etc.)
-    // Only catch clear knowledge-seeking patterns; let AI handle the rest.
-    if lower.starts_with("explain ") || lower.starts_with("define ") {
-        return Some(Route {
-            handler: "ask",
-            args: input.to_string(),
-            explicit: false,
-        });
-    }
-
-    None
-}
-
-/// Route system control commands (audio, brightness, wifi, bluetooth).
-/// Distinguishes action intents from info queries that should go to sysinfo.
-fn try_system_control(lower: &str) -> Option<Route> {
-    // --- Audio mute/unmute ---
-    if lower == "mute"
-        || lower == "mute audio"
-        || lower == "mute sound"
-        || lower == "mute system"
-        || lower == "mute speakers"
-    {
-        return Some(Route {
-            handler: "system",
-            args: "mute".into(),
-            explicit: false,
-        });
-    }
-    if lower == "unmute"
-        || lower == "unmute audio"
-        || lower == "unmute sound"
-        || lower == "unmute system"
-        || lower == "unmute speakers"
-    {
-        return Some(Route {
-            handler: "system",
-            args: "unmute".into(),
-            explicit: false,
-        });
-    }
-
-    // --- Volume control ---
-    if lower == "volume up"
-        || lower == "turn up volume"
-        || lower == "turn up the volume"
-        || lower == "louder"
-        || lower == "vol up"
-        || lower == "increase volume"
-        || lower == "increase the volume"
-        || lower == "raise volume"
-        || lower == "raise the volume"
-    {
-        return Some(Route {
-            handler: "system",
-            args: "volume up".into(),
-            explicit: false,
-        });
-    }
-    if lower == "volume down"
-        || lower == "turn down volume"
-        || lower == "turn down the volume"
-        || lower == "quieter"
-        || lower == "vol down"
-        || lower == "decrease volume"
-        || lower == "decrease the volume"
-        || lower == "reduce volume"
-        || lower == "reduce the volume"
-        || lower == "reduce the audio"
-        || lower == "lower volume"
-        || lower == "lower the volume"
-        || lower == "lower the audio"
-    {
-        return Some(Route {
-            handler: "system",
-            args: "volume down".into(),
-            explicit: false,
-        });
-    }
-    // "set volume to 50" / "set volume 50" / "volume 50"
-    for prefix in &["set volume to ", "set volume ", "volume "] {
-        if let Some(rest) = lower.strip_prefix(prefix) {
-            let rest = rest.trim().trim_end_matches('%');
-            if let Ok(n) = rest.parse::<u32>()
-                && n <= 150
-            {
-                return Some(Route {
-                    handler: "system",
-                    args: format!("volume {n}"),
-                    explicit: false,
-                });
-            }
-        }
-    }
-
-    // --- Brightness ---
-    if lower == "brightness up" || lower == "brighter" || lower == "screen brighter" {
-        return Some(Route {
-            handler: "system",
-            args: "brightness up".into(),
-            explicit: false,
-        });
-    }
-    if lower == "brightness down"
-        || lower == "dimmer"
-        || lower == "dim screen"
-        || lower == "screen dimmer"
-    {
-        return Some(Route {
-            handler: "system",
-            args: "brightness down".into(),
-            explicit: false,
-        });
-    }
-    // "set brightness to 50" / "set brightness 50" / "brightness 50"
-    for prefix in &["set brightness to ", "set brightness ", "brightness "] {
-        if let Some(rest) = lower.strip_prefix(prefix) {
-            let rest = rest.trim().trim_end_matches('%');
-            if let Ok(n) = rest.parse::<u32>()
-                && n <= 100
-            {
-                return Some(Route {
-                    handler: "system",
-                    args: format!("brightness {n}"),
-                    explicit: false,
-                });
-            }
-        }
-    }
-
-    // --- WiFi ---
-    if lower == "wifi on"
-        || lower == "enable wifi"
-        || lower == "turn on wifi"
-        || lower == "turn wifi on"
-    {
-        return Some(Route {
-            handler: "system",
-            args: "wifi on".into(),
-            explicit: false,
-        });
-    }
-    if lower == "wifi off"
-        || lower == "disable wifi"
-        || lower == "turn off wifi"
-        || lower == "turn wifi off"
-    {
-        return Some(Route {
-            handler: "system",
-            args: "wifi off".into(),
-            explicit: false,
-        });
-    }
-
-    // --- Bluetooth ---
-    if lower == "bluetooth on"
-        || lower == "bt on"
-        || lower == "enable bluetooth"
-        || lower == "turn on bluetooth"
-        || lower == "turn bluetooth on"
-    {
-        return Some(Route {
-            handler: "system",
-            args: "bluetooth on".into(),
-            explicit: false,
-        });
-    }
-    if lower == "bluetooth off"
-        || lower == "bt off"
-        || lower == "disable bluetooth"
-        || lower == "turn off bluetooth"
-        || lower == "turn bluetooth off"
-    {
-        return Some(Route {
-            handler: "system",
-            args: "bluetooth off".into(),
-            explicit: false,
-        });
-    }
-
-    // --- Bluetooth connect/disconnect ---
-    for prefix in &[
-        "connect bluetooth ",
-        "connect bt ",
-        "bluetooth connect ",
-        "bt connect ",
-        "connect to bluetooth ",
-        "connect to bt ",
-        "connect to my ",
-    ] {
-        if let Some(rest) = lower.strip_prefix(prefix) {
-            let device = rest.trim();
-            if !device.is_empty() {
-                return Some(Route {
-                    handler: "system",
-                    args: format!("connect bluetooth {device}"),
-                    explicit: false,
-                });
-            }
-        }
-    }
-    for prefix in &[
-        "disconnect bluetooth ",
-        "disconnect bt ",
-        "bluetooth disconnect ",
-        "bt disconnect ",
-        "disconnect from bluetooth ",
-        "disconnect from bt ",
-        "disconnect from my ",
-        "disconnect my ",
-    ] {
-        if let Some(rest) = lower.strip_prefix(prefix) {
-            let device = rest.trim();
-            if !device.is_empty() {
-                return Some(Route {
-                    handler: "system",
-                    args: format!("disconnect bluetooth {device}"),
-                    explicit: false,
-                });
-            }
-        }
-    }
-
-    None
-}
-
-/// Media playback verbs recognised by the keyword router.
-const MEDIA_VERBS: &[&str] = &[
-    "pause", "play", "skip", "next", "previous", "prev", "stop", "toggle", "resume",
-];
-
-/// Check if input contains a media playback verb.
-fn has_media_verb(lower: &str) -> bool {
-    MEDIA_VERBS.iter().any(|v| lower.contains(v))
-}
-
-/// Check if input is a natural-language media phrase (verb + context word).
-fn is_media_phrase(lower: &str) -> bool {
-    const CONTEXT_WORDS: &[&str] = &["music", "song", "media", "everything", "all", "track"];
-    has_media_verb(lower) && CONTEXT_WORDS.iter().any(|w| lower.contains(w))
-}
-
-/// Extract the canonical media verb from a phrase.
-fn extract_media_verb(lower: &str) -> &'static str {
-    if lower.contains("pause") || lower.contains("stop") {
-        "pause"
-    } else if lower.contains("next") || lower.contains("skip") {
-        "next"
-    } else if lower.contains("prev") || lower.contains("previous") {
-        "prev"
-    } else {
-        "play"
-    }
-}
-
-/// Try to route time/timezone-related input.
-fn try_time_route(lower: &str, original: &str) -> Option<Route> {
-    // "time in <city>" / "time in <tz>"
-    for prefix in &["time in ", "current time in ", "local time in "] {
-        if lower.starts_with(prefix) {
-            let location = original[prefix.len()..].trim();
-            if !location.is_empty() {
-                return Some(Route {
-                    handler: "time",
-                    args: location.to_string(),
-                    explicit: false,
-                });
-            }
-        }
-    }
-
-    // "what time is it in <city>"
-    if let Some(pos) = lower.find("time is it in ") {
-        let location = original[pos + "time is it in ".len()..].trim();
-        if !location.is_empty() {
-            return Some(Route {
-                handler: "time",
-                args: location.to_string(),
-                explicit: false,
-            });
-        }
-    }
-
-    // "what time is it" (no city) — show local time
-    if lower == "what time is it"
-        || lower == "current time"
-        || lower == "local time"
-        || lower == "world clock"
-    {
-        return Some(Route {
-            handler: "time",
-            args: String::new(),
-            explicit: false,
-        });
-    }
-
-    // Timezone conversion: "<time> <tz> to <tz>" (e.g. "3pm EST to IST")
-    if lower.contains(" to ") && crate::action_registry::handlers::time::is_tz_conversion(lower) {
-        return Some(Route {
-            handler: "time",
-            args: original.trim().to_string(),
-            explicit: false,
-        });
-    }
-
-    None
-}
-
-/// Try to route weather-related input.
-fn try_weather_route(lower: &str, original: &str) -> Option<Route> {
-    // Conversational weather → weather-ask
-    const CONVERSATIONAL: &[&str] = &[
-        "will it rain",
-        "is it rain",
-        "do i need an umbrella",
-        "do i need a jacket",
-        "should i wear",
-        "is it cold",
-        "is it hot",
-        "is it warm",
-        "is it snowing",
-    ];
-    for phrase in CONVERSATIONAL {
-        if lower.contains(phrase) {
-            return Some(Route {
-                handler: "weather-ask",
-                args: original.to_string(),
-                explicit: false,
-            });
-        }
-    }
-
-    // "weather in <city>" / "temperature in <city>" / "forecast for <city>"
-    for prefix in &[
-        "weather in ",
-        "temperature in ",
-        "forecast for ",
-        "forecast in ",
-    ] {
-        if lower.starts_with(prefix) {
-            let city = original[prefix.len()..].trim();
-            if !city.is_empty() {
-                return Some(Route {
-                    handler: "weather",
-                    args: city.to_string(),
-                    explicit: false,
-                });
-            }
-        }
-    }
-
-    // "what's the weather in <city>" / "how's the weather in <city>"
-    if let Some(pos) = lower
-        .find("weather in ")
-        .or_else(|| lower.find("weather at "))
-    {
-        let preposition_len = if lower[pos..].starts_with("weather in") {
-            "weather in ".len()
-        } else {
-            "weather at ".len()
-        };
-        let city = original[pos + preposition_len..].trim();
-        if !city.is_empty() {
-            return Some(Route {
-                handler: "weather",
-                args: city.to_string(),
-                explicit: false,
-            });
-        }
-    }
-
-    // "what's the weather" (no city) — default location
-    if lower.contains("the weather") || lower == "weather" {
-        return Some(Route {
-            handler: "weather",
-            args: String::new(),
-            explicit: false,
-        });
-    }
-
-    None
-}
-
 fn is_math_expression(input: &str) -> bool {
     if input.is_empty() {
         return false;
@@ -1254,36 +463,36 @@ mod tests {
 
     #[test]
     fn explicit_prefixes() {
-        let r = route("web rust lang");
+        let r = route("web rust lang").unwrap();
         assert_eq!(r.handler, "web");
         assert_eq!(r.args, "rust lang");
         assert!(r.explicit);
 
-        let r = route("yt funny cats");
+        let r = route("yt funny cats").unwrap();
         assert_eq!(r.handler, "yt");
         assert_eq!(r.args, "funny cats");
 
-        let r = route("run ls -la");
+        let r = route("run ls -la").unwrap();
         assert_eq!(r.handler, "run");
         assert_eq!(r.args, "ls -la");
 
-        let r = route("open firefox");
+        let r = route("open firefox").unwrap();
         assert_eq!(r.handler, "open");
         assert_eq!(r.args, "firefox");
     }
 
     #[test]
     fn trigger_characters() {
-        let r = route("=2+2");
+        let r = route("=2+2").unwrap();
         assert_eq!(r.handler, "calc");
         assert_eq!(r.args, "2+2");
         assert!(r.explicit);
 
-        let r = route("=sqrt(144)");
+        let r = route("=sqrt(144)").unwrap();
         assert_eq!(r.handler, "calc");
         assert_eq!(r.args, "sqrt(144)");
 
-        let r = route(">ls -la");
+        let r = route(">ls -la").unwrap();
         assert_eq!(r.handler, "run");
         assert_eq!(r.args, "ls -la");
         assert!(r.explicit);
@@ -1312,7 +521,7 @@ mod tests {
             ("sym:infinity", "sym", "infinity"),
         ];
         for &(input, expected_handler, expected_args) in cases {
-            let r = route(input);
+            let r = route(input).unwrap();
             assert_eq!(r.handler, expected_handler, "input: {input}");
             assert_eq!(r.args, expected_args, "input: {input}");
             assert!(r.explicit, "input: {input}");
@@ -1321,487 +530,295 @@ mod tests {
 
     #[test]
     fn file_paths() {
-        let r = route("~/Documents");
+        let r = route("~/Documents").unwrap();
         assert_eq!(r.handler, "file");
         assert_eq!(r.args, "~/Documents");
 
-        let r = route("/tmp");
+        let r = route("/tmp").unwrap();
         assert_eq!(r.handler, "file");
 
-        let r = route("./src");
+        let r = route("./src").unwrap();
         assert_eq!(r.handler, "file");
     }
 
     #[test]
     fn urls() {
-        let r = route("https://github.com");
+        let r = route("https://github.com").unwrap();
         assert_eq!(r.handler, "url");
 
-        let r = route("github.com");
+        let r = route("github.com").unwrap();
         assert_eq!(r.handler, "url");
 
-        let r = route("example.org/path");
+        let r = route("example.org/path").unwrap();
         assert_eq!(r.handler, "url");
 
-        // Not a URL — has spaces
-        let r = route("not a url.com");
-        assert_ne!(r.handler, "url");
+        // Not a URL — has spaces → NoMatch
+        assert!(matches!(
+            route("not a url.com"),
+            PatternResult::NoMatch { .. }
+        ));
     }
 
     #[test]
     fn math_expressions() {
-        let r = route("2+2");
+        let r = route("2+2").unwrap();
         assert_eq!(r.handler, "calc");
         assert_eq!(r.args, "2+2");
 
-        let r = route("100/3");
+        let r = route("100/3").unwrap();
         assert_eq!(r.handler, "calc");
 
-        let r = route("(10 + 5) * 3");
+        let r = route("(10 + 5) * 3").unwrap();
         assert_eq!(r.handler, "calc");
 
-        // Not math — contains letters
-        let r = route("2x+3");
-        assert_ne!(r.handler, "calc");
+        // Not math — contains letters → NoMatch
+        assert!(matches!(route("2x+3"), PatternResult::NoMatch { .. }));
     }
 
     #[test]
     fn default_app_search() {
-        let r = route("firefox");
-        assert_eq!(r.handler, "open");
-        assert_eq!(r.args, "firefox");
-        assert!(!r.explicit);
-
-        // Bare "spotify" opens the app, not media control
-        let r = route("spotify");
-        assert_eq!(r.handler, "open");
-        assert_eq!(r.args, "spotify");
-        assert!(!r.explicit);
+        // Bare app names with no structural match → NoMatch (AI or open fallback)
+        assert!(matches!(route("firefox"), PatternResult::NoMatch { .. }));
+        assert!(matches!(route("spotify"), PatternResult::NoMatch { .. }));
     }
 
     #[test]
     fn sysinfo_commands() {
-        let r = route("sysinfo");
+        let r = route("sysinfo").unwrap();
         assert_eq!(r.handler, "sysinfo");
         assert_eq!(r.args, "");
         assert!(r.explicit);
 
-        let r = route("sysinfo cpu");
+        let r = route("sysinfo cpu").unwrap();
         assert_eq!(r.handler, "sysinfo");
         assert_eq!(r.args, "cpu");
 
         // Bare shortcuts pass keyword as args
-        let r = route("ip");
+        let r = route("ip").unwrap();
         assert_eq!(r.handler, "sysinfo");
         assert_eq!(r.args, "ip");
 
-        let r = route("cpu");
+        let r = route("cpu").unwrap();
         assert_eq!(r.handler, "sysinfo");
         assert_eq!(r.args, "cpu");
 
-        let r = route("mem");
+        let r = route("mem").unwrap();
         assert_eq!(r.handler, "sysinfo");
         assert_eq!(r.args, "mem");
 
-        let r = route("disk");
+        let r = route("disk").unwrap();
         assert_eq!(r.handler, "sysinfo");
         assert_eq!(r.args, "disk");
     }
 
-    // --- Keyword routing tests ---
+    // --- Natural language fallback tests ---
+    // Natural language phrases have no structural match → PatternResult::NoMatch.
+    // IntentResolver then tries AI, then falls back to open→web.
 
     #[test]
-    fn keyword_system_power() {
-        let r = route("shut down the computer");
-        assert_eq!(r.handler, "system");
-        assert_eq!(r.args, "shutdown");
-        assert!(!r.explicit);
-
-        assert_eq!(route("lock my screen").handler, "system");
-        assert_eq!(route("lock my screen").args, "lock");
-
-        assert_eq!(route("put the computer to sleep").handler, "system");
-        assert_eq!(route("put the computer to sleep").args, "suspend");
-
-        assert_eq!(route("log out").handler, "system");
-        assert_eq!(route("log out").args, "logout");
-
-        // "reboot" as bare word → keyword routing
-        let r = route("reboot");
-        assert_eq!(r.handler, "system");
-        assert_eq!(r.args, "reboot");
-        assert!(!r.explicit);
-    }
-
-    #[test]
-    fn keyword_media() {
-        let r = route("pause the music");
-        assert_eq!(r.handler, "media");
-        assert_eq!(r.args, "pause");
-
-        let r = route("skip this song");
-        assert_eq!(r.handler, "media");
-        assert_eq!(r.args, "next");
-
-        let r = route("pause everything");
-        assert_eq!(r.handler, "media");
-        assert_eq!(r.args, "pause all");
-
-        let r = route("stop all music");
-        assert_eq!(r.handler, "media");
-        assert_eq!(r.args, "pause all");
-    }
-
-    #[test]
-    fn keyword_spotify() {
-        let r = route("play something on spotify");
-        assert_eq!(r.handler, "media");
-        assert_eq!(r.args, "spotify play");
-
-        let r = route("next song on spotify");
-        assert_eq!(r.handler, "media");
-        assert_eq!(r.args, "spotify next");
+    fn natural_language_is_no_match() {
+        for input in &[
+            "pause the music",
+            "play something on spotify",
+            "what's my ip address",
+            "how much ram is being used",
+            "shut down the computer",
+            "what's the weather in paris",
+            "will it rain today",
+            "what time is it in london",
+            "find large files in downloads",
+            "whats my system cpu",
+            "increase the volume",
+        ] {
+            assert!(
+                matches!(route(input), PatternResult::NoMatch { .. }),
+                "expected NoMatch for: {input}"
+            );
+        }
     }
 
     #[test]
     fn explicit_media_prefix() {
-        let r = route("media pause");
+        let r = route("media pause").unwrap();
         assert_eq!(r.handler, "media");
         assert_eq!(r.args, "pause");
         assert!(r.explicit);
 
-        let r = route("media spotify pause");
+        let r = route("media spotify pause").unwrap();
         assert_eq!(r.handler, "media");
         assert_eq!(r.args, "spotify pause");
         assert!(r.explicit);
 
-        let r = route("media yt next");
+        let r = route("media yt next").unwrap();
         assert_eq!(r.handler, "media");
         assert_eq!(r.args, "yt next");
         assert!(r.explicit);
     }
 
     #[test]
-    fn spotify_keyword_routes_to_media() {
-        // "spotify pause" — no longer a prefix, hits keyword routing
-        let r = route("spotify pause");
-        assert_eq!(r.handler, "media");
-        assert_eq!(r.args, "spotify pause");
-        assert!(!r.explicit);
-
-        let r = route("spotify next");
-        assert_eq!(r.handler, "media");
-        assert_eq!(r.args, "spotify next");
-        assert!(!r.explicit);
-    }
-
-    #[test]
-    fn keyword_sysinfo_phrases() {
-        let r = route("what's my ip address");
-        assert_eq!(r.handler, "sysinfo");
-        assert_eq!(r.args, "ip");
-
-        let r = route("how much ram is being used");
-        assert_eq!(r.handler, "sysinfo");
-        assert_eq!(r.args, "mem");
-
-        let r = route("show cpu usage");
-        assert_eq!(r.handler, "sysinfo");
-        assert_eq!(r.args, "cpu");
-
-        let r = route("how much disk space is left");
-        assert_eq!(r.handler, "sysinfo");
-        assert_eq!(r.args, "disk");
-    }
-
-    #[test]
-    fn keyword_weather() {
-        let r = route("weather in tokyo");
-        assert_eq!(r.handler, "weather");
-        assert_eq!(r.args, "tokyo");
-
-        let r = route("what's the weather in paris");
-        assert_eq!(r.handler, "weather");
-        assert_eq!(r.args, "paris");
-
-        let r = route("what's the weather");
-        assert_eq!(r.handler, "weather");
-        assert_eq!(r.args, "");
-
-        // Conversational → weather-ask
-        let r = route("will it rain today");
-        assert_eq!(r.handler, "weather-ask");
-
-        let r = route("do I need an umbrella");
-        assert_eq!(r.handler, "weather-ask");
-
-        let r = route("should I wear a jacket tomorrow");
-        assert_eq!(r.handler, "weather-ask");
-
-        let r = route("is it cold outside");
-        assert_eq!(r.handler, "weather-ask");
-    }
-
-    #[test]
-    fn keyword_todo() {
-        let r = route("add to my list: fix the login bug");
-        assert_eq!(r.handler, "todo");
-        assert_eq!(r.args, "add fix the login bug");
-
-        let r = route("what's on my plate");
-        assert_eq!(r.handler, "todo");
-        assert_eq!(r.args, "summary");
-
-        let r = route("show my todos");
-        assert_eq!(r.handler, "todo");
-        assert_eq!(r.args, "list");
-    }
-
-    #[test]
-    fn keyword_reminder() {
-        let r = route("remind me to buy milk");
-        assert_eq!(r.handler, "reminder");
-        assert_eq!(r.args, "add buy milk");
-
-        let r = route("remind me to call dentist in 2 hours");
-        assert_eq!(r.handler, "reminder");
-        assert_eq!(r.args, "add call dentist in 2 hours");
-
-        let r = route("set a reminder for standup at 9am");
-        assert_eq!(r.handler, "reminder");
-        assert!(r.args.contains("standup at 9am"));
-
-        // Explicit prefix
-        let r = route("reminder add test in 5m");
-        assert_eq!(r.handler, "reminder");
-        assert_eq!(r.args, "add test in 5m");
-
-        let r = route("reminder list");
-        assert_eq!(r.handler, "reminder");
-        assert_eq!(r.args, "list");
-
-        // "remind" prefix strips "me to"
-        let r = route("remind me to walk the dog in 30 minutes");
-        assert_eq!(r.handler, "reminder");
-        assert_eq!(r.args, "add walk the dog in 30 minutes");
-    }
-
-    #[test]
-    fn keyword_notes() {
-        let r = route("jot down: call dentist tomorrow");
-        assert_eq!(r.handler, "note");
-        assert_eq!(r.args, "call dentist tomorrow");
-
-        let r = route("write down meeting at 3pm");
-        assert_eq!(r.handler, "note");
-        assert_eq!(r.args, "meeting at 3pm");
-
-        let r = route("what did I write down");
-        assert_eq!(r.handler, "note");
-        assert_eq!(r.args, "read");
-    }
-
-    #[test]
     fn keyword_ask() {
-        // Only unambiguous starters — "explain" and "define"
-        let r = route("explain quantum computing");
-        assert_eq!(r.handler, "ask");
-
-        let r = route("define ephemeral");
-        assert_eq!(r.handler, "ask");
-
-        // Broad question words fall through to web search (AI can upgrade if available)
-        let r = route("what is the capital of France");
-        assert_eq!(r.handler, "web"); // multi-word → web search fallback
-
-        let r = route("who invented the telephone");
-        assert_eq!(r.handler, "web"); // multi-word → web search fallback
-
-        let r = route("how does photosynthesis work");
-        assert_eq!(r.handler, "web"); // multi-word → web search fallback
+        // Natural language questions → NoMatch (AI handles it)
+        assert!(matches!(
+            route("what is the capital of France"),
+            PatternResult::NoMatch { .. }
+        ));
+        assert!(matches!(
+            route("who invented the telephone"),
+            PatternResult::NoMatch { .. }
+        ));
+        assert!(matches!(
+            route("how does photosynthesis work"),
+            PatternResult::NoMatch { .. }
+        ));
     }
 
     #[test]
     fn conversion_expressions() {
-        let r = route("5 kg to lb");
+        let r = route("5 kg to lb").unwrap();
         assert_eq!(r.handler, "calc");
         assert_eq!(r.args, "5 kg to lb");
         assert!(!r.explicit);
 
-        let r = route("100cm to inches");
+        let r = route("100cm to inches").unwrap();
         assert_eq!(r.handler, "calc");
 
-        let r = route("72 f to c");
+        let r = route("72 f to c").unwrap();
         assert_eq!(r.handler, "calc");
 
-        let r = route("1 gal to l");
+        let r = route("1 gal to l").unwrap();
         assert_eq!(r.handler, "calc");
 
-        let r = route("1 gb to mb");
+        let r = route("1 gb to mb").unwrap();
         assert_eq!(r.handler, "calc");
 
         // Currency (routes to calc even though rates may not be cached)
-        let r = route("250 usd to eur");
+        let r = route("250 usd to eur").unwrap();
         assert_eq!(r.handler, "calc");
 
-        // Not a conversion
-        let r = route("5 kg");
-        assert_ne!(r.handler, "calc");
+        // Not a conversion → NoMatch
+        assert!(matches!(route("5 kg"), PatternResult::NoMatch { .. }));
     }
 
     #[test]
-    fn keyword_system_controls() {
-        // Audio
-        let r = route("mute");
+    fn explicit_system_power_words() {
+        // Bare power words are now explicit prefix matches — instant, no AI needed
+        let r = route("shutdown").unwrap();
+        assert_eq!(r.handler, "system");
+        assert_eq!(r.args, "shutdown");
+        assert!(r.explicit);
+
+        let r = route("reboot").unwrap();
+        assert_eq!(r.handler, "system");
+        assert_eq!(r.args, "reboot");
+        assert!(r.explicit);
+
+        let r = route("lock").unwrap();
+        assert_eq!(r.handler, "system");
+        assert_eq!(r.args, "lock");
+        assert!(r.explicit);
+
+        let r = route("suspend").unwrap();
+        assert_eq!(r.handler, "system");
+        assert_eq!(r.args, "suspend");
+        assert!(r.explicit);
+
+        let r = route("hibernate").unwrap();
+        assert_eq!(r.handler, "system");
+        assert_eq!(r.args, "hibernate");
+        assert!(r.explicit);
+
+        let r = route("logout").unwrap();
+        assert_eq!(r.handler, "system");
+        assert_eq!(r.args, "logout");
+        assert!(r.explicit);
+
+        let r = route("mute").unwrap();
         assert_eq!(r.handler, "system");
         assert_eq!(r.args, "mute");
-        assert!(!r.explicit);
+        assert!(r.explicit);
 
-        assert_eq!(route("unmute").handler, "system");
-        assert_eq!(route("unmute").args, "unmute");
-
-        assert_eq!(route("volume up").handler, "system");
-        assert_eq!(route("volume up").args, "volume up");
-
-        assert_eq!(route("volume down").handler, "system");
-        assert_eq!(route("volume down").args, "volume down");
-
-        assert_eq!(route("louder").handler, "system");
-        assert_eq!(route("louder").args, "volume up");
-
-        assert_eq!(route("quieter").handler, "system");
-        assert_eq!(route("quieter").args, "volume down");
-
-        let r = route("volume 50");
+        let r = route("unmute").unwrap();
         assert_eq!(r.handler, "system");
-        assert_eq!(r.args, "volume 50");
+        assert_eq!(r.args, "unmute");
+        assert!(r.explicit);
 
-        let r = route("set volume to 80");
+        // Aliases
+        let r = route("poweroff").unwrap();
         assert_eq!(r.handler, "system");
-        assert_eq!(r.args, "volume 80");
+        assert_eq!(r.args, "shutdown");
 
-        // Brightness
-        assert_eq!(route("brightness up").handler, "system");
-        assert_eq!(route("brightness up").args, "brightness up");
-
-        assert_eq!(route("brighter").handler, "system");
-        assert_eq!(route("brighter").args, "brightness up");
-
-        assert_eq!(route("dimmer").handler, "system");
-        assert_eq!(route("dimmer").args, "brightness down");
-
-        assert_eq!(route("dim screen").handler, "system");
-        assert_eq!(route("dim screen").args, "brightness down");
-
-        let r = route("brightness 50");
+        let r = route("restart").unwrap();
         assert_eq!(r.handler, "system");
-        assert_eq!(r.args, "brightness 50");
+        assert_eq!(r.args, "reboot");
 
-        // WiFi
-        assert_eq!(route("wifi on").handler, "system");
-        assert_eq!(route("wifi on").args, "wifi on");
-
-        assert_eq!(route("wifi off").handler, "system");
-        assert_eq!(route("wifi off").args, "wifi off");
-
-        assert_eq!(route("turn on wifi").handler, "system");
-        assert_eq!(route("turn on wifi").args, "wifi on");
-
-        assert_eq!(route("disable wifi").handler, "system");
-        assert_eq!(route("disable wifi").args, "wifi off");
-
-        // Bluetooth
-        assert_eq!(route("bluetooth on").handler, "system");
-        assert_eq!(route("bluetooth on").args, "bluetooth on");
-
-        assert_eq!(route("bt off").handler, "system");
-        assert_eq!(route("bt off").args, "bluetooth off");
-
-        assert_eq!(route("turn off bluetooth").handler, "system");
-        assert_eq!(route("turn off bluetooth").args, "bluetooth off");
-
-        // Natural language volume control
-        assert_eq!(route("reduce the audio").handler, "system");
-        assert_eq!(route("reduce the audio").args, "volume down");
-        assert_eq!(route("lower the volume").handler, "system");
-        assert_eq!(route("lower the volume").args, "volume down");
-        assert_eq!(route("increase the volume").handler, "system");
-        assert_eq!(route("increase the volume").args, "volume up");
-        assert_eq!(route("turn up the volume").handler, "system");
-        assert_eq!(route("turn up the volume").args, "volume up");
-        assert_eq!(route("turn down the volume").handler, "system");
-        assert_eq!(route("turn down the volume").args, "volume down");
-
-        // Info queries should still go to sysinfo
-        assert_eq!(route("what's my ip address").handler, "sysinfo");
-        // "wifi" without on/off context goes to sysinfo (via keyword_sysinfo)
-        // "volume" without control context goes to sysinfo
+        let r = route("sleep").unwrap();
+        assert_eq!(r.handler, "system");
+        assert_eq!(r.args, "suspend");
     }
 
     #[test]
-    fn keyword_time_routes() {
-        // World clock
-        let r = route("time in tokyo");
-        assert_eq!(r.handler, "time");
-        assert_eq!(r.args, "tokyo");
+    fn structured_power_phrases() {
+        // "shutdown in N" and "cancel shutdown" are handled deterministically
+        let r = route("shutdown in 10 minutes").unwrap();
+        assert_eq!(r.handler, "system");
+        assert!(r.args.contains("shutdown in"));
 
-        let r = route("time in new york");
-        assert_eq!(r.handler, "time");
-        assert_eq!(r.args, "new york");
+        let r = route("cancel shutdown").unwrap();
+        assert_eq!(r.handler, "system");
+        assert_eq!(r.args, "cancel shutdown");
+    }
 
-        let r = route("what time is it in london");
-        assert_eq!(r.handler, "time");
-        assert_eq!(r.args, "london");
-
-        let r = route("current time in paris");
-        assert_eq!(r.handler, "time");
-        assert_eq!(r.args, "paris");
-
-        // No city → local time
-        assert_eq!(route("what time is it").handler, "time");
-        assert_eq!(route("what time is it").args, "");
-        assert_eq!(route("current time").handler, "time");
-        assert_eq!(route("world clock").handler, "time");
-
-        // Timezone conversion
-        let r = route("3pm EST to IST");
-        assert_eq!(r.handler, "time");
-        assert_eq!(r.args, "3pm EST to IST");
-
-        let r = route("noon UTC to PST");
-        assert_eq!(r.handler, "time");
-        assert_eq!(r.args, "noon UTC to PST");
-
+    #[test]
+    fn explicit_time_prefix() {
         // Colon trigger
-        let r = route("tz:tokyo");
+        let r = route("tz:tokyo").unwrap();
         assert_eq!(r.handler, "time");
         assert_eq!(r.args, "tokyo");
         assert!(r.explicit);
 
         // Explicit prefix
-        let r = route("time tokyo");
+        let r = route("time tokyo").unwrap();
         assert_eq!(r.handler, "time");
         assert_eq!(r.args, "tokyo");
         assert!(r.explicit);
 
-        // Duration conversion should still go to calc, not time
-        let r = route("2 hours to minutes");
+        // Duration conversion still goes to calc
+        let r = route("2 hours to minutes").unwrap();
         assert_eq!(r.handler, "calc");
     }
 
     #[test]
-    fn keyword_no_false_positives() {
-        // Regular app names should not trigger keyword routing
-        let r = route("firefox");
-        assert_eq!(r.handler, "open");
+    fn fallback_behaviour() {
+        // Bare app names → NoMatch (IntentResolver tries AI then open→web)
+        assert!(matches!(route("firefox"), PatternResult::NoMatch { .. }));
+        assert!(matches!(
+            route("find large files in downloads"),
+            PatternResult::NoMatch { .. }
+        ));
 
-        // Multi-word ambiguous input → web search (AI can upgrade if available)
-        let r = route("find large files in downloads");
-        assert_eq!(r.handler, "web"); // multi-word → web search fallback
-
-        // Explicit prefix still wins over keyword
-        let r = route("weather london");
+        // Explicit prefix still wins
+        let r = route("weather london").unwrap();
         assert_eq!(r.handler, "weather");
         assert!(r.explicit);
+    }
+
+    #[test]
+    fn question_trigger_prefix() {
+        // ? prefix forces web search
+        let r = route("? whats my system memory").unwrap();
+        assert_eq!(r.handler, "web");
+        assert_eq!(r.args, "whats my system memory");
+        assert!(r.explicit);
+
+        let r = route("?rust programming").unwrap();
+        assert_eq!(r.handler, "web");
+        assert_eq!(r.args, "rust programming");
+        assert!(r.explicit);
+    }
+
+    #[test]
+    fn empty_input_is_no_match() {
+        assert!(matches!(route(""), PatternResult::NoMatch { .. }));
+        assert!(matches!(route("   "), PatternResult::NoMatch { .. }));
     }
 }

@@ -118,6 +118,7 @@ impl ActionHandler for WeatherAskHandler {
                 output_type: Some(OutputType::Text),
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             });
         }
 
@@ -168,6 +169,7 @@ impl ActionHandler for WeatherAskHandler {
             output_type: Some(OutputType::Text),
             executed_args: None,
             launch_desktop: None,
+            focus_app: None,
         })
     }
 }

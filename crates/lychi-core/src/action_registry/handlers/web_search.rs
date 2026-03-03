@@ -46,7 +46,7 @@ impl ActionHandler for WebSearch {
             label: format!("Search web: {query}"),
             icon_path: Some("__none__".to_string()),
             score: 100,
-            description: Some("Enter to search".to_string()),
+            description: Some("Enter · Ctrl+Enter".to_string()),
             reason: None,
         }]
     }
@@ -66,6 +66,7 @@ impl ActionHandler for WebSearch {
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             });
         }
 
@@ -73,7 +74,7 @@ impl ActionHandler for WebSearch {
 
         Ok(ActionResult {
             success: true,
-            output: Some(format!("Searching: {query}")),
+            output: None,
             error: None,
             duration_ms: 0,
             routed_by: None,
@@ -83,6 +84,7 @@ impl ActionHandler for WebSearch {
             output_type: None,
             executed_args: None,
             launch_desktop: None,
+            focus_app: None,
         })
     }
 }

@@ -64,6 +64,7 @@ impl ActionHandler for NotesHandler {
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             });
         }
 
@@ -83,6 +84,7 @@ impl ActionHandler for NotesHandler {
                     output_type: Some(OutputType::Text),
                     executed_args: None,
                     launch_desktop: None,
+                    focus_app: None,
                 });
             }
             let lines: Vec<String> = notes
@@ -107,6 +109,7 @@ impl ActionHandler for NotesHandler {
                 output_type: Some(OutputType::Text),
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             });
         }
 
@@ -130,6 +133,7 @@ impl ActionHandler for NotesHandler {
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             });
         }
 
@@ -152,6 +156,7 @@ impl ActionHandler for NotesHandler {
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             }),
             Err(e) if e.to_string().contains("limit reached") => {
                 // Return sentinel so frontend opens NotesPanel with pending note
@@ -167,6 +172,7 @@ impl ActionHandler for NotesHandler {
                     output_type: None,
                     executed_args: None,
                     launch_desktop: None,
+                    focus_app: None,
                 })
             }
             Err(e) => Err(e),
@@ -238,6 +244,7 @@ impl ActionHandler for TodoHandler {
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             });
         }
 
@@ -259,6 +266,7 @@ impl ActionHandler for TodoHandler {
                         output_type: None,
                         executed_args: None,
                         launch_desktop: None,
+                        focus_app: None,
                     });
                 }
                 let item = store.add_todo(&self.db, rest)?;
@@ -274,6 +282,7 @@ impl ActionHandler for TodoHandler {
                     output_type: None,
                     executed_args: None,
                     launch_desktop: None,
+                    focus_app: None,
                 })
             }
             "list" | "ls" => {
@@ -291,6 +300,7 @@ impl ActionHandler for TodoHandler {
                         output_type: None,
                         executed_args: None,
                         launch_desktop: None,
+                        focus_app: None,
                     });
                 }
                 let lines: Vec<String> = todos
@@ -312,6 +322,7 @@ impl ActionHandler for TodoHandler {
                     output_type: Some(OutputType::Text),
                     executed_args: None,
                     launch_desktop: None,
+                    focus_app: None,
                 })
             }
             "summary" => {
@@ -367,6 +378,7 @@ impl ActionHandler for TodoHandler {
                     output_type: Some(OutputType::Text),
                     executed_args: None,
                     launch_desktop: None,
+                    focus_app: None,
                 })
             }
             "done" | "check" | "toggle" => {
@@ -383,6 +395,7 @@ impl ActionHandler for TodoHandler {
                         output_type: None,
                         executed_args: None,
                         launch_desktop: None,
+                        focus_app: None,
                     });
                 }
                 store.toggle_todo(&self.db, rest)?;
@@ -398,6 +411,7 @@ impl ActionHandler for TodoHandler {
                     output_type: None,
                     executed_args: None,
                     launch_desktop: None,
+                    focus_app: None,
                 })
             }
             "delete" | "del" | "rm" | "remove" => {
@@ -414,6 +428,7 @@ impl ActionHandler for TodoHandler {
                         output_type: None,
                         executed_args: None,
                         launch_desktop: None,
+                        focus_app: None,
                     });
                 }
                 store.delete_todo(&self.db, rest)?;
@@ -429,6 +444,7 @@ impl ActionHandler for TodoHandler {
                     output_type: None,
                     executed_args: None,
                     launch_desktop: None,
+                    focus_app: None,
                 })
             }
             // If the first word isn't a subcommand, treat the entire args as "add"
@@ -446,6 +462,7 @@ impl ActionHandler for TodoHandler {
                     output_type: None,
                     executed_args: None,
                     launch_desktop: None,
+                    focus_app: None,
                 })
             }
         }

@@ -476,6 +476,7 @@ impl ActionHandler for SystemCommand {
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+            focus_app: None,
             });
         }
 
@@ -495,6 +496,7 @@ impl ActionHandler for SystemCommand {
                     output_type: Some(OutputType::Status),
                     executed_args: None,
                     launch_desktop: None,
+                    focus_app: None,
                 }),
                 Err(e) => Ok(ActionResult {
                     success: false,
@@ -508,6 +510,7 @@ impl ActionHandler for SystemCommand {
                     output_type: None,
                     executed_args: None,
                     launch_desktop: None,
+                    focus_app: None,
                 }),
             };
         }
@@ -528,6 +531,7 @@ impl ActionHandler for SystemCommand {
                     output_type: Some(OutputType::Status),
                     executed_args: None,
                     launch_desktop: None,
+                    focus_app: None,
                 }),
                 Err(e) => Ok(ActionResult {
                     success: false,
@@ -541,6 +545,7 @@ impl ActionHandler for SystemCommand {
                     output_type: None,
                     executed_args: None,
                     launch_desktop: None,
+                    focus_app: None,
                 }),
             };
         }
@@ -566,6 +571,7 @@ impl ActionHandler for SystemCommand {
                         output_type: Some(OutputType::Status),
                         executed_args: None,
                         launch_desktop: None,
+                        focus_app: None,
                     }),
                     Err(e) => Ok(ActionResult {
                         success: false,
@@ -579,6 +585,7 @@ impl ActionHandler for SystemCommand {
                         output_type: None,
                         executed_args: None,
                         launch_desktop: None,
+                        focus_app: None,
                     }),
                 }
             }
@@ -596,6 +603,7 @@ impl ActionHandler for SystemCommand {
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             }),
         }
     }

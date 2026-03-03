@@ -30,7 +30,7 @@ pub enum OutputType {
     Weather,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ActionResult {
     pub success: bool,
     pub output: Option<String>,
@@ -57,6 +57,10 @@ pub struct ActionResult {
     /// If set, the Tauri side should launch this .desktop file via GIO DesktopAppInfo.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launch_desktop: Option<String>,
+    /// If set, the app is already running — focus the window with this wm_class
+    /// instead of launching a new instance (smart-open behavior).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus_app: Option<String>,
 }
 
 impl ActionResult {
@@ -74,6 +78,7 @@ impl ActionResult {
             output_type: Some(output_type),
             executed_args: None,
             launch_desktop: None,
+            focus_app: None,
         }
     }
 
@@ -91,6 +96,7 @@ impl ActionResult {
             output_type: None,
             executed_args: None,
             launch_desktop: None,
+            focus_app: None,
         }
     }
 

@@ -349,6 +349,7 @@ impl ShellExec {
             output_type: Some(OutputType::Terminal),
             executed_args: Some(cmd.to_string()),
             launch_desktop: None,
+            focus_app: None,
         })
     }
 
@@ -377,6 +378,7 @@ impl ShellExec {
             output_type: Some(OutputType::Status),
             executed_args: Some(cmd.to_string()),
             launch_desktop: None,
+            focus_app: None,
         })
     }
 }
@@ -410,6 +412,7 @@ impl ActionHandler for ShellExec {
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             });
         }
 

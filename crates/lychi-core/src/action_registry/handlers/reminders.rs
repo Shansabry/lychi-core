@@ -38,6 +38,7 @@ fn ok_result(start: Instant, output: String) -> ActionResult {
         output_type: Some(OutputType::Status),
         executed_args: None,
         launch_desktop: None,
+        focus_app: None,
     }
 }
 
@@ -54,6 +55,7 @@ fn ok_text(start: Instant, output: String) -> ActionResult {
         output_type: Some(OutputType::Text),
         executed_args: None,
         launch_desktop: None,
+        focus_app: None,
     }
 }
 
@@ -70,6 +72,7 @@ fn err_result(start: Instant, error: String) -> ActionResult {
         output_type: None,
         executed_args: None,
         launch_desktop: None,
+        focus_app: None,
     }
 }
 

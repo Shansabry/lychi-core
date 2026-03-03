@@ -102,6 +102,7 @@ impl ActionHandler for CalcHandler {
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             });
         }
 
@@ -119,6 +120,7 @@ impl ActionHandler for CalcHandler {
                 output_type: Some(OutputType::Status),
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             });
         }
 
@@ -136,6 +138,7 @@ impl ActionHandler for CalcHandler {
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             }),
             None => Ok(ActionResult {
                 success: false,
@@ -149,6 +152,7 @@ impl ActionHandler for CalcHandler {
                 output_type: None,
                 executed_args: None,
                 launch_desktop: None,
+                focus_app: None,
             }),
         }
     }
