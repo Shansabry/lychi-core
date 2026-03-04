@@ -25,6 +25,7 @@ let {
 	ontabcomplete = () => {},
 	onshifttabback = () => {},
 	contextPill = "",
+	contextLoading = false,
 	searchGhost = "",
 	browseGhost = "",
 	history = [],
@@ -50,6 +51,7 @@ let {
 	ontabcomplete?: () => void;
 	onshifttabback?: () => void;
 	contextPill?: string;
+	contextLoading?: boolean;
 	searchGhost?: string;
 	browseGhost?: string;
 	history: string[];
@@ -266,7 +268,7 @@ function handleKeydown(e: KeyboardEvent) {
 	) {
 		e.preventDefault();
 		acceptGhost();
-	} else if (normalizeKey(e.key, e.code) === "enter" && (e.ctrlKey || e.metaKey)) {
+	} else if (matchesAction(e, "web_search")) {
 		e.preventDefault();
 		onsubmit({ ctrlKey: true });
 	} else if (matchesAction(e, "submit") && !e.shiftKey) {
@@ -338,7 +340,11 @@ function handleKeydown(e: KeyboardEvent) {
 			autofocus
 		/>
 	</div>
-	{#if contextPill}
+	{#if contextLoading && !contextPill}
+		<span class="context-pill context-pill-loading">
+			<LoaderCircle size={10} strokeWidth={1.5} />
+		</span>
+	{:else if contextPill}
 		<span class="context-pill">{contextPill}</span>
 	{/if}
 </div>
@@ -378,6 +384,26 @@ function handleKeydown(e: KeyboardEvent) {
 		border-radius: 9999px;
 		white-space: nowrap;
 		user-select: none;
+	}
+
+	.context-pill-loading {
+		display: flex;
+		align-items: center;
+		opacity: 0.3;
+		padding: 3px 8px;
+	}
+
+	.context-pill-loading :global(svg) {
+		animation: pill-spin 700ms linear infinite;
+	}
+
+	@keyframes pill-spin {
+		from { transform: rotate(0deg); }
+		to { transform: rotate(360deg); }
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.context-pill-loading :global(svg) { animation: none; }
 	}
 
 	.prompt.hidden-prompt {

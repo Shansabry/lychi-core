@@ -161,15 +161,7 @@ impl ActionHandler for AppLauncher {
                 let frecency_boost = (frecency_val * 300.0) as u16;
                 let blended = base.saturating_add(frecency_boost);
 
-                // Description communicates confidence: high scores are obvious (no label),
-                // mid-range scores show "Open app?" so the user knows what Enter does.
-                let description = if app_score >= crate::desktop_apps::AUTO_LAUNCH_THRESHOLD {
-                    None
-                } else if app_score >= 0.70 {
-                    Some("Open app?".to_string())
-                } else {
-                    Some("Open app".to_string())
-                };
+                let description = None;
 
                 CompletionItem {
                     label: entry.name.clone(),

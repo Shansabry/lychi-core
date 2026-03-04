@@ -16,6 +16,20 @@ pub struct NetworkContext {
     pub vpn_active: bool,
 }
 
+/// Pre-populate the network cache at startup so the first summon doesn't
+/// block on `nmcli`. Call from `spawn_blocking` during app setup.
+pub fn warmup() {
+    let t0 = std::time::Instant::now();
+    let result = detect();
+    super::cache::set_network(&result);
+    tracing::info!(
+        "[network] warmup done: {}ms (ssid={:?}, vpn={})",
+        t0.elapsed().as_millis(),
+        result.as_ref().and_then(|n| n.ssid.as_deref()),
+        result.as_ref().map(|n| n.vpn_active).unwrap_or(false)
+    );
+}
+
 /// Detect network context. Returns `None` if no useful info is available.
 pub fn detect() -> Option<NetworkContext> {
     let ssid = detect_ssid();

@@ -1,4 +1,7 @@
-use tauri::{AppHandle, Emitter, State};
+use std::os::unix::process::CommandExt;
+use std::process::Stdio;
+
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use lychi_core::action_registry::{ActionResult, CompletionItem};
 use lychi_core::db::frecency;
@@ -39,10 +42,46 @@ pub async fn execute_command(
         drop(executor_r);
     }
 
+    // If context is soft-stale, kick off a background re-gather before routing.
+    // This covers "Lychi was open, user came back, immediately hit Enter" — no summon fires.
+    // The fresh context arrives async; this execution uses the current (stale) context but
+    // subsequent completions and the next command will see fresh state.
+    {
+        let executor_r = state.executor.read().await;
+        let is_stale = executor_r
+            .context
+            .as_ref()
+            .is_some_and(|ctx| ctx.is_soft_stale());
+        drop(executor_r);
+
+        if is_stale {
+            lychi_core::context::metrics::inc_stale_refresh_triggered();
+            tracing::debug!("[execute_command] context is stale — triggering background re-gather");
+            let _ = app.emit("lychi://context-stale", ());
+            let ctx_handle = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let ctx = lychi_core::context::gather(None);
+                let state = ctx_handle.state::<crate::state::AppState>();
+                if let Ok(mut executor) = state.executor.try_write() {
+                    executor.context = Some(ctx.clone());
+                }
+                let _ = ctx_handle.emit("lychi://context-ready", &ctx);
+            });
+        }
+    }
+
+    // Set terminal routing mode from config (read before executor lock)
+    {
+        let config = state.config.read().await;
+        lychi_core::action_registry::handlers::shell_exec::set_terminal_routing(Some(
+            config.commands.terminal_routing.clone(),
+        ));
+    }
+
     // Run through executor pipeline: resolve → validate → execute
     let executor = state.executor.read().await;
     let privacy = state.config.read().await.privacy.clone();
-    let exec = executor
+    let mut exec = executor
         .run(&input, confirmed.unwrap_or(false), &privacy)
         .await?;
 
@@ -51,31 +90,111 @@ pub async fn execute_command(
         let _ = app.emit("lychi://notes-changed", ());
     }
 
-    // Launch desktop app via GIO DesktopAppInfo with GDK AppLaunchContext.
-    // This properly handles working directories, D-Bus activation, quoted Exec
-    // args, Terminal=true, and Wayland activation tokens.
+    // Launch desktop app. Primary path: GIO DesktopAppInfo + GDK AppLaunchContext,
+    // which handles D-Bus activation, Terminal=true, and Wayland activation tokens.
+    // Fallback: gtk-launch, which is what KDE Plasma uses and handles edge cases
+    // that GIO misses on KDE/Wayland (session env, DBus activation for JetBrains, etc.).
     if let Some(ref desktop_path) = exec.result.launch_desktop {
         let path = desktop_path.clone();
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+
+        // Step 1: try GIO on the GLib main thread (required for GDK context).
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         glib::MainContext::default().invoke(move || {
             use gio::prelude::*;
             let result = (|| {
                 let app_info = gio::DesktopAppInfo::from_filename(&path)
-                    .ok_or_else(|| format!("Failed to load desktop file: {path}"))?;
+                    .ok_or_else(|| format!("failed to load .desktop: {path}"))?;
                 let context: Option<gio::AppLaunchContext> = gdk::Display::default()
                     .and_then(|d| d.app_launch_context())
                     .map(|c| c.into());
+                if context.is_none() {
+                    tracing::warn!(
+                        "[open] no GDK display context (wayland={is_wayland}) — \
+                         Wayland activation token unavailable for {path}"
+                    );
+                }
                 app_info
                     .launch(&[], context.as_ref())
-                    .map_err(|e| format!("launch() failed: {e}"))
+                    .map_err(|e| format!("GIO launch failed: {e}"))
             })();
-            if let Err(e) = result {
-                tracing::error!("Failed to launch desktop app: {e}");
-            }
-            let _ = tx.send(());
+            let _ = tx.send(result);
         });
-        // Wait for GLib to complete the launch before returning
-        let _ = rx.await;
+        let gio_result = rx.await.unwrap_or(Err("GIO channel dropped".into()));
+
+        // Step 2: if GIO failed, try gtk-launch (KDE Plasma's own mechanism).
+        if let Err(gio_err) = gio_result {
+            tracing::warn!(
+                "[open] {gio_err} — trying gtk-launch fallback \
+                 (wayland={is_wayland}, path={desktop_path})"
+            );
+
+            let path_obj = std::path::Path::new(desktop_path.as_str());
+            let file_name = path_obj
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let file_stem = path_obj
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+
+            // Try file_name first (e.g. "android-studio.desktop"), then stem.
+            // Both are valid XDG desktop IDs accepted by gtk-launch.
+            // gtk-launch calls are synchronous subprocess waits — run on a blocking thread
+            // with a 3s timeout to guard against hung .desktop launchers.
+            let gtk_task = tauri::async_runtime::spawn_blocking(move || {
+                [file_name, file_stem]
+                    .into_iter()
+                    .filter(|id| !id.is_empty())
+                    .find_map(|id| {
+                        match std::process::Command::new("gtk-launch")
+                            .arg(&id)
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .process_group(0)
+                            .status()
+                        {
+                            Ok(s) if s.success() => {
+                                tracing::info!("[open] gtk-launch {id} succeeded");
+                                Some(true)
+                            }
+                            Ok(s) => {
+                                tracing::warn!("[open] gtk-launch {id} exited {:?}", s.code());
+                                None
+                            }
+                            Err(e) => {
+                                tracing::error!("[open] gtk-launch {id} spawn error: {e}");
+                                None
+                            }
+                        }
+                    })
+                    .is_some()
+            });
+            let fallback_ok =
+                match tokio::time::timeout(std::time::Duration::from_secs(3), gtk_task).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(e)) => {
+                        tracing::error!("[open] gtk-launch task panicked: {e}");
+                        false
+                    }
+                    Err(_) => {
+                        tracing::error!("[open] gtk-launch timed out after 3s");
+                        false
+                    }
+                };
+
+            if !fallback_ok {
+                exec.result.success = false;
+                exec.result.output = None;
+                exec.result.error = Some(format!(
+                    "Failed to launch app: GIO: {gio_err}; gtk-launch also failed"
+                ));
+            }
+        }
     }
 
     // Smart-open: focus the running window if the app was already open.

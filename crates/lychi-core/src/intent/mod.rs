@@ -65,9 +65,11 @@ impl IntentResolver {
                     phase = "pattern",
                     action = route.handler,
                     explicit = route.explicit,
-                    "[resolve] phase=pattern action={} explicit={}",
+                    confidence = ?route.confidence,
+                    "[resolve] phase=pattern action={} explicit={} confidence={:?}",
                     route.handler,
-                    route.explicit
+                    route.explicit,
+                    route.confidence
                 );
                 return ResolvedIntent {
                     action_id: route.handler.to_string(),
@@ -115,7 +117,8 @@ impl IntentResolver {
         let app_match = crate::desktop_apps::app_index().best_match(&no_match_input);
         match app_match {
             Some((id, score)) if score >= crate::desktop_apps::AUTO_LAUNCH_THRESHOLD => {
-                let entry = crate::desktop_apps::app_index().entry(id);
+                let index = crate::desktop_apps::app_index();
+                let entry = index.entry(id);
                 tracing::debug!(
                     phase = "fallback",
                     action = "open",

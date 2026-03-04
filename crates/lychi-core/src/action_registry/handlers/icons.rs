@@ -1,6 +1,72 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use crate::paths;
+
+/// Directories covered by the Tauri asset protocol scope.
+/// Paths outside these are copied to icon-cache so the webview can load them.
+const ALLOWED_PREFIXES: &[&str] = &[
+    "/usr/share/icons/",
+    "/usr/share/pixmaps/",
+    "/opt/",
+    "/var/lib/flatpak/",
+    "/var/lib/snapd/",
+];
+
+/// Returns the icon cache directory, creating it if needed.
+fn icon_cache_dir() -> PathBuf {
+    let dir = paths::data_dir().join("icon-cache");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Check if a path is within the Tauri asset protocol scope.
+fn is_in_asset_scope(path: &str) -> bool {
+    if ALLOWED_PREFIXES.iter().any(|p| path.starts_with(p)) {
+        return true;
+    }
+    // $HOME/.local/share/icons/ and $HOME/.local/share/flatpak/
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy();
+        if path.starts_with(&format!("{home}/.local/share/icons/"))
+            || path.starts_with(&format!("{home}/.local/share/flatpak/"))
+            || path.starts_with(&format!("{home}/.local/share/lychi/icon-cache/"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// If the path is outside the asset scope, copy it to icon-cache and return the cached path.
+fn ensure_in_scope(path: String) -> Option<String> {
+    if is_in_asset_scope(&path) {
+        return Some(path);
+    }
+    // Copy to icon-cache with a stable name derived from the original path
+    let hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut h);
+        h.finish()
+    };
+    let ext = Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("png");
+    let cached = icon_cache_dir().join(format!("{hash:016x}.{ext}"));
+    if cached.exists() {
+        return cached.to_str().map(|s| s.to_string());
+    }
+    match std::fs::copy(&path, &cached) {
+        Ok(_) => cached.to_str().map(|s| s.to_string()),
+        Err(e) => {
+            tracing::warn!("[icons] failed to cache {path}: {e}");
+            None
+        }
+    }
+}
+
 /// Cached active icon theme name, detected once at startup.
 static THEME: OnceLock<String> = OnceLock::new();
 
@@ -86,13 +152,16 @@ pub fn resolve_icon(icon: &str) -> Option<String> {
         return None;
     }
 
-    // Absolute path — use directly if it exists
+    // Absolute path — use directly if it exists (may need scope caching)
     if icon.starts_with('/') {
-        return Path::new(icon).exists().then(|| icon.to_string());
+        return Path::new(icon)
+            .exists()
+            .then(|| icon.to_string())
+            .and_then(ensure_in_scope);
     }
 
     if let Some(found) = search_all_themes(icon) {
-        return Some(found);
+        return ensure_in_scope(found);
     }
 
     // 5. Reverse-domain stripping: "com.spotify.Client" → "Client", "spotify", "com"
@@ -100,7 +169,7 @@ pub fn resolve_icon(icon: &str) -> Option<String> {
         for seg in icon.rsplit('.') {
             let lower = seg.to_lowercase();
             if let Some(found) = search_all_themes(&lower) {
-                return Some(found);
+                return ensure_in_scope(found);
             }
         }
     }

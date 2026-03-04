@@ -298,6 +298,53 @@ pub fn set_network(result: &Option<NetworkContext>) {
     }
 }
 
+// ── Terminal CWD Cache ───────────────────────────────────────────────────
+
+struct TerminalCwdCacheEntry {
+    result: Option<String>,
+    source: super::terminal_probe::ProbeSource,
+    wm_class: String,
+    pid: u32,
+    created: Instant,
+}
+
+static TERMINAL_CWD_CACHE: Mutex<Option<TerminalCwdCacheEntry>> = Mutex::new(None);
+
+const TERMINAL_CWD_TTL: Duration = Duration::from_secs(2);
+
+/// Check terminal CWD cache. Returns `Some(cached_result)` if valid.
+pub fn get_terminal_cwd(wm_class: &str, pid: u32) -> Option<Option<String>> {
+    let guard = TERMINAL_CWD_CACHE.lock().ok()?;
+    let entry = guard.as_ref()?;
+
+    if entry.created.elapsed() > TERMINAL_CWD_TTL {
+        return None;
+    }
+    if entry.wm_class != wm_class || entry.pid != pid {
+        return None;
+    }
+
+    Some(entry.result.clone())
+}
+
+/// Store a terminal CWD probe result in the cache.
+pub fn set_terminal_cwd(
+    wm_class: &str,
+    pid: u32,
+    result: &Option<String>,
+    source: super::terminal_probe::ProbeSource,
+) {
+    if let Ok(mut guard) = TERMINAL_CWD_CACHE.lock() {
+        *guard = Some(TerminalCwdCacheEntry {
+            result: result.clone(),
+            source,
+            wm_class: wm_class.to_string(),
+            pid,
+            created: Instant::now(),
+        });
+    }
+}
+
 // ── Cache stats (for ctx debug) ──────────────────────────────────────────
 
 /// Summary of cache state for debug display.
@@ -310,6 +357,8 @@ pub struct CacheStats {
     pub project_invalidation: Option<InvalidationReason>,
     pub network_age_ms: Option<u64>,
     pub network_invalidation: Option<InvalidationReason>,
+    pub terminal_cwd_age_ms: Option<u64>,
+    pub terminal_cwd_source: Option<String>,
 }
 
 /// Get current cache ages for the `ctx` debug command.
@@ -352,6 +401,20 @@ pub fn stats() -> CacheStats {
         .map(|(age, inv)| (Some(age), inv))
         .unwrap_or((None, None));
 
+    let (terminal_cwd_age_ms, terminal_cwd_source) = TERMINAL_CWD_CACHE
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref().map(|e| {
+                (
+                    e.created.elapsed().as_millis() as u64,
+                    e.source.as_str().to_string(),
+                )
+            })
+        })
+        .map(|(age, src)| (Some(age), Some(src)))
+        .unwrap_or((None, None));
+
     CacheStats {
         git_age_ms,
         git_invalidation,
@@ -361,5 +424,7 @@ pub fn stats() -> CacheStats {
         project_invalidation,
         network_age_ms,
         network_invalidation,
+        terminal_cwd_age_ms,
+        terminal_cwd_source,
     }
 }

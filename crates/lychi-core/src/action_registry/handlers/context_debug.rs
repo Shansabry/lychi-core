@@ -45,7 +45,62 @@ impl ActionHandler for ContextDebugHandler {
         "Show current environment context (debug)"
     }
 
-    async fn execute(&self, _args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+        let args_trimmed = args.trim();
+
+        // `ctx metrics` — process-lifetime totals
+        if args_trimmed == "metrics" {
+            let m = crate::context::metrics::snapshot();
+            let output = format!(
+                "Context metrics (process lifetime totals)\n\
+                 \n\
+                 Freshness\n\
+                 hard_stale_hit:               {}\n\
+                 soft_stale_hit:               {}\n\
+                 stale_refresh_triggered:      {}\n\
+                 \n\
+                 Correctness guardrails\n\
+                 terminal_incoherent_filtered: {}\n\
+                 \n\
+                 Intent binding\n\
+                 clipboard_expansion_used:     {}\n\
+                 clipboard_expansion_miss:     {} (empty={}, type_mismatch={})\n\
+                 \n\
+                 Terminal routing\n\
+                 terminal_route_hit:           {}\n\
+                 terminal_route_busy:          {}\n\
+                 terminal_route_fail:          {}\n\
+                 terminal_route_no_protocol:   {}",
+                m.hard_stale_hit,
+                m.soft_stale_hit,
+                m.stale_refresh_triggered,
+                m.terminal_incoherent_filtered,
+                m.clipboard_expansion_used,
+                m.clipboard_expansion_miss(),
+                m.clipboard_expansion_miss_empty,
+                m.clipboard_expansion_miss_type,
+                m.terminal_route_hit,
+                m.terminal_route_busy,
+                m.terminal_route_fail,
+                m.terminal_route_no_protocol,
+            );
+            return Ok(ActionResult::ok(output, OutputType::Text));
+        }
+
+        // `ctx metrics --reset` — set baseline for delta tracking
+        if args_trimmed == "metrics --reset" {
+            crate::context::metrics::reset_baseline();
+            return Ok(ActionResult::ok(
+                "Baseline reset. Use 'ctx metrics --rate' to see deltas.".to_string(),
+                OutputType::Text,
+            ));
+        }
+
+        // `ctx metrics --rate` — show deltas since last reset
+        if args_trimmed.starts_with("metrics --rate") {
+            return Ok(ActionResult::ok(format_metrics_rate(), OutputType::Text));
+        }
+
         let ctx = CONTEXT_SNAPSHOT.lock().ok().and_then(|g| g.clone());
 
         let output = match ctx {
@@ -56,27 +111,266 @@ impl ActionHandler for ContextDebugHandler {
         Ok(ActionResult::ok(output, OutputType::Text))
     }
 
-    async fn completions(&self, _partial: &str) -> Vec<CompletionItem> {
-        vec![CompletionItem {
+    async fn completions(&self, partial: &str) -> Vec<CompletionItem> {
+        let mut items = vec![CompletionItem {
             label: "ctx".to_string(),
             icon_path: Some("__context__".to_string()),
             score: 100,
             description: Some("Show environment context signals".to_string()),
             reason: None,
-        }]
+        }];
+        let p = partial.trim();
+        if "metrics".starts_with(p) || p.starts_with("metrics") {
+            items.push(CompletionItem {
+                label: "ctx metrics".to_string(),
+                icon_path: Some("__context__".to_string()),
+                score: 90,
+                description: Some(
+                    "Show context system counters (staleness, coherence, clipboard)".to_string(),
+                ),
+                reason: None,
+            });
+            items.push(CompletionItem {
+                label: "ctx metrics --reset".to_string(),
+                icon_path: Some("__context__".to_string()),
+                score: 85,
+                description: Some("Set baseline for delta/rate reporting".to_string()),
+                reason: None,
+            });
+            items.push(CompletionItem {
+                label: "ctx metrics --rate".to_string(),
+                icon_path: Some("__context__".to_string()),
+                score: 84,
+                description: Some("Show counter deltas since last reset".to_string()),
+                reason: None,
+            });
+        }
+        items
+    }
+}
+
+fn format_metrics_rate() -> String {
+    match crate::context::metrics::rate_since_baseline() {
+        None => "No baseline set. Run 'ctx metrics --reset' first.".to_string(),
+        Some((delta, elapsed_secs, baseline_at)) => {
+            // Format the baseline wall-clock time from the Instant by converting elapsed to SystemTime.
+            let baseline_time = {
+                let elapsed = baseline_at.elapsed();
+                std::time::SystemTime::now()
+                    .checked_sub(elapsed)
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| {
+                        let secs = d.as_secs();
+                        let h = (secs % 86400) / 3600;
+                        let m = (secs % 3600) / 60;
+                        let s = secs % 60;
+                        format!("{h:02}:{m:02}:{s:02}")
+                    })
+                    .unwrap_or_else(|| "unknown".to_string())
+            };
+            let r = |n: u64| -> f64 {
+                if elapsed_secs > 0.0 {
+                    n as f64 / elapsed_secs
+                } else {
+                    0.0
+                }
+            };
+            let rate = |n: u64| {
+                if elapsed_secs > 0.0 {
+                    format!("{n:>3}  ({:.2}/s)", r(n))
+                } else {
+                    format!("{n:>3}  (--/s)")
+                }
+            };
+
+            // ── Health summary ──────────────────────────────────────────────
+            let hard_stale_r = r(delta.hard_stale_hit);
+            let soft_stale_r = r(delta.soft_stale_hit);
+            let refresh_r = r(delta.stale_refresh_triggered);
+            let incoherent_r = r(delta.terminal_incoherent_filtered);
+            let clip_miss_r = r(delta.clipboard_expansion_miss());
+
+            // Health classification: any hard-stale is always "stale" — no downgrading to "degraded".
+            let (health_icon, health_reason, health_action) = if hard_stale_r > 0.0 {
+                (
+                    "⚠  stale",
+                    format!(
+                        "hard_stale_hit firing ({:.2}/s) — context expiring mid-session",
+                        hard_stale_r
+                    ),
+                    Some(
+                        "ensure background re-gather fires on idle→interaction (summon after long pause)",
+                    ),
+                )
+            } else if soft_stale_r > 0.1 && refresh_r < soft_stale_r {
+                (
+                    "⚠  degraded",
+                    format!(
+                        "soft-stale ({:.2}/s) but refresh not keeping up ({:.2}/s)",
+                        soft_stale_r, refresh_r
+                    ),
+                    Some("increase refresh trigger frequency or lower SOFT_STALE_SECS threshold"),
+                )
+            } else if incoherent_r > 0.2 {
+                (
+                    "⚠  degraded",
+                    format!(
+                        "terminal_incoherent_filtered spiking ({:.2}/s) — multi-project noise",
+                        incoherent_r
+                    ),
+                    Some(
+                        "review terminal_matches_workspace logic; consider terminal focus ring (3.1i)",
+                    ),
+                )
+            } else {
+                let parts: Vec<String> = [
+                    if hard_stale_r == 0.0 {
+                        Some("no hard-stale".to_string())
+                    } else {
+                        None
+                    },
+                    Some(format!("incoherence {:.2}/s", incoherent_r)),
+                    Some(format!("soft-stale {:.2}/s", soft_stale_r)),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                ("✓  stable", parts.join("; "), None)
+            };
+            let action_line = health_action
+                .map(|a| format!("\nSuggested action: {a}"))
+                .unwrap_or_default();
+
+            // Refresh coverage — only when < 90% (not interesting otherwise).
+            let refresh_coverage = if soft_stale_r > 0.1 {
+                let pct = (refresh_r / soft_stale_r * 100.0) as u64;
+                if pct < 90 {
+                    format!(
+                        "\nRefresh coverage: {}% (triggered {:.2}/s ÷ soft-stale {:.2}/s)",
+                        pct, refresh_r, soft_stale_r
+                    )
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+
+            // Tip line — only when unhealthy, guides the next debugging step.
+            let tip_line = if health_action.is_some() {
+                "\nTip: run 'ctx metrics --reset' then reproduce to measure improvements"
+            } else {
+                ""
+            };
+
+            // Top issue: priority-ranked, not just max rate. Good-news counters
+            // (stale_refresh_triggered, clipboard_expansion_used) never surface as issues.
+            struct Issue {
+                label: &'static str,
+                count: u64,
+                rate: f64,
+            }
+            let issues: Vec<Issue> = vec![
+                Issue {
+                    label: "hard_stale_hit (context expiring mid-session)",
+                    count: delta.hard_stale_hit,
+                    rate: hard_stale_r,
+                },
+                Issue {
+                    label: "terminal_incoherent_filtered (multi-project noise)",
+                    count: delta.terminal_incoherent_filtered,
+                    rate: incoherent_r,
+                },
+                Issue {
+                    label: "soft_stale_hit (refresh cadence may be too slow)",
+                    count: delta.soft_stale_hit,
+                    rate: soft_stale_r,
+                },
+                Issue {
+                    label: "clipboard_expansion_miss (implicit verb, no match)",
+                    count: delta.clipboard_expansion_miss(),
+                    rate: clip_miss_r,
+                },
+            ];
+            // First non-zero entry in priority order is the top issue.
+            let top_issue = issues
+                .iter()
+                .find(|i| i.count > 0)
+                .map(|i| format!("Top issue:  {} — +{}  ({:.2}/s)", i.label, i.count, i.rate))
+                .unwrap_or_else(|| "Top issue:  none".to_string());
+
+            // Clipboard miss breakdown (only when relevant)
+            let clip_breakdown = if delta.clipboard_expansion_miss() > 0 {
+                format!(
+                    " (empty={}, type_mismatch={})",
+                    delta.clipboard_expansion_miss_empty, delta.clipboard_expansion_miss_type,
+                )
+            } else {
+                String::new()
+            };
+
+            format!(
+                "Context metrics — delta since last reset ({:.1}s)\n\
+                 Baseline: {} ({:.1}s ago)\n\
+                 \n\
+                 Health: {}\n\
+                 Reason: {}{}{}{}\n\
+                 \n\
+                 Freshness\n\
+                 hard_stale_hit:               {}\n\
+                 soft_stale_hit:               {}\n\
+                 stale_refresh_triggered:      {}\n\
+                 \n\
+                 {}\n\
+                 \n\
+                 Correctness guardrails\n\
+                 terminal_incoherent_filtered: {}\n\
+                 \n\
+                 Intent binding\n\
+                 clipboard_expansion_used:     {}\n\
+                 clipboard_expansion_miss:     {}{}",
+                elapsed_secs,
+                baseline_time,
+                elapsed_secs,
+                health_icon,
+                health_reason,
+                refresh_coverage,
+                action_line,
+                tip_line,
+                rate(delta.hard_stale_hit),
+                rate(delta.soft_stale_hit),
+                rate(delta.stale_refresh_triggered),
+                top_issue,
+                rate(delta.terminal_incoherent_filtered),
+                rate(delta.clipboard_expansion_used),
+                rate(delta.clipboard_expansion_miss()),
+                clip_breakdown,
+            )
+        }
     }
 }
 
 fn format_context(ctx: &EnvironmentContext) -> String {
     let mut lines = vec![format!("Context gathered in {}ms", ctx.gather_ms)];
+    lines.push(format!(
+        "Sources: active_window={} terminal={} ide_workspace={}",
+        ctx.active_window_source, ctx.terminal_source, ctx.ide_workspace_source
+    ));
     lines.push(String::new());
 
     // Window
     match &ctx.active_window {
-        Some(w) => lines.push(format!(
-            "Window: {} ({}) pid={} terminal={} ide={}",
-            w.title, w.wm_class, w.pid, w.is_terminal, w.is_ide
-        )),
+        Some(w) => {
+            let id_suffix = w
+                .window_id
+                .as_deref()
+                .map(|id| format!(" id={id}"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "Window: {} ({}) pid={} terminal={} ide={}{}",
+                w.title, w.wm_class, w.pid, w.is_terminal, w.is_ide, id_suffix
+            ));
+        }
         None => lines.push("Window: none".to_string()),
     }
 
@@ -108,6 +402,13 @@ fn format_context(ctx: &EnvironmentContext) -> String {
         None => lines.push("Git: none".to_string()),
     }
 
+    // Git root vs CWD mismatch
+    if let (Some(cwd), Some(g)) = (&ctx.cwd, &ctx.git)
+        && cwd != &g.repo_root
+    {
+        lines.push(format!("Git root differs from CWD: {}", g.repo_root));
+    }
+
     // Project
     match &ctx.project {
         Some(p) => {
@@ -126,6 +427,10 @@ fn format_context(ctx: &EnvironmentContext) -> String {
                 "Project: {:?} root={} compose={}{pm_str}{scripts_str}",
                 p.kind, p.root, p.has_compose
             ));
+            if let Some(ref ws_root) = p.workspace_root {
+                let ws_count = p.workspace_scripts.len();
+                lines.push(format!("Workspace: root={ws_root} scripts={ws_count}"));
+            }
         }
         None => lines.push("Project: none".to_string()),
     }
@@ -214,13 +519,49 @@ fn format_context(ctx: &EnvironmentContext) -> String {
             None => age,
         }
     };
+    let terminal_cwd_info = match (
+        cache_stats.terminal_cwd_age_ms,
+        cache_stats.terminal_cwd_source.as_deref(),
+    ) {
+        (Some(age), Some(src)) => format!("{age}ms ago ({src})"),
+        _ => "empty".to_string(),
+    };
     lines.push(format!(
-        "Cache: git={}, docker={}, project={}, network={}",
+        "Cache: git={}, docker={}, project={}, network={}, terminal_cwd={}",
         fmt(cache_stats.git_age_ms, cache_stats.git_invalidation),
         fmt(cache_stats.docker_age_ms, cache_stats.docker_invalidation),
         fmt(cache_stats.project_age_ms, cache_stats.project_invalidation),
         fmt(cache_stats.network_age_ms, cache_stats.network_invalidation),
+        terminal_cwd_info,
     ));
+
+    // Focus ring
+    let ring_entries = crate::context::window_stack::ring_debug_entries();
+    if !ring_entries.is_empty() {
+        lines.push(format!("Focus ring: ({} entries)", ring_entries.len()));
+        for (wm_class, pid, cwd, age_secs) in ring_entries.iter().take(5) {
+            let cwd_str = cwd.as_deref().unwrap_or("?");
+            lines.push(format!(
+                "  {wm_class}(pid={pid}) {cwd_str} — {age_secs}s ago"
+            ));
+        }
+    }
+
+    // Terminal routing metrics
+    let metrics = crate::context::metrics::snapshot();
+    if metrics.terminal_route_hit > 0
+        || metrics.terminal_route_busy > 0
+        || metrics.terminal_route_fail > 0
+        || metrics.terminal_route_no_protocol > 0
+    {
+        lines.push(format!(
+            "Terminal routing: hit={} busy={} fail={} no_protocol={}",
+            metrics.terminal_route_hit,
+            metrics.terminal_route_busy,
+            metrics.terminal_route_fail,
+            metrics.terminal_route_no_protocol,
+        ));
+    }
 
     // Suggestions with provenance
     let suggestions = crate::context::suggestions::suggest(ctx, None);

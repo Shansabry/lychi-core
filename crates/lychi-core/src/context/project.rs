@@ -4,6 +4,7 @@
 //! `Cargo.toml`, `package.json`, `pyproject.toml`, etc.
 //! Also discovers project scripts/targets for contextual suggestions.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use super::{ProjectContext, ProjectKind, ProjectScript};
@@ -20,6 +21,26 @@ const MARKERS: &[(&str, ProjectKind)] = &[
     ("Dockerfile", ProjectKind::Docker),
 ];
 
+/// Build a `ProjectContext` for a directory that has a known marker.
+fn build_context(dir: &Path, kind: &ProjectKind) -> ProjectContext {
+    let has_compose = dir.join("docker-compose.yml").exists() || dir.join("compose.yml").exists();
+    let package_manager = if *kind == ProjectKind::Node {
+        Some(detect_package_manager(dir))
+    } else {
+        None
+    };
+    let scripts = discover_scripts(dir, kind, package_manager.as_deref());
+    ProjectContext {
+        root: dir.to_string_lossy().into_owned(),
+        kind: kind.clone(),
+        has_compose,
+        scripts,
+        package_manager,
+        workspace_root: None,
+        workspace_scripts: Vec::new(),
+    }
+}
+
 /// Detect project type by walking upward from `dir`.
 pub fn detect(dir: &str) -> Option<ProjectContext> {
     let mut current = Path::new(dir);
@@ -27,27 +48,94 @@ pub fn detect(dir: &str) -> Option<ProjectContext> {
     for _ in 0..50 {
         for (marker, kind) in MARKERS {
             if current.join(marker).exists() {
-                let has_compose = current.join("docker-compose.yml").exists()
-                    || current.join("compose.yml").exists();
-                let package_manager = if *kind == ProjectKind::Node {
-                    Some(detect_package_manager(current))
-                } else {
-                    None
-                };
-                let scripts = discover_scripts(current, kind, package_manager.as_deref());
-                return Some(ProjectContext {
-                    root: current.to_string_lossy().into_owned(),
-                    kind: kind.clone(),
-                    has_compose,
-                    scripts,
-                    package_manager,
-                });
+                return Some(build_context(current, kind));
             }
         }
         current = current.parent()?;
     }
 
     None
+}
+
+/// Detect project type at a single directory (no upward walk).
+/// Used for workspace root detection where we know the exact directory.
+pub fn detect_at(dir: &str) -> Option<ProjectContext> {
+    let path = Path::new(dir);
+    for (marker, kind) in MARKERS {
+        if path.join(marker).exists() {
+            return Some(build_context(path, kind));
+        }
+    }
+    None
+}
+
+/// Explicit workspace markers — files/configs that prove a directory is a
+/// monorepo/workspace root, not just a project that happens to have a Makefile.
+const WORKSPACE_MARKERS: &[&str] = &[
+    "pnpm-workspace.yaml",
+    "nx.json",
+    "turbo.json",
+    "lerna.json",
+    "rush.json",
+];
+
+/// Check if a directory is an explicit workspace/monorepo root.
+///
+/// Returns true if the directory has workspace configuration markers:
+/// file-based (pnpm/nx/turbo/lerna/rush), package.json "workspaces" key,
+/// or Cargo.toml `[workspace]` section.
+pub fn is_workspace_root(dir: &Path) -> bool {
+    // File-based markers
+    if WORKSPACE_MARKERS.iter().any(|m| dir.join(m).exists()) {
+        return true;
+    }
+    // npm/yarn: "workspaces" key in package.json
+    if let Ok(content) = std::fs::read_to_string(dir.join("package.json"))
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
+        && json.get("workspaces").is_some()
+    {
+        return true;
+    }
+    // Cargo: [workspace] in Cargo.toml
+    if let Ok(content) = std::fs::read_to_string(dir.join("Cargo.toml"))
+        && content.contains("[workspace]")
+    {
+        return true;
+    }
+    false
+}
+
+/// Enrich a subpackage `ProjectContext` with workspace-level context.
+///
+/// When the git root differs from the project root and the subpackage lives
+/// under the git root, this sets `workspace_root` (always, for observability)
+/// and `workspace_scripts` (only if the git root is a proven workspace).
+///
+/// Scripts are deduplicated: workspace scripts whose `(runner, name)` pair
+/// matches a subpackage script are excluded.
+pub fn enrich_with_workspace(proj: &mut ProjectContext, git_root: &str) {
+    if git_root == proj.root || !proj.root.starts_with(git_root) {
+        return;
+    }
+    let git_path = Path::new(git_root);
+    // Always set workspace_root for observability
+    proj.workspace_root = Some(git_root.to_string());
+    // Only attach scripts if this is a proven workspace
+    if !is_workspace_root(git_path) {
+        return;
+    }
+    if let Some(ws_proj) = detect_at(git_root) {
+        let existing: HashSet<(&str, &str)> = proj
+            .scripts
+            .iter()
+            .map(|s| (s.runner.as_str(), s.name.as_str()))
+            .collect();
+        proj.workspace_scripts = ws_proj
+            .scripts
+            .into_iter()
+            .filter(|s| !existing.contains(&(s.runner.as_str(), s.name.as_str())))
+            .collect();
+    }
 }
 
 /// Detect the Node.js package manager from lockfile presence.

@@ -19,6 +19,7 @@ const SYNCABLE_KEYS: &[&str] = &[
     "commands.default_search_engine",
     "commands.youtube_url",
     "commands.terminal",
+    "commands.terminal_routing",
     "history.max_entries",
     "history.deduplicate",
     "ai.mode",
@@ -118,6 +119,9 @@ pub fn apply_to_config(settings: &HashMap<String, String>, config: &mut Config) 
                 config.commands.default_search_engine = value.clone();
             }
             "commands.youtube_url" => config.commands.youtube_url = value.clone(),
+            "commands.terminal_routing" => {
+                config.commands.terminal_routing = value.clone();
+            }
             "history.max_entries" => {
                 config.history.max_entries = value.parse().unwrap_or(config.history.max_entries);
             }
@@ -188,6 +192,10 @@ fn extract_syncable_from_config(config: &Config) -> Vec<(String, String)> {
         (
             "commands.youtube_url".into(),
             config.commands.youtube_url.clone(),
+        ),
+        (
+            "commands.terminal_routing".into(),
+            config.commands.terminal_routing.clone(),
         ),
         (
             "history.max_entries".into(),

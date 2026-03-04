@@ -68,6 +68,12 @@ fn build_label(original_partial: &str, entry_name: &str, is_dir: bool) -> String
 /// - Directories sort before files, max 10 results
 #[tauri::command]
 pub async fn list_path_completions(partial: String) -> Result<Vec<CompletionItem>, LychiError> {
+    tauri::async_runtime::spawn_blocking(move || list_path_completions_sync(partial))
+        .await
+        .map_err(|e| LychiError::ExecutionFailed(format!("path completions task panicked: {e}")))?
+}
+
+fn list_path_completions_sync(partial: String) -> Result<Vec<CompletionItem>, LychiError> {
     let raw = partial.trim();
 
     let (dir_to_list, stem_filter): (PathBuf, String) =
@@ -175,6 +181,12 @@ pub async fn list_path_completions(partial: String) -> Result<Vec<CompletionItem
 /// crashes on Wayland layer-shell surfaces.
 #[tauri::command]
 pub async fn list_directories(path: String) -> Result<Vec<DirEntry>, LychiError> {
+    tauri::async_runtime::spawn_blocking(move || list_directories_sync(path))
+        .await
+        .map_err(|e| LychiError::ExecutionFailed(format!("list_directories task panicked: {e}")))?
+}
+
+fn list_directories_sync(path: String) -> Result<Vec<DirEntry>, LychiError> {
     let dir = if path.is_empty() {
         dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
     } else {
@@ -243,6 +255,12 @@ pub struct FileSearchBatch {
 /// Detect real mounted filesystems. Home directory is always first.
 #[tauri::command]
 pub async fn get_mount_points() -> Result<Vec<MountPoint>, LychiError> {
+    tauri::async_runtime::spawn_blocking(get_mount_points_sync)
+        .await
+        .map_err(|e| LychiError::ExecutionFailed(format!("get_mount_points task panicked: {e}")))?
+}
+
+fn get_mount_points_sync() -> Result<Vec<MountPoint>, LychiError> {
     let home = dirs::home_dir()
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|| "/home".into());

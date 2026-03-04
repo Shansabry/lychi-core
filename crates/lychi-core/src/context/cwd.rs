@@ -13,7 +13,13 @@
 /// Parses the terminal window title for a path. Returns `None` if the
 /// title doesn't contain a recognizable path (e.g. when a command is
 /// running and the title shows `pnpm dev` instead of `user@host:/path`).
-pub fn detect(_pid: u32, _wm_class: &str, title: &str) -> Option<String> {
+pub fn detect(pid: u32, wm_class: &str, title: &str) -> Option<String> {
+    // Try terminal-native probe first (accurate even when commands are running)
+    if let Some(cwd) = super::terminal_probe::probe_terminal_cwd(wm_class, pid, title) {
+        tracing::debug!("cwd::detect: probe({wm_class}, pid={pid}) → {cwd}");
+        return Some(cwd);
+    }
+
     let home = std::env::var("HOME").unwrap_or_default();
 
     if let Some(cwd) = cwd_from_title(title, &home) {
@@ -21,7 +27,7 @@ pub fn detect(_pid: u32, _wm_class: &str, title: &str) -> Option<String> {
         return Some(cwd);
     }
 
-    tracing::debug!("cwd::detect: no path in title '{}', returning None", title);
+    tracing::debug!("cwd::detect: no path (wm_class={wm_class}, pid={pid}, title='{title}')");
     None
 }
 

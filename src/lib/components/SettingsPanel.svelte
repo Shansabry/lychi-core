@@ -29,6 +29,8 @@ let aiConfig: AiConfig = $state({
 	provider: "anthropic",
 	model: "",
 	ollama_url: "",
+	timeout_secs: 8,
+	max_tokens: 300,
 });
 let generalConfig: GeneralConfig = $state({
 	hide_on_blur: true,

@@ -50,6 +50,8 @@ pub enum SuggestionReason {
     BrowserContext { detail: String },
     /// Generic app-class suggestion (media, file manager, etc.).
     AppClassSuggestion { app: String },
+    /// Pinned workspace is active or detection failed (pin hint).
+    PinnedWorkspace,
 }
 
 impl SuggestionReason {
@@ -70,6 +72,7 @@ impl SuggestionReason {
             Self::WorkspaceMemory { project } => format!("Recent in {project}"),
             Self::BrowserContext { detail } => detail.clone(),
             Self::AppClassSuggestion { app } => app.clone(),
+            Self::PinnedWorkspace => "Pinned workspace".into(),
         }
     }
 
@@ -92,6 +95,7 @@ impl SuggestionReason {
             Self::WorkspaceMemory { project } => format!("workspace={project}"),
             Self::BrowserContext { detail } => format!("browser={detail}"),
             Self::AppClassSuggestion { app } => format!("app_class={app}"),
+            Self::PinnedWorkspace => "workspace.pinned=true".into(),
         }
     }
 }
@@ -298,6 +302,37 @@ fn suggest_dev(
             added_labels.push(label.clone());
             items.push(completion(&label, &desc, score.max(84), &reason));
         }
+    }
+
+    // Workspace-root scripts (monorepo) — lower score, always labelled (workspace)
+    if let Some(ref project) = ctx.project {
+        for (i, script) in project.workspace_scripts.iter().enumerate() {
+            let score = 82u16.saturating_sub(i as u16);
+            let base_label = if script.name.is_empty() {
+                format!("run {}", script.runner)
+            } else {
+                format!("run {} {}", script.runner, script.name)
+            };
+            let label = format!("{base_label} (workspace)");
+            let desc = if script.name.is_empty() {
+                format!("{} (workspace)", script.runner)
+            } else {
+                format!("{} {} (workspace)", script.runner, script.name)
+            };
+            let reason = SuggestionReason::ProjectScript {
+                runner: format!("{} (workspace)", script.runner),
+            };
+            added_labels.push(label.clone());
+            items.push(completion(&label, &desc, score.max(70), &reason));
+        }
+    }
+
+    // Pinned workspace — show unpin option when active
+    if super::pin::get().is_some() {
+        let reason = SuggestionReason::PinnedWorkspace;
+        let label = "pin workspace clear";
+        added_labels.push(label.to_string());
+        items.push(completion(label, "Unpin workspace", 75, &reason));
     }
 
     // Docker Compose suggestions (project-level)

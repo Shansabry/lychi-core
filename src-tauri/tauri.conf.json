@@ -37,7 +37,8 @@
           "/var/lib/snapd/desktop/icons/**",
           "$HOME/.local/share/icons/**",
           "$HOME/.local/share/flatpak/exports/share/icons/**",
-          "$HOME/.local/share/flatpak/app/**/icons/**"
+          "$HOME/.local/share/flatpak/app/**/icons/**",
+          "$HOME/.local/share/lychi/icon-cache/**"
         ]
       }
     }

@@ -15,6 +15,7 @@ mod kwin_windows;
 #[cfg(feature = "mpris")]
 pub mod media;
 pub mod notes;
+pub mod pin_workspace;
 pub mod project_open;
 pub mod reminders;
 pub mod shell_exec;
@@ -22,6 +23,8 @@ pub mod snippets;
 pub mod symbol;
 pub mod sysinfo;
 pub mod system;
+#[cfg(target_os = "linux")]
+pub mod terminal_send;
 pub mod time;
 pub mod timer;
 pub mod unicode;

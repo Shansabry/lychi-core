@@ -149,6 +149,15 @@ pub async fn save_projects_config(
     projects: ProjectsConfig,
 ) -> Result<(), LychiError> {
     let dirs = projects.directories.clone();
+
+    // Re-register extra markers with updated config
+    lychi_core::context::ide::register_extra_markers(
+        &projects.extra_strong_markers,
+        &projects.extra_soft_markers,
+    );
+    // Update pinned workspace
+    lychi_core::context::pin::set(projects.pinned_workspace.clone());
+
     let mut config = state.config.write().await;
     config.projects = projects;
     config.save(&paths::config_file())?;

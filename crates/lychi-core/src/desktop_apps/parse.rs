@@ -4,9 +4,9 @@ use std::sync::OnceLock;
 
 use super::entry::{DesktopEntry, exec_basename, make_acronym, strip_field_codes, tokenize};
 
-/// Discover all desktop entries from XDG application directories.
-pub fn discover_entries() -> Vec<DesktopEntry> {
-    let dirs = [
+/// Return the XDG application directories that should be watched for .desktop file changes.
+pub fn watch_dirs() -> Vec<PathBuf> {
+    vec![
         PathBuf::from("/usr/share/applications"),
         PathBuf::from("/usr/local/share/applications"),
         PathBuf::from("/var/lib/flatpak/exports/share/applications"),
@@ -17,7 +17,12 @@ pub fn discover_entries() -> Vec<DesktopEntry> {
         dirs::home_dir()
             .map(|h| h.join(".local/share/flatpak/exports/share/applications"))
             .unwrap_or_default(),
-    ];
+    ]
+}
+
+/// Discover all desktop entries from XDG application directories.
+pub fn discover_entries() -> Vec<DesktopEntry> {
+    let dirs = watch_dirs();
 
     let mut entries = Vec::new();
 

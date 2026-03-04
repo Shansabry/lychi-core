@@ -50,6 +50,15 @@ pub fn show_window(window: &WebviewWindow) {
     // Snapshot the active window BEFORE we show Lychi (otherwise we'd detect ourselves).
     let pre_window = lychi_core::context::snapshot_active_window();
 
+    // Seed the focus ring with the pre-summon window if it's a terminal.
+    // This handles cold-start: if the user summoned Lychi from a terminal,
+    // the ring is immediately non-empty and the next gather() hits it.
+    if let Some(ref w) = pre_window
+        && w.is_terminal
+    {
+        lychi_core::context::window_stack::push_focus_entry_pre_summon(w.clone());
+    }
+
     // Clear frontend state before the window becomes visible so there is no
     // stale-completions flash. The WebView is already loaded (just hidden) and
     // can process the event before the compositor paints the first frame.
@@ -103,7 +112,14 @@ pub fn show_window(window: &WebviewWindow) {
             && let Some(ref cached_ctx) = executor.context
         {
             let same_window = match (&pre_window, &cached_ctx.active_window) {
-                (Some(pre), Some(cached)) => pre.wm_class == cached.wm_class,
+                (Some(pre), Some(cached)) => {
+                    // Use window_id (UUID) when available — distinguishes two windows
+                    // of the same app (e.g. VS Code with different projects open).
+                    match (&pre.window_id, &cached.window_id) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => pre.wm_class == cached.wm_class,
+                    }
+                }
                 (None, None) => true,
                 _ => false,
             };
@@ -121,9 +137,27 @@ pub fn show_window(window: &WebviewWindow) {
 
     // Gather fresh context asynchronously (never blocks summon).
     // Result replaces the cached context and is re-emitted to frontend.
+    // Latest-wins: if a newer summon started while we were gathering, discard.
     let ctx_handle = window.app_handle().clone();
+    let gather_seq = seq;
     tauri::async_runtime::spawn_blocking(move || {
         let ctx = lychi_core::context::gather(pre_window);
+
+        // Latest-wins: discard if a newer summon has started
+        let current_seq = {
+            let state = ctx_handle.state::<AppState>();
+            state.summon_seq.load(Ordering::SeqCst)
+        };
+        if gather_seq < current_seq {
+            tracing::debug!(
+                "Context gathered in {}ms but discarded (seq={}, current={})",
+                ctx.gather_ms,
+                gather_seq,
+                current_seq
+            );
+            return;
+        }
+
         tracing::info!(
             "Context gathered in {}ms: window={}, cwd={}, terminal_cwd={}, git={}, project={}, docker={}",
             ctx.gather_ms,

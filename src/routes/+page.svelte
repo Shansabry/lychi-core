@@ -114,6 +114,8 @@ let initialNotesTab: "notes" | "todos" | "reminders" | "timers" | "snippets" | u
 	$state(undefined);
 let mediaPlayers: TrackInfo[] = $state([]);
 let envContext: EnvironmentContext | null = $state(null);
+let contextLoading = $state(false);
+let contextLoadingTimer: ReturnType<typeof setTimeout> | undefined;
 let contextPill = $derived.by(() => {
 	// Only show context pill for terminal/IDE — not browsers or random apps
 	const w = envContext?.active_window;
@@ -394,6 +396,15 @@ onMount(() => {
 			pendingPlan = null;
 			mediaOpen = false;
 			notesOpen = false;
+			// Clear stale context immediately — fast path re-populates if same window,
+			// fresh gather populates for changed windows. Prevents flash of wrong context.
+			envContext = null;
+			// Delayed spinner: only show skeleton if context takes >120ms
+			clearTimeout(contextLoadingTimer);
+			contextLoading = false;
+			contextLoadingTimer = setTimeout(() => {
+				contextLoading = true;
+			}, 120);
 
 			completions = [];
 			completionIndex = -1;
@@ -419,6 +430,8 @@ onMount(() => {
 		// Listen for context-ready event from async context gathering
 		const unlistenContext = await win.listen<EnvironmentContext>("lychi://context-ready", (e) => {
 			envContext = e.payload;
+			clearTimeout(contextLoadingTimer);
+			contextLoading = false;
 			// Fetch context suggestions only if the input is still empty.
 			// Use Svelte state (inputValue) not a DOM query — DOM can be stale when
 			// focus hasn't been granted yet. Guard with completionGen so a fast typist
@@ -1181,6 +1194,7 @@ async function handleDismiss() {
 			routing={isRouting}
 			executing={isExecuting}
 			{contextPill}
+			{contextLoading}
 			{atMode}
 			{atStart}
 			{searchMode}

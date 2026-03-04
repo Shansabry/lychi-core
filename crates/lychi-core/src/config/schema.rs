@@ -52,6 +52,16 @@ pub struct CommandsConfig {
     pub shell: String,
     /// Default terminal emulator for `run` commands (auto-detected if empty).
     pub terminal: String,
+    /// Additional WM classes to recognise as terminal emulators.
+    /// Matched exactly (case-insensitive) — no substring matching.
+    /// Example: extra_terminals = ["com.my.custom.term"]
+    #[serde(default)]
+    pub extra_terminals: Vec<String>,
+    /// Terminal routing: "auto" | "manual" | "off"
+    /// - auto: always try sending to existing terminal first
+    /// - manual: only route when terminal and IDE are in the same project
+    /// - off: always open new terminal (current behavior)
+    pub terminal_routing: String,
 }
 
 impl Default for CommandsConfig {
@@ -61,6 +71,8 @@ impl Default for CommandsConfig {
             youtube_url: "https://www.youtube.com/results?search_query=".to_string(),
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
             terminal: detect_terminal(),
+            extra_terminals: Vec::new(),
+            terminal_routing: "manual".to_string(),
         }
     }
 }
@@ -114,6 +126,18 @@ impl Default for HistoryConfig {
 #[serde(default)]
 pub struct ProjectsConfig {
     pub directories: Vec<String>,
+    /// Extra filenames treated as strong project markers (tier 1).
+    /// Example: `["flake.nix", "WORKSPACE.bazel"]`
+    #[serde(default)]
+    pub extra_strong_markers: Vec<String>,
+    /// Extra filenames treated as soft project markers (tier 2).
+    /// Soft markers only accepted when a strong marker exists in a child dir.
+    /// Example: `[".devcontainer"]`
+    #[serde(default)]
+    pub extra_soft_markers: Vec<String>,
+    /// Pinned workspace path — overrides auto-detection when set.
+    #[serde(default)]
+    pub pinned_workspace: Option<String>,
 }
 
 impl Default for ProjectsConfig {
@@ -125,6 +149,9 @@ impl Default for ProjectsConfig {
                 "~/Code".to_string(),
                 "~/repos".to_string(),
             ],
+            extra_strong_markers: Vec::new(),
+            extra_soft_markers: Vec::new(),
+            pinned_workspace: None,
         }
     }
 }
@@ -140,6 +167,19 @@ pub struct AiConfig {
     pub model: String,
     /// Ollama server URL (for future Phase 2.1)
     pub ollama_url: String,
+    /// AI request timeout in seconds (default 8).
+    #[serde(default = "default_ai_timeout")]
+    pub timeout_secs: u64,
+    /// Max tokens for routing/intent calls (default 300).
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+}
+
+fn default_ai_timeout() -> u64 {
+    8
+}
+fn default_max_tokens() -> u32 {
+    300
 }
 
 impl Default for AiConfig {
@@ -149,6 +189,8 @@ impl Default for AiConfig {
             provider: "anthropic".to_string(),
             model: "claude-sonnet-4-5-20250929".to_string(),
             ollama_url: "http://localhost:11434".to_string(),
+            timeout_secs: default_ai_timeout(),
+            max_tokens: default_max_tokens(),
         }
     }
 }
@@ -197,6 +239,7 @@ pub struct KeybindingsConfig {
     pub tab_complete: String,
     pub tab_back: String,
     pub switch_scope: String,
+    pub web_search: String,
 }
 
 impl Default for KeybindingsConfig {
@@ -212,6 +255,7 @@ impl Default for KeybindingsConfig {
             tab_complete: "Tab".to_string(),
             tab_back: "Shift+Tab".to_string(),
             switch_scope: "Ctrl+Tab".to_string(),
+            web_search: "Ctrl+Enter".to_string(),
         }
     }
 }

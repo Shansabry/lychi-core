@@ -22,6 +22,19 @@ pub async fn save_ai_config(
 
 #[tauri::command]
 pub async fn set_api_key(provider: String, key: String) -> Result<(), LychiError> {
+    // keyring calls are blocking D-Bus round-trips on Linux — run on a blocking thread
+    // with a 5s timeout to guard against a hung secret-service daemon.
+    let task = tauri::async_runtime::spawn_blocking(move || set_api_key_sync(&provider, &key));
+    match tokio::time::timeout(std::time::Duration::from_secs(5), task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => Err(LychiError::Config(format!("keyring task panicked: {e}"))),
+        Err(_) => Err(LychiError::Config(
+            "keyring timed out after 5s — secret-service daemon may be unresponsive".into(),
+        )),
+    }
+}
+
+fn set_api_key_sync(provider: &str, key: &str) -> Result<(), LychiError> {
     let entry = keyring::Entry::new("lychi", &format!("byo-{provider}"))
         .map_err(|e| LychiError::Config(format!("Keyring error: {e}")))?;
     if key.is_empty() {
@@ -30,7 +43,7 @@ pub async fn set_api_key(provider: String, key: String) -> Result<(), LychiError
         Ok(())
     } else {
         entry
-            .set_password(&key)
+            .set_password(key)
             .map_err(|e| LychiError::Config(format!("Failed to store API key: {e}")))
     }
 }
@@ -68,8 +81,12 @@ pub async fn check_ai_health(state: State<'_, AppState>) -> Result<bool, LychiEr
         }
         if let Ok(key) = key {
             let provider: lychi_core::providers::byo::BYOProvider = config.ai.provider.parse()?;
-            let client =
-                lychi_core::providers::byo::BYOClient::new(provider, config.ai.model.clone(), key);
+            let client = lychi_core::providers::byo::BYOClient::new(
+                provider,
+                config.ai.model.clone(),
+                key,
+                config.ai.max_tokens,
+            );
             use lychi_core::providers::AiProvider;
             return Ok(client.health_check().await);
         }
@@ -80,9 +97,19 @@ pub async fn check_ai_health(state: State<'_, AppState>) -> Result<bool, LychiEr
 
 #[tauri::command]
 pub async fn get_masked_api_key(provider: String) -> Result<Option<String>, LychiError> {
-    match get_stored_key(&provider) {
+    // keyring calls are blocking D-Bus round-trips on Linux — run on a blocking thread
+    // with a 5s timeout to guard against a hung secret-service daemon.
+    let task = tauri::async_runtime::spawn_blocking(move || match get_stored_key(&provider) {
         Ok(key) => Ok(Some(mask_key(&key))),
         Err(_) => Ok(None),
+    });
+    match tokio::time::timeout(std::time::Duration::from_secs(5), task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => Err(LychiError::Config(format!("keyring task panicked: {e}"))),
+        Err(_) => {
+            tracing::warn!("get_masked_api_key timed out — returning None");
+            Ok(None) // Treat timeout as "no key found" so UI doesn't break
+        }
     }
 }
 

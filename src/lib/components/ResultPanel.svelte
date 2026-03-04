@@ -1,7 +1,7 @@
 <script lang="ts">
 import AnsiToHtml from "ansi-to-html";
 import type { CommandResult } from "$lib/ipc";
-import { matchesAction } from "$lib/keybindings";
+import { getComboString, matchesAction } from "$lib/keybindings";
 import { sanitizeTerminal } from "$lib/sanitize";
 import WeatherCard from "./WeatherCard.svelte";
 
@@ -245,7 +245,7 @@ function handleKeydown(e: KeyboardEvent) {
 		{#if hasInlineUrl}
 			<div class="inline-url-actions">
 				<button class="btn btn-browser" onmousedown={(e) => e.preventDefault()} onclick={onopenurl}>
-					Browse <span class="kbd">Ctrl+O</span>
+					Browse <span class="kbd">{getComboString("open_inline_url")}</span>
 				</button>
 			</div>
 		{/if}

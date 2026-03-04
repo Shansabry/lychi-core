@@ -9,6 +9,7 @@
 pub mod entry;
 pub mod index;
 pub mod parse;
+pub mod watcher;
 
 pub use entry::DesktopEntry;
 pub use index::{AUTO_LAUNCH_THRESHOLD, AppIndex, CANDIDATE_THRESHOLD, app_index};

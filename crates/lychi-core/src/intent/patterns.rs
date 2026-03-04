@@ -22,6 +22,8 @@ pub const KNOWN_PREFIXES: &[&str] = &[
     "focus",
     "kill",
     "open",
+    "pin",
+    "unpin",
     "sym",
     "unicode",
     "web",
@@ -96,6 +98,18 @@ const TLDS: &[&str] = &[
     ".ly", ".ai", ".gg", ".tv", ".cc",
 ];
 
+/// Confidence level of a deterministic pattern match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Confidence {
+    /// Explicit prefix or trigger character (`web `, `=`, `>`, `?`, colon-triggers).
+    Explicit,
+    /// Strong structural signal: URL, absolute/relative file path, math expression,
+    /// unit/currency conversion, known power phrase.
+    Strong,
+    /// Weak heuristic: home-directory filename match (no explicit prefix).
+    Weak,
+}
+
 /// A deterministically matched route from patterns.rs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
@@ -103,8 +117,11 @@ pub struct Route {
     pub handler: &'static str,
     /// Arguments to pass to the handler
     pub args: String,
-    /// Whether this route was explicitly triggered (prefix or trigger char)
+    /// Whether this route was explicitly triggered (prefix or trigger char).
+    /// Kept for RoutingMethod selection in IntentResolver.
     pub explicit: bool,
+    /// Confidence level of this match.
+    pub confidence: Confidence,
 }
 
 /// Result of deterministic pattern matching.
@@ -192,6 +209,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
                 handler,
                 args: rest.trim().to_string(),
                 explicit: true,
+                confidence: Confidence::Explicit,
             });
         }
     }
@@ -200,6 +218,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
             handler: "web",
             args: query.trim().to_string(),
             explicit: true,
+            confidence: Confidence::Explicit,
         });
     }
     if let Some(expr) = trimmed.strip_prefix('=') {
@@ -207,6 +226,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
             handler: "calc",
             args: expr.trim().to_string(),
             explicit: true,
+            confidence: Confidence::Explicit,
         });
     }
     if let Some(cmd) = trimmed.strip_prefix('>') {
@@ -214,6 +234,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
             handler: "run",
             args: cmd.trim().to_string(),
             explicit: true,
+            confidence: Confidence::Explicit,
         });
     }
 
@@ -223,6 +244,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
             handler: "file",
             args: trimmed.to_string(),
             explicit: false,
+            confidence: Confidence::Strong,
         });
     }
 
@@ -232,6 +254,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
             handler: "url",
             args: trimmed.to_string(),
             explicit: false,
+            confidence: Confidence::Strong,
         });
     }
 
@@ -241,6 +264,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
             handler: "calc",
             args: trimmed.to_string(),
             explicit: false,
+            confidence: Confidence::Strong,
         });
     }
 
@@ -250,6 +274,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
             handler: "calc",
             args: trimmed.to_string(),
             explicit: false,
+            confidence: Confidence::Strong,
         });
     }
 
@@ -260,6 +285,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
             handler: "system",
             args: lower,
             explicit: false,
+            confidence: Confidence::Strong,
         });
     }
     if lower == "cancel shutdown" || lower == "shutdown cancel" {
@@ -267,6 +293,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
             handler: "system",
             args: "cancel shutdown".to_string(),
             explicit: false,
+            confidence: Confidence::Strong,
         });
     }
 
@@ -296,6 +323,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
                 handler: "file",
                 args: format!("~/{trimmed}"),
                 explicit: false,
+                confidence: Confidence::Weak,
             });
         }
     }
@@ -338,6 +366,12 @@ fn try_explicit_prefix(input: &str) -> Option<Route> {
             "file" => ("file", args),
             "url" => ("url", args),
             "media" => ("media", args),
+            "pin" => {
+                // "pin workspace /path" → strip "workspace " prefix
+                let pin_args = args.strip_prefix("workspace ").unwrap_or(&args).to_string();
+                ("pin_workspace", pin_args)
+            }
+            "unpin" => ("pin_workspace", "clear".to_string()),
             "project" => ("project", args),
             "system" => ("system", args),
             "note" | "notes" => ("note", args),
@@ -402,6 +436,7 @@ fn try_explicit_prefix(input: &str) -> Option<Route> {
             handler,
             args,
             explicit: true,
+            confidence: Confidence::Explicit,
         })
     } else {
         None

@@ -19,6 +19,19 @@ static CONTEXT_CWD: Mutex<Option<String>> = Mutex::new(None);
 /// Terminal emulator setting — set by the executor from config.
 static TERMINAL_SETTING: Mutex<Option<String>> = Mutex::new(None);
 
+/// Terminal routing mode — "auto", "manual", or "off".
+static TERMINAL_ROUTING: Mutex<Option<String>> = Mutex::new(None);
+
+/// Target terminal for routing — resolved from the focus ring by the executor.
+static CONTEXT_TERMINAL: Mutex<Option<TerminalTarget>> = Mutex::new(None);
+
+#[derive(Clone)]
+struct TerminalTarget {
+    wm_class: String,
+    pid: u32,
+    window_id: Option<String>,
+}
+
 /// Set the working directory for the next shell command.
 pub fn set_context_cwd(cwd: Option<String>) {
     if let Ok(mut guard) = CONTEXT_CWD.lock() {
@@ -41,6 +54,38 @@ pub fn set_terminal(terminal: Option<String>) {
 /// Get the configured terminal emulator.
 fn get_terminal() -> Option<String> {
     TERMINAL_SETTING.lock().ok().and_then(|g| g.clone())
+}
+
+/// Set the terminal routing mode for the next command.
+pub fn set_terminal_routing(mode: Option<String>) {
+    if let Ok(mut guard) = TERMINAL_ROUTING.lock() {
+        *guard = mode;
+    }
+}
+
+/// Get the current terminal routing mode.
+pub fn get_terminal_routing() -> String {
+    TERMINAL_ROUTING
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_else(|| "off".to_string())
+}
+
+/// Set the target terminal for routing.
+pub fn set_context_terminal(wm_class: Option<String>, pid: u32, window_id: Option<String>) {
+    if let Ok(mut guard) = CONTEXT_TERMINAL.lock() {
+        *guard = wm_class.map(|wm| TerminalTarget {
+            wm_class: wm,
+            pid,
+            window_id,
+        });
+    }
+}
+
+/// Get the current routing target.
+fn get_context_terminal() -> Option<TerminalTarget> {
+    CONTEXT_TERMINAL.lock().ok().and_then(|g| g.clone())
 }
 
 // ── Inline-safe whitelist ───────────────────────────────────────────────
@@ -353,6 +398,104 @@ impl ShellExec {
         })
     }
 
+    /// Try to route a command to an existing terminal via native protocol.
+    ///
+    /// Returns `Some(ActionResult)` on success, `None` if routing failed
+    /// (caller should fall back to opening a new terminal).
+    fn try_route_command(&self, cmd: &str) -> Option<ActionResult> {
+        let target = match get_context_terminal() {
+            Some(t) => t,
+            None => {
+                tracing::debug!(
+                    "terminal_route: no target terminal in context, fallback=new_terminal"
+                );
+                return None;
+            }
+        };
+
+        tracing::debug!(
+            "terminal_route: attempt wm_class={} pid={} cmd={}",
+            target.wm_class,
+            target.pid,
+            cmd
+        );
+
+        // Busy guard: don't send to a terminal running a foreground process
+        #[cfg(target_os = "linux")]
+        if super::terminal_send::is_terminal_busy(target.pid) {
+            tracing::debug!(
+                "terminal_route: busy wm_class={} pid={} fallback=new_terminal",
+                target.wm_class,
+                target.pid
+            );
+            crate::context::metrics::inc_terminal_route_busy();
+            return None;
+        }
+
+        // Send command via terminal protocol
+        #[cfg(target_os = "linux")]
+        match super::terminal_send::send_command(&target.wm_class, target.pid, cmd) {
+            Ok(()) => {
+                // Focus the terminal window
+                if let Some(ref wid) = target.window_id {
+                    let _ = super::kwin_windows::focus_window_by_id(wid);
+                } else {
+                    let _ = super::kwin_windows::focus_window(&target.wm_class);
+                }
+
+                crate::context::metrics::inc_terminal_route_hit();
+                tracing::info!(
+                    "terminal_route: sent wm_class={} pid={} cmd={}",
+                    target.wm_class,
+                    target.pid,
+                    cmd
+                );
+
+                Some(ActionResult {
+                    success: true,
+                    output: Some(format!(
+                        "\u{2192} {} (pid={}): {cmd}",
+                        target.wm_class, target.pid
+                    )),
+                    error: None,
+                    duration_ms: 0,
+                    routed_by: Some("terminal_routing".to_string()),
+                    open_url: None,
+                    needs_confirmation: None,
+                    risk_level: None,
+                    output_type: Some(OutputType::Status),
+                    executed_args: Some(cmd.to_string()),
+                    launch_desktop: None,
+                    focus_app: None,
+                })
+            }
+            Err(e) => {
+                if e.contains("no send protocol") {
+                    tracing::debug!(
+                        "terminal_route: no_protocol wm_class={} fallback=new_terminal",
+                        target.wm_class
+                    );
+                    crate::context::metrics::inc_terminal_route_no_protocol();
+                } else {
+                    tracing::warn!(
+                        "terminal_route: fail wm_class={} pid={} err={} fallback=new_terminal",
+                        target.wm_class,
+                        target.pid,
+                        e
+                    );
+                    crate::context::metrics::inc_terminal_route_fail();
+                }
+                None
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = target;
+            None
+        }
+    }
+
     /// Launch a command in the user's terminal emulator.
     fn execute_in_terminal(
         &self,
@@ -419,10 +562,17 @@ impl ActionHandler for ShellExec {
         let cwd = get_context_cwd();
 
         // Smart split: inline-safe commands run in subprocess, everything else
-        // opens in the user's terminal emulator.
+        // opens in the user's terminal emulator (or routes to an existing one).
         if is_inline_safe(cmd) {
             self.execute_inline(cmd, cwd.as_deref()).await
         } else {
+            // Try terminal routing before opening a new terminal
+            let routing_mode = get_terminal_routing();
+            if routing_mode != "off"
+                && let Some(result) = self.try_route_command(cmd)
+            {
+                return Ok(result);
+            }
             self.execute_in_terminal(cmd, cwd.as_deref())
         }
     }

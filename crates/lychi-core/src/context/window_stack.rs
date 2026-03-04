@@ -5,35 +5,155 @@
 //!
 //! KWin Wayland: `workspace.stackingOrder` via D-Bus scripting.
 //! X11: `_NET_CLIENT_LIST_STACKING` EWMH property.
+//!
+//! The focus ring (`FOCUS_RING`) is maintained by the KWin watcher task and
+//! reflects true last-focus order. `find_recent_terminal()` checks it first
+//! before falling back to the Z-order stack scan.
 
-use super::WindowContext;
+use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use super::active_window::{is_terminal_class, parse_wm_class};
+use super::{TerminalSource, WindowContext};
 
-/// Find the most recently focused terminal from the window stack.
+// ── Focus ring ───────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct FocusEntry {
+    window: WindowContext,
+    source: TerminalSource,
+    focused_at: Instant,
+    /// CWD resolved via terminal probes at push time. `None` if probe failed.
+    cwd: Option<String>,
+}
+
+static FOCUS_RING: Mutex<VecDeque<FocusEntry>> = Mutex::new(VecDeque::new());
+const RING_CAPACITY: usize = 10;
+
+fn push_focus_entry_inner(window: WindowContext, source: TerminalSource) {
+    // Resolve CWD before locking — avoids holding ring mutex during I/O
+    let cwd = super::cwd::detect(window.pid, &window.wm_class, &window.title);
+
+    let Ok(mut ring) = FOCUS_RING.lock() else {
+        return;
+    };
+    ring.retain(|e| !same_window(&e.window, &window));
+    ring.push_front(FocusEntry {
+        window,
+        source,
+        focused_at: Instant::now(),
+        cwd,
+    });
+    ring.truncate(RING_CAPACITY);
+}
+
+/// Push a terminal focus event from the background watcher into the ring.
 ///
-/// Returns `None` if no terminal is in the stack, or if the focused
-/// window is already a terminal (caller should use the primary context).
-pub fn find_recent_terminal(focused: Option<&WindowContext>) -> Option<WindowContext> {
-    // If the focused window is already a terminal, no need to search the stack
+/// Deduplicates by `window_id` when available, otherwise by `pid + wm_class`.
+/// Most-recently-focused is always at the front.
+pub fn push_focus_entry(window: WindowContext) {
+    push_focus_entry_inner(window, TerminalSource::FocusRingWatcher);
+}
+
+/// Push a terminal focus event from a pre-summon window snapshot.
+///
+/// Used to seed the ring on the first summon when the user was already in a
+/// terminal — avoids the "ring empty until post-start terminal focus" cold start.
+pub fn push_focus_entry_pre_summon(window: WindowContext) {
+    push_focus_entry_inner(window, TerminalSource::FocusRingPreSummon);
+}
+
+/// Two windows are the same if they share a `window_id`, or (fallback) the
+/// same `pid + wm_class` when no window ID is available.
+fn same_window(a: &WindowContext, b: &WindowContext) -> bool {
+    match (&a.window_id, &b.window_id) {
+        (Some(ia), Some(ib)) => ia == ib,
+        _ => a.pid == b.pid && a.wm_class == b.wm_class,
+    }
+}
+
+/// Pre-populate the focus ring by scanning the window stack once at startup.
+///
+/// This avoids the D-Bus stack scan on the very first summon. Call from
+/// `spawn_blocking` during app setup. Safe to call on X11 too.
+pub fn warmup() {
+    let t0 = Instant::now();
+    let wayland = super::is_wayland();
+    let stack = if wayland {
+        detect_stack_kwin()
+    } else {
+        detect_stack_x11()
+    };
+
+    let mut seeded = 0u32;
+    for win in stack {
+        if is_terminal_class(&win.wm_class) {
+            push_focus_entry_inner(win, TerminalSource::FocusRingPreSummon);
+            seeded += 1;
+        }
+    }
+    tracing::info!(
+        "[window_stack] warmup done: {}ms (seeded {} terminals)",
+        t0.elapsed().as_millis(),
+        seeded
+    );
+}
+
+// ── Public API ───────────────────────────────────────────────────────────
+
+/// Find the most recently focused terminal from the focus ring or window stack.
+///
+/// Returns `(terminal, source)`:
+/// - `terminal`: the terminal window, or `None` if the focused window is already
+///   a terminal or no background terminal is found.
+/// - `source`: how the terminal was found (`FocusRing`, `Stacking`, or `None`).
+pub fn find_recent_terminal(
+    focused: Option<&WindowContext>,
+) -> (Option<WindowContext>, TerminalSource) {
+    // If the focused window is already a terminal, no need to search
     if let Some(w) = focused {
         if is_terminal_class(&w.wm_class) {
             tracing::debug!(
                 "window_stack: focused is already a terminal ({}), skipping",
                 w.wm_class
             );
-            return None;
+            return (None, TerminalSource::None);
         }
         tracing::debug!(
-            "window_stack: focused is '{}', scanning stack for terminal",
+            "window_stack: focused is '{}', scanning for background terminal",
             w.wm_class
         );
     } else {
-        tracing::debug!("window_stack: no focused window, scanning stack for terminal");
+        tracing::debug!("window_stack: no focused window, scanning for terminal");
     }
 
+    // Check focus ring first (true last-focus order)
+    if let Ok(ring) = FOCUS_RING.lock()
+        && !ring.is_empty()
+    {
+        for entry in ring.iter() {
+            // Exclude the currently focused window by stable ID
+            if let Some(f) = focused
+                && same_window(&entry.window, f)
+            {
+                continue;
+            }
+            tracing::debug!(
+                "window_stack: focus ring hit ({}) — '{}' pid={} cwd={:?}",
+                entry.source,
+                entry.window.wm_class,
+                entry.window.pid,
+                entry.cwd.as_deref(),
+            );
+            return (Some(entry.window.clone()), entry.source);
+        }
+    }
+
+    // Fall back to Z-order stack scan
     let wayland = super::is_wayland();
     tracing::debug!(
-        "window_stack: session_type={}",
+        "window_stack: focus ring empty/exhausted, falling back to stack scan (session={})",
         if wayland { "wayland" } else { "x11" }
     );
 
@@ -53,21 +173,76 @@ pub fn find_recent_terminal(focused: Option<&WindowContext>) -> Option<WindowCon
             .join(", ")
     );
 
-    // Stack is ordered most-recent-first (we reverse the raw bottom→top order).
-    // Find the first terminal that isn't Lychi.
+    // Stack is ordered most-recent-first. Find the first terminal.
     let result = stack.into_iter().find(|w| is_terminal_class(&w.wm_class));
 
     match &result {
-        Some(t) => tracing::debug!(
-            "window_stack: found terminal '{}' pid={} title='{}'",
-            t.wm_class,
-            t.pid,
-            t.title
-        ),
-        None => tracing::debug!("window_stack: no terminal found in stack"),
+        Some(t) => {
+            tracing::debug!(
+                "window_stack: stacking fallback found terminal '{}' pid={}",
+                t.wm_class,
+                t.pid
+            );
+            (Some(t.clone()), TerminalSource::Stacking)
+        }
+        None => {
+            tracing::debug!("window_stack: no terminal found in stack");
+            (None, TerminalSource::None)
+        }
     }
+}
 
-    result
+/// Find the most recently focused terminal whose CWD is within `project_root`.
+///
+/// Returns `None` if no matching terminal is found — does NOT fall back to
+/// any-terminal (caller should use `find_recent_terminal()` for that).
+///
+/// Not wired into `gather()` yet — exists as API for future Phase 3 consumers.
+pub fn find_recent_terminal_for_project(
+    project_root: &str,
+    focused: Option<&WindowContext>,
+) -> Option<(WindowContext, TerminalSource)> {
+    let ring = FOCUS_RING.lock().ok()?;
+    let pr = project_root.trim_end_matches('/');
+    for entry in ring.iter() {
+        // Skip focused window
+        if let Some(f) = focused
+            && same_window(&entry.window, f)
+        {
+            continue;
+        }
+        // Skip stale entries (>15min)
+        if entry.focused_at.elapsed() > RING_STALE_TTL {
+            continue;
+        }
+        // Match: CWD equals or is under project_root (normalized)
+        if let Some(ref cwd) = entry.cwd {
+            let c = cwd.trim_end_matches('/');
+            if c == pr || c.starts_with(&format!("{pr}/")) {
+                return Some((entry.window.clone(), entry.source));
+            }
+        }
+    }
+    None
+}
+
+const RING_STALE_TTL: Duration = Duration::from_secs(900); // 15 minutes
+
+/// Return ring entries for debug display (most recent first).
+pub fn ring_debug_entries() -> Vec<(String, u32, Option<String>, u64)> {
+    let Ok(ring) = FOCUS_RING.lock() else {
+        return Vec::new();
+    };
+    ring.iter()
+        .map(|e| {
+            (
+                e.window.wm_class.clone(),
+                e.window.pid,
+                e.cwd.clone(),
+                e.focused_at.elapsed().as_secs(),
+            )
+        })
+        .collect()
 }
 
 // ── KWin Wayland ────────────────────────────────────────────────────────
@@ -88,9 +263,11 @@ fn detect_stack_kwin() -> Vec<WindowContext> {
     let bus_name = conn.unique_name().to_string();
 
     // Use workspace.stackingOrder — returns windows ordered bottom→top by Z-order.
-    // The topmost (last) window is the most recently focused.
+    // w.internalId provides a stable per-window UUID for deduplication.
+    // Delimiter is \x1F (ASCII Unit Separator) — cannot appear in window titles.
     let script = format!(
         r#"
+var SEP = "\x1F";
 var wins = workspace.stackingOrder;
 var result = [];
 for (var i = 0; i < wins.length; i++) {{
@@ -98,10 +275,11 @@ for (var i = 0; i < wins.length; i++) {{
     var rc = w.resourceClass ? w.resourceClass.toString() : "";
     var cap = w.caption ? w.caption.toString() : "";
     var p = w.pid ? w.pid : 0;
+    var id = w.internalId ? w.internalId.toString() : "";
     if (cap === "" || p === 0) continue;
     if (rc.toLowerCase() === "lychi") continue;
     if (w.minimized) continue;
-    result.push(rc + "\t" + p + "\t" + cap);
+    result.push(rc + SEP + p + SEP + cap + SEP + id);
 }}
 callDBus("{bus_name}", "/", "", "lychi_stack", result.join("\n"));
 "#
@@ -185,17 +363,23 @@ callDBus("{bus_name}", "/", "", "lychi_stack", result.join("\n"));
         _ => return Vec::new(),
     };
 
-    // Parse tab-separated lines, reverse to get most-recent-first
+    // Parse lines: rc \x1F pid \x1F cap \x1F id (id may be absent on older Plasma)
+    // \x1F (Unit Separator) cannot appear in window titles, unlike \t.
     let mut windows: Vec<WindowContext> = data
         .lines()
         .filter_map(|line| {
-            let parts: Vec<&str> = line.splitn(3, '\t').collect();
-            if parts.len() != 3 {
+            let parts: Vec<&str> = line.splitn(4, '\x1F').collect();
+            if parts.len() < 3 {
                 return None;
             }
             let wm_class = parts[0].to_lowercase();
             let pid: u32 = parts[1].parse().ok()?;
             let title = parts[2].to_string();
+            let window_id = parts
+                .get(3)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
             if pid == 0 || title.is_empty() {
                 return None;
             }
@@ -205,6 +389,7 @@ callDBus("{bus_name}", "/", "", "lychi_stack", result.join("\n"));
                 title,
                 is_terminal: is_terminal_class(parts[0]),
                 is_ide: false, // stack scan only cares about terminals
+                window_id,
             })
         })
         .collect();
@@ -299,12 +484,12 @@ fn detect_stack_x11() -> Vec<WindowContext> {
         );
         let pid =
             conn.get_property::<u32, Atom>(false, wid, net_wm_pid, AtomEnum::CARDINAL.into(), 0, 1);
-        requests.push((name, name_fb, class, pid));
+        requests.push((wid, name, name_fb, class, pid));
     }
 
     let mut windows: Vec<WindowContext> = requests
         .into_iter()
-        .filter_map(|(name_cookie, fb_cookie, class_cookie, pid_cookie)| {
+        .filter_map(|(wid, name_cookie, fb_cookie, class_cookie, pid_cookie)| {
             let title = name_cookie
                 .ok()
                 .and_then(|c| c.reply().ok())
@@ -340,6 +525,7 @@ fn detect_stack_x11() -> Vec<WindowContext> {
                 title,
                 wm_class,
                 pid,
+                window_id: Some(format!("{:#010x}", wid)),
             })
         })
         .collect();

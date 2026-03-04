@@ -18,6 +18,7 @@ use lychi_core::action_registry::handlers::file_open::FileOpen;
 #[cfg(feature = "mpris")]
 use lychi_core::action_registry::handlers::media::MediaHandler;
 use lychi_core::action_registry::handlers::notes::{NotesHandler, TodoHandler};
+use lychi_core::action_registry::handlers::pin_workspace::PinWorkspaceHandler;
 use lychi_core::action_registry::handlers::project_open::ProjectOpen;
 use lychi_core::action_registry::handlers::reminders::RemindersHandler;
 use lychi_core::action_registry::handlers::shell_exec::ShellExec;
@@ -63,6 +64,16 @@ pub struct AppState {
     /// Focus handlers check this to ignore stale events from previous summon
     /// cycles (e.g. rapid double-summon).
     pub summon_seq: Arc<AtomicU64>,
+    /// Shutdown signal for the clipboard monitor OS thread. Set to false on exit
+    /// to stop the monitor before D-Bus/arboard teardown begins.
+    pub clipboard_running: Arc<AtomicBool>,
+    /// Shutdown signal for the timer/reminder monitor OS thread.
+    pub timer_running: Arc<AtomicBool>,
+    /// Shutdown signal for the app-index filesystem watcher OS thread.
+    pub app_index_watcher_running: Arc<AtomicBool>,
+    /// Limits concurrent heavy spawn_blocking tasks (file preview, future indexing)
+    /// to prevent burst-load exhaustion of the blocking thread pool.
+    pub heavy_sem: Arc<tokio::sync::Semaphore>,
     #[cfg(feature = "mpris")]
     pub mpris: Arc<RwLock<Option<MprisManager>>>,
 }
@@ -177,6 +188,7 @@ impl AppState {
         registry.register(Box::new(SnippetsHandler::new(db.clone())));
         registry.register(Box::new(BrowseHandler::new()));
         registry.register(Box::new(ContextDebugHandler::new()));
+        registry.register(Box::new(PinWorkspaceHandler));
         let weather_handler = Arc::new(WeatherHandler::new(
             config.weather.unit.clone(),
             config.weather.default_location.clone(),
@@ -185,7 +197,8 @@ impl AppState {
 
         // Initialize AI provider if configured (shared between router and ask handler)
         let ai_provider: Option<Arc<dyn AiProvider>> = if config.ai.mode == "byo" {
-            match Self::init_byo_client(&config.ai.provider, &config.ai.model) {
+            match Self::init_byo_client(&config.ai.provider, &config.ai.model, config.ai.max_tokens)
+            {
                 Ok(client) => {
                     tracing::info!("AI initialized (BYO: {})", config.ai.provider);
                     Some(client)
@@ -208,7 +221,9 @@ impl AppState {
             ai_provider.clone(),
         )));
 
-        let ai_router = ai_provider.map(AiRouter::new_shared);
+        let ai_router = ai_provider.map(|p| {
+            AiRouter::new_shared(p, std::time::Duration::from_secs(config.ai.timeout_secs))
+        });
 
         let history = HistoryStore::new(config.history.max_entries, config.history.deduplicate);
 
@@ -226,12 +241,20 @@ impl AppState {
             timer_state,
             dismiss_armed: Arc::new(AtomicBool::new(false)),
             summon_seq: Arc::new(AtomicU64::new(0)),
+            clipboard_running: Arc::new(AtomicBool::new(true)),
+            timer_running: Arc::new(AtomicBool::new(true)),
+            app_index_watcher_running: Arc::new(AtomicBool::new(true)),
+            heavy_sem: Arc::new(tokio::sync::Semaphore::new(3)),
             #[cfg(feature = "mpris")]
             mpris,
         }
     }
 
-    fn init_byo_client(provider_name: &str, model: &str) -> Result<Arc<dyn AiProvider>, String> {
+    fn init_byo_client(
+        provider_name: &str,
+        model: &str,
+        max_tokens: u32,
+    ) -> Result<Arc<dyn AiProvider>, String> {
         let provider: BYOProvider = provider_name
             .parse()
             .map_err(|e: lychi_core::error::LychiError| e.to_string())?;
@@ -242,7 +265,7 @@ impl AppState {
             .get_password()
             .map_err(|e| format!("No API key stored for {provider_name}: {e}"))?;
 
-        let client = BYOClient::new(provider, model.to_string(), api_key);
+        let client = BYOClient::new(provider, model.to_string(), api_key, max_tokens);
         Ok(Arc::new(client))
     }
 }

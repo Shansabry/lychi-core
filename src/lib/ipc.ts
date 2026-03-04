@@ -154,7 +154,14 @@ export interface AllSettings {
 export async function getAllSettings(): Promise<AllSettings> {
 	if (!isTauri())
 		return {
-			ai: { mode: "disabled", provider: "anthropic", model: "", ollama_url: "" },
+			ai: {
+				mode: "disabled",
+				provider: "anthropic",
+				model: "",
+				ollama_url: "",
+				timeout_secs: 8,
+				max_tokens: 300,
+			},
 			general: {
 				hide_on_blur: true,
 				show_duration_ms: true,
@@ -184,6 +191,7 @@ export async function getAllSettings(): Promise<AllSettings> {
 				tab_complete: "Tab",
 				tab_back: "Shift+Tab",
 				switch_scope: "Ctrl+Tab",
+				web_search: "Ctrl+Enter",
 			},
 			app_version: "0.0.0",
 			layer_shell_supported: false,
@@ -270,6 +278,9 @@ export async function saveCommandsConfig(commands: CommandsConfig): Promise<void
 
 export interface ProjectsConfig {
 	directories: string[];
+	extra_strong_markers?: string[];
+	extra_soft_markers?: string[];
+	pinned_workspace?: string | null;
 }
 
 export async function getProjectsConfig(): Promise<ProjectsConfig> {
@@ -336,6 +347,7 @@ export interface KeybindingsConfig {
 	tab_complete: string;
 	tab_back: string;
 	switch_scope: string;
+	web_search: string;
 }
 
 export const KEYBINDINGS_DEFAULTS: KeybindingsConfig = {
@@ -349,6 +361,7 @@ export const KEYBINDINGS_DEFAULTS: KeybindingsConfig = {
 	tab_complete: "Tab",
 	tab_back: "Shift+Tab",
 	switch_scope: "Ctrl+Tab",
+	web_search: "Ctrl+Enter",
 };
 
 export async function getKeybindingsConfig(): Promise<KeybindingsConfig> {
@@ -368,6 +381,8 @@ export interface AiConfig {
 	provider: string;
 	model: string;
 	ollama_url: string;
+	timeout_secs: number;
+	max_tokens: number;
 }
 
 export interface AiStatus {
@@ -378,7 +393,15 @@ export interface AiStatus {
 }
 
 export async function getAiConfig(): Promise<AiConfig> {
-	if (!isTauri()) return { mode: "disabled", provider: "anthropic", model: "", ollama_url: "" };
+	if (!isTauri())
+		return {
+			mode: "disabled",
+			provider: "anthropic",
+			model: "",
+			ollama_url: "",
+			timeout_secs: 8,
+			max_tokens: 300,
+		};
 	return invoke<AiConfig>("get_ai_config");
 }
 
@@ -651,6 +674,9 @@ export interface ProjectContext {
 	kind: string;
 	has_compose: boolean;
 	scripts: ProjectScript[];
+	package_manager?: string;
+	workspace_root?: string;
+	workspace_scripts?: ProjectScript[];
 }
 
 export interface ContainerInfo {

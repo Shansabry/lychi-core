@@ -117,7 +117,21 @@ fn modified_epoch(metadata: &std::fs::Metadata) -> u64 {
 }
 
 #[tauri::command]
-pub async fn get_file_preview(path: String) -> Result<FilePreviewData, LychiError> {
+pub async fn get_file_preview(
+    path: String,
+    state: tauri::State<'_, crate::state::AppState>,
+) -> Result<FilePreviewData, LychiError> {
+    let _permit = state
+        .heavy_sem
+        .acquire()
+        .await
+        .map_err(|_| LychiError::ExecutionFailed("heavy semaphore closed".into()))?;
+    tauri::async_runtime::spawn_blocking(move || get_file_preview_sync(path))
+        .await
+        .map_err(|e| LychiError::ExecutionFailed(format!("preview task panicked: {e}")))?
+}
+
+fn get_file_preview_sync(path: String) -> Result<FilePreviewData, LychiError> {
     let file_path = Path::new(&path);
     let full_path = file_path
         .canonicalize()

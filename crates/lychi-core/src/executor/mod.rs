@@ -65,7 +65,20 @@ impl Executor {
             ai.set_context_hint(hint);
         }
 
-        let intent = self.resolver.resolve(input, &self.registry).await;
+        // Implicit object expansion: if input is an underspecified verb and clipboard
+        // holds a compatible value, expand deterministically before hitting AI.
+        // Only fires when patterns::route returns NoMatch (no structural match).
+        // Strict guards: ≤2 tokens, no existing argument, compatible clipboard type.
+        let effective_input = self
+            .context
+            .as_ref()
+            .and_then(|ctx| resolve_with_clipboard(input, ctx))
+            .unwrap_or_else(|| input.to_string());
+
+        let intent = self
+            .resolver
+            .resolve(&effective_input, &self.registry)
+            .await;
         tracing::info!(
             action = %intent.action_id,
             routing = ?intent.routing,
@@ -131,8 +144,14 @@ impl Executor {
             // Execute (or Confirm with confirmed=true)
             _ => {
                 // Set context CWD so shell commands run in the detected workspace.
-                // When IDE is focused, prefer IDE workspace (cwd) over background terminal.
-                // Otherwise prefer terminal_cwd (from window stack) over cwd.
+                //
+                // Precedence rules:
+                // 1. IDE focused → prefer IDE workspace (cwd). terminal_cwd is only used
+                //    as a fallback, and only when it's coherent (same repo/project).
+                // 2. Terminal focused → prefer terminal_cwd (may differ from IDE workspace).
+                //    Still falls back to cwd if terminal_cwd is absent.
+                // 3. Incoherent terminal context (different project) → never use as override.
+                //    This prevents Node terminal from contaminating a Rust IDE session.
                 let focused_is_ide = self
                     .context
                     .as_ref()
@@ -140,10 +159,17 @@ impl Executor {
                     .is_some_and(|w| w.is_ide);
                 crate::action_registry::handlers::shell_exec::set_context_cwd(
                     self.context.as_ref().and_then(|ctx| {
+                        let coherent_terminal = ctx
+                            .terminal_matches_workspace
+                            .then(|| ctx.terminal_cwd.clone())
+                            .flatten();
                         if focused_is_ide {
-                            ctx.cwd.clone().or_else(|| ctx.terminal_cwd.clone())
+                            // IDE focused: workspace root is authoritative; only fall back to
+                            // terminal_cwd if it's in the same project.
+                            ctx.cwd.clone().or(coherent_terminal)
                         } else {
-                            ctx.terminal_cwd.clone().or_else(|| ctx.cwd.clone())
+                            // Terminal focused: terminal_cwd (if coherent) takes priority.
+                            coherent_terminal.or_else(|| ctx.cwd.clone())
                         }
                     }),
                 );
@@ -154,6 +180,29 @@ impl Executor {
                     && which::which(tc).is_ok()
                 {
                     crate::action_registry::handlers::shell_exec::set_terminal(Some(tc.clone()));
+                }
+
+                // Terminal routing: resolve target from focus ring for `run` commands.
+                // Clear previous state first to prevent stale routing.
+                crate::action_registry::handlers::shell_exec::set_terminal_routing(None);
+                crate::action_registry::handlers::shell_exec::set_context_terminal(None, 0, None);
+                if intent.action_id == "run"
+                    && let Some(ref ctx) = self.context
+                {
+                    let routing_mode = get_terminal_routing_mode(ctx);
+                    crate::action_registry::handlers::shell_exec::set_terminal_routing(Some(
+                        routing_mode.clone(),
+                    ));
+                    if routing_mode != "off" {
+                        let target = resolve_routing_target(ctx, &routing_mode);
+                        if let Some((win, _src)) = target {
+                            crate::action_registry::handlers::shell_exec::set_context_terminal(
+                                Some(win.wm_class.clone()),
+                                win.pid,
+                                win.window_id.clone(),
+                            );
+                        }
+                    }
                 }
 
                 // Set context snapshot for `ctx` debug handler
@@ -206,8 +255,33 @@ impl Executor {
         if trimmed.len() <= 1
             && let Some(ref ctx) = self.context
         {
-            let ctx_items = crate::context::suggestions::suggest(ctx, Some(&self.db));
+            let mut ctx_items = crate::context::suggestions::suggest(ctx, Some(&self.db));
             if !ctx_items.is_empty() && trimmed.is_empty() {
+                // Stale context warning: soft-stale triggers a UX hint.
+                // Hard-stale additionally notes that AI routing may be conservative.
+                if ctx.is_soft_stale() {
+                    let age_secs = ctx.age().map(|d| d.as_secs()).unwrap_or(0);
+                    crate::context::metrics::inc_soft_stale_hit();
+                    if ctx.is_hard_stale() {
+                        crate::context::metrics::inc_hard_stale_hit();
+                    }
+                    tracing::debug!("completions: context is soft-stale ({age_secs}s old)");
+                    let desc = if ctx.is_hard_stale() {
+                        "Context is >5min old — AI routing will be conservative".into()
+                    } else {
+                        "Suggestions reflect state from your last summon".into()
+                    };
+                    ctx_items.insert(
+                        0,
+                        crate::action_registry::CompletionItem {
+                            label: "Context may be outdated — summon again to refresh".into(),
+                            icon_path: Some("__info__".to_string()),
+                            score: 0,
+                            description: Some(desc),
+                            reason: None,
+                        },
+                    );
+                }
                 return ctx_items;
             }
         }
@@ -343,6 +417,152 @@ impl Executor {
     pub fn refresh_context(&mut self, pre_window: Option<crate::context::WindowContext>) {
         self.context = Some(crate::context::gather(pre_window));
     }
+}
+
+/// Try to expand an underspecified verb using clipboard content as the implicit object.
+///
+/// Only fires when ALL of these hold:
+/// - Input has ≤ 2 tokens (bare verb, or "verb this" / "verb it")
+/// - First token is a recognized implicit-object verb
+/// - Clipboard holds a value compatible with that verb
+/// - Input does not already contain a real argument (not a pronoun)
+///
+/// Returns `Some(expanded)` on success, `None` to leave input unchanged.
+fn resolve_with_clipboard(input: &str, ctx: &crate::context::EnvironmentContext) -> Option<String> {
+    use crate::context::clipboard_detect::ClipboardContentType;
+
+    let trimmed = input.trim();
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+
+    // Strict guard: only expand 1 or 2 token inputs
+    if tokens.is_empty() || tokens.len() > 2 {
+        return None;
+    }
+
+    // If 2 tokens, second must be a placeholder pronoun (not a real argument)
+    const PRONOUNS: &[&str] = &["this", "it", "that"];
+    if tokens.len() == 2 && !PRONOUNS.contains(&tokens[1].to_lowercase().as_str()) {
+        return None;
+    }
+
+    let verb = tokens[0].to_lowercase();
+
+    // Recognised verbs — the set we can expand.
+    const SUPPORTED_VERBS: &[&str] = &[
+        "open", "browse", "clone", "ping", "ssh", "whois", "curl", "show",
+    ];
+
+    let clip = match ctx.clipboard.as_ref() {
+        Some(c) => c,
+        None => {
+            // Clipboard empty — count as miss only if the verb is one we'd act on.
+            if SUPPORTED_VERBS.contains(&verb.as_str()) {
+                crate::context::metrics::inc_clipboard_expansion_miss_empty();
+            }
+            return None;
+        }
+    };
+
+    let expanded = match (verb.as_str(), clip) {
+        // open/browse + URL → web open
+        ("open" | "browse", ClipboardContentType::Url(url)) => {
+            format!("web {url}")
+        }
+        // open + file path → file open
+        ("open", ClipboardContentType::FilePath(path)) => {
+            format!("open {path}")
+        }
+        // clone + URL (GitHub or any git URL) → run git clone
+        ("clone", ClipboardContentType::Url(url))
+            if url.contains("github.com")
+                || url.contains("gitlab.com")
+                || url.contains("bitbucket.org")
+                || url.ends_with(".git") =>
+        {
+            format!("run git clone {url}")
+        }
+        // ping + IP address → run ping
+        ("ping", ClipboardContentType::IpAddress(ip)) => {
+            format!("run ping -c 4 {ip}")
+        }
+        // ssh + IP address → run ssh
+        ("ssh", ClipboardContentType::IpAddress(ip)) => {
+            format!("run ssh {ip}")
+        }
+        // whois + URL → extract host and run whois
+        ("whois", ClipboardContentType::Url(url)) => {
+            // Strip scheme and path, keep host only
+            let host = url
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or(url);
+            format!("run whois {host}")
+        }
+        // curl + URL → run curl
+        ("curl", ClipboardContentType::Url(url)) => {
+            format!("run curl {url}")
+        }
+        // show + git hash (in a git repo) → run git show
+        ("show", ClipboardContentType::GitHash(hash)) if ctx.git.is_some() => {
+            format!("run git show {hash}")
+        }
+        _ => {
+            // Verb is recognised but clipboard type didn't match — record friction.
+            if SUPPORTED_VERBS.contains(&verb.as_str()) {
+                crate::context::metrics::inc_clipboard_expansion_miss_type();
+            }
+            return None;
+        }
+    };
+
+    crate::context::metrics::inc_clipboard_expansion_used();
+    tracing::debug!(
+        "[resolve_with_clipboard] expanded {:?} → {:?} (clipboard={:?})",
+        trimmed,
+        expanded,
+        clip
+    );
+
+    Some(expanded)
+}
+
+/// Read the terminal routing mode from the shell_exec static (set by Tauri layer).
+fn get_terminal_routing_mode(_ctx: &crate::context::EnvironmentContext) -> String {
+    crate::action_registry::handlers::shell_exec::get_terminal_routing()
+}
+
+/// Resolve the best terminal to route to from the focus ring.
+///
+/// For "auto" mode: project-match first, then any recent terminal.
+/// For "manual" mode: only project-match when terminal_matches_workspace is true.
+fn resolve_routing_target(
+    ctx: &crate::context::EnvironmentContext,
+    mode: &str,
+) -> Option<(
+    crate::context::WindowContext,
+    crate::context::TerminalSource,
+)> {
+    let focused = ctx.active_window.as_ref();
+
+    // Try project-match first
+    if let Some(ref project) = ctx.project
+        && let Some(hit) =
+            crate::context::window_stack::find_recent_terminal_for_project(&project.root, focused)
+    {
+        return Some(hit);
+    }
+
+    // For manual mode: only route when terminal is project-coherent.
+    // If project-match failed above, don't fall through to any-terminal.
+    if mode == "manual" {
+        return None;
+    }
+
+    // Auto mode: fall back to any recent terminal
+    let (win, src) = crate::context::window_stack::find_recent_terminal(focused);
+    win.map(|w| (w, src))
 }
 
 #[cfg(test)]
@@ -546,5 +766,161 @@ mod tests {
             has_web,
             "expected a 'Search web:' completion item, got: {completions:?}"
         );
+    }
+
+    // ── Golden Scenario: resolve_with_clipboard ───────────────────────────
+
+    fn make_ctx_with_clipboard(
+        clip: crate::context::clipboard_detect::ClipboardContentType,
+    ) -> crate::context::EnvironmentContext {
+        crate::context::EnvironmentContext {
+            clipboard: Some(clip),
+            gathered_at: Some(std::time::Instant::now()),
+            ..Default::default()
+        }
+    }
+
+    fn make_ctx_with_clipboard_and_git(
+        clip: crate::context::clipboard_detect::ClipboardContentType,
+    ) -> crate::context::EnvironmentContext {
+        crate::context::EnvironmentContext {
+            clipboard: Some(clip),
+            git: Some(crate::context::GitContext {
+                repo_root: "/tmp/repo".into(),
+                branch: "main".into(),
+                dirty: false,
+                remote: None,
+            }),
+            gathered_at: Some(std::time::Instant::now()),
+            ..Default::default()
+        }
+    }
+
+    /// Clipboard expansion: bare "open" + URL → "web <url>"
+    #[test]
+    fn clipboard_expansion_open_url() {
+        use crate::context::clipboard_detect::ClipboardContentType;
+        let ctx = make_ctx_with_clipboard(ClipboardContentType::Url(
+            "https://github.com/user/repo".into(),
+        ));
+        let result = super::resolve_with_clipboard("open", &ctx);
+        assert_eq!(result, Some("web https://github.com/user/repo".into()));
+    }
+
+    /// "open this" is a pronoun form — same expansion as bare "open"
+    #[test]
+    fn clipboard_expansion_open_this_url() {
+        use crate::context::clipboard_detect::ClipboardContentType;
+        let ctx = make_ctx_with_clipboard(ClipboardContentType::Url("https://example.com".into()));
+        let result = super::resolve_with_clipboard("open this", &ctx);
+        assert_eq!(result, Some("web https://example.com".into()));
+    }
+
+    /// "open firefox" has a real argument — must NOT be expanded
+    #[test]
+    fn clipboard_expansion_does_not_hijack_real_arg() {
+        use crate::context::clipboard_detect::ClipboardContentType;
+        let ctx = make_ctx_with_clipboard(ClipboardContentType::Url("https://example.com".into()));
+        let result = super::resolve_with_clipboard("open firefox", &ctx);
+        assert_eq!(
+            result, None,
+            "open with a real argument must not be expanded"
+        );
+    }
+
+    /// "clone" + GitHub URL → "run git clone <url>"
+    #[test]
+    fn clipboard_expansion_clone_github() {
+        use crate::context::clipboard_detect::ClipboardContentType;
+        let ctx = make_ctx_with_clipboard(ClipboardContentType::Url(
+            "https://github.com/user/lychi".into(),
+        ));
+        let result = super::resolve_with_clipboard("clone", &ctx);
+        assert_eq!(
+            result,
+            Some("run git clone https://github.com/user/lychi".into())
+        );
+    }
+
+    /// "clone" + non-git URL → None (don't blindly clone arbitrary URLs)
+    #[test]
+    fn clipboard_expansion_clone_non_git_url_rejected() {
+        use crate::context::clipboard_detect::ClipboardContentType;
+        let ctx =
+            make_ctx_with_clipboard(ClipboardContentType::Url("https://example.com/page".into()));
+        let result = super::resolve_with_clipboard("clone", &ctx);
+        assert_eq!(result, None, "clone of a non-git URL must not expand");
+    }
+
+    /// "ping" + IP → "run ping -c 4 <ip>"
+    #[test]
+    fn clipboard_expansion_ping_ip() {
+        use crate::context::clipboard_detect::ClipboardContentType;
+        let ctx = make_ctx_with_clipboard(ClipboardContentType::IpAddress("192.168.1.1".into()));
+        let result = super::resolve_with_clipboard("ping", &ctx);
+        assert_eq!(result, Some("run ping -c 4 192.168.1.1".into()));
+    }
+
+    /// "ssh" + IP → "run ssh <ip>"
+    #[test]
+    fn clipboard_expansion_ssh_ip() {
+        use crate::context::clipboard_detect::ClipboardContentType;
+        let ctx = make_ctx_with_clipboard(ClipboardContentType::IpAddress("10.0.0.5".into()));
+        let result = super::resolve_with_clipboard("ssh", &ctx);
+        assert_eq!(result, Some("run ssh 10.0.0.5".into()));
+    }
+
+    /// "whois" + URL → host extracted, no scheme/path
+    #[test]
+    fn clipboard_expansion_whois_url() {
+        use crate::context::clipboard_detect::ClipboardContentType;
+        let ctx = make_ctx_with_clipboard(ClipboardContentType::Url(
+            "https://example.com/some/path".into(),
+        ));
+        let result = super::resolve_with_clipboard("whois", &ctx);
+        assert_eq!(result, Some("run whois example.com".into()));
+    }
+
+    /// "show" + git hash requires git context — no git → None
+    #[test]
+    fn clipboard_expansion_show_hash_requires_git() {
+        use crate::context::clipboard_detect::ClipboardContentType;
+        let ctx = make_ctx_with_clipboard(ClipboardContentType::GitHash("a1b2c3d".into()));
+        // No git context on this ctx
+        let result = super::resolve_with_clipboard("show", &ctx);
+        assert_eq!(
+            result, None,
+            "show hash without git context must not expand"
+        );
+    }
+
+    /// "show" + git hash with git context → "run git show <hash>"
+    #[test]
+    fn clipboard_expansion_show_hash_with_git() {
+        use crate::context::clipboard_detect::ClipboardContentType;
+        let ctx = make_ctx_with_clipboard_and_git(ClipboardContentType::GitHash("a1b2c3d".into()));
+        let result = super::resolve_with_clipboard("show", &ctx);
+        assert_eq!(result, Some("run git show a1b2c3d".into()));
+    }
+
+    /// Three-token input is never expanded
+    #[test]
+    fn clipboard_expansion_rejects_three_tokens() {
+        use crate::context::clipboard_detect::ClipboardContentType;
+        let ctx = make_ctx_with_clipboard(ClipboardContentType::Url("https://example.com".into()));
+        let result = super::resolve_with_clipboard("open the url", &ctx);
+        assert_eq!(result, None, "three-token input must not be expanded");
+    }
+
+    /// No clipboard → no expansion
+    #[test]
+    fn clipboard_expansion_no_clipboard_returns_none() {
+        let ctx = crate::context::EnvironmentContext {
+            clipboard: None,
+            gathered_at: Some(std::time::Instant::now()),
+            ..Default::default()
+        };
+        let result = super::resolve_with_clipboard("open", &ctx);
+        assert_eq!(result, None);
     }
 }

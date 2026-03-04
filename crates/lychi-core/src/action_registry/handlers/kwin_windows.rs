@@ -58,6 +58,27 @@ for (var i = 0; i < wins.length; i++) {{
     run_kwin_script(&script)
 }
 
+/// Focus a specific window by its KWin internalId (UUID).
+///
+/// Unlike `focus_window()` which matches the first window by resource class,
+/// this targets a specific window — important when multiple instances exist
+/// (e.g. two Konsole windows).
+pub fn focus_window_by_id(window_id: &str) -> Result<(), String> {
+    let script = format!(
+        r#"
+var wins = workspace.windowList();
+for (var i = 0; i < wins.length; i++) {{
+    if (wins[i].internalId && wins[i].internalId.toString() === "{}") {{
+        workspace.activeWindow = wins[i];
+        break;
+    }}
+}}
+"#,
+        window_id.replace('"', r#"\""#)
+    );
+    run_kwin_script(&script)
+}
+
 /// Close a window by resource class via KWin scripting.
 pub fn close_window(resource_class: &str) -> Result<(), String> {
     let script = format!(

@@ -589,11 +589,49 @@ impl ActionHandler for TimerHandler {
 ///
 /// All notify-rust calls are serialized in this single thread to avoid
 /// concurrent D-Bus access that causes heap corruption on Linux.
-pub fn run_timer_monitor(state: TimerState, db: std::sync::Arc<redb::Database>) {
+/// Runs on a dedicated OS thread until `running` is set to false.
+/// Automatically recovers from panics (logs and restarts the poll loop).
+pub fn run_timer_monitor(
+    state: TimerState,
+    db: std::sync::Arc<redb::Database>,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    tracing::info!("Timer monitor started");
+
+    loop {
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            timer_monitor_loop(&state, &db, &running);
+        }));
+
+        if let Err(_panic) = result {
+            tracing::error!(
+                "Timer monitor panicked — restarting in 1s \
+                 (in-flight timers may have been lost)"
+            );
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        } else {
+            // Loop returned normally — `running` is false, exit cleanly
+            break;
+        }
+    }
+    tracing::info!("Timer monitor stopped");
+}
+
+fn timer_monitor_loop(
+    state: &TimerState,
+    db: &std::sync::Arc<redb::Database>,
+    running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
     let reminder_store = crate::reminders::store::RemindersStore::new();
     let mut tick: u32 = 0;
 
-    loop {
+    while running.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(500));
         tick = tick.wrapping_add(1);
 
@@ -630,7 +668,7 @@ pub fn run_timer_monitor(state: TimerState, db: std::sync::Arc<redb::Database>) 
 
         // --- Reminder checks (every ~10s = 20 ticks) ---
         if tick.is_multiple_of(20) {
-            crate::reminders::monitor::check_and_fire(&reminder_store, &db);
+            crate::reminders::monitor::check_and_fire(&reminder_store, db);
         }
     }
 }

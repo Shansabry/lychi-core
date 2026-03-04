@@ -45,15 +45,17 @@ pub struct BYOClient {
     provider: BYOProvider,
     model: String,
     api_key: String,
+    max_tokens: u32,
     http: Client,
 }
 
 impl BYOClient {
-    pub fn new(provider: BYOProvider, model: String, api_key: String) -> Self {
+    pub fn new(provider: BYOProvider, model: String, api_key: String, max_tokens: u32) -> Self {
         Self {
             provider,
             model,
             api_key,
+            max_tokens,
             http: Client::new(),
         }
     }
@@ -69,7 +71,7 @@ impl BYOClient {
                 { "role": "system", "content": system_prompt },
                 { "role": "user", "content": user_input }
             ],
-            "max_tokens": 300,
+            "max_tokens": self.max_tokens,
             "temperature": 0.0
         });
 
@@ -111,7 +113,7 @@ impl BYOClient {
             "messages": [
                 { "role": "user", "content": user_input }
             ],
-            "max_tokens": 300,
+            "max_tokens": self.max_tokens,
             "temperature": 0.0
         });
 

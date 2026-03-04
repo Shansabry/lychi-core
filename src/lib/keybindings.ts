@@ -17,19 +17,21 @@ export type ActionId =
 	| "dismiss"
 	| "tab_complete"
 	| "tab_back"
-	| "switch_scope";
+	| "switch_scope"
+	| "web_search";
 
 export const ACTION_LABELS: Record<ActionId, string> = {
 	toggle_history: "Toggle history",
 	toggle_notes: "Toggle notes",
 	toggle_media: "Toggle media",
 	toggle_settings: "Toggle settings",
-	open_inline_url: "Open inline URL",
+	open_inline_url: "Open result in browser",
 	submit: "Submit command",
 	dismiss: "Dismiss / hide",
 	tab_complete: "Accept completion",
 	tab_back: "Go back / up folder",
-	switch_scope: "Switch scope",
+	switch_scope: "Switch result scope",
+	web_search: "Search web",
 };
 
 export const ALL_ACTIONS: ActionId[] = Object.keys(ACTION_LABELS) as ActionId[];

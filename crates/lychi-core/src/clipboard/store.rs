@@ -136,8 +136,37 @@ pub fn hash_text(text: &str) -> u64 {
 }
 
 /// Background clipboard monitor — polls system clipboard every 500ms and stores new entries.
-/// Runs forever in a blocking thread. Call from `spawn_blocking`.
-pub fn run_clipboard_monitor(db: Arc<Database>) {
+/// Runs on a dedicated OS thread until `running` is set to false.
+/// Automatically recovers from panics (logs and restarts the poll loop).
+pub fn run_clipboard_monitor(db: Arc<Database>, running: Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    tracing::info!("Clipboard monitor started");
+
+    loop {
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            clipboard_monitor_loop(&db, &running);
+        }));
+
+        if let Err(_panic) = result {
+            tracing::error!(
+                "Clipboard monitor panicked — restarting in 1s \
+                 (clipboard history may have a gap)"
+            );
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        } else {
+            // Loop returned normally — `running` is false, exit cleanly
+            break;
+        }
+    }
+    tracing::info!("Clipboard monitor stopped");
+}
+
+fn clipboard_monitor_loop(db: &Arc<Database>, running: &Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
     let store = ClipboardStore::new();
     let mut last_hash: u64 = 0;
 
@@ -148,9 +177,7 @@ pub fn run_clipboard_monitor(db: Arc<Database>) {
         last_hash = hash_text(&text);
     }
 
-    tracing::info!("Clipboard monitor started");
-
-    loop {
+    while running.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         let text = match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
@@ -169,7 +196,7 @@ pub fn run_clipboard_monitor(db: Arc<Database>) {
         }
         last_hash = current_hash;
 
-        if let Err(e) = store.push(&db, text) {
+        if let Err(e) = store.push(db, text) {
             tracing::warn!("Clipboard store error: {e}");
         }
     }

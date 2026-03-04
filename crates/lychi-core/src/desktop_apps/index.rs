@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+use arc_swap::ArcSwap;
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
@@ -14,12 +15,23 @@ pub const AUTO_LAUNCH_THRESHOLD: f32 = 0.90;
 /// Minimum score to include in completion candidates.
 pub const CANDIDATE_THRESHOLD: f32 = 0.30;
 
-/// Global AppIndex — built once at warmup, never mutated.
-static APP_INDEX: OnceLock<AppIndex> = OnceLock::new();
+/// Global AppIndex — ArcSwap allows lock-free reads and atomic hot-swap on rebuild.
+static APP_INDEX: OnceLock<ArcSwap<AppIndex>> = OnceLock::new();
 
-/// Get (or build) the global AppIndex.
-pub fn app_index() -> &'static AppIndex {
-    APP_INDEX.get_or_init(|| AppIndex::build(discover_entries()))
+fn global_store() -> &'static ArcSwap<AppIndex> {
+    APP_INDEX.get_or_init(|| ArcSwap::from_pointee(AppIndex::build(discover_entries())))
+}
+
+/// Get a snapshot of the current AppIndex. The returned Guard derefs to AppIndex.
+pub fn app_index() -> arc_swap::Guard<Arc<AppIndex>> {
+    global_store().load()
+}
+
+/// Rebuild the AppIndex from disk and atomically swap it in.
+/// Called by the watcher thread after a debounced filesystem change.
+pub fn rebuild_app_index() {
+    let new_index = Arc::new(AppIndex::build(discover_entries()));
+    global_store().store(new_index);
 }
 
 pub struct AppIndex {

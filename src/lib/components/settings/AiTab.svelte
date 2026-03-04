@@ -215,6 +215,33 @@ export function dismissConfirm() {
 	</div>
 
 	<div class="field">
+		<label for="ai-timeout">Timeout</label>
+		<div class="number-row">
+			<input
+				id="ai-timeout"
+				type="number"
+				min="2"
+				max="60"
+				bind:value={aiConfig.timeout_secs}
+				onchange={saveAi}
+			/>
+			<span class="unit-label">s</span>
+		</div>
+	</div>
+
+	<div class="field">
+		<label for="ai-max-tokens">Max Tokens</label>
+		<input
+			id="ai-max-tokens"
+			type="number"
+			min="100"
+			max="2000"
+			bind:value={aiConfig.max_tokens}
+			onchange={saveAi}
+		/>
+	</div>
+
+	<div class="field">
 		<label for="ai-key">API Key</label>
 		<div class="key-row">
 			{#if maskedKey && !editingKey}
@@ -285,6 +312,34 @@ export function dismissConfirm() {
 		font-size: 12px;
 		flex-shrink: 0;
 		width: 120px;
+	}
+
+	input[type="number"] {
+		background: var(--bg-secondary);
+		color: var(--fg);
+		border: 1px solid var(--border);
+		border-radius: 4px;
+		padding: 5px 8px;
+		font-family: var(--font-mono);
+		font-size: 12px;
+		outline: none;
+		width: 64px;
+		text-align: right;
+	}
+
+	input[type="number"]:focus {
+		border-color: var(--fg-muted);
+	}
+
+	.number-row {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+	}
+
+	.unit-label {
+		font-size: 12px;
+		color: var(--fg-muted);
 	}
 
 	.key-row {

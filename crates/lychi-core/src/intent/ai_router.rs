@@ -66,20 +66,20 @@ pub struct AiRouter {
 const CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 
 impl AiRouter {
-    pub fn new(provider: Box<dyn AiProvider>) -> Self {
+    pub fn new(provider: Box<dyn AiProvider>, timeout: Duration) -> Self {
         Self {
             provider: Arc::from(provider),
-            timeout: Duration::from_secs(8),
+            timeout,
             context_hint: Mutex::new(None),
             cache: Mutex::new(HashMap::new()),
             health: Mutex::new(HealthGate::new()),
         }
     }
 
-    pub fn new_shared(provider: Arc<dyn AiProvider>) -> Self {
+    pub fn new_shared(provider: Arc<dyn AiProvider>, timeout: Duration) -> Self {
         Self {
             provider,
-            timeout: Duration::from_secs(8),
+            timeout,
             context_hint: Mutex::new(None),
             cache: Mutex::new(HashMap::new()),
             health: Mutex::new(HealthGate::new()),

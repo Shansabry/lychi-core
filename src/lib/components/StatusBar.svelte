@@ -11,6 +11,7 @@ import {
 } from "lucide-svelte";
 import type { CommandResult, TrackInfo } from "$lib/ipc";
 import { mediaControl } from "$lib/ipc";
+import { getComboString } from "$lib/keybindings";
 
 let {
 	result = null,
@@ -143,7 +144,7 @@ async function togglePlayPause() {
 			class:active={historyOpen}
 			onmousedown={(e) => e.preventDefault()}
 			onclick={ontogglehistory}
-			title="History (Ctrl+1)"
+			title="History ({getComboString('toggle_history')})"
 			tabindex={-1}
 		>
 			<Clock size={14} strokeWidth={1.5} />
@@ -153,7 +154,7 @@ async function togglePlayPause() {
 			class:active={notesOpen}
 			onmousedown={(e) => e.preventDefault()}
 			onclick={ontogglenotes}
-			title="Utility (Ctrl+2)"
+			title="Utility ({getComboString('toggle_notes')})"
 			tabindex={-1}
 		>
 			<ClipboardList size={14} strokeWidth={1.5} />
@@ -163,7 +164,7 @@ async function togglePlayPause() {
 			class:active={mediaOpen}
 			onmousedown={(e) => e.preventDefault()}
 			onclick={ontogglemedia}
-			title="Media (Ctrl+3)"
+			title="Media ({getComboString('toggle_media')})"
 			tabindex={-1}
 		>
 			<Music size={14} strokeWidth={1.5} />
@@ -173,7 +174,7 @@ async function togglePlayPause() {
 			class:active={settingsOpen}
 			onmousedown={(e) => e.preventDefault()}
 			onclick={ontogglesettings}
-			title="Settings (Ctrl+4)"
+			title="Settings ({getComboString('toggle_settings')})"
 			tabindex={-1}
 		>
 			<Settings size={14} strokeWidth={1.5} />

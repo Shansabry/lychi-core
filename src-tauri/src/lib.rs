@@ -22,6 +22,14 @@ pub fn run() {
     let app_state = AppState::new();
     let (hotkey, window_strategy, shell_path, project_dirs) = {
         let config = app_state.config.blocking_read();
+        lychi_core::context::active_window::register_extra_terminals(
+            &config.commands.extra_terminals,
+        );
+        lychi_core::context::ide::register_extra_markers(
+            &config.projects.extra_strong_markers,
+            &config.projects.extra_soft_markers,
+        );
+        lychi_core::context::pin::set(config.projects.pinned_workspace.clone());
         (
             config.general.hotkey.clone(),
             config.general.window_strategy.clone(),
@@ -146,6 +154,12 @@ pub fn run() {
             tauri::async_runtime::spawn_blocking(|| {
                 lychi_core::history::HistoryStore::warmup();
             });
+            tauri::async_runtime::spawn_blocking(|| {
+                lychi_core::context::network::warmup();
+            });
+            tauri::async_runtime::spawn_blocking(|| {
+                lychi_core::context::window_stack::warmup();
+            });
 
             // Warm alias cache for transparent alias resolution in router
             let alias_db = app.state::<state::AppState>().db.clone();
@@ -156,21 +170,35 @@ pub fn run() {
                 lychi_core::action_registry::handlers::calc::fetch_exchange_rates().await;
             });
 
-            // Background clipboard monitor
+            // Background clipboard monitor — owns its OS thread (not the Tokio blocking pool)
             let clip_db = app.state::<AppState>().db.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                lychi_core::clipboard::store::run_clipboard_monitor(clip_db);
-            });
+            let clipboard_running = app.state::<AppState>().clipboard_running.clone();
+            std::thread::Builder::new()
+                .name("lychi-clipboard".to_string())
+                .spawn(move || {
+                    lychi_core::clipboard::store::run_clipboard_monitor(clip_db, clipboard_running);
+                })
+                .expect("failed to spawn clipboard monitor thread");
 
-            // Background timer + reminder monitor (single thread for all notify-rust calls)
+            // App-index filesystem watcher — rebuilds AppIndex when .desktop files change
+            let watcher_running = app.state::<AppState>().app_index_watcher_running.clone();
+            lychi_core::desktop_apps::watcher::start(watcher_running);
+
+            // Background timer + reminder monitor — owns its OS thread
+            // (all notify-rust D-Bus calls serialized in this single thread)
             let timer_state = app.state::<AppState>().timer_state.clone();
             let monitor_db = app.state::<AppState>().db.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                lychi_core::action_registry::handlers::timer::run_timer_monitor(
-                    timer_state,
-                    monitor_db,
-                );
-            });
+            let timer_running = app.state::<AppState>().timer_running.clone();
+            std::thread::Builder::new()
+                .name("lychi-timer".to_string())
+                .spawn(move || {
+                    lychi_core::action_registry::handlers::timer::run_timer_monitor(
+                        timer_state,
+                        monitor_db,
+                        timer_running,
+                    );
+                })
+                .expect("failed to spawn timer monitor thread");
 
             // Register global shortcut
             use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
@@ -223,6 +251,19 @@ pub fn run() {
                     if let Err(e) = ipc_server::run(ipc_handle).await {
                         tracing::error!("IPC server error: {e}");
                     }
+                });
+            }
+
+            // Spawn KWin active-window watcher (keeps context cache warm on Wayland)
+            #[cfg(target_os = "linux")]
+            if lychi_core::context::is_wayland() {
+                tauri::async_runtime::spawn(async move {
+                    lychi_core::context::active_window::run_kwin_watcher(|ctx| {
+                        if ctx.is_terminal {
+                            lychi_core::context::window_stack::push_focus_entry(ctx);
+                        }
+                    })
+                    .await;
                 });
             }
 
@@ -280,29 +321,60 @@ pub fn run() {
         .expect("error while building Lychi");
 
     app.run(|_app, event| {
-        if let tauri::RunEvent::Exit = event {
-            // Clean up Unix domain socket
-            #[cfg(unix)]
-            {
-                let path = platform::ipc_path();
-                if path.exists() {
-                    let _ = std::fs::remove_file(&path);
+        match event {
+            tauri::RunEvent::ExitRequested { .. } => {
+                // Signal monitors to stop before Tauri begins teardown, so they
+                // don't issue D-Bus calls (notify_rust / arboard) mid-shutdown.
+                let state = _app.state::<AppState>();
+                state
+                    .clipboard_running
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                state
+                    .timer_running
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                state
+                    .app_index_watcher_running
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            tauri::RunEvent::Exit => {
+                // Belt-and-suspenders: also set on Exit in case ExitRequested was skipped.
+                {
+                    let state = _app.state::<AppState>();
+                    state
+                        .clipboard_running
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    state
+                        .timer_running
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    state
+                        .app_index_watcher_running
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+
+                // Clean up Unix domain socket
+                #[cfg(unix)]
+                {
+                    let path = platform::ipc_path();
+                    if path.exists() {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+
+                // Drop the MPRIS manager cleanly so D-Bus subscriptions
+                // are released before the process exits. This prevents
+                // crashes in media players (e.g. Spotify) caused by
+                // abrupt D-Bus peer disconnection.
+                #[cfg(feature = "mpris")]
+                {
+                    let state = _app.state::<AppState>();
+                    let mpris = state.mpris.clone();
+                    tauri::async_runtime::block_on(async {
+                        let mut guard = mpris.write().await;
+                        guard.take();
+                    });
                 }
             }
-
-            // Drop the MPRIS manager cleanly so D-Bus subscriptions
-            // are released before the process exits. This prevents
-            // crashes in media players (e.g. Spotify) caused by
-            // abrupt D-Bus peer disconnection.
-            #[cfg(feature = "mpris")]
-            {
-                let state = _app.state::<AppState>();
-                let mpris = state.mpris.clone();
-                tauri::async_runtime::block_on(async {
-                    let mut guard = mpris.write().await;
-                    guard.take();
-                });
-            }
+            _ => {}
         }
     });
 }
