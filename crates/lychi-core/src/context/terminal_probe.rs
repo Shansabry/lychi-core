@@ -74,13 +74,11 @@ pub fn probe_terminal_cwd(wm_class: &str, pid: u32, title: &str) -> Option<Strin
 }
 
 fn dispatch(wm_class: &str, pid: u32, title: &str) -> (Option<String>, ProbeSource) {
-    let lower = wm_class.to_lowercase();
-    match lower.as_str() {
+    let short = super::active_window::normalize_wm_class(wm_class);
+    match short.as_str() {
         "konsole" => (KonsoleProbe.probe(pid, title), ProbeSource::Konsole),
         "kitty" => (KittyProbe.probe(pid, title), ProbeSource::Kitty),
-        "wezterm" | "org.wezfurlong.wezterm" => {
-            (WeztermProbe.probe(pid, title), ProbeSource::Wezterm)
-        }
+        "wezterm" => (WeztermProbe.probe(pid, title), ProbeSource::Wezterm),
         c if SINGLE_TAB_TERMINALS.contains(&c) => {
             (ProcCwdProbe.probe(pid, title), ProbeSource::Proc)
         }
@@ -120,31 +118,82 @@ impl TerminalProbe for KonsoleProbe {
     fn probe(&self, pid: u32, _title: &str) -> Option<String> {
         use dbus::blocking::SyncConnection;
 
-        let conn = SyncConnection::new_session().ok()?;
+        let conn = match SyncConnection::new_session() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!("konsole_probe: D-Bus session connect failed: {e}");
+                return None;
+            }
+        };
         let service = format!("org.kde.konsole-{pid}");
         let timeout = Duration::from_millis(200);
+        tracing::debug!("konsole_probe: trying service={service}");
 
         // Collect CWDs from all responding windows — return only if unique.
         let mut cwds = Vec::new();
+        let mut any_window_responded = false;
         for win_id in 1..=5 {
             let win_path = format!("/Windows/{win_id}");
             let win_proxy = conn.with_proxy(&service, &win_path, timeout);
             let session_id: i32 =
                 match win_proxy.method_call("org.kde.konsole.Window", "currentSession", ()) {
-                    Ok((id,)) => id,
-                    Err(_) => continue,
+                    Ok((id,)) => {
+                        any_window_responded = true;
+                        id
+                    }
+                    Err(e) => {
+                        tracing::debug!("konsole_probe: Window/{win_id} failed: {e}");
+                        continue;
+                    }
                 };
 
             let session_path = format!("/Sessions/{session_id}");
             let session_proxy = conn.with_proxy(&service, &session_path, timeout);
-            if let Ok((cwd,)) = session_proxy.method_call::<(String,), _, _, _>(
-                "org.kde.konsole.Session",
-                "currentWorkingDirectory",
-                (),
-            ) && !cwd.is_empty()
-            {
-                cwds.push(cwd);
+
+            // Try currentWorkingDirectory first (newer Konsole versions),
+            // fall back to processId + /proc/{pid}/cwd (works on all versions).
+            let cwd_result = session_proxy
+                .method_call::<(String,), _, _, _>(
+                    "org.kde.konsole.Session",
+                    "currentWorkingDirectory",
+                    (),
+                )
+                .ok()
+                .map(|(s,)| s)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    // Fallback: get shell PID and read /proc/{pid}/cwd
+                    let shell_pid: i32 = session_proxy
+                        .method_call("org.kde.konsole.Session", "processId", ())
+                        .ok()
+                        .map(|(id,)| id)?;
+                    if shell_pid > 0 {
+                        let cwd = std::fs::read_link(format!("/proc/{shell_pid}/cwd"))
+                            .ok()?
+                            .to_str()?
+                            .to_string();
+                        tracing::debug!(
+                            "konsole_probe: session={session_id} via /proc/{shell_pid}/cwd"
+                        );
+                        Some(cwd)
+                    } else {
+                        None
+                    }
+                });
+
+            match cwd_result {
+                Some(cwd) => {
+                    tracing::debug!("konsole_probe: session={session_id} cwd={cwd}");
+                    cwds.push(cwd);
+                }
+                None => {
+                    tracing::debug!("konsole_probe: session={session_id} no cwd");
+                }
             }
+        }
+
+        if !any_window_responded {
+            tracing::debug!("konsole_probe: no windows responded for {service}");
         }
 
         // Normalize trailing slashes before dedup (D-Bus may return `/tmp/` vs `/tmp`)
@@ -156,6 +205,7 @@ impl TerminalProbe for KonsoleProbe {
         // Deduplicate — ambiguity → None (C16: no context > wrong context)
         cwds.sort();
         cwds.dedup();
+        tracing::debug!("konsole_probe: result cwds={cwds:?}");
         if cwds.len() == 1 { cwds.pop() } else { None }
     }
 

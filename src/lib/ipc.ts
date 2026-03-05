@@ -258,6 +258,7 @@ export interface CommandsConfig {
 	youtube_url: string;
 	shell: string;
 	terminal: string;
+	terminal_routing: string;
 }
 
 export async function getCommandsConfig(): Promise<CommandsConfig> {
@@ -267,8 +268,14 @@ export async function getCommandsConfig(): Promise<CommandsConfig> {
 			youtube_url: "https://www.youtube.com/results?search_query=",
 			shell: "/bin/bash",
 			terminal: "",
+			terminal_routing: "manual",
 		};
 	return invoke<CommandsConfig>("get_commands_config");
+}
+
+export async function getInstalledTerminals(): Promise<string[]> {
+	if (!isTauri()) return ["xterm"];
+	return invoke<string[]>("get_installed_terminals");
 }
 
 export async function saveCommandsConfig(commands: CommandsConfig): Promise<void> {

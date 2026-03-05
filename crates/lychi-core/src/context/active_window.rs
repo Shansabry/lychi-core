@@ -64,14 +64,27 @@ pub fn register_extra_terminals(extra: &[String]) {
 }
 
 /// Check if a wm_class is a terminal emulator.
+/// Normalize a Wayland reverse-DNS `resourceClass` to its short form.
+/// `"org.kde.konsole"` → `"konsole"`, `"kitty"` → `"kitty"`.
+pub fn normalize_wm_class(wm_class: &str) -> String {
+    let lower = wm_class.to_lowercase();
+    let short = lower.rsplit('.').next().unwrap_or(&lower);
+    if short == lower {
+        lower
+    } else {
+        short.to_string()
+    }
+}
+
 pub fn is_terminal_class(wm_class: &str) -> bool {
     let lower = wm_class.to_lowercase();
-    if TERMINALS.iter().any(|t| lower == *t) {
+    let short = normalize_wm_class(wm_class);
+    if TERMINALS.iter().any(|t| lower == *t || short == *t) {
         return true;
     }
     EXTRA_TERMINALS
         .get()
-        .is_some_and(|extra| extra.contains(&lower))
+        .is_some_and(|extra| extra.contains(&lower) || extra.contains(&short))
 }
 
 /// Known IDE WM classes.

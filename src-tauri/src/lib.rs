@@ -75,6 +75,7 @@ pub fn run() {
             commands::config::restart_app,
             commands::config::set_hotkey,
             commands::config::record_hotkey,
+            commands::config::get_installed_terminals,
             commands::config::get_layer_shell_supported,
             commands::config::get_active_window_strategy,
             commands::config::hide_launcher,

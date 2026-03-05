@@ -568,10 +568,14 @@ impl ActionHandler for ShellExec {
         } else {
             // Try terminal routing before opening a new terminal
             let routing_mode = get_terminal_routing();
-            if routing_mode != "off"
-                && let Some(result) = self.try_route_command(cmd)
-            {
-                return Ok(result);
+            tracing::debug!("shell_exec: routing_mode={routing_mode} for cmd={cmd}");
+            if routing_mode != "off" {
+                tracing::debug!("shell_exec: attempting try_route_command");
+                if let Some(result) = self.try_route_command(cmd) {
+                    tracing::info!("shell_exec: routed successfully");
+                    return Ok(result);
+                }
+                tracing::debug!("shell_exec: routing failed, falling back to new terminal");
             }
             self.execute_in_terminal(cmd, cwd.as_deref())
         }

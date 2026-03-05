@@ -239,6 +239,12 @@ pub fn restart_app(app: AppHandle) {
     app.restart();
 }
 
+/// Returns terminal emulators found in PATH.
+#[tauri::command]
+pub fn get_installed_terminals() -> Vec<String> {
+    lychi_core::config::schema::detect_installed_terminals()
+}
+
 /// Returns whether layer-shell (Wayland) is supported on this session.
 #[tauri::command]
 pub fn get_layer_shell_supported() -> bool {

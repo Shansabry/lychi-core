@@ -2,6 +2,7 @@
 import { Moon, Sun, X } from "lucide-svelte";
 import type { CommandsConfig, GeneralConfig, PrivacyConfig } from "$lib/ipc";
 import {
+	getInstalledTerminals,
 	recordHotkey,
 	restartApp,
 	saveCommandsConfig,
@@ -30,6 +31,16 @@ let {
 let recordingHotkey = $state(false);
 let hotkeyError = $state("");
 let customShell = $state(false);
+let terminalOptions: { value: string; label: string }[] = $state([]);
+
+// Fetch installed terminals on mount (non-blocking)
+getInstalledTerminals().then((terminals) => {
+	terminalOptions = terminals.map((t) => ({ value: t, label: t }));
+	// If current terminal isn't in the list, add it so the dropdown shows it
+	if (commandsConfig.terminal && !terminals.includes(commandsConfig.terminal)) {
+		terminalOptions.unshift({ value: commandsConfig.terminal, label: commandsConfig.terminal });
+	}
+});
 
 const knownShells = [
 	"/bin/bash",
@@ -275,18 +286,22 @@ async function handleTerminalChange(val: string) {
 	{/if}
 </div>
 <div class="field">
-	<label for="terminal-input">Terminal</label>
-	<div class="key-row">
-		<input
-			id="terminal-input"
-			type="text"
-			bind:value={commandsConfig.terminal}
-			spellcheck="false"
-			placeholder="auto-detected"
-			onkeydown={(e) => { if (e.key === "Enter") { e.preventDefault(); handleTerminalChange(commandsConfig.terminal); } }}
+	<label for="terminal-select">Terminal</label>
+	{#if terminalOptions.length > 0}
+		<Select
+			id="terminal-select"
+			value={commandsConfig.terminal}
+			options={terminalOptions}
+			onchange={handleTerminalChange}
 		/>
-		<button class="set-btn" onclick={() => handleTerminalChange(commandsConfig.terminal)}>Set</button>
-	</div>
+	{:else}
+		<Select
+			id="terminal-select"
+			value={commandsConfig.terminal}
+			options={[{ value: commandsConfig.terminal, label: commandsConfig.terminal || "detecting..." }]}
+			onchange={handleTerminalChange}
+		/>
+	{/if}
 </div>
 <div class="section-label">Privacy</div>
 <div class="field">

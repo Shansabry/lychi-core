@@ -341,6 +341,8 @@ impl std::fmt::Display for CodeRootSource {
 /// Informational only — not sent to AI, not serialized.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TerminalSource {
+    /// The focused window itself is a terminal (summoned from terminal).
+    FocusedWindow,
     /// Selected from the focus ring, populated by the background watcher.
     FocusRingWatcher,
     /// Selected from the focus ring, seeded from the pre-summon window snapshot.
@@ -355,6 +357,7 @@ pub enum TerminalSource {
 impl std::fmt::Display for TerminalSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::FocusedWindow => f.write_str("focused_window"),
             Self::FocusRingWatcher => f.write_str("focus_ring(watcher)"),
             Self::FocusRingPreSummon => f.write_str("focus_ring(pre_summon)"),
             Self::Stacking => f.write_str("stacking"),

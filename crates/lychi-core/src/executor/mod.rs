@@ -183,18 +183,36 @@ impl Executor {
                 }
 
                 // Terminal routing: resolve target from focus ring for `run` commands.
-                // Clear previous state first to prevent stale routing.
-                crate::action_registry::handlers::shell_exec::set_terminal_routing(None);
+                // Read the routing mode BEFORE clearing stale state (the Tauri layer
+                // set it from config just before calling run()).
+                let saved_routing_mode =
+                    crate::action_registry::handlers::shell_exec::get_terminal_routing();
+                // Clear stale target (but preserve the mode we just read).
                 crate::action_registry::handlers::shell_exec::set_context_terminal(None, 0, None);
                 if intent.action_id == "run"
                     && let Some(ref ctx) = self.context
                 {
-                    let routing_mode = get_terminal_routing_mode(ctx);
+                    let routing_mode = saved_routing_mode.clone();
+                    tracing::debug!(
+                        "terminal_route: mode={routing_mode} active_window={:?}",
+                        ctx.active_window.as_ref().map(|w| format!(
+                            "{}(pid={},term={})",
+                            w.wm_class, w.pid, w.is_terminal
+                        ))
+                    );
                     crate::action_registry::handlers::shell_exec::set_terminal_routing(Some(
                         routing_mode.clone(),
                     ));
                     if routing_mode != "off" {
                         let target = resolve_routing_target(ctx, &routing_mode);
+                        match &target {
+                            Some((win, src)) => tracing::debug!(
+                                "terminal_route: target={}(pid={}) source={src}",
+                                win.wm_class,
+                                win.pid
+                            ),
+                            None => tracing::debug!("terminal_route: no target found"),
+                        }
                         if let Some((win, _src)) = target {
                             crate::action_registry::handlers::shell_exec::set_context_terminal(
                                 Some(win.wm_class.clone()),
@@ -528,11 +546,6 @@ fn resolve_with_clipboard(input: &str, ctx: &crate::context::EnvironmentContext)
     Some(expanded)
 }
 
-/// Read the terminal routing mode from the shell_exec static (set by Tauri layer).
-fn get_terminal_routing_mode(_ctx: &crate::context::EnvironmentContext) -> String {
-    crate::action_registry::handlers::shell_exec::get_terminal_routing()
-}
-
 /// Resolve the best terminal to route to from the focus ring.
 ///
 /// For "auto" mode: project-match first, then any recent terminal.
@@ -546,7 +559,15 @@ fn resolve_routing_target(
 )> {
     let focused = ctx.active_window.as_ref();
 
-    // Try project-match first
+    // If the focused window IS a terminal, route to it directly.
+    // This handles the common case of summoning Lychi from a terminal.
+    if let Some(w) = focused
+        && w.is_terminal
+    {
+        return Some((w.clone(), crate::context::TerminalSource::FocusedWindow));
+    }
+
+    // Try project-match first (background terminal in focus ring)
     if let Some(ref project) = ctx.project
         && let Some(hit) =
             crate::context::window_stack::find_recent_terminal_for_project(&project.root, focused)

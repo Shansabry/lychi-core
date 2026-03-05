@@ -16,10 +16,11 @@ use std::time::Duration;
 /// Returns `Ok(())` on success, `Err(reason)` if the terminal type is unsupported
 /// or the protocol call failed. Caller should fall back to `launch_in_terminal()`.
 pub fn send_command(wm_class: &str, pid: u32, command: &str) -> Result<(), String> {
-    match wm_class.to_lowercase().as_str() {
+    let short = crate::context::active_window::normalize_wm_class(wm_class);
+    match short.as_str() {
         "konsole" => konsole_send(pid, command),
         "kitty" => kitty_send(command),
-        "wezterm" | "org.wezfurlong.wezterm" => wezterm_send(command),
+        "wezterm" => wezterm_send(command),
         _ => Err(format!("no send protocol for {wm_class}")),
     }
 }
@@ -178,7 +179,13 @@ mod tests {
     fn send_command_dispatches_known_terminals() {
         // These will fail (no actual terminal running) but should NOT return
         // "no send protocol" — they should attempt the real protocol.
-        for wm_class in &["konsole", "kitty", "wezterm", "org.wezfurlong.wezterm"] {
+        for wm_class in &[
+            "konsole",
+            "org.kde.konsole",
+            "kitty",
+            "wezterm",
+            "org.wezfurlong.wezterm",
+        ] {
             let result = send_command(wm_class, 9999999, "echo test");
             assert!(result.is_err(), "{wm_class} should fail (no real terminal)");
             assert!(

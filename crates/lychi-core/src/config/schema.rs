@@ -77,33 +77,43 @@ impl Default for CommandsConfig {
     }
 }
 
-/// Auto-detect the user's terminal emulator from PATH.
+const TERMINAL_CANDIDATES: &[&str] = &[
+    "ghostty",
+    "kitty",
+    "alacritty",
+    "wezterm",
+    "foot",
+    "gnome-terminal",
+    "konsole",
+    "xfce4-terminal",
+    "mate-terminal",
+    "tilix",
+    "terminator",
+    "ptyxis",
+    "blackbox",
+    "rio",
+    "contour",
+    "sakura",
+    "xterm",
+];
+
+/// Auto-detect the user's terminal emulator from PATH (first match).
 fn detect_terminal() -> String {
-    const CANDIDATES: &[&str] = &[
-        "ghostty",
-        "kitty",
-        "alacritty",
-        "wezterm",
-        "foot",
-        "gnome-terminal",
-        "konsole",
-        "xfce4-terminal",
-        "mate-terminal",
-        "tilix",
-        "terminator",
-        "ptyxis",
-        "blackbox",
-        "rio",
-        "contour",
-        "sakura",
-        "xterm",
-    ];
-    for term in CANDIDATES {
+    for term in TERMINAL_CANDIDATES {
         if which::which(term).is_ok() {
             return term.to_string();
         }
     }
     "xterm".to_string()
+}
+
+/// Return all installed terminal emulators found in PATH.
+pub fn detect_installed_terminals() -> Vec<String> {
+    TERMINAL_CANDIDATES
+        .iter()
+        .filter(|t| which::which(t).is_ok())
+        .map(|t| t.to_string())
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

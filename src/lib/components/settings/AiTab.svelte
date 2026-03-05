@@ -1,4 +1,5 @@
 <script lang="ts">
+import { onMount } from "svelte";
 import type { AiConfig } from "$lib/ipc";
 import { checkAiHealth, getMaskedApiKey, saveAiConfig, setApiKey } from "$lib/ipc";
 import Select from "../Select.svelte";
@@ -46,6 +47,10 @@ const FALLBACK_MODELS: ModelManifest = {
 let cachedManifest: ModelManifest | null = null;
 let providerModels: ModelManifest = $state(FALLBACK_MODELS);
 let models = $derived(providerModels[aiConfig.provider] ?? []);
+
+onMount(() => {
+	initModels(aiConfig.mode);
+});
 
 export async function initModels(aiMode: string) {
 	providerModels = await fetchModels(aiMode);

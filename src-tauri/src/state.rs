@@ -107,8 +107,16 @@ impl AppState {
                 {
                     tracing::error!("Failed to sync TOML changes: {e}");
                 }
-                // Apply DB settings over TOML (DB wins for syncable fields)
-                lychi_core::config::db::apply_to_config(&db_settings, &mut config);
+                // Re-read DB after sync so TOML edits take effect immediately
+                match lychi_core::config::db::load_syncable(&db) {
+                    Ok(synced_settings) => {
+                        lychi_core::config::db::apply_to_config(&synced_settings, &mut config);
+                    }
+                    Err(_) => {
+                        // Fall back to pre-sync settings if re-read fails
+                        lychi_core::config::db::apply_to_config(&db_settings, &mut config);
+                    }
+                }
             }
             Err(e) => {
                 tracing::error!("Failed to load settings from DB: {e}");
