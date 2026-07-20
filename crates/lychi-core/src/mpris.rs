@@ -10,6 +10,20 @@ const MPRIS_PREFIX: &str = "org.mpris.MediaPlayer2.";
 const OBJECT_PATH: &str = "/org/mpris/MediaPlayer2";
 const PLAYER_IFACE: &str = "org.mpris.MediaPlayer2.Player";
 
+/// Web-browser MPRIS bus-name fragments (browsers expose YouTube/web audio as
+/// MPRIS players). Single source of truth — the browser-dedup in `refresh` and
+/// the `Browser`/`yt` targeting in the media handler both key off this.
+const BROWSER_BUS_FRAGMENTS: &[&str] = &[
+    "chromium", "chrome", "firefox", "brave", "vivaldi", "edge",
+];
+
+/// Whether an MPRIS bus name belongs to a web browser.
+pub fn is_browser_bus(bus_name: &str) -> bool {
+    BROWSER_BUS_FRAGMENTS
+        .iter()
+        .any(|frag| bus_name.contains(frag))
+}
+
 /// Current playback state from a media player via MPRIS.
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct TrackInfo {
@@ -145,6 +159,7 @@ impl MprisClient {
             "play_pause" => "PlayPause",
             "play" => "Play",
             "pause" => "Pause",
+            "stop" => "Stop",
             "next" => "Next",
             "prev" => "Previous",
             other => {
@@ -214,10 +229,65 @@ impl MprisClient {
     }
 }
 
+/// Tracks last-activity ordering across MPRIS players by bus name.
+///
+/// A monotonically increasing sequence is stamped on a player whenever it is
+/// observed playing or freshly discovered; the highest sequence is the most
+/// recently active. This is how we pick the "most recently active" player among
+/// equal-status candidates — the MPRIS convention — instead of an arbitrary
+/// alphabetical tiebreak. Interior mutability (Mutex + atomic) because the
+/// pick/status methods that stamp activity take `&self`.
+#[derive(Default)]
+struct ActivityTracker {
+    ranks: std::sync::Mutex<HashMap<String, u64>>,
+    seq: std::sync::atomic::AtomicU64,
+}
+
+impl ActivityTracker {
+    /// Stamp a bus name as just-active (next in the monotonic sequence).
+    fn mark(&self, bus_name: &str) {
+        let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut map) = self.ranks.lock() {
+            map.insert(bus_name.to_string(), seq);
+        }
+    }
+
+    /// Current activity rank for a bus name (higher = more recently active,
+    /// 0 if never observed active).
+    fn rank(&self, bus_name: &str) -> u64 {
+        self.ranks
+            .lock()
+            .ok()
+            .and_then(|m| m.get(bus_name).copied())
+            .unwrap_or(0)
+    }
+
+    /// Drop ranks for players no longer present.
+    fn retain(&self, keep: &[String]) {
+        if let Ok(mut map) = self.ranks.lock() {
+            map.retain(|name, _| keep.contains(name));
+        }
+    }
+}
+
+/// Total-order sort key for ranking players: primary by status tier
+/// (Playing < Paused < Stopped, ascending so Playing sorts first), secondary by
+/// *descending* activity recency (encoded as `u64::MAX - rank`) so the most
+/// recently active player wins ties. Pure — unit-tested independently of D-Bus.
+fn sort_key(status: &PlaybackStatus, activity_rank: u64) -> (u8, u64) {
+    let tier = match status {
+        PlaybackStatus::Playing => 0,
+        PlaybackStatus::Paused => 1,
+        PlaybackStatus::Stopped => 2,
+    };
+    (tier, u64::MAX - activity_rank)
+}
+
 /// Manages multiple MPRIS media players, discovering them on the D-Bus.
 pub struct MprisManager {
     conn: Arc<Connection>,
     players: HashMap<String, MprisClient>,
+    activity: ActivityTracker,
 }
 
 impl MprisManager {
@@ -231,6 +301,7 @@ impl MprisManager {
         let mut manager = Self {
             conn,
             players: HashMap::new(),
+            activity: ActivityTracker::default(),
         };
         manager.refresh().await?;
         Ok(manager)
@@ -257,12 +328,9 @@ impl MprisManager {
         // If the real browser player is present, skip the duplicate bridge.
         let has_browser = active_names.iter().any(|n| {
             let suffix = n.strip_prefix(MPRIS_PREFIX).unwrap_or("");
-            suffix.starts_with("chromium")
-                || suffix.starts_with("chrome")
-                || suffix.starts_with("firefox")
-                || suffix.starts_with("brave")
-                || suffix.starts_with("vivaldi")
-                || suffix.starts_with("edge")
+            // Match on the suffix so the bridge itself ("plasma-browser-…")
+            // doesn't count as a real browser player.
+            is_browser_bus(suffix)
         });
         if has_browser {
             active_names.retain(|n| !n.contains("plasma-browser-integration"));
@@ -270,12 +338,16 @@ impl MprisManager {
 
         // Remove players no longer on the bus
         self.players.retain(|name, _| active_names.contains(name));
+        // Drop stale activity entries for players that are gone.
+        self.activity.retain(&active_names);
 
-        // Add new players
+        // Add new players. A newly-appeared player is the most recent activity
+        // (the user just opened/started it), so stamp it active.
         for name in &active_names {
             if !self.players.contains_key(name) {
                 let client = MprisClient::from_connection(Arc::clone(&self.conn), name.clone());
                 self.players.insert(name.clone(), client);
+                self.activity.mark(name);
                 tracing::info!("[mpris] Discovered player: {name}");
             }
         }
@@ -284,18 +356,25 @@ impl MprisManager {
     }
 
     /// Get status from all connected players.
+    ///
+    /// Sorted by playback status (Playing > Paused > Stopped), then by
+    /// **last-activity recency** within each status tier — so the most recently
+    /// active player wins ties, per the MPRIS convention, rather than an
+    /// arbitrary alphabetical order. A player observed Playing here is stamped
+    /// active, keeping the recency ranking fresh as playback state is polled.
     pub async fn get_all_status(&self) -> Vec<TrackInfo> {
         let mut results = Vec::new();
         for client in self.players.values() {
             if let Ok(info) = client.get_status().await {
+                if info.status == PlaybackStatus::Playing {
+                    self.activity.mark(&info.bus_name);
+                }
                 results.push(info);
             }
         }
-        // Sort: playing first, then paused, then stopped
-        results.sort_by_key(|t| match t.status {
-            PlaybackStatus::Playing => 0,
-            PlaybackStatus::Paused => 1,
-            PlaybackStatus::Stopped => 2,
+        results.sort_by(|a, b| {
+            sort_key(&a.status, self.activity.rank(&a.bus_name))
+                .cmp(&sort_key(&b.status, self.activity.rank(&b.bus_name)))
         });
         results
     }
@@ -348,18 +427,24 @@ impl MprisManager {
         self.players.keys().cloned().collect()
     }
 
-    /// Find the first player whose bus name matches a predicate, or fall back to any player.
-    /// Returns the bus name. This avoids fetching full metadata just to pick a target.
-    /// Uses sorted keys for deterministic fallback when no predicate match is found.
+    /// Find the best player whose bus name matches a predicate, or fall back to
+    /// any player. Returns the bus name. Avoids fetching full metadata just to
+    /// pick a target. When several players match (or as the no-match fallback),
+    /// the **most recently active** one wins — the MPRIS convention — instead of
+    /// an arbitrary alphabetical pick.
     pub fn find_player_by_bus(&self, predicate: impl Fn(&str) -> bool) -> Option<String> {
-        // Prefer a matching player
-        if let Some(name) = self.players.keys().find(|name| predicate(name.as_str())) {
+        let by_recency = |a: &&String, b: &&String| self.activity.rank(a).cmp(&self.activity.rank(b));
+        // Prefer the most-recently-active matching player.
+        if let Some(name) = self
+            .players
+            .keys()
+            .filter(|name| predicate(name.as_str()))
+            .max_by(by_recency)
+        {
             return Some(name.clone());
         }
-        // Deterministic fallback: sorted by bus name so the same player is always picked
-        let mut names: Vec<&String> = self.players.keys().collect();
-        names.sort();
-        names.first().cloned().cloned()
+        // Fallback: the most-recently-active player overall.
+        self.players.keys().max_by(by_recency).cloned()
     }
 
     /// Send a control command to the first player matching a predicate (or any player).
@@ -473,4 +558,84 @@ fn extract_object_path(metadata: &HashMap<String, OwnedValue>, key: &str) -> Opt
             .ok()
             .map(|p| p.to_string())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_browser_bus_matches_known_browsers() {
+        for bn in [
+            "org.mpris.MediaPlayer2.firefox.instance1234",
+            "org.mpris.MediaPlayer2.chromium.instance99",
+            "org.mpris.MediaPlayer2.chrome",
+            "org.mpris.MediaPlayer2.brave.instance1",
+            "org.mpris.MediaPlayer2.vivaldi",
+            "org.mpris.MediaPlayer2.edge",
+        ] {
+            assert!(is_browser_bus(bn), "should match: {bn}");
+        }
+        // Non-browsers must not match.
+        for bn in [
+            "org.mpris.MediaPlayer2.spotify",
+            "org.mpris.MediaPlayer2.vlc",
+            "org.mpris.MediaPlayer2.mpv",
+        ] {
+            assert!(!is_browser_bus(bn), "should NOT match: {bn}");
+        }
+    }
+
+    #[test]
+    fn friendly_name_strips_prefix_instance_and_capitalizes() {
+        assert_eq!(friendly_name("org.mpris.MediaPlayer2.spotify"), "Spotify");
+        assert_eq!(
+            friendly_name("org.mpris.MediaPlayer2.firefox.instance42"),
+            "Firefox"
+        );
+    }
+
+    #[test]
+    fn activity_tracker_ranks_by_recency() {
+        let t = ActivityTracker::default();
+        // Never-seen players rank 0.
+        assert_eq!(t.rank("a"), 0);
+        // Marking increases rank monotonically; the last-marked ranks highest.
+        t.mark("a");
+        t.mark("b");
+        t.mark("a"); // a is now more recent than b
+        assert!(t.rank("a") > t.rank("b"), "re-marked player should be newer");
+        // retain drops absent players.
+        t.retain(&["a".to_string()]);
+        assert_eq!(t.rank("b"), 0, "dropped player resets to 0");
+        assert!(t.rank("a") > 0);
+    }
+
+    #[test]
+    fn sort_key_orders_status_then_recency() {
+        use PlaybackStatus::*;
+        // Status tier dominates: any Playing sorts before any Paused/Stopped,
+        // regardless of recency.
+        assert!(sort_key(&Playing, 0) < sort_key(&Paused, u64::MAX - 1));
+        assert!(sort_key(&Paused, 5) < sort_key(&Stopped, u64::MAX - 1));
+        // Within a tier, higher activity rank (more recent) sorts first.
+        assert!(sort_key(&Paused, 10) < sort_key(&Paused, 3));
+        assert!(sort_key(&Playing, 100) < sort_key(&Playing, 99));
+    }
+
+    #[test]
+    fn sort_key_full_ordering_picks_recent_paused_over_old_paused() {
+        use PlaybackStatus::*;
+        // Simulate get_all_status: a playing player, then two paused ones where
+        // the second was used more recently. Expect: playing first, then the
+        // recently-used paused player, then the older paused one.
+        let mut players = vec![
+            ("old_paused", Paused, 2u64),
+            ("playing", Playing, 1u64),
+            ("recent_paused", Paused, 5u64),
+        ];
+        players.sort_by(|a, b| sort_key(&a.1, a.2).cmp(&sort_key(&b.1, b.2)));
+        let order: Vec<&str> = players.iter().map(|p| p.0).collect();
+        assert_eq!(order, ["playing", "recent_paused", "old_paused"]);
+    }
 }

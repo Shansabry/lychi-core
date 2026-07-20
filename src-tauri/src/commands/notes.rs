@@ -3,7 +3,7 @@ use tauri::State;
 
 use lychi_core::error::LychiError;
 use lychi_core::notes::store::NotesStore;
-use lychi_core::notes::{NoteItem, TodoItem};
+use lychi_core::notes::{NoteItem, ScratchItem, TodoItem};
 
 use crate::state::AppState;
 
@@ -21,6 +21,33 @@ pub async fn get_all_notes(state: State<'_, AppState>) -> Result<AllNotes, Lychi
         notes: store.get_notes(&state.db)?,
         todos: store.get_todos(&state.db)?,
     })
+}
+
+// ---- Unified scratch surface (notes + todos merged into one list) ----
+
+/// The single list the unified Notes UI renders: plain notes (done=None) and
+/// checklist lines (done=Some) merged, newest-updated first.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_all_items(state: State<'_, AppState>) -> Result<Vec<ScratchItem>, LychiError> {
+    let store = NotesStore::new();
+    store.get_all_items(&state.db)
+}
+
+/// Toggle a checklist line's done state (no-op error for plain notes).
+#[tauri::command]
+#[specta::specta]
+pub async fn toggle_item(id: String, state: State<'_, AppState>) -> Result<(), LychiError> {
+    let store = NotesStore::new();
+    store.toggle_item(&state.db, &id)
+}
+
+/// Delete any item (note or todo) by id, whichever table it lives in.
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_item(id: String, state: State<'_, AppState>) -> Result<(), LychiError> {
+    let store = NotesStore::new();
+    store.delete_item(&state.db, &id)
 }
 
 // ---- Notes ----

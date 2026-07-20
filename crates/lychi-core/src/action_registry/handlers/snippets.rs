@@ -31,10 +31,16 @@ impl SnippetsHandler {
         Self { db }
     }
 
+    /// First line of a snippet body, truncated to ~`max` bytes on a char
+    /// boundary (a naive `[..max]` panics mid-UTF-8-char on emoji/CJK).
     fn truncate_body(body: &str, max: usize) -> &str {
         let first_line = body.lines().next().unwrap_or(body);
         if first_line.len() > max {
-            &first_line[..max]
+            let mut end = max;
+            while end > 0 && !first_line.is_char_boundary(end) {
+                end -= 1;
+            }
+            &first_line[..end]
         } else {
             first_line
         }
@@ -228,5 +234,18 @@ impl ActionHandler for SnippetsHandler {
         }
 
         items
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_body_never_panics_on_multibyte() {
+        let s = format!("{}最tail", "a".repeat(39));
+        let t = SnippetsHandler::truncate_body(&s, 40);
+        assert!(t.len() <= 40 && s.is_char_boundary(t.len()));
+        assert_eq!(SnippetsHandler::truncate_body("one\ntwo", 50), "one");
     }
 }

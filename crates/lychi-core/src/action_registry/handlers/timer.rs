@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use redb::{ReadableDatabase, ReadableTable};
 use serde::Serialize;
 
 use crate::action_registry::{
@@ -63,6 +64,135 @@ impl Timer {
     pub fn is_done(&self) -> bool {
         !self.is_stopwatch() && self.elapsed_secs() >= self.duration_secs as f64
     }
+
+    /// Convert to the persistable wall-clock representation.
+    fn to_entry(&self) -> crate::db::schema::TimerEntry {
+        // If running, the current run's wall-clock start = now - (Instant elapsed
+        // of this run). If paused, there is no active run.
+        let running_since_epoch_ms = if self.paused_at.is_some() {
+            None
+        } else {
+            let this_run_secs = self.started_at.elapsed().as_secs_f64();
+            let started_ms = crate::db::now_millis().saturating_sub((this_run_secs * 1000.0) as u64);
+            Some(started_ms)
+        };
+        // When paused, fold the paused run's elapsed into elapsed_before so the
+        // entry fully captures accumulated time with no active run.
+        let elapsed_before_secs = if let Some(paused) = self.paused_at {
+            self.elapsed_before_secs + paused.duration_since(self.started_at).as_secs_f64()
+        } else {
+            self.elapsed_before_secs
+        };
+        crate::db::schema::TimerEntry {
+            name: self.name.clone(),
+            duration_secs: self.duration_secs,
+            elapsed_before_secs,
+            running_since_epoch_ms,
+        }
+    }
+
+    /// Reconstruct a live `Timer` from its persisted form, mapping the stored
+    /// wall-clock start back onto the monotonic `Instant` clock.
+    fn from_entry(e: &crate::db::schema::TimerEntry) -> Self {
+        let now = Instant::now();
+        match e.running_since_epoch_ms {
+            // Running: place started_at in the past by the wall-clock elapsed
+            // since the stored start, so remaining time continues correctly.
+            Some(started_ms) => {
+                let elapsed_ms = crate::db::now_millis().saturating_sub(started_ms);
+                let started_at = now
+                    .checked_sub(std::time::Duration::from_millis(elapsed_ms))
+                    .unwrap_or(now);
+                Timer {
+                    name: e.name.clone(),
+                    duration_secs: e.duration_secs,
+                    started_at,
+                    elapsed_before_secs: e.elapsed_before_secs,
+                    paused_at: None,
+                    completed: false,
+                }
+            }
+            // Paused: no active run; started_at == paused_at == now so this run
+            // contributes zero, and all elapsed lives in elapsed_before_secs.
+            None => Timer {
+                name: e.name.clone(),
+                duration_secs: e.duration_secs,
+                started_at: now,
+                elapsed_before_secs: e.elapsed_before_secs,
+                paused_at: Some(now),
+                completed: false,
+            },
+        }
+    }
+}
+
+/// Persist the entire timer map to redb (called after every mutation). Timers
+/// are few and small, so a full rewrite each time is simplest and cheap.
+pub fn persist_timers(state: &TimerState, db: &Arc<redb::Database>) {
+    let snapshot: Vec<(String, crate::db::schema::TimerEntry)> = {
+        let Ok(timers) = state.lock() else {
+            return;
+        };
+        timers
+            .iter()
+            // Don't persist already-completed timers (they're about to be removed).
+            .filter(|(_, t)| !t.completed)
+            .map(|(id, t)| (id.clone(), t.to_entry()))
+            .collect()
+    };
+
+    let write = || -> Result<(), LychiError> {
+        let txn = db.begin_write()?;
+        {
+            let mut table = txn.open_table(crate::db::TIMERS)?;
+            // Clear then rewrite: collect existing keys, remove, insert current.
+            let existing: Vec<String> = table
+                .iter()?
+                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_string()))
+                .collect();
+            for k in existing {
+                table.remove(k.as_str())?;
+            }
+            for (id, entry) in &snapshot {
+                let bytes = postcard::to_allocvec(entry)
+                    .map_err(|e| LychiError::Database(e.to_string()))?;
+                table.insert(id.as_str(), bytes.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        tracing::warn!("[timer] failed to persist timers: {e}");
+    }
+}
+
+/// Load persisted timers at startup, reconstructing live `Timer`s. Timers that
+/// already completed while the app was closed are dropped (a fire-on-boot could
+/// be added later, but silently dropping a long-expired timer is the safer
+/// default than a surprise notification for something the user forgot).
+pub fn load_timers(db: &Arc<redb::Database>) -> HashMap<String, Timer> {
+    let mut map = HashMap::new();
+    let mut read = || -> Result<(), LychiError> {
+        let txn = db.begin_read()?;
+        let table = txn.open_table(crate::db::TIMERS)?;
+        for result in table.iter()? {
+            let (key, val) = result?;
+            let entry: crate::db::schema::TimerEntry = postcard::from_bytes(val.value())
+                .map_err(|e| LychiError::Database(e.to_string()))?;
+            let timer = Timer::from_entry(&entry);
+            // Skip countdowns that already elapsed while the app was closed.
+            if timer.is_done() {
+                continue;
+            }
+            map.insert(key.value().to_string(), timer);
+        }
+        Ok(())
+    };
+    if let Err(e) = read() {
+        tracing::warn!("[timer] failed to load timers: {e}");
+    }
+    map
 }
 
 /// Serializable timer status sent to the frontend.
@@ -161,11 +291,17 @@ fn err_result(start: Instant, error: String) -> ActionResult {
 
 pub struct TimerHandler {
     state: TimerState,
+    db: Arc<redb::Database>,
 }
 
 impl TimerHandler {
-    pub fn new(state: TimerState) -> Self {
-        Self { state }
+    pub fn new(state: TimerState, db: Arc<redb::Database>) -> Self {
+        Self { state, db }
+    }
+
+    /// Persist the current timer map after a mutation. Best-effort.
+    fn persist(&self) {
+        persist_timers(&self.state, &self.db);
     }
 }
 
@@ -210,7 +346,34 @@ impl ActionHandler for TimerHandler {
         let (cmd, rest) = trimmed.split_once(' ').unwrap_or((trimmed, ""));
         let rest = rest.trim();
 
-        match cmd.to_lowercase().as_str() {
+        // Persist after any command that can mutate the timer map, so running
+        // timers survive a restart. `status` is the only read-only verb.
+        let verb = cmd.to_lowercase();
+        let mutating = verb != "status";
+        // `cmd` is the original-cased first token — needed so the bare
+        // `timer <name> <dur>` form keeps the name's casing.
+        let result = self.execute_verb(ctx, &verb, cmd, rest, start).await;
+        if mutating {
+            self.persist();
+        }
+        result
+    }
+
+    async fn completions(&self, partial: &str) -> Vec<CompletionItem> {
+        self.completions_impl(partial).await
+    }
+}
+
+impl TimerHandler {
+    async fn execute_verb(
+        &self,
+        ctx: &ExecContext,
+        verb: &str,
+        cmd: &str,
+        rest: &str,
+        start: Instant,
+    ) -> Result<ActionResult, LychiError> {
+        match verb {
             "start" => {
                 // Parse: "timer start 25m" or "timer start workout 5m"
                 // Last token is the duration, everything before is the name
@@ -509,7 +672,7 @@ impl ActionHandler for TimerHandler {
                     Ok(err_result(
                         start,
                         format!(
-                            "Unknown timer command: \"{cmd}\"\nUsage: timer 25m, timer start workout 5m, timer stop, timer status"
+                            "Unknown timer command: \"{verb}\"\nUsage: timer 25m, timer start workout 5m, timer stop, timer status"
                         ),
                     ))
                 }
@@ -517,7 +680,7 @@ impl ActionHandler for TimerHandler {
         }
     }
 
-    async fn completions(&self, partial: &str) -> Vec<CompletionItem> {
+    async fn completions_impl(&self, partial: &str) -> Vec<CompletionItem> {
         let lower = partial.to_lowercase();
 
         // Show active timers as completions when relevant
@@ -654,8 +817,15 @@ fn timer_monitor_loop(
                 }
             }
 
+            let removed_any = !to_remove.is_empty();
             for id in to_remove {
                 timers.remove(&id);
+            }
+            drop(timers);
+            // A fired timer was removed → update the persisted set so it doesn't
+            // resurrect on the next restart.
+            if removed_any {
+                persist_timers(state, db);
             }
         }
 
@@ -684,6 +854,76 @@ mod tests {
         assert_eq!(parse_duration("25m"), Some(25 * 60));
         assert_eq!(parse_duration("5m"), Some(5 * 60));
         assert_eq!(parse_duration("1m"), Some(60));
+    }
+
+    #[test]
+    fn persist_roundtrip_preserves_running_timer() {
+        // A running 10-minute timer that's ~elapsed 100s: after to_entry →
+        // from_entry the remaining time must be preserved (within a small delta).
+        let t = Timer {
+            name: "focus".into(),
+            duration_secs: 600,
+            started_at: Instant::now() - std::time::Duration::from_secs(100),
+            elapsed_before_secs: 0.0,
+            paused_at: None,
+            completed: false,
+        };
+        let before = t.remaining_secs();
+        let restored = Timer::from_entry(&t.to_entry());
+        assert_eq!(restored.name, "focus");
+        assert!(!restored.is_paused());
+        // Remaining should match within 2s (wall-clock ms rounding + test time).
+        assert!(
+            (restored.remaining_secs() - before).abs() < 2.0,
+            "remaining drifted: {before} → {}",
+            restored.remaining_secs()
+        );
+    }
+
+    #[test]
+    fn persist_roundtrip_preserves_paused_timer() {
+        // A paused timer: elapsed is frozen, and it must come back paused with
+        // the same elapsed time regardless of wall-clock passing.
+        let now = Instant::now();
+        let t = Timer {
+            name: "brew".into(),
+            duration_secs: 300,
+            started_at: now - std::time::Duration::from_secs(50),
+            elapsed_before_secs: 0.0,
+            paused_at: Some(now), // paused after 50s of running
+            completed: false,
+        };
+        let elapsed_before = t.elapsed_secs();
+        let restored = Timer::from_entry(&t.to_entry());
+        assert!(restored.is_paused(), "should restore paused");
+        assert!(
+            (restored.elapsed_secs() - elapsed_before).abs() < 2.0,
+            "paused elapsed drifted: {elapsed_before} → {}",
+            restored.elapsed_secs()
+        );
+    }
+
+    #[test]
+    fn load_persist_via_db_roundtrips() {
+        let db = crate::db::open_test_database();
+        let state = new_timer_state();
+        state.lock().unwrap().insert(
+            "id1".to_string(),
+            Timer {
+                name: "washer".into(),
+                duration_secs: 1800,
+                started_at: Instant::now(),
+                elapsed_before_secs: 0.0,
+                paused_at: None,
+                completed: false,
+            },
+        );
+        persist_timers(&state, &db);
+
+        let loaded = load_timers(&db);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.get("id1").unwrap().name, "washer");
+        assert_eq!(loaded.get("id1").unwrap().duration_secs, 1800);
     }
 
     #[test]
@@ -739,7 +979,7 @@ mod tests {
     #[tokio::test]
     async fn test_timer_start_and_status() {
         let state = new_timer_state();
-        let handler = TimerHandler::new(state.clone());
+        let handler = TimerHandler::new(state.clone(), crate::db::open_test_database());
 
         let result = handler
             .execute(
@@ -768,7 +1008,7 @@ mod tests {
     #[tokio::test]
     async fn test_timer_pause_resume() {
         let state = new_timer_state();
-        let handler = TimerHandler::new(state.clone());
+        let handler = TimerHandler::new(state.clone(), crate::db::open_test_database());
 
         handler
             .execute(
@@ -804,7 +1044,7 @@ mod tests {
     #[tokio::test]
     async fn test_timer_stop() {
         let state = new_timer_state();
-        let handler = TimerHandler::new(state.clone());
+        let handler = TimerHandler::new(state.clone(), crate::db::open_test_database());
 
         handler
             .execute(
@@ -832,7 +1072,7 @@ mod tests {
     #[tokio::test]
     async fn test_timer_shorthand() {
         let state = new_timer_state();
-        let handler = TimerHandler::new(state.clone());
+        let handler = TimerHandler::new(state.clone(), crate::db::open_test_database());
 
         // "timer 25m" → starts a timer and opens panel
         let result = handler
@@ -847,7 +1087,7 @@ mod tests {
     #[tokio::test]
     async fn test_timer_clear() {
         let state = new_timer_state();
-        let handler = TimerHandler::new(state.clone());
+        let handler = TimerHandler::new(state.clone(), crate::db::open_test_database());
 
         handler
             .execute(
@@ -878,7 +1118,7 @@ mod tests {
     #[tokio::test]
     async fn test_stopwatch_start() {
         let state = new_timer_state();
-        let handler = TimerHandler::new(state.clone());
+        let handler = TimerHandler::new(state.clone(), crate::db::open_test_database());
 
         let result = handler
             .execute(&crate::action_registry::ExecContext::default(), "stopwatch")
@@ -898,7 +1138,7 @@ mod tests {
     #[tokio::test]
     async fn test_stopwatch_named() {
         let state = new_timer_state();
-        let handler = TimerHandler::new(state.clone());
+        let handler = TimerHandler::new(state.clone(), crate::db::open_test_database());
 
         let result = handler
             .execute(
@@ -918,7 +1158,7 @@ mod tests {
     #[tokio::test]
     async fn test_stopwatch_stop() {
         let state = new_timer_state();
-        let handler = TimerHandler::new(state.clone());
+        let handler = TimerHandler::new(state.clone(), crate::db::open_test_database());
 
         handler
             .execute(
@@ -942,7 +1182,7 @@ mod tests {
     #[tokio::test]
     async fn test_stopwatch_sw_alias() {
         let state = new_timer_state();
-        let handler = TimerHandler::new(state.clone());
+        let handler = TimerHandler::new(state.clone(), crate::db::open_test_database());
 
         let result = handler
             .execute(&crate::action_registry::ExecContext::default(), "sw")

@@ -184,7 +184,18 @@ impl AppState {
             );
         }
 
+        // Rehydrate timers persisted from a previous run so running countdowns
+        // and stopwatches survive an app restart.
         let timer_state = lychi_core::action_registry::handlers::timer::new_timer_state();
+        {
+            let restored = lychi_core::action_registry::handlers::timer::load_timers(&db);
+            if !restored.is_empty() {
+                tracing::info!("[timer] restored {} timer(s) from disk", restored.len());
+                if let Ok(mut t) = timer_state.lock() {
+                    *t = restored;
+                }
+            }
+        }
 
         #[cfg(feature = "mpris")]
         let mpris: Arc<RwLock<Option<lychi_core::mpris::MprisManager>>> =
@@ -226,7 +237,7 @@ impl AppState {
         )));
         registry.register(Box::new(SystemCommand::new()));
         registry.register(Box::new(TimeHandler::new()));
-        registry.register(Box::new(TimerHandler::new(timer_state.clone())));
+        registry.register(Box::new(TimerHandler::new(timer_state.clone(), db.clone())));
         registry.register(Box::new(SymbolHandler::new()));
         registry.register(Box::new(SysInfoHandler::new()));
         registry.register(Box::new(UnicodeHandler::new()));

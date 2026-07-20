@@ -7,16 +7,18 @@ use crate::db::{
     schema::{NoteEntry, SYNC_LOCAL, TodoEntry},
 };
 use crate::error::LychiError;
-use crate::notes::{NoteItem, TodoItem};
+use crate::notes::{NoteItem, ScratchItem, TodoItem};
 
-/// Maximum number of notes.
-pub const MAX_NOTES: usize = 5;
+/// Maximum number of notes. A generous soft ceiling rather than a true cap:
+/// the notes surface should feel unlimited for scratch use, but a bound keeps
+/// the redb file and (future) cloud-sync payload from growing pathologically.
+pub const MAX_NOTES: usize = 500;
 
 /// Maximum character length per note.
 const MAX_NOTE_CHARS: usize = 500;
 
-/// Maximum number of todo items.
-const MAX_TODOS: usize = 20;
+/// Maximum number of todo items (same generous soft ceiling as notes).
+const MAX_TODOS: usize = 500;
 
 #[derive(Default)]
 pub struct NotesStore;
@@ -165,6 +167,65 @@ impl NotesStore {
             }
         }
         Ok(count)
+    }
+
+    // ---- Unified scratch surface (notes + todos merged) ----
+
+    /// Return every item — plain notes and checklist lines — merged into one
+    /// list, most-recently-updated first. Plain notes get `done: None`; todos
+    /// get `done: Some(bool)`. This is the single source the unified UI renders.
+    pub fn get_all_items(&self, db: &Arc<Database>) -> Result<Vec<ScratchItem>, LychiError> {
+        let mut items: Vec<ScratchItem> = Vec::new();
+
+        // Plain notes (done = None).
+        for n in self.get_notes(db)? {
+            items.push(ScratchItem {
+                id: n.id,
+                text: n.text,
+                done: None,
+                created_at: n.created_at,
+                updated_at: n.updated_at,
+            });
+        }
+        // Checklist lines (done = Some) from the todos table. `get_todos`
+        // doesn't carry timestamps, so read the raw entries here for ordering.
+        let txn = db.begin_read()?;
+        let table = txn.open_table(db::TODOS)?;
+        for result in table.iter()? {
+            let (key, val) = result?;
+            let entry: TodoEntry = postcard::from_bytes(val.value())
+                .map_err(|e| LychiError::Database(e.to_string()))?;
+            if entry.deleted_at.is_none() {
+                items.push(ScratchItem {
+                    id: key.value().to_string(),
+                    text: entry.text,
+                    done: Some(entry.done),
+                    created_at: entry.created_at,
+                    updated_at: entry.updated_at,
+                });
+            }
+        }
+
+        // Newest first (by last update).
+        items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(items)
+    }
+
+    /// Toggle a checklist line's done state by id. Only meaningful for todos;
+    /// a plain-note id returns a not-found error (notes aren't checkable).
+    /// This is the unified toggle the UI calls regardless of item kind.
+    pub fn toggle_item(&self, db: &Arc<Database>, id: &str) -> Result<(), LychiError> {
+        self.toggle_todo(db, id)
+    }
+
+    /// Delete an item by id, whichever table it lives in. Tries the notes table
+    /// first, then todos — so the unified UI can delete any row with one call.
+    pub fn delete_item(&self, db: &Arc<Database>, id: &str) -> Result<(), LychiError> {
+        match self.delete_note(db, id) {
+            Ok(()) => Ok(()),
+            // Not a note → try todos.
+            Err(_) => self.delete_todo(db, id),
+        }
     }
 
     // ---- Todos ----
@@ -372,5 +433,33 @@ mod tests {
         let store = NotesStore::new();
         assert!(store.add_todo(&db, "").is_err());
         assert!(store.add_todo(&db, "   ").is_err());
+    }
+
+    #[test]
+    fn get_all_items_merges_notes_and_todos() {
+        let db = open_test_database();
+        let store = NotesStore::new();
+        store.add_note(&db, "a plain note").unwrap();
+        let todo = store.add_todo(&db, "a checklist line").unwrap();
+
+        let items = store.get_all_items(&db).unwrap();
+        assert_eq!(items.len(), 2);
+        // Plain note → done: None; todo → done: Some(false).
+        let note = items.iter().find(|i| i.text == "a plain note").unwrap();
+        assert_eq!(note.done, None);
+        let check = items.iter().find(|i| i.text == "a checklist line").unwrap();
+        assert_eq!(check.done, Some(false));
+
+        // Unified toggle flips the checklist line.
+        store.toggle_item(&db, &todo.id).unwrap();
+        let items = store.get_all_items(&db).unwrap();
+        assert_eq!(
+            items.iter().find(|i| i.id == todo.id).unwrap().done,
+            Some(true)
+        );
+
+        // Unified delete removes from whichever table.
+        store.delete_item(&db, &todo.id).unwrap();
+        assert_eq!(store.get_all_items(&db).unwrap().len(), 1);
     }
 }

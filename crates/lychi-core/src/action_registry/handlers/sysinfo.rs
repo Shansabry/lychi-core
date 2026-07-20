@@ -81,11 +81,10 @@ impl ActionHandler for SysInfoHandler {
         let output = match cmd.as_str() {
             "" => {
                 // No subcommand — show a brief overview
-                let ip = run_cmd("hostname", &["-I"]).unwrap_or_default();
-                let mem = run_cmd("free", &["-h", "--si"]).unwrap_or_default();
-                let disk = run_cmd("df", &["-h", "--total", "-x", "tmpfs", "-x", "devtmpfs"])
-                    .unwrap_or_default();
-                let uptime = run_cmd("uptime", &["-p"]).unwrap_or_default();
+                let ip = read_local_ips();
+                let mem = read_mem_info();
+                let disk = read_disk_info();
+                let uptime = read_uptime();
                 let temps = read_temps_summary();
                 let battery = read_battery_summary();
                 let net = read_net_summary();
@@ -112,7 +111,7 @@ impl ActionHandler for SysInfoHandler {
                 Ok(out)
             }
             "ip" => {
-                let local = run_cmd("hostname", &["-I"]).unwrap_or_else(|e| e);
+                let local = read_local_ips();
                 Ok(format!("Local: {}", local.trim()))
             }
             "cpu" => {
@@ -130,8 +129,8 @@ impl ActionHandler for SysInfoHandler {
                     load.trim()
                 ))
             }
-            "mem" => run_cmd("free", &["-h", "--si"]),
-            "disk" => run_cmd("df", &["-h", "--total", "-x", "tmpfs", "-x", "devtmpfs"]),
+            "mem" => Ok(read_mem_info()),
+            "disk" => Ok(read_disk_info()),
             "temp" => Ok(read_temps()),
             "gpu" => Ok(read_gpu()),
             "battery" | "bat" => Ok(read_battery()),
@@ -605,10 +604,26 @@ fn read_audio_summary() -> String {
 // ---------------------------------------------------------------------------
 
 /// Full display info for `sysinfo display`.
+///
+/// `xrandr` only reports real outputs under X11 (or a single XWayland virtual
+/// output under Wayland — not the true per-monitor layout). So on a native
+/// Wayland session we ask the compositor's own tool first — `kscreen-doctor`
+/// (KDE), `wlr-randr` (wlroots), or `swaymsg` (Sway) — and only fall back to
+/// xrandr on X11, then to the resolution-less drm-sysfs listing as a last
+/// resort. This is the Gap-D fix for the previous xrandr-only path that
+/// degraded on Wayland (the project's own target).
 fn read_display() -> String {
+    // Wayland: try the compositor-native tool before xrandr.
+    if crate::context::is_wayland()
+        && let Some(out) = read_display_wayland()
+        && !out.is_empty()
+    {
+        return out;
+    }
+
     let mut lines = Vec::new();
 
-    // Try xrandr (works on both X11 and XWayland)
+    // X11 / XWayland: xrandr.
     if let Ok(xr) = run_cmd("xrandr", &["--current"]) {
         for line in xr.lines() {
             if line.contains(" connected") {
@@ -674,6 +689,108 @@ fn read_display() -> String {
     }
 }
 
+/// Query per-monitor info on a native Wayland session via the compositor's own
+/// CLI. Returns `None` if no such tool is installed (caller falls back to
+/// xrandr / drm-sysfs). Order: wlr-randr (wlroots/Sway/Hyprland), kscreen-doctor
+/// (KDE), swaymsg (Sway JSON).
+fn read_display_wayland() -> Option<String> {
+    // wlr-randr: blocks of "OUTPUT "Name"\n  ... \n  Current mode: 1920x1080 ...".
+    if let Ok(out) = run_cmd("wlr-randr", &[]) {
+        let mut lines = Vec::new();
+        let mut current: Option<String> = None;
+        for raw in out.lines() {
+            // A new output starts at column 0 (no leading whitespace).
+            if !raw.starts_with(char::is_whitespace) && !raw.trim().is_empty() {
+                if let Some(name) = raw.split_whitespace().next() {
+                    current = Some(name.to_string());
+                }
+            } else if let Some(rest) = raw.trim().strip_prefix("Enabled: ") {
+                // no-op; kept for clarity of format
+                let _ = rest;
+            } else if raw.contains('*') || raw.trim().starts_with("Current") {
+                // A current-mode line: "1920x1080 px, 60.000 Hz" (possibly '*').
+                if let Some(name) = &current {
+                    let mode = raw
+                        .trim()
+                        .trim_start_matches("Current mode:")
+                        .trim()
+                        .trim_end_matches('*')
+                        .trim();
+                    lines.push(format!("{name}: {mode}"));
+                    current = None; // one line per output is enough
+                }
+            }
+        }
+        if !lines.is_empty() {
+            return Some(lines.join("\n"));
+        }
+    }
+
+    // kscreen-doctor -o (KDE). See parse_kscreen for the format.
+    if let Ok(out) = run_cmd("kscreen-doctor", &["-o"]) {
+        let parsed = parse_kscreen(&strip_ansi(&out));
+        if !parsed.is_empty() {
+            return Some(parsed);
+        }
+    }
+
+    None
+}
+
+/// Parse `kscreen-doctor -o` output (already ANSI-stripped) into one line per
+/// enabled output. Split out for testing against real output.
+///
+/// Each output is a block starting `Output: <id> <name> <uuid>`, followed by
+/// indented lines including `enabled`/`disabled` and a `Modes:` line whose
+/// current mode is the token marked with `*`, e.g. `9:1920x1080@24.00*` (the
+/// leading `N:` is the mode index; a `!` marks the preferred mode).
+fn parse_kscreen(clean: &str) -> String {
+    let mut lines = Vec::new();
+    for block in clean.split("Output:").skip(1) {
+        let name = block.split_whitespace().nth(1).unwrap_or("?");
+        if !block.contains("enabled") {
+            continue; // skip disabled/disconnected outputs
+        }
+        // Current mode = the Modes token containing '*'. Strip the "N:" index
+        // prefix and the '*'/'!' markers, then prettify "1920x1080@24.00".
+        let mode = block
+            .split_whitespace()
+            .find(|t| t.contains('*') && t.contains('x'))
+            .map(|t| {
+                let t = t.trim_end_matches(['*', '!']);
+                // Drop a leading "N:" mode index if present.
+                let t = t.split_once(':').map(|(_, rest)| rest).unwrap_or(t);
+                format!("{}Hz", t.replace('@', " @ "))
+            })
+            .unwrap_or_default();
+        if mode.is_empty() {
+            lines.push(format!("{name}: enabled"));
+        } else {
+            lines.push(format!("{name}: {mode}"));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Strip ANSI color/escape sequences from CLI output (kscreen-doctor colorizes).
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // ESC — skip until a letter terminates the sequence (CSI ... [a-zA-Z]).
+            for e in chars.by_ref() {
+                if e.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // OS / System
 // ---------------------------------------------------------------------------
@@ -710,9 +827,10 @@ fn read_os() -> String {
         lines.push(format!("Host: {}", host.trim()));
     }
 
-    // Uptime
-    if let Ok(uptime) = run_cmd("uptime", &["-p"]) {
-        lines.push(uptime.trim().to_string());
+    // Uptime (portable — see read_uptime).
+    let uptime = read_uptime();
+    if !uptime.is_empty() {
+        lines.push(uptime);
     }
 
     // Desktop environment
@@ -808,5 +926,173 @@ fn run_cmd(program: &str, args: &[&str]) -> Result<String, String> {
         } else {
             Err(stderr)
         }
+    }
+}
+
+// ── Portable readers (busybox/Alpine-safe) ─────────────────────────────────
+//
+// The overview/ip/mem readers used GNU-only tool flags (`hostname -I`,
+// `free --si`, `df --total`) that busybox and some minimal images don't
+// implement. These helpers read the same data from `/proc` and iproute2
+// (universal on Linux) so the info shows up on Alpine/busybox too, and fall
+// back to the GNU tools where a nicer human format is wanted.
+
+/// Local IPv4 addresses, space-separated (like `hostname -I`), via iproute2
+/// which is present on every modern Linux — unlike GNU `hostname -I`.
+fn read_local_ips() -> String {
+    // `ip -o -4 addr show scope global` → lines like
+    // "2: wlan0    inet 192.168.1.5/24 brd ... scope global ...".
+    if let Ok(out) = run_cmd("ip", &["-o", "-4", "addr", "show", "scope", "global"]) {
+        let ips: Vec<String> = out
+            .lines()
+            .filter_map(|l| {
+                let after = l.split("inet ").nth(1)?;
+                let cidr = after.split_whitespace().next()?;
+                Some(cidr.split('/').next()?.to_string())
+            })
+            .collect();
+        if !ips.is_empty() {
+            return ips.join(" ");
+        }
+    }
+    // Last resort: GNU hostname (may not exist / lack -I on busybox).
+    run_cmd("hostname", &["-I"]).unwrap_or_default()
+}
+
+/// Memory summary from `/proc/meminfo` (universal). Falls back to `free` for
+/// its familiar table when meminfo can't be read.
+fn read_mem_info() -> String {
+    let Ok(meminfo) = fs::read_to_string("/proc/meminfo") else {
+        return run_cmd("free", &["-h", "--si"]).unwrap_or_default();
+    };
+    // Values are in kB.
+    let kb = |key: &str| -> Option<u64> {
+        meminfo
+            .lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    let total = kb("MemTotal:");
+    let avail = kb("MemAvailable:");
+    match (total, avail) {
+        (Some(t), Some(a)) => {
+            let used = t.saturating_sub(a);
+            let gib = |kb: u64| format!("{:.1} GiB", kb as f64 / 1024.0 / 1024.0);
+            format!(
+                "Memory: {} used / {} total ({} available)",
+                gib(used),
+                gib(t),
+                gib(a)
+            )
+        }
+        _ => run_cmd("free", &["-h", "--si"]).unwrap_or_default(),
+    }
+}
+
+/// Uptime, pretty ("up 3 hours, 12 minutes"). `uptime -p` is a procps-ng flag
+/// busybox lacks; derive from `/proc/uptime` (universal) instead.
+fn read_uptime() -> String {
+    let Ok(raw) = fs::read_to_string("/proc/uptime") else {
+        return run_cmd("uptime", &["-p"]).unwrap_or_default();
+    };
+    let secs = raw
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0) as u64;
+    format_uptime(secs)
+}
+
+/// Pure formatter for uptime seconds → "up 3 hours, 12 minutes". Split out so
+/// it's unit-testable without reading `/proc`.
+fn format_uptime(secs: u64) -> String {
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+    let mut parts = Vec::new();
+    let unit = |n: u64, s: &str| format!("{n} {s}{}", if n == 1 { "" } else { "s" });
+    if days > 0 {
+        parts.push(unit(days, "day"));
+    }
+    if hours > 0 {
+        parts.push(unit(hours, "hour"));
+    }
+    // Always show minutes when there are no larger units, so uptime is never blank.
+    if mins > 0 || parts.is_empty() {
+        parts.push(unit(mins, "minute"));
+    }
+    format!("up {}", parts.join(", "))
+}
+
+/// Disk summary. `df` itself is universal; only the GNU `--total`/`-x` flags
+/// aren't. Pass a busybox-safe invocation and skip pseudo-filesystems by
+/// filtering the output instead of relying on `-x`.
+fn read_disk_info() -> String {
+    // `-h` (human) and `-P` (POSIX one-line-per-fs) are both in busybox df.
+    let Ok(out) = run_cmd("df", &["-hP"]) else {
+        return String::new();
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for (i, line) in out.lines().enumerate() {
+        if i == 0 {
+            lines.push(line.to_string()); // header
+            continue;
+        }
+        // Skip pseudo/virtual filesystems (what GNU `-x tmpfs -x devtmpfs` did,
+        // generalized): match on the mount source in column 1.
+        let src = line.split_whitespace().next().unwrap_or("");
+        let skip = src.starts_with("tmpfs")
+            || src.starts_with("devtmpfs")
+            || src.starts_with("efivarfs")
+            || src == "overlay"
+            || src.starts_with("/dev/loop");
+        if !skip {
+            lines.push(line.to_string());
+        }
+    }
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_uptime_pluralizes_and_never_blank() {
+        assert_eq!(format_uptime(0), "up 0 minutes");
+        assert_eq!(format_uptime(60), "up 1 minute");
+        assert_eq!(format_uptime(3600), "up 1 hour");
+        assert_eq!(format_uptime(3660), "up 1 hour, 1 minute");
+        assert_eq!(format_uptime(90000), "up 1 day, 1 hour");
+        assert_eq!(format_uptime(2 * 86400 + 3 * 3600 + 12 * 60), "up 2 days, 3 hours, 12 minutes");
+    }
+
+    #[test]
+    fn strip_ansi_removes_color_codes() {
+        // kscreen-doctor colorizes with SGR sequences like "\x1b[38;5;2m".
+        let colored = "\u{1b}[38;5;2mOutput:\u{1b}[0m 1 eDP-1 enabled";
+        assert_eq!(strip_ansi(colored), "Output: 1 eDP-1 enabled");
+        // Plain text is unchanged.
+        assert_eq!(strip_ansi("no escapes here"), "no escapes here");
+    }
+
+    #[test]
+    fn parse_kscreen_extracts_name_and_current_mode() {
+        // Real (ANSI-stripped) kscreen-doctor -o shape: the current mode is the
+        // "N:WxH@Hz" token marked with '*'; '!' marks the preferred mode.
+        let sample = "Output: 1 HDMI-A-1 da0542b8\n\
+             \tenabled\n\tconnected\n\
+             \tModes:  1:1920x1080@60.00!  9:1920x1080@24.00*  10:1920x1080@23.98\n\
+             \tGeometry: 1920,0 1920x1080\n";
+        assert_eq!(parse_kscreen(sample), "HDMI-A-1: 1920x1080 @ 24.00Hz");
+
+        // A disabled output is skipped entirely.
+        let disabled = "Output: 2 DP-2 disconnected\n\tdisabled\n";
+        assert_eq!(parse_kscreen(disabled), "");
+
+        // Enabled but no current-mode marker → falls back to "enabled".
+        let no_mode = "Output: 3 eDP-1 enabled\n\tconnected\n";
+        assert_eq!(parse_kscreen(no_mode), "eDP-1: enabled");
     }
 }

@@ -106,3 +106,22 @@ pub struct SnippetEntry {
     #[serde(default)]
     pub sync_status: SyncStatus,
 }
+
+/// Persisted timer/stopwatch, so a running countdown survives an app restart.
+///
+/// The live `Timer` uses a monotonic `Instant` (not persistable across process
+/// restarts), so we serialize the equivalent in **wall-clock** terms:
+/// `elapsed_before_ms` is time already accumulated (from prior runs/pauses), and
+/// `running_since_epoch_ms` is the wall-clock instant the current run began — or
+/// `None` if paused. On load we reconstruct the `Instant` by subtracting the
+/// wall-clock elapsed-since-that-epoch from `Instant::now()`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TimerEntry {
+    pub name: String,
+    /// Total countdown duration in seconds; 0 means a stopwatch (counts up).
+    pub duration_secs: u64,
+    /// Elapsed seconds accumulated before the current run (from pauses).
+    pub elapsed_before_secs: f64,
+    /// Wall-clock epoch (ms) when the current run started; None if paused.
+    pub running_since_epoch_ms: Option<u64>,
+}

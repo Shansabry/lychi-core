@@ -42,16 +42,29 @@ pub fn detect() -> Option<(String, ClipboardContentType)> {
         return None;
     }
 
-    // Only classify the first 4 KB to avoid spending time on huge clipboard payloads.
-    let sample = if trimmed.len() > 4096 {
-        &trimmed[..4096]
-    } else {
-        trimmed
-    };
+    // Only classify the first 4 KB to avoid spending time on huge clipboard
+    // payloads.
+    let sample = sample_for_classify(trimmed);
 
     let content_type = classify(sample);
     tracing::debug!("clipboard_detect: classified as {:?}", content_type);
     Some((trimmed.to_string(), content_type))
+}
+
+/// Take at most the first ~4 KB of `text`, truncated on a UTF-8 char boundary.
+///
+/// A naive `&text[..4096]` panics when byte 4096 lands inside a multi-byte char
+/// (emoji, CJK glyph, etc.) — which crashed the context detector on real-world
+/// clipboard contents. Walk back to the nearest char boundary instead.
+fn sample_for_classify(text: &str) -> &str {
+    if text.len() <= 4096 {
+        return text;
+    }
+    let mut end = 4096;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Classify a clipboard text sample. Most-specific patterns checked first.
@@ -283,6 +296,29 @@ fn truncate_line(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_for_classify_never_panics_on_multibyte_boundary() {
+        // Build a string where a 3-byte char straddles byte 4096. "本" is 3 bytes;
+        // 4095 ASCII bytes + "本" puts the char across the 4096 cut point.
+        let mut s = "a".repeat(4095);
+        s.push('本'); // bytes 4095..4098
+        s.push_str(&"b".repeat(100));
+        // Must not panic, and must return valid UTF-8 truncated before the char.
+        let sample = sample_for_classify(&s);
+        assert!(sample.len() <= 4096);
+        assert_eq!(sample.len(), 4095, "should stop before the straddling char");
+        assert!(sample.chars().all(|c| c == 'a'));
+
+        // Emoji (4 bytes) straddling the boundary must also be safe.
+        let mut e = "x".repeat(4094);
+        e.push('😀'); // 4 bytes, bytes 4094..4098
+        let sample = sample_for_classify(&e);
+        assert!(sample.len() <= 4096 && sample.is_char_boundary(sample.len()));
+
+        // Short strings pass through unchanged.
+        assert_eq!(sample_for_classify("hello"), "hello");
+    }
 
     #[test]
     fn test_url_detection() {

@@ -29,6 +29,7 @@ import type {
 	PrivacyConfig,
 	ProjectsConfig,
 	ReminderItem,
+	ScratchItem,
 	SnippetItem,
 	TimerStatus,
 	TodoItem,
@@ -73,6 +74,7 @@ export type {
 	ProjectsConfig,
 	ReminderItem,
 	RiskLevel,
+	ScratchItem,
 	SnippetItem,
 	TimerStatus,
 	TodoItem,
@@ -587,6 +589,23 @@ export async function updateNote(id: string, text: string): Promise<void> {
 export async function deleteNote(id: string): Promise<void> {
 	if (!isTauri()) return;
 	unwrap(await commands.deleteNote(id));
+}
+
+// --- Unified scratch surface (notes + todos merged) ---
+
+export async function getAllItems(): Promise<ScratchItem[]> {
+	if (!isTauri()) return [];
+	return unwrap(await commands.getAllItems());
+}
+
+export async function toggleItem(id: string): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.toggleItem(id));
+}
+
+export async function deleteItem(id: string): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.deleteItem(id));
 }
 
 export async function getTodos(): Promise<TodoItem[]> {

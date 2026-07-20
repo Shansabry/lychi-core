@@ -1,17 +1,24 @@
 <script lang="ts">
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Clipboard, Clock, ListChecks, StickyNote, Timer } from "lucide-svelte";
+import { Clipboard, Clock, StickyNote, Timer } from "lucide-svelte";
 import { onMount } from "svelte";
-import type { NoteItem, ReminderItem, SnippetItem, TimerStatus, TodoItem } from "$lib/ipc";
-import { getNotes, getReminders, getSnippets, getTimers, getTodos } from "$lib/ipc";
-import { invalidateNotes, preloadNotes } from "$lib/preloadCache";
+import type {
+	ReminderItem,
+	ScratchItem,
+	SnippetItem,
+	TimerStatus,
+} from "$lib/ipc";
+import {
+	getAllItems,
+	getReminders,
+	getSnippets,
+	getTimers,
+} from "$lib/ipc";
+import { invalidateNotes } from "$lib/preloadCache";
 import NotesTab from "./notes/NotesTab.svelte";
 import RemindersTab from "./notes/RemindersTab.svelte";
 import SnippetsTab from "./notes/SnippetsTab.svelte";
 import TimersTab from "./notes/TimersTab.svelte";
-import TodosTab from "./notes/TodosTab.svelte";
-
-const MAX_NOTES = 5;
 
 let {
 	ondismiss,
@@ -23,31 +30,33 @@ let {
 	ondismiss: () => void;
 	pendingNoteText?: string | null;
 	onpendingcleared?: () => void;
+	// "todos" accepted for backwards-compat with old sentinels → maps to notes.
 	initialNotesTab?: "notes" | "todos" | "reminders" | "timers" | "snippets";
 	visible?: boolean;
 } = $props();
 
-type TabId = "notes" | "todos" | "reminders" | "timers" | "snippets";
+// Notes and Todos are now one unified "Notes" surface.
+type TabId = "notes" | "reminders" | "timers" | "snippets";
 let activeTab: TabId = $state("notes");
-const TAB_ORDER: TabId[] = ["notes", "todos", "reminders", "timers", "snippets"];
+const TAB_ORDER: TabId[] = ["notes", "reminders", "timers", "snippets"];
 
-// Data state
-let notes: NoteItem[] = $state([]);
-let todos: TodoItem[] = $state([]);
+// Data state — unified notes+todos list.
+let items: ScratchItem[] = $state([]);
 let reminders: ReminderItem[] = $state([]);
 let timers: TimerStatus[] = $state([]);
 let snippets: SnippetItem[] = $state([]);
 
 // Derived for tab badges
-let remainingTodos = $derived(todos.filter((t) => !t.done).length);
+let openChecklist = $derived(items.filter((i) => i.done === false).length);
 let activeReminders = $derived(reminders.filter((r) => !r.fired));
 
 let notesTabRef: NotesTab | undefined = $state();
 
-// Switch tab when initialNotesTab changes from parent
+// Switch tab when initialNotesTab changes from parent. The old "todos" tab is
+// folded into "notes", so map it there for backwards-compat with any sentinel.
 $effect(() => {
 	if (initialNotesTab) {
-		activeTab = initialNotesTab;
+		activeTab = initialNotesTab === "todos" ? "notes" : initialNotesTab;
 	}
 });
 
@@ -89,11 +98,10 @@ onMount(() => {
 });
 
 function initialLoad() {
-	preloadNotes()
-		.then((cached) => {
+	getAllItems()
+		.then((i) => {
 			requestAnimationFrame(() => {
-				notes = cached.notes;
-				todos = cached.todos;
+				items = i;
 			});
 		})
 		.catch((err) => {
@@ -113,9 +121,8 @@ function initialLoad() {
 
 async function reloadData() {
 	try {
-		const [n, t, r, s] = await Promise.all([getNotes(), getTodos(), getReminders(), getSnippets()]);
-		notes = n;
-		todos = t;
+		const [i, r, s] = await Promise.all([getAllItems(), getReminders(), getSnippets()]);
+		items = i;
 		reminders = r;
 		snippets = s;
 	} catch (err) {
@@ -147,16 +154,7 @@ function handleKeydown(e: KeyboardEvent) {
 			onclick={() => { activeTab = "notes"; }}
 			tabindex={-1}
 		>
-			<StickyNote size={11} strokeWidth={1.5} style="display:inline;vertical-align:-1px;margin-right:3px" />Notes{#if notes.length > 0}<span class="tab-badge" class:limit={notes.length >= MAX_NOTES}>{notes.length}/{MAX_NOTES}</span>{/if}
-		</button>
-		<button
-			class="tab"
-			class:active={activeTab === "todos"}
-			onmousedown={(e) => e.preventDefault()}
-			onclick={() => { activeTab = "todos"; }}
-			tabindex={-1}
-		>
-			<ListChecks size={11} strokeWidth={1.5} style="display:inline;vertical-align:-1px;margin-right:3px" />Todos{#if todos.length > 0}<span class="tab-badge">{remainingTodos}/{todos.length}</span>{/if}
+			<StickyNote size={11} strokeWidth={1.5} style="display:inline;vertical-align:-1px;margin-right:3px" />Notes{#if items.length > 0}<span class="tab-badge">{#if openChecklist > 0}{openChecklist}·{/if}{items.length}</span>{/if}
 		</button>
 		<button
 			class="tab"
@@ -190,12 +188,10 @@ function handleKeydown(e: KeyboardEvent) {
 	{#if activeTab === "notes"}
 		<NotesTab
 			bind:this={notesTabRef}
-			bind:notes
+			bind:items
 			{pendingNoteText}
 			{onpendingcleared}
 		/>
-	{:else if activeTab === "todos"}
-		<TodosTab bind:todos />
 	{:else if activeTab === "reminders"}
 		<RemindersTab bind:reminders active={activeTab === "reminders"} />
 	{:else if activeTab === "timers"}
@@ -248,7 +244,4 @@ function handleKeydown(e: KeyboardEvent) {
 		margin-left: 4px;
 	}
 
-	.tab-badge.limit {
-		color: var(--error);
-	}
 </style>

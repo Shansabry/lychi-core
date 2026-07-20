@@ -36,6 +36,10 @@ pub const REMINDERS: TableDefinition<&str, &[u8]> = TableDefinition::new("remind
 /// Snippets: key = UUID v7 string, value = postcard-serialized SnippetEntry.
 pub const SNIPPETS: TableDefinition<&str, &[u8]> = TableDefinition::new("snippets");
 
+/// Timers: key = timer id, value = postcard-serialized TimerEntry. Persisted so
+/// running countdowns/stopwatches survive an app restart (rehydrated on boot).
+pub const TIMERS: TableDefinition<&str, &[u8]> = TableDefinition::new("timers");
+
 /// Open (or create) the redb database at the given path.
 /// If the file exists but uses an older format version, back it up and recreate.
 pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
@@ -64,6 +68,7 @@ pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
     txn.open_table(ALIASES)?;
     txn.open_table(REMINDERS)?;
     txn.open_table(SNIPPETS)?;
+    txn.open_table(TIMERS)?;
     txn.commit()?;
 
     Ok(Arc::new(db))

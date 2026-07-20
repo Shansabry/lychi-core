@@ -43,14 +43,7 @@ fn media_result(
 fn bus_matches_target(bn: &str, target: Target) -> bool {
     match target {
         Target::Spotify => bn.contains("spotify"),
-        Target::Browser => {
-            bn.contains("chromium")
-                || bn.contains("chrome")
-                || bn.contains("firefox")
-                || bn.contains("brave")
-                || bn.contains("vivaldi")
-                || bn.contains("edge")
-        }
+        Target::Browser => crate::mpris::is_browser_bus(bn),
         Target::Any => true,
     }
 }
@@ -78,7 +71,10 @@ async fn execute_media(
     let first_word = action.split_whitespace().next().unwrap_or(&action);
     let mpris_action = match first_word {
         "play" | "resume" => "play",
-        "pause" | "stop" => "pause",
+        "pause" => "pause",
+        // `stop` is the real MPRIS Stop (halt + reset position), distinct from
+        // pause. Players that don't implement Stop fall through harmlessly.
+        "stop" => "stop",
         "next" | "skip" => "next",
         "prev" | "previous" | "back" => "prev",
         "toggle" => "play_pause",
@@ -88,7 +84,7 @@ async fn execute_media(
                 false,
                 None,
                 Some(format!(
-                    "Unknown action: {other}. Try: play, pause, next, prev, pause all"
+                    "Unknown action: {other}. Try: play, pause, stop, next, prev, pause all"
                 )),
             ));
         }
@@ -108,11 +104,17 @@ async fn execute_media(
 
     // Dispatch
     if action == "pause all" || action == "stop all" {
-        let count = mgr.control_all("pause").await?;
+        // `stop all` truly stops; `pause all` pauses.
+        let (verb, past) = if action == "stop all" {
+            ("stop", "Stopped")
+        } else {
+            ("pause", "Paused")
+        };
+        let count = mgr.control_all(verb).await?;
         return Ok(media_result(
             start,
             true,
-            Some(format!("Paused {count} player(s)")),
+            Some(format!("{past} {count} player(s)")),
             None,
         ));
     }
@@ -149,15 +151,7 @@ fn find_target(players: &[TrackInfo], target: Target) -> Option<&TrackInfo> {
             .or(players.first()),
         Target::Browser => players
             .iter()
-            .find(|p| {
-                let bn = &p.bus_name;
-                bn.contains("chromium")
-                    || bn.contains("chrome")
-                    || bn.contains("firefox")
-                    || bn.contains("brave")
-                    || bn.contains("vivaldi")
-                    || bn.contains("edge")
-            })
+            .find(|p| crate::mpris::is_browser_bus(&p.bus_name))
             .or(players.first()),
         Target::Any => {
             // Prefer the currently playing player
@@ -169,7 +163,8 @@ fn find_target(players: &[TrackInfo], target: Target) -> Option<&TrackInfo> {
     }
 }
 
-const MEDIA_SUBCOMMANDS: &[&str] = &["play", "pause", "next", "prev", "toggle", "pause all"];
+const MEDIA_SUBCOMMANDS: &[&str] =
+    &["play", "pause", "stop", "next", "prev", "toggle", "pause all"];
 
 fn media_completions(partial: &str) -> Vec<CompletionItem> {
     let lower = partial.to_lowercase();
@@ -217,13 +212,7 @@ fn parse_provider_and_args(args: &str) -> (Target, &str) {
 fn player_to_provider_key(bus_name: &str) -> String {
     if bus_name.contains("spotify") {
         "spotify".to_string()
-    } else if bus_name.contains("chromium")
-        || bus_name.contains("chrome")
-        || bus_name.contains("firefox")
-        || bus_name.contains("brave")
-        || bus_name.contains("vivaldi")
-        || bus_name.contains("edge")
-    {
+    } else if crate::mpris::is_browser_bus(bus_name) {
         "yt".to_string()
     } else {
         crate::mpris::friendly_name(bus_name).to_lowercase()
@@ -310,8 +299,8 @@ impl MediaHandler {
                 };
 
                 let actions: &[&str] = match p.status {
-                    PlaybackStatus::Playing => &["pause", "next", "prev", "toggle"],
-                    PlaybackStatus::Paused => &["play", "next", "prev", "toggle"],
+                    PlaybackStatus::Playing => &["pause", "stop", "next", "prev", "toggle"],
+                    PlaybackStatus::Paused => &["play", "stop", "next", "prev", "toggle"],
                     PlaybackStatus::Stopped => &["play"],
                 };
 

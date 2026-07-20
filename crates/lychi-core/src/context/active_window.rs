@@ -261,6 +261,7 @@ pub fn detect() -> Option<WindowContext> {
     let result = match super::compositor() {
         super::Compositor::KdeWayland => detect_kwin(),
         super::Compositor::X11 => detect_x11(),
+        super::Compositor::OtherWayland => detect_wlr(),
         _ => None,
     };
     tracing::debug!(
@@ -286,6 +287,7 @@ pub(crate) fn detect_live() -> Option<WindowContext> {
             Some(w)
         }
         super::Compositor::X11 => detect_x11(),
+        super::Compositor::OtherWayland => detect_wlr(),
         _ => None,
     };
     tracing::debug!(
@@ -296,6 +298,37 @@ pub(crate) fn detect_live() -> Option<WindowContext> {
         ))
     );
     result
+}
+
+// ── wlroots (Sway / Hyprland / niri / wlroots family) ────────────────────
+
+/// Detect the active window via the wlr-foreign-toplevel protocol: the toplevel
+/// carrying the `activated` state is the focused one. The protocol exposes no
+/// pid (so `pid: 0`) and no stable cross-connection id (so `window_id: None`);
+/// classification uses the `app_id` as the wm_class, which is what the terminal
+/// and IDE classifiers key on.
+#[cfg(target_os = "linux")]
+fn detect_wlr() -> Option<WindowContext> {
+    let active = super::wlr_toplevel::list_toplevels()
+        .into_iter()
+        .find(|w| w.activated)?;
+    let wm_class = active.app_id.to_lowercase();
+    if wm_class.is_empty() || wm_class == "lychi" {
+        return None;
+    }
+    Some(WindowContext {
+        is_terminal: is_terminal_class(&wm_class),
+        is_ide: is_ide_class(&wm_class),
+        title: active.title,
+        wm_class,
+        pid: 0,
+        window_id: None,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_wlr() -> Option<WindowContext> {
+    None
 }
 
 // ── KWin Wayland ────────────────────────────────────────────────────────

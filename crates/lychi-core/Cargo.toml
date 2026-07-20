@@ -52,6 +52,12 @@ futures-core = { version = "0.3", optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", default-features = false }
 dbus = { version = "0.9", default-features = false }
+# Wayland client + wlr foreign-toplevel protocol: the standards-based window
+# enumeration / focus / close backend for wlroots compositors (Sway, Hyprland,
+# niri, Wayfire, COSMIC), where neither the KWin script nor X11 EWMH backends
+# apply. Versions match src-tauri's existing wayland stack.
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

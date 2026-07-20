@@ -1,25 +1,41 @@
 <script lang="ts">
 import { ChevronLeft, Plus, X } from "lucide-svelte";
-import type { NoteItem } from "$lib/ipc";
-import { addNote, deleteNote, updateNote } from "$lib/ipc";
+import type { ScratchItem } from "$lib/ipc";
+import {
+	addNote,
+	addTodo,
+	deleteItem,
+	toggleItem,
+	updateNote,
+} from "$lib/ipc";
 
-const MAX_NOTES = 5;
 const MAX_NOTE_CHARS = 500;
 
 let {
-	notes = $bindable(),
+	items = $bindable(),
 	pendingNoteText = null,
 	onpendingcleared,
 }: {
-	notes: NoteItem[];
+	// Unified list: plain notes (done === null) and checklist lines (done !== null).
+	items: ScratchItem[];
 	pendingNoteText?: string | null;
 	onpendingcleared?: () => void;
 } = $props();
 
-let editingNote: NoteItem | null = $state(null);
+let editingNote: ScratchItem | null = $state(null);
 let isNewNote = $state(false);
 let editText = $state("");
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
+let todoInput = $state("");
+
+// Split the unified list for rendering: checklist lines grouped (unchecked
+// first), plain notes shown as openable titles.
+let checklist = $derived(
+	items
+		.filter((i) => i.done !== null)
+		.sort((a, b) => Number(a.done) - Number(b.done)),
+);
+let plainNotes = $derived(items.filter((i) => i.done === null));
 
 export function isEditing(): boolean {
 	return !!(editingNote || isNewNote);
@@ -45,9 +61,52 @@ function noteTitle(text: string): string {
 	return first.length > 50 ? `${first.slice(0, 50)}…` : first;
 }
 
-function openNote(note: NoteItem) {
+function openNote(note: ScratchItem) {
 	editingNote = note;
 	editText = note.text;
+}
+
+// --- Checklist (todo) actions ---
+
+async function handleAddTodo() {
+	const text = todoInput.trim();
+	if (!text) return;
+	try {
+		const item = await addTodo(text);
+		items = [
+			{
+				id: item.id,
+				text: item.text,
+				done: item.done,
+				created_at: Date.now(),
+				updated_at: Date.now(),
+			},
+			...items,
+		];
+		todoInput = "";
+	} catch (err) {
+		console.error("[notes] add checklist item error:", err);
+	}
+}
+
+async function handleToggle(id: string) {
+	try {
+		await toggleItem(id);
+		items = items.map((i) =>
+			i.id === id && i.done !== null ? { ...i, done: !i.done } : i,
+		);
+	} catch (err) {
+		console.error("[notes] toggle error:", err);
+	}
+}
+
+async function handleDeleteItem(id: string) {
+	try {
+		await deleteItem(id);
+		items = items.filter((i) => i.id !== id);
+	} catch (err) {
+		console.error("[notes] delete error:", err);
+	}
 }
 
 function handleNewNote() {
@@ -69,12 +128,19 @@ async function saveCurrentNote() {
 	try {
 		if (isNewNote) {
 			const item = await addNote(editText);
-			notes = [...notes, item];
-			editingNote = item;
+			const scratch: ScratchItem = {
+				id: item.id,
+				text: item.text,
+				done: null,
+				created_at: item.created_at,
+				updated_at: item.updated_at,
+			};
+			items = [scratch, ...items];
+			editingNote = scratch;
 			isNewNote = false;
 		} else if (editingNote) {
 			await updateNote(editingNote.id, editText);
-			notes = notes.map((n) =>
+			items = items.map((n) =>
 				n.id === editingNote?.id ? { ...n, text: editText, updated_at: Date.now() } : n,
 			);
 		}
@@ -85,14 +151,25 @@ async function saveCurrentNote() {
 
 async function handleDeleteNote(id: string) {
 	try {
-		await deleteNote(id);
-		notes = notes.filter((n) => n.id !== id);
+		await deleteItem(id);
+		items = items.filter((n) => n.id !== id);
 		if (editingNote?.id === id) editingNote = null;
 
-		if (pendingNoteText && notes.length < MAX_NOTES) {
+		// A pending note was waiting for room (from the old cap); now unbounded,
+		// but keep the auto-add-on-delete behavior for the sentinel path.
+		if (pendingNoteText) {
 			try {
 				const item = await addNote(pendingNoteText);
-				notes = [...notes, item];
+				items = [
+					{
+						id: item.id,
+						text: item.text,
+						done: null,
+						created_at: item.created_at,
+						updated_at: item.updated_at,
+					},
+					...items,
+				];
 				onpendingcleared?.();
 			} catch (addErr) {
 				console.error("[notes] auto-add pending error:", addErr);
@@ -138,39 +215,76 @@ function cancelPending() {
 				<div class="pending-text">{noteTitle(pendingNoteText)}</div>
 			</div>
 		{/if}
-		{#if notes.length > 0}
-			<ul class="note-list" role="list">
-				{#each notes as note (note.id)}
-					<li class="note-item" class:show-delete={!!pendingNoteText}>
-						<button
-							class="note-content"
-							onclick={() => openNote(note)}
-							onmousedown={(e) => e.preventDefault()}
-							tabindex={-1}
-						>
-							<span class="note-title">{noteTitle(note.text)}</span>
-						</button>
-						<button
-							class="note-delete"
-							onclick={() => handleDeleteNote(note.id)}
-							onmousedown={(e) => e.preventDefault()}
-							tabindex={-1}
-							aria-label="Delete"
-						>
-							<X size={12} strokeWidth={1.5} />
-						</button>
-					</li>
-				{/each}
-			</ul>
-		{/if}
-		{#if notes.length < MAX_NOTES}
+			<!-- Checklist add + list -->
+			<div class="todo-add">
+				<input
+					class="todo-input"
+					bind:value={todoInput}
+					onkeydown={(e) => { if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); handleAddTodo(); } }}
+					placeholder="Add checklist item..."
+					type="text"
+				/>
+			</div>
+			{#if checklist.length > 0}
+				<ul class="todo-list" role="list">
+					{#each checklist as item (item.id)}
+						<li class="todo-item" class:done={item.done}>
+							<button
+								class="todo-check"
+								onclick={() => handleToggle(item.id)}
+								onmousedown={(e) => e.preventDefault()}
+								tabindex={-1}
+								aria-label={item.done ? "Uncheck" : "Check"}
+							>
+								<span class="check-box" class:checked={item.done}>
+									{#if item.done}&#10003;{/if}
+								</span>
+							</button>
+							<span class="todo-text">{item.text}</span>
+							<button
+								class="todo-delete"
+								onclick={() => handleDeleteItem(item.id)}
+								onmousedown={(e) => e.preventDefault()}
+								tabindex={-1}
+								aria-label="Delete"
+							>
+								<X size={12} strokeWidth={1.5} />
+							</button>
+						</li>
+					{/each}
+				</ul>
+			{/if}
+
+			<!-- Notes list -->
+			{#if plainNotes.length > 0}
+				<ul class="note-list" role="list">
+					{#each plainNotes as note (note.id)}
+						<li class="note-item" class:show-delete={!!pendingNoteText}>
+							<button
+								class="note-content"
+								onclick={() => openNote(note)}
+								onmousedown={(e) => e.preventDefault()}
+								tabindex={-1}
+							>
+								<span class="note-title">{noteTitle(note.text)}</span>
+							</button>
+							<button
+								class="note-delete"
+								onclick={() => handleDeleteNote(note.id)}
+								onmousedown={(e) => e.preventDefault()}
+								tabindex={-1}
+								aria-label="Delete"
+							>
+								<X size={12} strokeWidth={1.5} />
+							</button>
+						</li>
+					{/each}
+				</ul>
+			{/if}
 			<button class="btn-add-note" onclick={handleNewNote} onmousedown={(e) => e.preventDefault()} tabindex={-1}>
 				<Plus size={13} strokeWidth={1.5} />
 				<span>New note</span>
 			</button>
-		{:else}
-			<div class="note-limit-msg">{MAX_NOTES}/{MAX_NOTES} — delete a note to add more</div>
-		{/if}
 	{/if}
 </div>
 
@@ -183,6 +297,116 @@ function cancelPending() {
 		list-style: none;
 		padding: 0;
 		margin: 0;
+	}
+
+	/* --- Checklist (unified todo lines) --- */
+	.todo-add {
+		margin-bottom: 4px;
+	}
+
+	.todo-input {
+		width: 100%;
+		background: var(--bg-secondary);
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		color: var(--fg);
+		font-family: var(--font-mono);
+		font-size: 13px;
+		padding: 6px 10px;
+		outline: none;
+	}
+
+	.todo-input:focus {
+		border-color: var(--fg-muted);
+	}
+
+	.todo-input::placeholder {
+		color: var(--fg-muted);
+		opacity: 0.5;
+	}
+
+	.todo-list {
+		list-style: none;
+		padding: 0;
+		margin: 0 0 8px 0;
+	}
+
+	.todo-item {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 4px 0;
+		transition: opacity 100ms ease;
+	}
+
+	.todo-item.done {
+		opacity: 0.5;
+	}
+
+	.todo-check {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		background: none;
+		border: none;
+		cursor: pointer;
+		padding: 0;
+		flex-shrink: 0;
+	}
+
+	.check-box {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 14px;
+		height: 14px;
+		border: 1px solid var(--fg-muted);
+		border-radius: 3px;
+		font-size: 10px;
+		color: var(--success);
+		transition: border-color 100ms ease;
+	}
+
+	.check-box.checked {
+		border-color: var(--success);
+	}
+
+	.todo-text {
+		flex: 1;
+		font-family: var(--font-mono);
+		font-size: 13px;
+		color: var(--fg);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.todo-item.done .todo-text {
+		text-decoration: line-through;
+		color: var(--fg-muted);
+	}
+
+	.todo-delete {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		background: none;
+		border: none;
+		color: var(--fg-muted);
+		cursor: pointer;
+		padding: 2px;
+		border-radius: 3px;
+		opacity: 0;
+		transition: opacity 100ms ease, color 100ms ease;
+		flex-shrink: 0;
+	}
+
+	.todo-item:hover .todo-delete {
+		opacity: 1;
+	}
+
+	.todo-delete:hover {
+		color: var(--error);
 	}
 
 	.note-item {
@@ -319,14 +543,6 @@ function cancelPending() {
 		border-color: var(--fg-muted);
 	}
 
-	.note-limit-msg {
-		font-family: var(--font-mono);
-		font-size: 11px;
-		color: var(--fg-muted);
-		text-align: center;
-		padding: 8px 0;
-		margin-top: 4px;
-	}
 
 	.note-editor-header {
 		display: flex;

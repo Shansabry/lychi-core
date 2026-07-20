@@ -77,7 +77,8 @@ pub(crate) fn get_windows() -> Vec<RunningWindow> {
 /// Enumerate windows using the appropriate backend for the session type.
 /// KDE Wayland → KWin D-Bus scripting (sees all windows).
 /// X11 → native EWMH protocol via x11rb.
-/// Other Wayland (GNOME/wlroots) → no backend, empty list.
+/// Other Wayland (Sway/Hyprland/niri/wlroots) → wlr-foreign-toplevel protocol.
+/// GNOME Wayland → no backend (Mutter implements neither protocol), empty list.
 #[cfg(target_os = "linux")]
 fn enumerate_windows() -> Vec<RunningWindow> {
     let compositor = crate::context::compositor();
@@ -104,6 +105,23 @@ fn enumerate_windows() -> Vec<RunningWindow> {
                 wm_class: w.wm_class,
                 pid: w.pid,
                 desktop: w.desktop,
+            })
+            .collect()
+    } else if compositor == crate::context::Compositor::OtherWayland {
+        // wlroots family (Sway/Hyprland/niri/Wayfire/COSMIC). The protocol gives
+        // app_id (used as wm_class, lowercased for match parity) + title, but no
+        // pid and no virtual-desktop info — hence pid: 0, desktop: None. Focus
+        // and close later re-match on (wm_class, title) since the protocol has
+        // no stable cross-connection window id.
+        crate::context::wlr_toplevel::list_toplevels()
+            .into_iter()
+            .map(|w| RunningWindow {
+                window_id: None,
+                kwin_id: None,
+                title: w.title,
+                wm_class: w.app_id.to_lowercase(),
+                pid: 0,
+                desktop: None,
             })
             .collect()
     } else {
@@ -177,6 +195,9 @@ pub(crate) fn do_focus(window: &RunningWindow) -> Result<(), String> {
                 Err("No window ID available".to_string())
             }
         }
+        crate::context::Compositor::OtherWayland => {
+            crate::context::wlr_toplevel::activate(&window.wm_class, &window.title)
+        }
         _ => Err("Window control not available on this compositor".to_string()),
     }
 }
@@ -212,6 +233,9 @@ pub(crate) fn do_close(window: &RunningWindow) -> Result<(), String> {
             } else {
                 Err("No window ID available".to_string())
             }
+        }
+        crate::context::Compositor::OtherWayland => {
+            crate::context::wlr_toplevel::close(&window.wm_class, &window.title)
         }
         _ => Err("Window control not available on this compositor".to_string()),
     }

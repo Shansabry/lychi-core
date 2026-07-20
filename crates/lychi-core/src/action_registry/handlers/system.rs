@@ -35,62 +35,116 @@ struct SimpleAction {
 fn simple_actions() -> &'static [SimpleAction] {
     &[
         // --- Power ---
+        // Chain: systemd (`systemctl`) → logind (`loginctl`, also on elogind
+        // systems w/o systemd) → sysvinit/util-linux binaries. Covers
+        // Void/Artix/Alpine/Devuan, not just systemd distros.
         SimpleAction {
             name: "shutdown",
             description: "Power off the system",
-            run: || run_cmd("systemctl", &["poweroff"]),
+            run: || {
+                run_first_available(&[
+                    ("systemctl", &["poweroff"]),
+                    ("loginctl", &["poweroff"]),
+                    ("poweroff", &[]),
+                ])
+            },
         },
         SimpleAction {
             name: "reboot",
             description: "Restart the system",
-            run: || run_cmd("systemctl", &["reboot"]),
+            run: || {
+                run_first_available(&[
+                    ("systemctl", &["reboot"]),
+                    ("loginctl", &["reboot"]),
+                    ("reboot", &[]),
+                ])
+            },
         },
         SimpleAction {
             name: "suspend",
             description: "Suspend (sleep) the system",
-            run: || run_cmd("systemctl", &["suspend"]),
+            run: || {
+                run_first_available(&[
+                    ("systemctl", &["suspend"]),
+                    ("loginctl", &["suspend"]),
+                ])
+            },
         },
         SimpleAction {
             name: "hibernate",
             description: "Hibernate the system",
-            run: || run_cmd("systemctl", &["hibernate"]),
+            run: || {
+                run_first_available(&[
+                    ("systemctl", &["hibernate"]),
+                    ("loginctl", &["hibernate"]),
+                ])
+            },
         },
         SimpleAction {
             name: "lock",
             description: "Lock the screen",
-            run: || run_cmd("loginctl", &["lock-session"]),
+            // `loginctl lock-session` emits the logind lock signal the DE's
+            // locker listens for. `xdg-screensaver lock` is a portable X11
+            // fallback for bare WMs without logind lock wiring.
+            run: || {
+                run_first_available(&[
+                    ("loginctl", &["lock-session"]),
+                    ("xdg-screensaver", &["lock"]),
+                ])
+            },
         },
         SimpleAction {
             name: "logout",
             description: "Log out of the current session",
-            run: || {
-                if run_cmd("loginctl", &["terminate-user", &whoami()]).is_ok() {
-                    return Ok(());
-                }
-                run_cmd("loginctl", &["terminate-session", "self"])
-            },
+            run: logout_session,
         },
         // --- Audio ---
+        // Chain: PipeWire (`wpctl`) → PulseAudio (`pactl`) → ALSA (`amixer`).
+        // PulseAudio is still default on many stable/LTS distros.
         SimpleAction {
             name: "mute",
             description: "Mute system audio",
-            run: || run_cmd("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "1"]),
+            run: || {
+                run_first_available(&[
+                    ("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "1"]),
+                    ("pactl", &["set-sink-mute", "@DEFAULT_SINK@", "1"]),
+                    ("amixer", &["set", "Master", "mute"]),
+                ])
+            },
         },
         SimpleAction {
             name: "unmute",
             description: "Unmute system audio",
-            run: || run_cmd("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "0"]),
+            run: || {
+                run_first_available(&[
+                    ("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "0"]),
+                    ("pactl", &["set-sink-mute", "@DEFAULT_SINK@", "0"]),
+                    ("amixer", &["set", "Master", "unmute"]),
+                ])
+            },
         },
         // --- Network ---
+        // Chain: NetworkManager (`nmcli`) → kernel `rfkill` (network-manager
+        // independent; works on iwd/networkd/connman systems).
         SimpleAction {
             name: "wifi on",
             description: "Enable WiFi",
-            run: || run_cmd("nmcli", &["radio", "wifi", "on"]),
+            run: || {
+                run_first_available(&[
+                    ("nmcli", &["radio", "wifi", "on"]),
+                    ("rfkill", &["unblock", "wifi"]),
+                ])
+            },
         },
         SimpleAction {
             name: "wifi off",
             description: "Disable WiFi",
-            run: || run_cmd("nmcli", &["radio", "wifi", "off"]),
+            run: || {
+                run_first_available(&[
+                    ("nmcli", &["radio", "wifi", "off"]),
+                    ("rfkill", &["block", "wifi"]),
+                ])
+            },
         },
         SimpleAction {
             name: "bluetooth on",
@@ -251,25 +305,40 @@ fn try_parameterized(input: &str) -> Option<Result<String, String>> {
     let lower = input.to_lowercase();
 
     // --- Volume ---
+    // Same PipeWire → PulseAudio → ALSA chain as mute; each tool takes a
+    // different value syntax (wpctl relative "5%+", pactl "+5%", amixer "5%+").
     if lower == "volume up" {
         return Some(
-            run_cmd("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", "5%+"])
-                .map(|()| read_volume()),
+            run_first_available(&[
+                ("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", "5%+"]),
+                ("pactl", &["set-sink-volume", "@DEFAULT_SINK@", "+5%"]),
+                ("amixer", &["set", "Master", "5%+"]),
+            ])
+            .map(|()| read_volume()),
         );
     }
     if lower == "volume down" {
         return Some(
-            run_cmd("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", "5%-"])
-                .map(|()| read_volume()),
+            run_first_available(&[
+                ("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", "5%-"]),
+                ("pactl", &["set-sink-volume", "@DEFAULT_SINK@", "-5%"]),
+                ("amixer", &["set", "Master", "5%-"]),
+            ])
+            .map(|()| read_volume()),
         );
     }
     if let Some(rest) = lower.strip_prefix("volume ") {
         let rest = rest.trim();
         if let Some(n) = parse_percent(rest) {
             let frac = format!("{:.2}", n as f64 / 100.0);
+            let pct = format!("{n}%");
             return Some(
-                run_cmd("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", &frac])
-                    .map(|()| format!("Volume set to {n}%")),
+                run_first_available(&[
+                    ("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", &frac]),
+                    ("pactl", &["set-sink-volume", "@DEFAULT_SINK@", &pct]),
+                    ("amixer", &["set", "Master", &pct]),
+                ])
+                .map(|()| format!("Volume set to {n}%")),
             );
         }
     }
@@ -332,30 +401,44 @@ fn parse_percent(s: &str) -> Option<u32> {
     }
 }
 
-/// Read current volume via wpctl.
+/// Read current volume, cosmetic read-back after a change.
+///
+/// Tries PipeWire (`wpctl`) then PulseAudio (`pactl`); if neither is present or
+/// parsing fails, degrades to a generic "Volume changed" (the change itself
+/// already succeeded — this is only the confirmation text).
 fn read_volume() -> String {
-    match run_cmd_output("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"]) {
-        Ok(out) => {
-            // Output like "Volume: 0.50" or "Volume: 0.50 [MUTED]"
-            let trimmed = out.trim();
-            if let Some(rest) = trimmed.strip_prefix("Volume: ") {
-                let parts: Vec<&str> = rest.split_whitespace().collect();
-                if let Some(val) = parts.first()
-                    && let Ok(f) = val.parse::<f64>()
-                {
-                    let pct = (f * 100.0).round() as u32;
-                    let muted = if rest.contains("[MUTED]") {
-                        " (muted)"
-                    } else {
-                        ""
-                    };
-                    return format!("Volume: {pct}%{muted}");
-                }
+    // PipeWire: "Volume: 0.50" or "Volume: 0.50 [MUTED]"
+    if let Ok(out) = run_cmd_output("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"]) {
+        let trimmed = out.trim();
+        if let Some(rest) = trimmed.strip_prefix("Volume: ") {
+            if let Some(val) = rest.split_whitespace().next()
+                && let Ok(f) = val.parse::<f64>()
+            {
+                let pct = (f * 100.0).round() as u32;
+                let muted = if rest.contains("[MUTED]") {
+                    " (muted)"
+                } else {
+                    ""
+                };
+                return format!("Volume: {pct}%{muted}");
             }
-            "Volume changed".to_string()
         }
-        Err(_) => "Volume changed".to_string(),
     }
+
+    // PulseAudio: `pactl get-sink-volume @DEFAULT_SINK@` → a line containing
+    // e.g. "front-left: 32768 /  50% / ...". Take the first percentage.
+    if let Ok(out) = run_cmd_output("pactl", &["get-sink-volume", "@DEFAULT_SINK@"]) {
+        if let Some(pct) = out
+            .split('%')
+            .next()
+            .and_then(|s| s.rsplit(|c: char| !c.is_ascii_digit()).next())
+            .filter(|s| !s.is_empty())
+        {
+            return format!("Volume: {pct}%");
+        }
+    }
+
+    "Volume changed".to_string()
 }
 
 /// Read current brightness via brightnessctl.
@@ -392,6 +475,49 @@ fn run_cmd(program: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
+/// One candidate in a fallback chain: a program plus its args.
+type Candidate<'a> = (&'a str, &'a [&'a str]);
+
+/// Run the first *installed* program in a fallback chain.
+///
+/// Linux is not one platform: audio might be PipeWire (`wpctl`), PulseAudio
+/// (`pactl`), or bare ALSA (`amixer`); wifi might be NetworkManager (`nmcli`) or
+/// kernel rfkill; power might be systemd (`systemctl`) or sysvinit (`poweroff`).
+/// Rather than assume one tool and fail cryptically elsewhere, we try each in
+/// order and use the first one that exists on this system.
+///
+/// Semantics, chosen deliberately:
+/// - A program that is **not installed** (`ErrorKind::NotFound`) is skipped —
+///   we fall through to the next candidate.
+/// - A program that **runs but fails** is a *real* error (e.g. polkit denied,
+///   bad device): we return it immediately rather than masking it by trying a
+///   different tool that would also fail or, worse, do the wrong thing.
+/// - If **no** candidate is installed, we return a single actionable message
+///   naming what to install, instead of a raw "No such file or directory".
+fn run_first_available(chain: &[Candidate]) -> Result<(), String> {
+    for (program, args) in chain {
+        match Command::new(program).args(*args).output() {
+            Ok(output) => {
+                return if output.status.success() {
+                    Ok(())
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    Err(format!("{program} failed: {}", stderr.trim()))
+                };
+            }
+            // Not installed — try the next tool in the chain.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // Installed but couldn't be launched (permissions, etc.) — real error.
+            Err(e) => return Err(format!("Failed to run {program}: {e}")),
+        }
+    }
+    let tools: Vec<&str> = chain.iter().map(|(p, _)| *p).collect();
+    Err(format!(
+        "None of the required tools are installed (tried: {}). Install one of them.",
+        tools.join(", ")
+    ))
+}
+
 fn run_cmd_output(program: &str, args: &[&str]) -> Result<String, String> {
     let output = Command::new(program)
         .args(args)
@@ -410,6 +536,52 @@ fn whoami() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_default()
+}
+
+/// Log out of the current session.
+///
+/// Prefer the DE-native logout (which runs the session's save-state hooks)
+/// based on `XDG_CURRENT_DESKTOP`, then fall back to logind's blunter
+/// `terminate-session`/`terminate-user` (works on any systemd/elogind system).
+fn logout_session() -> Result<(), String> {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .to_lowercase();
+
+    // DE-native logout first — it saves session state and is the "right" logout.
+    let de_native: Option<Candidate> = if desktop.contains("kde") || desktop.contains("plasma") {
+        // qdbus argument list; 1,-1,-1 = logout, no confirm, default shutdown mode.
+        Some((
+            "qdbus",
+            &[
+                "org.kde.Shutdown",
+                "/Shutdown",
+                "org.kde.Shutdown.logout",
+            ],
+        ))
+    } else if desktop.contains("gnome") {
+        Some(("gnome-session-quit", &["--logout", "--no-prompt"]))
+    } else if desktop.contains("xfce") {
+        Some(("xfce4-session-logout", &["--logout"]))
+    } else if desktop.contains("sway") {
+        Some(("swaymsg", &["exit"]))
+    } else if desktop.contains("hyprland") {
+        Some(("hyprctl", &["dispatch", "exit"]))
+    } else {
+        None
+    };
+
+    if let Some(candidate) = de_native
+        && run_first_available(&[candidate]).is_ok()
+    {
+        return Ok(());
+    }
+
+    // Fall back to logind (systemd/elogind). terminate-user, then session-self.
+    run_first_available(&[
+        ("loginctl", &["terminate-user", &whoami()]),
+        ("loginctl", &["terminate-session", "self"]),
+    ])
 }
 
 /// All action names for completions (simple + parameterized).
@@ -665,6 +837,43 @@ mod tests {
                 assert!(item.fill.is_none());
             }
         }
+    }
+
+    #[test]
+    fn run_first_available_skips_missing_and_reports_none_installed() {
+        // A chain of only-nonexistent programs → the "none installed" message,
+        // NOT a raw "No such file or directory".
+        let missing: &[&str] = &[];
+        let err = run_first_available(&[
+            ("lychi_nonexistent_tool_a", missing),
+            ("lychi_nonexistent_tool_b", missing),
+        ])
+        .unwrap_err();
+        assert!(err.contains("None of the required tools"), "got: {err}");
+        assert!(err.contains("lychi_nonexistent_tool_a"), "got: {err}");
+    }
+
+    #[test]
+    fn run_first_available_uses_first_installed() {
+        // `true` exists on every Linux and exits 0; a missing tool before it is
+        // skipped, and we stop at `true` (success) without reaching a later one.
+        let empty: &[&str] = &[];
+        let ok = run_first_available(&[
+            ("lychi_nonexistent_tool", empty),
+            ("true", empty),
+            ("lychi_should_not_be_reached", empty),
+        ]);
+        assert!(ok.is_ok(), "expected `true` to satisfy the chain: {ok:?}");
+    }
+
+    #[test]
+    fn run_first_available_surfaces_real_failure_without_falling_through() {
+        // `false` is installed and exits non-zero. That's a REAL failure — we
+        // must return it, not silently try the next candidate (which could do
+        // the wrong thing). So the later `true` is never reached.
+        let empty: &[&str] = &[];
+        let err = run_first_available(&[("false", empty), ("true", empty)]).unwrap_err();
+        assert!(err.contains("false failed"), "got: {err}");
     }
 
     #[test]

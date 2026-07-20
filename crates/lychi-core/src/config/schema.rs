@@ -1,9 +1,21 @@
 use serde::{Deserialize, Serialize};
 
+/// Current config schema version. Bump when a *breaking* change to the config
+/// shape needs a migration (see `Config::migrate`). A config written by an older
+/// Lychi loads with its stored version; migrations bring it up to `CONFIG_VERSION`.
+pub const CONFIG_VERSION: u32 = 1;
+
+fn default_config_version() -> u32 {
+    // A config file without a `version` field predates versioning → treat as v1.
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(default)]
-#[derive(Default)]
 pub struct Config {
+    /// Schema version — enables safe migration across breaking config changes.
+    #[serde(default = "default_config_version")]
+    pub version: u32,
     pub general: GeneralConfig,
     pub commands: CommandsConfig,
     pub history: HistoryConfig,
@@ -13,6 +25,24 @@ pub struct Config {
     pub privacy: PrivacyConfig,
     pub keybindings: KeybindingsConfig,
     pub suggestions: SuggestionsConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            // A fresh config is written at the current version.
+            version: CONFIG_VERSION,
+            general: GeneralConfig::default(),
+            commands: CommandsConfig::default(),
+            history: HistoryConfig::default(),
+            ai: AiConfig::default(),
+            projects: ProjectsConfig::default(),
+            weather: WeatherConfig::default(),
+            privacy: PrivacyConfig::default(),
+            keybindings: KeybindingsConfig::default(),
+            suggestions: SuggestionsConfig::default(),
+        }
+    }
 }
 
 /// Controls the context-aware suggestion panel.

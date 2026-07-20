@@ -82,7 +82,8 @@ pub fn warmup() {
     let stack = match super::compositor() {
         super::Compositor::KdeWayland => detect_stack_kwin(),
         super::Compositor::X11 => detect_stack_x11(),
-        // No stack backend on GNOME/wlroots Wayland — nothing to seed
+        super::Compositor::OtherWayland => detect_stack_wlr(),
+        // No stack backend on GNOME Wayland (Mutter offers no protocol)
         _ => Vec::new(),
     };
 
@@ -159,7 +160,8 @@ pub fn find_recent_terminal(
     let stack = match compositor {
         super::Compositor::KdeWayland => detect_stack_kwin(),
         super::Compositor::X11 => detect_stack_x11(),
-        // No stack backend on GNOME/wlroots Wayland
+        super::Compositor::OtherWayland => detect_stack_wlr(),
+        // No stack backend on GNOME Wayland (Mutter offers no protocol)
         _ => Vec::new(),
     };
 
@@ -400,6 +402,51 @@ callDBus("{bus_name}", "/", "", "lychi_stack", result.join("\n"));
 
 #[cfg(not(target_os = "linux"))]
 fn detect_stack_kwin() -> Vec<WindowContext> {
+    Vec::new()
+}
+
+// ── wlroots (Sway / Hyprland / niri / wlroots family) ────────────────────
+
+/// Build the window stack from the wlr-foreign-toplevel protocol.
+///
+/// The protocol exposes **no Z-order**, so we can't reproduce a true stacking
+/// order. What it does give is the `activated` (focused) flag — so we surface
+/// the activated window first and the rest after. It also exposes **no pid**;
+/// unlike the X11/KWin scans (which drop pid==0 as junk) we keep pid==0 here
+/// because that's every wlr window, and the nearest-terminal logic keys on
+/// wm_class, not pid.
+fn detect_stack_wlr() -> Vec<WindowContext> {
+    let mut toplevels: Vec<_> = super::wlr_toplevel::list_toplevels()
+        .into_iter()
+        .filter(|w| {
+            // Drop our own window and anything nameless.
+            let app = w.app_id.to_lowercase();
+            !app.is_empty() && app != "lychi"
+        })
+        .collect();
+
+    // Best-effort recency: the `activated` (focused) window first, the rest
+    // after. Stable so relative order of the non-activated tail is preserved.
+    toplevels.sort_by_key(|w| std::cmp::Reverse(w.activated));
+
+    toplevels
+        .into_iter()
+        .map(|w| {
+            let wm_class = w.app_id.to_lowercase();
+            WindowContext {
+                is_terminal: is_terminal_class(&wm_class),
+                is_ide: false, // stack scan only cares about terminals
+                title: w.title,
+                wm_class,
+                pid: 0,            // foreign-toplevel exposes no pid
+                window_id: None,   // no stable cross-connection id
+            }
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_stack_wlr() -> Vec<WindowContext> {
     Vec::new()
 }
 

@@ -25,6 +25,7 @@ pub mod project;
 pub mod suggestions;
 pub mod terminal_probe;
 pub mod window_stack;
+pub mod wlr_toplevel;
 pub mod workspace_cache;
 
 use std::time::Instant;

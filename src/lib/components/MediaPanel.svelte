@@ -6,9 +6,15 @@ import { mediaControl, mediaSeek } from "$lib/ipc";
 let {
 	ondismiss,
 	players = [],
+	visible = true,
 }: {
 	ondismiss: () => void;
 	players: TrackInfo[];
+	/** Whether the panel is currently shown. The panel stays mounted and is
+	 * toggled via a CSS class, so we gate the 1s progress ticker (and its CSS
+	 * width transition) on this — a hidden-but-animating progress bar is a
+	 * continuous WebView repaint cost for no visible benefit. */
+	visible?: boolean;
 } = $props();
 let selectedBusName: string | null = $state(null);
 let notRunning = $state(false);
@@ -45,12 +51,16 @@ function startTimer() {
 	}, 1000);
 }
 
-// Sync position when selected track changes
+// Sync position when selected track changes, and drive the ticker only while
+// the panel is visible. When hidden, the timer is cleared so no per-second
+// repaint happens off-screen; on re-show it resyncs from the latest position.
 $effect(() => {
-	if (track) {
+	if (track && visible) {
 		positionUs = track.position_us;
 		clearInterval(positionTimer);
 		if (track.status === "playing") startTimer();
+	} else if (!visible) {
+		clearInterval(positionTimer);
 	}
 });
 
@@ -146,7 +156,7 @@ function selectPlayer(busName: string) {
 		<div class="progress-section">
 			<span class="time">{positionStr}</span>
 			<div class="progress-bar" role="slider" tabindex={0} aria-valuenow={positionUs} aria-valuemin={0} aria-valuemax={track.length_us} onclick={handleSeek}>
-				<div class="progress-fill" style="width: {progress * 100}%"></div>
+				<div class="progress-fill" class:animate={visible} style="width: {progress * 100}%"></div>
 			</div>
 			<span class="time">{durationStr}</span>
 		</div>
@@ -321,6 +331,12 @@ function selectPlayer(busName: string) {
 		height: 100%;
 		background: var(--fg);
 		border-radius: 2px;
+	}
+
+	/* Only animate the fill while the panel is visible. When hidden the width is
+	 * frozen; gating the transition means re-showing snaps to the current
+	 * position instead of sliding from a stale one, and avoids off-screen paint. */
+	.progress-fill.animate {
 		transition: width 1s linear;
 	}
 

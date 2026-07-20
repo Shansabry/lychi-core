@@ -3,11 +3,14 @@
 //! KDE (spectacle), GNOME (gnome-screenshot), plus the cross-desktop flameshot
 //! and the X11 classics (scrot, maim, ImageMagick's import).
 //!
-//! Rather than hardcode one tool, this handler is **adaptive**: it probes the
-//! session type and which tools are actually installed, then picks the best
-//! available one and maps the requested mode onto that tool's own flags. So the
-//! same `screenshot area` works on Sway, Plasma, GNOME, or bare X11 — whatever
-//! the user happens to run — with zero configuration.
+//! The **primary** path is the XDG Screenshot portal
+//! (`org.freedesktop.portal.Screenshot`) — DE-agnostic and requires *no*
+//! screenshot tool installed. When no portal backend is present, this handler
+//! falls back to being **adaptive**: it probes the session type and which tools
+//! are actually installed, then picks the best available one and maps the
+//! requested mode onto that tool's own flags. So the same `screenshot area`
+//! works on Sway, Plasma, GNOME, or bare X11 — whatever the user happens to
+//! run — with zero configuration.
 //!
 //! Modes:
 //!   - `screenshot`         → full screen (all monitors)
@@ -19,7 +22,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 
@@ -159,14 +162,20 @@ fn plan(mode: Mode, path: &str) -> Option<Plan> {
 fn build_plan(tool: &str, mode: Mode, path: &str) -> Plan {
     let s = |x: &str| x.to_string();
     match tool {
-        // KDE — spectacle. Background mode, no notification, writes -o file,
-        // and -c copies to clipboard too. -a active window, -r region, -f full.
+        // KDE — spectacle background mode (-b): captures and exits with NO
+        // Spectacle app window, just the native selector where relevant. -n no
+        // notification, -c copies to clipboard, -o writes the file.
+        //   -f full screen
+        //   -r region  → Spectacle's own crosshair drag (the good region UX)
+        //   -u window-under-cursor → click to pick a window. NOT -a (active
+        //      window), because Lychi itself is the active/focused window when
+        //      the command runs, so -a would screenshot Lychi.
         "spectacle" => {
             let mut args = vec![s("-b"), s("-n"), s("-c"), s("-o"), s(path)];
             match mode {
                 Mode::Full => args.insert(0, s("-f")),
                 Mode::Area => args.insert(0, s("-r")),
-                Mode::Window => args.insert(0, s("-a")),
+                Mode::Window => args.insert(0, s("-u")),
             }
             Plan {
                 program: s("spectacle"),
@@ -324,10 +333,11 @@ fn capture(plan: Plan, path: &str) -> Result<(), String> {
     }
 
     // Copy the saved file to the clipboard if the tool didn't already.
-    if let Some(copy) = plan.clipboard_after {
-        if plan.writes_file && have(copy.program) {
-            copy_file_to_clipboard(&copy, path);
-        }
+    if let Some(copy) = plan.clipboard_after
+        && plan.writes_file
+        && have(copy.program)
+    {
+        copy_file_to_clipboard(&copy, path);
     }
 
     Ok(())
@@ -368,6 +378,215 @@ fn notify_saved(path: &str, mode: Mode) {
         .appname("Lychi")
         .timeout(notify_rust::Timeout::Milliseconds(4000))
         .show();
+}
+
+/// Outcome of the portal attempt, so the caller knows whether to fall back.
+enum PortalOutcome {
+    /// Portal captured to `dest` — done, no tool fallback needed.
+    Captured,
+    /// Portal is unavailable on this system — fall back to CLI tools.
+    Unavailable,
+    /// Portal ran but the user cancelled / it errored — surface this, don't
+    /// silently retry with a tool (which would re-prompt the user).
+    Failed(String),
+}
+
+/// Try the XDG Screenshot portal (`org.freedesktop.portal.Screenshot`).
+///
+/// This is the industry-standard, DE-agnostic path: it needs **no** screenshot
+/// tool installed and works on KDE, GNOME, wlroots, Hyprland, Sway, COSMIC —
+/// anywhere a portal backend is running. The portal writes to its own location
+/// and hands back a `file://` URI; we copy that into our timestamped Pictures
+/// path so the result matches the tool path (saved file + clipboard).
+///
+/// We speak the D-Bus interface directly (via the `dbus` crate the core already
+/// links) rather than pull in a portal wrapper crate, to avoid a heavy new
+/// dependency and its version churn.
+///
+/// The Screenshot portal only distinguishes non-interactive vs interactive; it
+/// has no "active window" mode. So: Full → non-interactive; Area/Window →
+/// interactive (the portal presents its own region/window picker). A dedicated
+/// active-window capture, when the portal can't, is left to the tool fallback.
+async fn try_portal_capture(mode: Mode, dest: &str) -> PortalOutcome {
+    let interactive = !matches!(mode, Mode::Full);
+
+    // The `dbus` crate's blocking connection spins up its own internal runtime,
+    // which PANICS with "Cannot start a runtime from within a runtime" if run on
+    // a tokio worker thread — and `spawn_blocking` threads are tokio-managed, so
+    // they trip it too. Run the handshake on a *plain* std thread (no ambient
+    // tokio runtime) and await the result over a oneshot channel. This keeps the
+    // async fn non-blocking while giving the D-Bus call a clean thread.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(portal_screenshot_blocking(interactive));
+    });
+
+    let uri = match rx.await {
+        Ok(Ok(Some(uri))) => uri,
+        // Portal returned but produced no URI, or the user cancelled the dialog
+        // (response code != 0). A deliberate cancel shouldn't fall back to a
+        // CLI tool and re-prompt.
+        Ok(Ok(None)) => return PortalOutcome::Failed("Screenshot cancelled".to_string()),
+        // No portal backend / D-Bus unavailable, or the worker thread died → let
+        // the tool path handle it.
+        Ok(Err(_)) | Err(_) => return PortalOutcome::Unavailable,
+    };
+
+    // The portal hands back a file:// URI. Resolve it to a path and copy the
+    // bytes into our timestamped Pictures destination.
+    let src = match uri_to_path(&uri) {
+        Some(p) => p,
+        None => {
+            return PortalOutcome::Failed(
+                "Screenshot portal returned an unreadable location".to_string(),
+            );
+        }
+    };
+    if let Err(e) = std::fs::copy(&src, dest) {
+        return PortalOutcome::Failed(format!("Failed to save screenshot: {e}"));
+    }
+    // Best-effort: the portal often keeps the file in a temp/cache dir; remove
+    // the source copy so we don't leave duplicates behind. Non-fatal.
+    let _ = std::fs::remove_file(&src);
+
+    // Copy to clipboard using whatever tool fits the session (best-effort).
+    copy_dest_to_clipboard(dest);
+
+    PortalOutcome::Captured
+}
+
+/// Decode a `file://` URI to a filesystem path (handles percent-encoding).
+fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    // Strip an optional authority component ("//host/path" → "/path"); portals
+    // emit a bare local path, so anything before the first '/' is a host we drop.
+    let path = match rest.find('/') {
+        Some(0) => rest,
+        Some(i) => &rest[i..],
+        None => return None,
+    };
+    let decoded = urlencoding::decode(path).ok()?;
+    Some(PathBuf::from(decoded.into_owned()))
+}
+
+/// Blocking D-Bus handshake with `org.freedesktop.portal.Screenshot`.
+///
+/// Returns `Ok(Some(uri))` on a successful capture, `Ok(None)` on user cancel
+/// (or a success response carrying no uri), and `Err` if the portal is
+/// unavailable (so the caller can fall back to CLI tools).
+fn portal_screenshot_blocking(interactive: bool) -> Result<Option<String>, String> {
+    use dbus::arg::{RefArg, Variant};
+    use dbus::blocking::SyncConnection;
+    use dbus::message::MatchRule;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+
+    let conn = SyncConnection::new_session().map_err(|e| format!("D-Bus session: {e}"))?;
+
+    // The portal replies asynchronously via a Response signal on a Request
+    // object path. To avoid a race we predict that path from a handle_token and
+    // subscribe to its Response signal *before* issuing the call. The path is
+    //   /org/freedesktop/portal/desktop/request/<SENDER>/<TOKEN>
+    // where SENDER is our unique bus name with dots→underscores and the leading
+    // ':' stripped. (Portal spec, org.freedesktop.portal.Request.)
+    let token = format!("lychi_{}", std::process::id());
+    let sender = conn
+        .unique_name()
+        .trim_start_matches(':')
+        .replace('.', "_");
+    let request_path = format!(
+        "/org/freedesktop/portal/desktop/request/{sender}/{token}"
+    );
+
+    let (tx, rx) = mpsc::channel::<(u32, Option<String>)>();
+    let tx = Arc::new(Mutex::new(tx));
+
+    let mut rule = MatchRule::new_signal("org.freedesktop.portal.Request", "Response");
+    rule.path = Some(request_path.clone().into());
+
+    let tx_cb = tx.clone();
+    let _token = conn
+        .add_match(rule, move |_: (), _conn, msg| {
+            // Response(u response, a{sv} results). response==0 means success.
+            let mut it = msg.iter_init();
+            let code: u32 = it.read().unwrap_or(1);
+            let mut uri: Option<String> = None;
+            // results is a{sv}; find the "uri" key.
+            if let Ok(dict) = it.read::<dbus::arg::PropMap>()
+                && let Some(v) = dict.get("uri")
+            {
+                uri = v.0.as_str().map(|s| s.to_string());
+            }
+            if let Ok(tx) = tx_cb.lock() {
+                let _ = tx.send((code, uri));
+            }
+            true
+        })
+        .map_err(|e| format!("add_match: {e}"))?;
+
+    // Issue the Screenshot call. Signature: Screenshot(s parent_window,
+    // a{sv} options) -> (o handle). Options carry our handle_token and the
+    // interactive flag.
+    let proxy = conn.with_proxy(
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        Duration::from_secs(2),
+    );
+    let mut options: dbus::arg::PropMap = std::collections::HashMap::new();
+    options.insert(
+        "handle_token".to_string(),
+        Variant(Box::new(token.clone()) as Box<dyn RefArg>),
+    );
+    options.insert(
+        "interactive".to_string(),
+        Variant(Box::new(interactive) as Box<dyn RefArg>),
+    );
+
+    let call: Result<(dbus::Path,), _> = proxy.method_call(
+        "org.freedesktop.portal.Screenshot",
+        "Screenshot",
+        ("", options),
+    );
+    // A failed call here (no such service/method) means no portal backend.
+    call.map_err(|e| format!("Screenshot call: {e}"))?;
+
+    // Pump the connection until the Response signal arrives or we time out.
+    // Interactive captures wait on the user, so allow a generous window.
+    let deadline = if interactive { 120 } else { 15 };
+    let end = std::time::Instant::now() + Duration::from_secs(deadline);
+    loop {
+        if let Ok((code, uri)) = rx.try_recv() {
+            return Ok(if code == 0 { uri } else { None });
+        }
+        if std::time::Instant::now() >= end {
+            return Ok(None);
+        }
+        // Process incoming messages (fires the add_match callback).
+        conn.process(Duration::from_millis(200))
+            .map_err(|e| format!("D-Bus process: {e}"))?;
+    }
+}
+
+/// Best-effort clipboard copy of the saved file, session-appropriate:
+/// `wl-copy` on Wayland, `xclip` on X11. Non-fatal — the file is already saved.
+fn copy_dest_to_clipboard(path: &str) {
+    let s = |x: &str| x.to_string();
+    let copy = if is_wayland() && have("wl-copy") {
+        Some(ClipboardCopy {
+            program: "wl-copy",
+            args: vec![s("--type"), s("image/png")],
+        })
+    } else if have("xclip") {
+        Some(ClipboardCopy {
+            program: "xclip",
+            args: vec![s("-selection"), s("clipboard"), s("-t"), s("image/png")],
+        })
+    } else {
+        None
+    };
+    if let Some(copy) = copy {
+        copy_file_to_clipboard(&copy, path);
+    }
 }
 
 #[async_trait]
@@ -430,10 +649,70 @@ impl ActionHandler for ScreenshotHandler {
         let path = output_path();
         let path_str = path.to_string_lossy().to_string();
 
+        // Capture-method priority is mode-dependent:
+        //
+        // - Region/Window: prefer the NATIVE tool (spectacle -r/-u, grim+slurp,
+        //   flameshot gui, …). Each brings its own selector — Spectacle's region
+        //   crosshair, window-under-cursor pick — which is the good, direct UX.
+        //   The portal's interactive picker is clunkier and is only a fallback
+        //   here. This is the fix for the poor area/window experience.
+        // - Full screen: prefer the portal (no selector needed; DE-agnostic,
+        //   needs nothing installed), tool as fallback.
+        let native_first = !matches!(mode, Mode::Full);
+
+        if native_first
+            && let Some(plan) = plan(mode, &path_str)
+        {
+            match capture(plan, &path_str) {
+                Ok(()) if std::path::Path::new(&path_str).exists() => {
+                    notify_saved(&path_str, mode);
+                    return Ok(ActionResult::ok(
+                        format!(
+                            "Screenshot saved ({})\n{}\n\n📋 Copied to clipboard",
+                            mode.label(),
+                            path_str
+                        ),
+                        OutputType::Text,
+                    ));
+                }
+                // A soft cancel (user aborted the region drag) is a deliberate
+                // action — report it, don't fall through to a second selector.
+                Ok(()) => return Ok(ActionResult::err("Screenshot cancelled")),
+                Err(e) if e.contains("cancelled") || e.contains("Selection cancelled") => {
+                    return Ok(ActionResult::err(e));
+                }
+                // A real tool failure (missing slurp, etc.) → try the portal.
+                Err(_) => {}
+            }
+        }
+
+        // Portal path: primary for full screen, fallback for region/window.
+        match try_portal_capture(mode, &path_str).await {
+            PortalOutcome::Captured => {
+                return Ok(if std::path::Path::new(&path_str).exists() {
+                    notify_saved(&path_str, mode);
+                    ActionResult::ok(
+                        format!(
+                            "Screenshot saved ({})\n{}\n\n📋 Copied to clipboard",
+                            mode.label(),
+                            path_str
+                        ),
+                        OutputType::Text,
+                    )
+                } else {
+                    ActionResult::err("Screenshot cancelled")
+                });
+            }
+            PortalOutcome::Failed(e) => return Ok(ActionResult::err(e)),
+            // Portal not available → fall through to the tool-detection path.
+            PortalOutcome::Unavailable => {}
+        }
+
         let Some(plan) = plan(mode, &path_str) else {
             return Ok(ActionResult::err(
-                "No screenshot tool found. Install one of: grim (+slurp), spectacle, \
-                 gnome-screenshot, flameshot, scrot, or maim.",
+                "No screenshot method available. Enable an XDG screenshot portal, \
+                 or install one of: grim (+slurp), spectacle, gnome-screenshot, \
+                 flameshot, scrot, or maim.",
             ));
         };
 
@@ -491,8 +770,11 @@ mod tests {
 
         let p = build_plan("spectacle", Mode::Area, "/tmp/x.png");
         assert!(p.args.contains(&"-r".to_string()));
+        // Window mode uses -u (window-under-cursor / click-to-pick), NOT -a
+        // (active window) — Lychi is the active window when the command runs.
         let p = build_plan("spectacle", Mode::Window, "/tmp/x.png");
-        assert!(p.args.contains(&"-a".to_string()));
+        assert!(p.args.contains(&"-u".to_string()));
+        assert!(!p.args.contains(&"-a".to_string()));
     }
 
     #[test]
@@ -547,6 +829,26 @@ mod tests {
         assert!(p.args.contains(&"-u".to_string()));
         let p = build_plan("scrot", Mode::Area, "/tmp/x.png");
         assert!(p.args.contains(&"-s".to_string()));
+    }
+
+    #[test]
+    fn uri_to_path_decodes_file_uris() {
+        assert_eq!(
+            uri_to_path("file:///home/sab/Pictures/a.png"),
+            Some(PathBuf::from("/home/sab/Pictures/a.png"))
+        );
+        // Percent-encoded space.
+        assert_eq!(
+            uri_to_path("file:///tmp/my%20shot.png"),
+            Some(PathBuf::from("/tmp/my shot.png"))
+        );
+        // Authority form: host is dropped, absolute path kept.
+        assert_eq!(
+            uri_to_path("file://localhost/tmp/x.png"),
+            Some(PathBuf::from("/tmp/x.png"))
+        );
+        // Not a file URI.
+        assert_eq!(uri_to_path("https://example.com/x.png"), None);
     }
 
     #[test]

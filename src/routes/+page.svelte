@@ -51,6 +51,10 @@ import { preloadAll } from "$lib/preloadCache";
 
 let inputValue = $state("");
 let isExecuting = $state(false);
+// Bumped when a stuck/in-flight command is cancelled via Escape, so a late
+// resolution of the abandoned executeCommand promise is ignored instead of
+// clobbering fresh state.
+let executeGeneration = 0;
 let isRouting = $state(false);
 let backendReady = $state(false);
 let lastResult: CommandResult | null = $state(null);
@@ -1097,6 +1101,7 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 async function runCommand(command: string, opts?: { runInline?: boolean }) {
 	if (isExecuting) return;
 	isExecuting = true;
+	const generation = ++executeGeneration;
 	completions = [];
 	completionIndex = -1;
 	historyOpen = false;
@@ -1105,7 +1110,18 @@ async function runCommand(command: string, opts?: { runInline?: boolean }) {
 	notesOpen = false;
 	try {
 		lastCommand = command;
-		lastResult = await executeCommand(command, undefined, opts?.runInline);
+		// Screenshot commands open a region/window selector — Lychi must leave
+		// the screen first or it lands in the shot and blocks the selector. Hide
+		// and let the compositor unmap before the capture starts.
+		if (/^screenshot(\s|$)/i.test(command.trim())) {
+			await hide();
+			await new Promise((r) => setTimeout(r, 180));
+		}
+		const result = await executeCommand(command, undefined, opts?.runInline);
+		// If this command was cancelled (Escape) while awaiting, a newer command
+		// started, ignore its stale result entirely.
+		if (generation !== executeGeneration) return;
+		lastResult = result;
 		// If confirmation is needed, show the confirm panel and wait for user decision
 		if (lastResult.needs_confirmation) {
 			return;
@@ -1173,6 +1189,7 @@ async function runCommand(command: string, opts?: { runInline?: boolean }) {
 			await hide();
 		}
 	} catch (err) {
+		if (generation !== executeGeneration) return;
 		lastResult = {
 			success: false,
 			output: null,
@@ -1181,7 +1198,9 @@ async function runCommand(command: string, opts?: { runInline?: boolean }) {
 			auto_open: false,
 		};
 	} finally {
-		isExecuting = false;
+		// Only clear the running flag if we're still the current command — a
+		// cancel (Escape) already reset it and may have started a new one.
+		if (generation === executeGeneration) isExecuting = false;
 	}
 }
 
@@ -1515,6 +1534,25 @@ async function handleDismiss() {
 		routingGeneration++;
 		isRouting = false;
 	}
+
+	// Escape hatch for a stuck command. If a command is mid-execution (e.g. a
+	// screenshot whose portal call hung, or a backend task that died without
+	// resolving its IPC promise), the first Escape *cancels* the stuck state and
+	// keeps the launcher open so the user can retry — rather than hiding a window
+	// that's frozen on "Running...". A second Escape then hides as usual.
+	if (isExecuting) {
+		executeGeneration++;
+		isExecuting = false;
+		lastResult = {
+			success: false,
+			output: null,
+			error: "Cancelled",
+			duration_ms: 0,
+			auto_open: false,
+		};
+		return;
+	}
+
 	await hide();
 }
 </script>
@@ -1631,7 +1669,7 @@ async function handleDismiss() {
 			<NotesPanel ondismiss={() => { notesOpen = false; pendingNoteText = null; initialNotesTab = undefined; }} {pendingNoteText} onpendingcleared={() => { pendingNoteText = null; }} {initialNotesTab} visible={notesOpen} />
 		</div>
 		<div class:panel-hidden={!mediaOpen}>
-			<MediaPanel ondismiss={() => { mediaOpen = false; }} players={mediaPlayers} />
+			<MediaPanel visible={mediaOpen} ondismiss={() => { mediaOpen = false; }} players={mediaPlayers} />
 		</div>
 		<div class="settings-wrapper" class:panel-hidden={!settingsOpen}>
 			<SettingsPanel ondismiss={() => { settingsOpen = false; }} />

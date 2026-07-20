@@ -26,11 +26,17 @@ impl NotesHandler {
         Self { db }
     }
 
-    /// Format a note's first line as its title (truncated to 40 chars).
+    /// Format a note's first line as its title (truncated to ~40 bytes on a
+    /// char boundary — a naive `[..40]` panics when byte 40 splits a multi-byte
+    /// UTF-8 char, e.g. an emoji or CJK glyph in the note).
     fn note_title(text: &str) -> &str {
         let first_line = text.lines().next().unwrap_or(text);
         if first_line.len() > 40 {
-            &first_line[..40]
+            let mut end = 40;
+            while end > 0 && !first_line.is_char_boundary(end) {
+                end -= 1;
+            }
+            &first_line[..end]
         } else {
             first_line
         }
@@ -323,5 +329,25 @@ impl ActionHandler for TodoHandler {
                 ..Default::default()
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn note_title_never_panics_on_multibyte() {
+        // 40th byte lands inside a multi-byte char — must not panic, must return
+        // valid UTF-8 truncated before the char.
+        let s = format!("{}最", "a".repeat(39)); // 39 ASCII + 3-byte char at 39..42
+        let t = NotesHandler::note_title(&s);
+        assert!(t.len() <= 40 && s.is_char_boundary(t.len()));
+        // Emoji straddling the boundary.
+        let e = format!("{}😀ok", "x".repeat(38));
+        let t = NotesHandler::note_title(&e);
+        assert!(t.chars().all(|c| c == 'x'));
+        // First line only.
+        assert_eq!(NotesHandler::note_title("hello\nworld"), "hello");
     }
 }
