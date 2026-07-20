@@ -1,7 +1,80 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use crate::paths;
+
+// --- Persistent icon-path cache -------------------------------------------
+//
+// Resolving an icon name to a file path via the freedesktop theme spec is
+// expensive (theme-index parsing + directory walks), and on a desktop with many
+// installed themes it added up to ~6.5s to resolve every app's icon. That work
+// is identical across launches — only the icon theme and the set of installed
+// apps change. So we persist the `icon name → resolved path` map to disk, keyed
+// by the active theme, and reuse it on the next launch. A miss simply resolves
+// live and gets added; the whole file is rewritten once after the background
+// prewarm. Theme change invalidates the whole cache (different `theme` key).
+
+/// On-disk shape: the theme it was built for, plus the name→path map. `path` is
+/// null when the icon couldn't be resolved (cached so we don't retry every time).
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct IconCacheFile {
+    theme: String,
+    entries: HashMap<String, Option<String>>,
+}
+
+static ICON_CACHE: OnceLock<Mutex<IconCacheFile>> = OnceLock::new();
+
+fn icon_cache_file_path() -> PathBuf {
+    paths::data_dir().join("icon-paths.json")
+}
+
+/// Load the persisted cache, discarding it if it was built for a different icon
+/// theme (a theme switch changes every resolution).
+fn icon_cache() -> &'static Mutex<IconCacheFile> {
+    ICON_CACHE.get_or_init(|| {
+        let theme = active_theme().to_string();
+        let loaded = std::fs::read_to_string(icon_cache_file_path())
+            .ok()
+            .and_then(|s| serde_json::from_str::<IconCacheFile>(&s).ok())
+            .filter(|c| c.theme == theme)
+            .unwrap_or_else(|| IconCacheFile {
+                theme,
+                entries: HashMap::new(),
+            });
+        Mutex::new(loaded)
+    })
+}
+
+/// Resolve an icon, consulting (and populating) the persistent cache. This is
+/// the entry point warmup + query paths should use.
+pub fn resolve_icon_cached(icon: &str) -> Option<String> {
+    if icon.is_empty() {
+        return None;
+    }
+    {
+        let cache = icon_cache().lock().unwrap();
+        if let Some(hit) = cache.entries.get(icon) {
+            return hit.clone();
+        }
+    }
+    let resolved = resolve_icon(icon);
+    icon_cache()
+        .lock()
+        .unwrap()
+        .entries
+        .insert(icon.to_string(), resolved.clone());
+    resolved
+}
+
+/// Write the cache to disk (best-effort). Called once after the background
+/// prewarm has populated it, so the next launch starts warm.
+pub fn save_icon_cache() {
+    let cache = icon_cache().lock().unwrap();
+    if let Ok(json) = serde_json::to_string(&*cache) {
+        let _ = std::fs::write(icon_cache_file_path(), json);
+    }
+}
 
 /// Directories covered by the Tauri asset protocol scope.
 /// Paths outside these are copied to icon-cache so the webview can load them.
@@ -98,7 +171,18 @@ fn resolve_path(path: PathBuf) -> Option<String> {
     resolved.to_str().map(|s| s.to_string())
 }
 
-/// Search the user's theme, common fallbacks, all installed themes, and pixmaps.
+/// Search the user's theme, common fallbacks, pixmaps, then (last resort) every
+/// installed theme.
+///
+/// Order matters for performance: the all-themes sweep is O(installed themes)
+/// and on a typical desktop that's 40+ themes (every Mint-X/Mint-Y variant,
+/// Breeze, oxygen, …), each costing an `index.theme` parse + directory walk. An
+/// icon that isn't in the active theme, Adwaita, gnome, or hicolor is almost
+/// never hiding in a random decorative theme — it's a Flatpak/Snap/legacy app
+/// whose icon lives in /usr/share/pixmaps or the hicolor apps dir. So we try
+/// those cheap, high-hit-rate locations BEFORE the expensive sweep, and only
+/// fall through to the sweep as a genuine last resort. This is what turned the
+/// icon warmup from ~6.5s into a fraction of that.
 fn search_all_themes(name: &str) -> Option<String> {
     let theme = active_theme();
 
@@ -116,7 +200,17 @@ fn search_all_themes(name: &str) -> Option<String> {
         }
     }
 
-    // 3. Broad sweep: try all installed themes
+    // 3. /usr/share/pixmaps — legacy apps store icons here without themes. Cheap
+    //    (a few stat() calls) and where most non-themed app icons actually are.
+    for ext in ["svg", "png", "xpm"] {
+        let pixmap = PathBuf::from(format!("/usr/share/pixmaps/{name}.{ext}"));
+        if pixmap.exists() {
+            return resolve_path(pixmap);
+        }
+    }
+
+    // 4. Last resort: broad sweep over every installed theme. Rarely hits, so
+    //    it runs only after the cheap paths above have all missed.
     for t in all_themes() {
         if t != theme
             && t != "Adwaita"
@@ -125,14 +219,6 @@ fn search_all_themes(name: &str) -> Option<String> {
             && let Some(path) = try_lookup(name, t)
         {
             return resolve_path(path);
-        }
-    }
-
-    // 4. /usr/share/pixmaps (legacy apps store icons here without themes)
-    for ext in ["svg", "png", "xpm"] {
-        let pixmap = PathBuf::from(format!("/usr/share/pixmaps/{name}.{ext}"));
-        if pixmap.exists() {
-            return resolve_path(pixmap);
         }
     }
 

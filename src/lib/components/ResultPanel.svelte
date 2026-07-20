@@ -2,7 +2,7 @@
 import AnsiToHtml from "ansi-to-html";
 import type { CommandResult } from "$lib/ipc";
 import { getComboString, matchesAction } from "$lib/keybindings";
-import { sanitizeTerminal } from "$lib/sanitize";
+import { sanitizeSvg, sanitizeTerminal } from "$lib/sanitize";
 import WeatherCard from "./WeatherCard.svelte";
 
 let {
@@ -24,6 +24,49 @@ let {
 let hasInlineUrl = $derived(!!result.output && !!result.open_url);
 let outputType = $derived(result.output_type ?? "status");
 let isTerminal = $derived(outputType === "terminal");
+
+// QR "copy image" — rasterize the inline SVG to a PNG and put it on the clipboard.
+let svgWrap: HTMLDivElement | undefined = $state();
+let qrCopied = $state(false);
+// Exposed so a global keyboard shortcut (Ctrl+Shift+C) can copy the QR too.
+export function copyQr() {
+	if (isSvg) copyQrPng();
+}
+async function copyQrPng() {
+	const svg = svgWrap?.querySelector("svg");
+	if (!svg) return;
+	try {
+		// Serialize the SVG, draw it onto a canvas at a crisp fixed size, export PNG.
+		const size = 512; // high-res so the pasted image scans well
+		const xml = new XMLSerializer().serializeToString(svg);
+		const svgUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(xml)}`;
+		const img = new Image();
+		await new Promise<void>((resolve, reject) => {
+			img.onload = () => resolve();
+			img.onerror = () => reject(new Error("svg load failed"));
+			img.src = svgUrl;
+		});
+		const canvas = document.createElement("canvas");
+		canvas.width = size;
+		canvas.height = size;
+		const ctx = canvas.getContext("2d");
+		if (!ctx) return;
+		ctx.fillStyle = "#ffffff";
+		ctx.fillRect(0, 0, size, size);
+		ctx.drawImage(img, 0, 0, size, size);
+		const blob: Blob | null = await new Promise((resolve) =>
+			canvas.toBlob((b) => resolve(b), "image/png"),
+		);
+		if (!blob) return;
+		await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+		qrCopied = true;
+		setTimeout(() => {
+			qrCopied = false;
+		}, 1500);
+	} catch (err) {
+		console.error("[qr] copy failed:", err);
+	}
+}
 
 const darkColors = [
 	"#5c6370",
@@ -88,6 +131,11 @@ let outputHtml = $derived(
 	isTerminal && result.output ? sanitizeTerminal(converter.toHtml(result.output)) : "",
 );
 let errorHtml = $derived(result.error ? sanitizeTerminal(converter.toHtml(result.error)) : "");
+
+// SVG output (e.g. a QR code) — embedded inline, crisp and scannable. Sanitized
+// to strip any scripts/handlers while keeping the vector shapes.
+let isSvg = $derived(outputType === "svg");
+let svgHtml = $derived(isSvg && result.output ? sanitizeSvg(result.output) : "");
 
 // --- Clickable filenames in ls output ---
 
@@ -231,6 +279,15 @@ function handleKeydown(e: KeyboardEvent) {
 		{#if result.output}
 			{#if isTerminal}
 				<pre class="output terminal" role={lsDirectory ? "button" : undefined} tabindex={lsDirectory ? 0 : undefined} onclick={lsDirectory ? handleTerminalClick : undefined} onkeydown={lsDirectory ? (e) => { if (e.key === 'Enter') handleTerminalClick(e); } : undefined}>{@html processedHtml}</pre>
+			{:else if isSvg}
+				<!-- Inline SVG (QR code) — crisp, scannable, compact. -->
+				<div class="output svg-output">
+					<div class="svg-wrap" bind:this={svgWrap}>{@html svgHtml}</div>
+					<button class="btn btn-copy-qr" onmousedown={(e) => e.preventDefault()} onclick={copyQrPng}>
+						{qrCopied ? "Copied" : "Copy image"}
+						{#if !qrCopied}<span class="kbd">{getComboString("copy_path")}</span>{/if}
+					</button>
+				</div>
 			{:else if outputType === "text"}
 				<div class="output text">{result.output}</div>
 			{:else if outputType === "weather"}
@@ -286,6 +343,42 @@ function handleKeydown(e: KeyboardEvent) {
 
 	.output.terminal {
 		color: var(--fg);
+	}
+
+	/* Inline SVG output (QR code): compact, centered, on a white plate so it
+	   scans in dark mode too. Fixed modest size — SVG scales crisply. */
+	.output.svg-output {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 8px;
+		padding: 12px;
+	}
+
+	.output.svg-output :global(svg) {
+		width: 180px;
+		height: 180px;
+		background: #fff;
+		border-radius: 6px;
+		padding: 8px;
+		box-sizing: border-box;
+	}
+
+	.btn-copy-qr {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--fg-muted);
+		background: none;
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		padding: 3px 12px;
+		cursor: pointer;
+		transition: color 100ms ease, border-color 100ms ease;
+	}
+
+	.btn-copy-qr:hover {
+		color: var(--fg);
+		border-color: var(--fg-muted);
 	}
 
 	.output.terminal :global(.clickable-file) {

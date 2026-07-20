@@ -26,3 +26,7 @@ pub fn config_file() -> PathBuf {
 pub fn db_file() -> PathBuf {
     data_dir().join("lychi.redb")
 }
+
+pub fn clipboard_images_dir() -> PathBuf {
+    data_dir().join("clipboard-images")
+}

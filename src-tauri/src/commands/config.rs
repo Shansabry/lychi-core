@@ -4,12 +4,13 @@ use lychi_core::config::db as config_db;
 use lychi_core::config::schema::{KeybindingsConfig, PrivacyConfig};
 use lychi_core::config::{AiConfig, CommandsConfig, GeneralConfig, ProjectsConfig};
 use lychi_core::error::LychiError;
+use lychi_core::events::{ConfigSection, DomainEvent};
 use lychi_core::paths;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
 /// Single-IPC batch response for all settings data the frontend needs at startup.
-#[derive(Serialize)]
+#[derive(Serialize, specta::Type)]
 pub struct AllSettings {
     pub ai: AiConfig,
     pub general: GeneralConfig,
@@ -20,9 +21,13 @@ pub struct AllSettings {
     pub app_version: String,
     pub layer_shell_supported: bool,
     pub active_window_strategy: String,
+    /// False when running on X11 without a compositor — the transparent
+    /// overlay renders opaque and the user should enable compositing.
+    pub screen_composited: bool,
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn get_all_settings(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -31,23 +36,7 @@ pub fn get_all_settings(
 
     let layer_shell_supported = gtk_layer_shell::is_supported();
 
-    let active_window_strategy = if let Some(win) = app.get_webview_window("main") {
-        if let Ok(gtk_win) = win.gtk_window() {
-            use gtk_layer_shell::LayerShell;
-            if gtk_win.is_layer_window() {
-                "layer-shell"
-            } else if crate::platform::is_kde_wayland() {
-                "toplevel"
-            } else {
-                "x11"
-            }
-        } else {
-            "x11"
-        }
-    } else {
-        "x11"
-    }
-    .to_string();
+    let active_window_strategy = crate::platform::active_strategy().as_str().to_string();
 
     let app_version = app.package_info().version.to_string();
 
@@ -61,16 +50,19 @@ pub fn get_all_settings(
         app_version,
         layer_shell_supported,
         active_window_strategy,
+        screen_composited: crate::platform::screen_composited(),
     })
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_hide_on_blur(state: State<'_, AppState>) -> Result<bool, LychiError> {
     let config = state.config.read().await;
     Ok(config.general.hide_on_blur)
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn save_window_position(
     state: State<'_, AppState>,
     x: i32,
@@ -83,12 +75,14 @@ pub async fn save_window_position(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_general_config(state: State<'_, AppState>) -> Result<GeneralConfig, LychiError> {
     let config = state.config.read().await;
     Ok(config.general.clone())
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn save_general_config(
     state: State<'_, AppState>,
     general: GeneralConfig,
@@ -101,73 +95,74 @@ pub async fn save_general_config(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_commands_config(state: State<'_, AppState>) -> Result<CommandsConfig, LychiError> {
     let config = state.config.read().await;
     Ok(config.commands.clone())
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn save_commands_config(
     state: State<'_, AppState>,
     commands: CommandsConfig,
 ) -> Result<(), LychiError> {
-    let new_shell = commands.shell.clone();
-    let mut config = state.config.write().await;
-    let old_shell = config.commands.shell.clone();
-    config.commands = commands;
-    config.save(&paths::config_file())?;
-    config_db::save_config_to_db(&state.db, &config)?;
-
-    // If shell changed, invalidate cached env and re-register handler
-    if old_shell != new_shell {
-        lychi_core::action_registry::handlers::shell_exec::invalidate_shell_env();
-        let mut executor = state.executor.write().await;
-        executor.registry.register(Box::new(
-            lychi_core::action_registry::handlers::shell_exec::ShellExec::with_shell(
-                new_shell.clone(),
-            ),
-        ));
-        tracing::info!("Shell changed to: {new_shell}");
+    // Reject search-engine shortcuts that collide with a reserved command
+    // before persisting, so a bad keyword never shadows a real command. The
+    // reserved-command check is delegated to the live action registry.
+    {
+        let executor = state.executor.read().await;
+        commands
+            .validate_search_engines(&|w| executor.registry.is_known_prefix(w))
+            .map_err(LychiError::Config)?;
     }
 
-    // Update terminal setting
-    let new_terminal = config.commands.terminal.clone();
-    lychi_core::action_registry::handlers::shell_exec::set_terminal(Some(new_terminal));
+    // Persist, then release the write lock BEFORE emitting — the reactors acquire
+    // the config/executor locks with blocking_*, so the command must not still be
+    // holding them when the event fans out.
+    {
+        let mut config = state.config.write().await;
+        config.commands = commands;
+        config.save(&paths::config_file())?;
+        config_db::save_config_to_db(&state.db, &config)?;
+    }
+
+    // The CommandsReactor re-derives shell + terminal + bang routing from the live
+    // config. The command no longer knows those subsystems exist.
+    state.event_bus.emit(DomainEvent::ConfigChanged {
+        section: ConfigSection::Commands,
+    });
 
     Ok(())
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_projects_config(state: State<'_, AppState>) -> Result<ProjectsConfig, LychiError> {
     let config = state.config.read().await;
     Ok(config.projects.clone())
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn save_projects_config(
     state: State<'_, AppState>,
     projects: ProjectsConfig,
 ) -> Result<(), LychiError> {
-    let dirs = projects.directories.clone();
+    // Persist, then release the write lock before emitting (see the note in
+    // save_commands_config — reactors take the config/executor locks blocking).
+    {
+        let mut config = state.config.write().await;
+        config.projects = projects;
+        config.save(&paths::config_file())?;
+        config_db::save_config_to_db(&state.db, &config)?;
+    }
 
-    // Re-register extra markers with updated config
-    lychi_core::context::ide::register_extra_markers(
-        &projects.extra_strong_markers,
-        &projects.extra_soft_markers,
-    );
-    // Update pinned workspace
-    lychi_core::context::pin::set(projects.pinned_workspace.clone());
-
-    let mut config = state.config.write().await;
-    config.projects = projects;
-    config.save(&paths::config_file())?;
-    config_db::save_config_to_db(&state.db, &config)?;
-
-    // Re-register project handler with updated directories
-    let mut executor = state.executor.write().await;
-    executor.registry.register(Box::new(
-        lychi_core::action_registry::handlers::project_open::ProjectOpen::with_directories(dirs),
-    ));
+    // The ProjectsReactor updates IDE markers, the pinned workspace, and the
+    // project handler's directories from the live config.
+    state.event_bus.emit(DomainEvent::ConfigChanged {
+        section: ConfigSection::Projects,
+    });
 
     Ok(())
 }
@@ -175,12 +170,14 @@ pub async fn save_projects_config(
 // --- Privacy ---
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_privacy_config(state: State<'_, AppState>) -> Result<PrivacyConfig, LychiError> {
     let config = state.config.read().await;
     Ok(config.privacy.clone())
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn save_privacy_config(
     state: State<'_, AppState>,
     privacy: PrivacyConfig,
@@ -196,6 +193,7 @@ pub async fn save_privacy_config(
 /// Called by the frontend when the user confirms a privacy-gated action.
 /// `feature` is one of: "ip_geolocation", "public_ip"
 #[tauri::command]
+#[specta::specta]
 pub async fn grant_privacy_consent(
     state: State<'_, AppState>,
     feature: String,
@@ -216,6 +214,7 @@ pub async fn grant_privacy_consent(
 // --- Keybindings ---
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_keybindings_config(
     state: State<'_, AppState>,
 ) -> Result<KeybindingsConfig, LychiError> {
@@ -224,6 +223,7 @@ pub async fn get_keybindings_config(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn save_keybindings_config(
     state: State<'_, AppState>,
     keybindings: KeybindingsConfig,
@@ -235,18 +235,21 @@ pub async fn save_keybindings_config(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn restart_app(app: AppHandle) {
     app.restart();
 }
 
 /// Returns terminal emulators found in PATH.
 #[tauri::command]
+#[specta::specta]
 pub fn get_installed_terminals() -> Vec<String> {
     lychi_core::config::schema::detect_installed_terminals()
 }
 
 /// Returns whether layer-shell (Wayland) is supported on this session.
 #[tauri::command]
+#[specta::specta]
 pub fn get_layer_shell_supported() -> bool {
     gtk_layer_shell::is_supported()
 }
@@ -254,25 +257,75 @@ pub fn get_layer_shell_supported() -> bool {
 /// Returns the window strategy that is currently active (what init_window chose).
 /// "layer-shell" | "toplevel" | "x11"
 #[tauri::command]
-pub fn get_active_window_strategy(app: AppHandle) -> String {
-    if let Some(win) = app.get_webview_window("main")
-        && let Ok(gtk_win) = win.gtk_window()
-    {
-        use gtk_layer_shell::LayerShell;
-        if gtk_win.is_layer_window() {
-            return "layer-shell".to_string();
-        }
-    }
-    if crate::platform::is_kde_wayland() {
-        "toplevel".to_string()
+#[specta::specta]
+pub fn get_active_window_strategy() -> String {
+    crate::platform::active_strategy().as_str().to_string()
+}
+
+/// Whether the app is registered to start at login (XDG autostart entry).
+/// The OS entry is the source of truth — no config field involved.
+#[tauri::command]
+#[specta::specta]
+pub fn get_autostart_enabled(app: AppHandle) -> Result<bool, LychiError> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|e| LychiError::Config(format!("autostart: {e}")))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<(), LychiError> {
+    use tauri_plugin_autostart::ManagerExt;
+    let autolaunch = app.autolaunch();
+    let result = if enabled {
+        autolaunch.enable()
     } else {
-        "x11".to_string()
+        autolaunch.disable()
+    };
+    result.map_err(|e| LychiError::Config(format!("autostart: {e}")))?;
+    tracing::info!("Autostart {}", if enabled { "enabled" } else { "disabled" });
+    Ok(())
+}
+
+/// Hotkey registration status, used by the frontend to guide Wayland users
+/// toward a DE-bound `lychi --toggle` shortcut when the in-app hotkey
+/// cannot work system-wide.
+#[derive(Serialize, specta::Type)]
+pub struct HotkeyStatus {
+    pub registered: bool,
+    /// "wayland" | "x11"
+    pub session_type: String,
+    /// XDG_CURRENT_DESKTOP (e.g. "KDE", "GNOME"), empty if unset
+    pub desktop: String,
+    /// True when the in-app shortcut fires system-wide. On Wayland the
+    /// X11-based plugin only fires while an XWayland window is focused,
+    /// so registration success there does not mean reliable.
+    pub reliable: bool,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn get_hotkey_status(state: State<'_, AppState>) -> HotkeyStatus {
+    let registered = state
+        .hotkey_registered
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let portal_bound = state.portal_bound.load(std::sync::atomic::Ordering::SeqCst);
+    let wayland = lychi_core::context::is_wayland();
+    HotkeyStatus {
+        registered,
+        session_type: if wayland { "wayland" } else { "x11" }.to_string(),
+        desktop: std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
+        // X11 plugin registration is system-wide on X11; on Wayland only a
+        // portal binding counts as reliable.
+        reliable: registered && (!wayland || portal_bound),
     }
 }
 
 /// Hide the launcher window.
 /// Called from frontend instead of window.hide() to keep hide logic centralised.
 #[tauri::command]
+#[specta::specta]
 pub fn hide_launcher(app: AppHandle) {
     // Disarm dismiss so focus-out during hide doesn't re-trigger
     let state = app.state::<AppState>();
@@ -286,6 +339,7 @@ pub fn hide_launcher(app: AppHandle) {
 
 /// Change the global hotkey at runtime: unregister old, register new, persist to config.
 #[tauri::command]
+#[specta::specta]
 pub async fn set_hotkey(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -293,25 +347,33 @@ pub async fn set_hotkey(
 ) -> Result<(), LychiError> {
     use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
-    let shortcut_manager = app.global_shortcut();
+    // Wayland: the compositor binding (`lychi --toggle`) is the single toggle
+    // source — persist the combo but never register the X11-based plugin
+    // (it would double-fire with the DE binding over XWayland windows).
+    if !lychi_core::context::is_wayland() {
+        let shortcut_manager = app.global_shortcut();
 
-    // Unregister the old hotkey
-    let old_hotkey = {
-        let config = state.config.read().await;
-        config.general.hotkey.clone()
-    };
-    let _ = shortcut_manager.unregister(old_hotkey.as_str());
+        // Unregister the old hotkey
+        let old_hotkey = {
+            let config = state.config.read().await;
+            config.general.hotkey.clone()
+        };
+        let _ = shortcut_manager.unregister(old_hotkey.as_str());
 
-    // Register the new hotkey
-    shortcut_manager
-        .on_shortcut(hotkey.as_str(), move |app, _shortcut, event| {
-            if event.state == ShortcutState::Pressed
-                && let Some(w) = app.get_webview_window("main")
-            {
-                window::toggle_window(&w);
-            }
-        })
-        .map_err(|e| LychiError::Config(format!("Invalid hotkey: {e}")))?;
+        // Register the new hotkey
+        shortcut_manager
+            .on_shortcut(hotkey.as_str(), move |app, _shortcut, event| {
+                if event.state == ShortcutState::Pressed
+                    && let Some(w) = app.get_webview_window("main")
+                {
+                    window::toggle_window(&w);
+                }
+            })
+            .map_err(|e| LychiError::Config(format!("Invalid hotkey: {e}")))?;
+        state
+            .hotkey_registered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 
     // Persist to config
     let mut config = state.config.write().await;
@@ -325,6 +387,7 @@ pub async fn set_hotkey(
 /// Grab keyboard and wait for a modifier+key combo.
 /// Returns the combo string (e.g. "Super+Space") or an error.
 #[tauri::command]
+#[specta::specta]
 pub async fn record_hotkey(app: AppHandle) -> Result<String, LychiError> {
     // First, unregister the current hotkey so it doesn't interfere with recording
     let current_hotkey = {
@@ -341,7 +404,8 @@ pub async fn record_hotkey(app: AppHandle) -> Result<String, LychiError> {
     let result = crate::platform::record_hotkey(&app).await;
 
     // Re-register the current hotkey if recording was cancelled
-    if result.is_err() {
+    // (X11 only — the plugin shortcut is never registered on Wayland)
+    if result.is_err() && !lychi_core::context::is_wayland() {
         let app_clone = app.clone();
         let hotkey = current_hotkey.clone();
         use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};

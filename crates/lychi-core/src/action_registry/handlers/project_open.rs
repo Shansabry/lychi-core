@@ -9,7 +9,9 @@ use std::process::Command;
 use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+};
 use crate::error::LychiError;
 
 #[derive(Debug)]
@@ -377,6 +379,12 @@ pub fn invalidate_project_cache() {
 
 #[async_trait]
 impl ActionHandler for ProjectOpen {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["project"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "project"
     }
@@ -385,45 +393,17 @@ impl ActionHandler for ProjectOpen {
         "Open a project folder in the code editor"
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let query = args.trim();
         if query.is_empty() {
-            return Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some("Usage: project <name>".to_string()),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(ActionResult::err("Usage: project <name>".to_string()));
         }
 
         let start = Instant::now();
 
         if self.directories.is_empty() {
-            return Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some(
-                    "No project directories configured. Add your project folders in Settings → Projects."
-                        .to_string(),
-                ),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-            focus_app: None,
-            });
+            return Ok(ActionResult::err("No project directories configured. Add your project folders in Settings → Projects."
+                        .to_string(),));
         }
 
         let entries = self.get_projects();
@@ -447,20 +427,11 @@ impl ActionHandler for ProjectOpen {
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        Ok(ActionResult {
-            success: true,
-            output: Some(format!("Opened {} in editor", entry.name)),
-            error: None,
-            duration_ms,
-            routed_by: None,
-            open_url: None,
-            needs_confirmation: None,
-            risk_level: None,
-            output_type: None,
-            executed_args: None,
-            launch_desktop: None,
-            focus_app: None,
-        })
+        Ok(ActionResult::ok(
+            format!("Opened {} in editor", entry.name),
+            OutputType::Status,
+        )
+        .with_duration(duration_ms))
     }
 
     async fn completions(&self, partial: &str) -> Vec<CompletionItem> {
@@ -481,6 +452,9 @@ impl ActionHandler for ProjectOpen {
                 score,
                 description: None,
                 reason: None,
+                thumb_b64: None,
+                run: Some(format!("project {}", entry.name)),
+                ..Default::default()
             })
             .collect()
     }

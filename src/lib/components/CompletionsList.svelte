@@ -4,6 +4,7 @@ import {
 	AppWindow,
 	Clock,
 	Folder,
+	Lightbulb,
 	LoaderCircle,
 	Terminal,
 	TriangleAlert,
@@ -25,6 +26,7 @@ let {
 	searchMode = false,
 	metaMap = undefined,
 	ignoreActive = false,
+	flashMessage = "",
 }: {
 	items: CompletionItem[];
 	selectedIndex: number;
@@ -38,6 +40,7 @@ let {
 	searchMode?: boolean;
 	metaMap?: Map<string, { size_bytes?: number | null; modified_secs?: number | null }>;
 	ignoreActive?: boolean;
+	flashMessage?: string;
 } = $props();
 
 // Fixed pool size — matches the max completions returned (20 for search, ~10 for normal)
@@ -190,9 +193,11 @@ function formatSize(bytes: number | null | undefined): string {
 		{@const isWarning = item?.icon_path === "__warning__"}
 		{@const isContext = item?.icon_path === "__context__"}
 		{@const isTerminal = item?.icon_path === "__terminal__"}
+		{@const isInfo = item?.icon_path === "__info__"}
+		{@const isClipImage = item?.icon_path === "__clipboard_image__"}
 		{@const isWeb = item?.label?.startsWith("Search web:")}
 		{@const hideIcon = item?.icon_path === "__none__" || item?.icon_path === "__web__" || isWeb || isSeparator}
-		{@const hasCustomIcon = !!(item?.icon_path && item.icon_path !== "__folder__" && item.icon_path !== "__none__" && item.icon_path !== "__web__" && item.icon_path !== "__history__" && item.icon_path !== "__separator__" && item.icon_path !== "__warning__" && item.icon_path !== "__context__" && item.icon_path !== "__terminal__")}
+		{@const hasCustomIcon = !!(item?.icon_path && item.icon_path !== "__folder__" && item.icon_path !== "__none__" && item.icon_path !== "__web__" && item.icon_path !== "__history__" && item.icon_path !== "__separator__" && item.icon_path !== "__warning__" && item.icon_path !== "__context__" && item.icon_path !== "__terminal__" && item.icon_path !== "__info__" && item.icon_path !== "__clipboard_image__")}
 		{@const noIcon = !item?.icon_path}
 		{@const iconKey = item?.icon_path ?? ""}
 		{@const iconBroken = hasCustomIcon && brokenIcons.has(iconKey)}
@@ -206,13 +211,13 @@ function formatSize(bytes: number | null | undefined): string {
 			class="completion-item"
 			class:completion-separator={active && isSeparator}
 			class:completion-warning={active && isWarning}
-			class:selected={active && idx === selectedIndex && !isSeparator && !isWarning}
+			class:selected={active && idx === selectedIndex && !isSeparator && !isWarning && !isInfo}
 			class:inactive={!active}
 			onmousedown={(e) => e.preventDefault()}
-			onclick={() => active && !isSeparator && !isWarning && onselect(item.label)}
-			onkeydown={(e) => e.key === "Enter" && active && !isSeparator && !isWarning && onselect(item.label)}
+			onclick={() => active && !isSeparator && !isWarning && !isInfo && onselect(item.label)}
+			onkeydown={(e) => e.key === "Enter" && active && !isSeparator && !isWarning && !isInfo && onselect(item.label)}
 			role={isSeparator ? "separator" : "option"}
-			aria-selected={active && idx === selectedIndex && !isSeparator && !isWarning}
+			aria-selected={active && idx === selectedIndex && !isSeparator && !isWarning && !isInfo}
 			tabindex="-1"
 		>
 			<!-- Separator layout -->
@@ -238,6 +243,16 @@ function formatSize(bytes: number | null | undefined): string {
 				<span style:visibility={isTerminal ? "visible" : "hidden"} class="icon-slot">
 					<Terminal size={20} strokeWidth={1.5} class="icon-terminal" />
 				</span>
+				<span style:visibility={isInfo ? "visible" : "hidden"} class="icon-slot">
+					<Lightbulb size={20} strokeWidth={1.5} class="icon-info" />
+				</span>
+				<span style:visibility={isClipImage && item?.thumb_b64 ? "visible" : "hidden"} class="icon-slot clip-thumb-slot">
+					<img
+						class="clip-thumb"
+						src={isClipImage && item?.thumb_b64 ? `data:image/png;base64,${item.thumb_b64}` : ""}
+						alt=""
+					/>
+				</span>
 				<span
 					class="icon-slot icon-img-slot"
 					style:visibility={showImg ? "visible" : "hidden"}
@@ -262,23 +277,32 @@ function formatSize(bytes: number | null | undefined): string {
 				<span class="label" class:label-history={isHistory}>{pathContext ? displayName(label) : label}</span>
 				<span
 					class="description"
-					class:reason-highlight={isContext}
 					class:confidence-badge={!isContext && !isWeb && !!item?.description}
 					class:web-hint={isWeb && !!item?.description}
 					style:visibility={item?.description ? "visible" : "hidden"}
 				>{item?.description ?? "\u00A0"}</span>
+				<span
+					class="description reason-highlight"
+					style:visibility={isContext && item?.reason ? "visible" : "hidden"}
+					style:display={isContext && item?.reason ? "" : "none"}
+				>{item?.reason ?? "\u00A0"}</span>
 			</div>
 		</li>
 	{/each}
 	<!-- Hints bar — kept with {#if} since it's not in the hot path -->
 	<li class="hints" aria-hidden="true" class:inactive={items.length === 0}>
-		<span class="hint"><kbd>↑↓</kbd> navigate</span>
-		<span class="hint"><kbd>↵</kbd> {isSearchMode ? (items[selectedIndex]?.icon_path === "__folder__" ? "drill into" : "open") : (items[selectedIndex]?.icon_path === "__folder__" ? "open folder" : "select")}</span>
-		<span class="hint" style:visibility={isSearchMode && items[selectedIndex]?.icon_path === "__folder__" ? "visible" : "hidden"}><kbd>ctrl+↵</kbd> open</span>
-		<span class="hint" style:visibility={browseMode && items[selectedIndex]?.icon_path === "__folder__" ? "visible" : "hidden"}><kbd>tab</kbd> drill into</span>
-		<span class="hint" style:visibility={isSearchMode || (browseMode && pathContext && pathContext !== "~/") ? "visible" : "hidden"}><kbd>⇧tab</kbd> go back</span>
-		<span class="hint" style:visibility={scopeTabs.length > 1 ? "visible" : "hidden"}><kbd>ctrl+tab</kbd> switch scope</span>
-		<span class="hint"><kbd>esc</kbd> dismiss</span>
+		{#if flashMessage}
+			<span class="hint flash">{flashMessage}</span>
+		{:else}
+			<span class="hint"><kbd>↑↓</kbd> navigate</span>
+			<span class="hint"><kbd>↵</kbd> {isSearchMode ? (items[selectedIndex]?.icon_path === "__folder__" ? "open folder" : "open") : (items[selectedIndex]?.icon_path === "__folder__" ? "open folder" : "select")}</span>
+			<span class="hint" style:visibility={(isSearchMode || browseMode) && items[selectedIndex]?.icon_path === "__folder__" ? "visible" : "hidden"}><kbd>tab</kbd>/<kbd>→</kbd> drill into</span>
+			<span class="hint" style:visibility={isSearchMode ? "visible" : "hidden"}><kbd>ctrl+↵</kbd> reveal</span>
+			<span class="hint" style:visibility={isSearchMode ? "visible" : "hidden"}><kbd>ctrl+⇧+c</kbd> copy path</span>
+			<span class="hint" style:visibility={isSearchMode || (browseMode && pathContext && pathContext !== "~/") ? "visible" : "hidden"}><kbd>⇧tab</kbd> go back</span>
+			<span class="hint" style:visibility={scopeTabs.length > 1 ? "visible" : "hidden"}><kbd>ctrl+tab</kbd> switch scope</span>
+			<span class="hint"><kbd>esc</kbd> dismiss</span>
+		{/if}
 	</li>
 </ul>
 
@@ -482,6 +506,12 @@ function formatSize(bytes: number | null | undefined): string {
 		align-items: center;
 		justify-content: center;
 	}
+	.clip-thumb {
+		width: 24px;
+		height: 24px;
+		object-fit: contain;
+		border-radius: 2px;
+	}
 
 	.icon-img-slot {
 		background-size: contain;
@@ -650,5 +680,10 @@ function formatSize(bytes: number | null | undefined): string {
 		font-family: inherit;
 		font-size: inherit;
 		opacity: 0.7;
+	}
+
+	.hint.flash {
+		color: var(--accent);
+		opacity: 1;
 	}
 </style>

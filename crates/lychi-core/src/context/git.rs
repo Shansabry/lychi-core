@@ -28,7 +28,7 @@ pub fn detect(dir: &str) -> Option<GitContext> {
 ///
 /// Returns the **working-tree root** (directory containing `.git`), not the gitdir itself.
 /// Handles plain repos, worktrees (`.git` is a file), and submodules.
-fn find_git_root(start: &str) -> Option<String> {
+pub(crate) fn find_git_root(start: &str) -> Option<String> {
     let mut dir = Path::new(start);
     for _ in 0..50 {
         let git_entry = dir.join(".git");

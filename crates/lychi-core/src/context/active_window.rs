@@ -53,63 +53,144 @@ const TERMINALS: &[&str] = &[
     "warp",
 ];
 
-/// User-supplied extra terminal WM classes, registered once at startup.
-static EXTRA_TERMINALS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-
-/// Register additional terminal WM classes from config.
-/// Call once at startup with `config.commands.extra_terminals`.
-/// No-op if called more than once.
-pub fn register_extra_terminals(extra: &[String]) {
-    let _ = EXTRA_TERMINALS.set(extra.iter().map(|s| s.to_lowercase()).collect());
-}
-
-/// Check if a wm_class is a terminal emulator.
-/// Normalize a Wayland reverse-DNS `resourceClass` to its short form.
-/// `"org.kde.konsole"` → `"konsole"`, `"kitty"` → `"kitty"`.
-pub fn normalize_wm_class(wm_class: &str) -> String {
-    let lower = wm_class.to_lowercase();
-    let short = lower.rsplit('.').next().unwrap_or(&lower);
-    if short == lower {
-        lower
-    } else {
-        short.to_string()
-    }
-}
-
-pub fn is_terminal_class(wm_class: &str) -> bool {
-    let lower = wm_class.to_lowercase();
-    let short = normalize_wm_class(wm_class);
-    if TERMINALS.iter().any(|t| lower == *t || short == *t) {
-        return true;
-    }
-    EXTRA_TERMINALS
-        .get()
-        .is_some_and(|extra| extra.contains(&lower) || extra.contains(&short))
-}
-
-/// Known IDE WM classes.
+/// Known IDE / GUI code-editor WM classes (short form, exact-matched). GUI
+/// editors only — terminal-based editors (nvim, helix, emacs -nw) live INSIDE a
+/// terminal window and are classified as terminals, which is correct.
 const IDES: &[&str] = &[
     "code",
-    "code - oss",
+    "code-oss",
     "vscodium",
+    "codium",
     "cursor",
     "windsurf",
-    "jetbrains-idea",
-    "jetbrains-pycharm",
-    "jetbrains-webstorm",
-    "jetbrains-clion",
-    "jetbrains-goland",
-    "jetbrains-rustrover",
-    "jetbrains-rider",
-    "jetbrains-phpstorm",
-    "jetbrains-datagrip",
     "zed",
+    "sublime_text",
+    "neovide",
+    "emacs",
+    "lapce",
+    "fleet",
+    // Android Studio + Fleet reverse-DNS also normalize into these / jetbrains-.
 ];
 
-/// Check if a wm_class is an IDE.
+/// User-supplied extra terminal WM classes (from `config.commands.extra_terminals`).
+/// `Mutex` (not `OnceLock`) so a config change actually applies at runtime — the
+/// old `OnceLock` silently ignored every write after the first (a real bug).
+static EXTRA_TERMINALS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// User-supplied extra IDE WM classes (symmetric to EXTRA_TERMINALS).
+static EXTRA_IDES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Register additional terminal WM classes from config. Now re-appliable — a
+/// later config change replaces the set (was a no-op-after-first `OnceLock`).
+pub fn register_extra_terminals(extra: &[String]) {
+    if let Ok(mut g) = EXTRA_TERMINALS.lock() {
+        *g = extra.iter().map(|s| s.to_lowercase()).collect();
+    }
+}
+
+/// Register additional IDE WM classes from config (re-appliable).
+pub fn register_extra_ides(extra: &[String]) {
+    if let Ok(mut g) = EXTRA_IDES.lock() {
+        *g = extra.iter().map(|s| s.to_lowercase()).collect();
+    }
+}
+
+/// Normalize a window class to a canonical short token for exact matching.
+///
+/// - lowercases,
+/// - strips reverse-DNS to the last segment (`org.kde.konsole` → `konsole`,
+///   `dev.zed.zed` → `zed`),
+/// - strips noise suffixes apps append (`code-url-handler` → `code`,
+///   `gnome-terminal-server` → `gnome-terminal`, trailing `.desktop`).
+///
+/// Kept `pub` — callers also compare against the full lowercase form.
+pub fn normalize_wm_class(wm_class: &str) -> String {
+    let mut s = wm_class.to_lowercase();
+    if let Some(stripped) = s.strip_suffix(".desktop") {
+        s = stripped.to_string();
+    }
+    // Reverse-DNS → last dotted segment.
+    if s.contains('.') {
+        if let Some(short) = s.rsplit('.').next() {
+            s = short.to_string();
+        }
+    }
+    // Noise suffixes.
+    for suffix in ["-url-handler", "-server", "-bin", "-wrapped"] {
+        if let Some(stripped) = s.strip_suffix(suffix) {
+            s = stripped.to_string();
+            break;
+        }
+    }
+    s
+}
+
+/// Layered classification of a focused window's class. Returns whether it's a
+/// terminal — see [`classify_window_class`] for the full policy.
+pub fn is_terminal_class(wm_class: &str) -> bool {
+    classify_window_class(wm_class) == WindowKind::Terminal
+}
+
+/// Layered classification — whether the window is an IDE / GUI code editor.
 pub fn is_ide_class(wm_class: &str) -> bool {
-    let lower = wm_class.to_lowercase();
-    IDES.iter().any(|t| lower.contains(t))
+    classify_window_class(wm_class) == WindowKind::Ide
+}
+
+/// What a focused window is, for context-aware behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowKind {
+    Terminal,
+    Ide,
+    Other,
+}
+
+/// Classify a window class using the research-backed layered strategy:
+/// 1. normalize (short + full form),
+/// 2. exact-match curated terminal / IDE sets (+ user config),
+/// 3. deliberate family rules (`jetbrains-` prefix → IDE),
+/// 4. `.desktop` `Categories` fallback (`TerminalEmulator` / `IDE`) via the
+///    existing wm_class → desktop-entry index — extensible with zero curation.
+///
+/// No substring matching (avoids `contains("code")` false positives). Terminal
+/// is checked first so a terminal hosting a TUI editor stays a terminal.
+pub fn classify_window_class(wm_class: &str) -> WindowKind {
+    let full = wm_class.to_lowercase();
+    let short = normalize_wm_class(wm_class);
+
+    // 2a. Terminals (exact, curated + user config).
+    if TERMINALS.iter().any(|t| full == *t || short == *t)
+        || EXTRA_TERMINALS
+            .lock()
+            .is_ok_and(|e| e.contains(&full) || e.contains(&short))
+    {
+        return WindowKind::Terminal;
+    }
+
+    // 2b/3. IDEs (exact curated + user config, plus the jetbrains- family).
+    if IDES.iter().any(|t| full == *t || short == *t)
+        || short.starts_with("jetbrains-")
+        || full.starts_with("jetbrains-")
+        || EXTRA_IDES
+            .lock()
+            .is_ok_and(|e| e.contains(&full) || e.contains(&short))
+    {
+        return WindowKind::Ide;
+    }
+
+    // 4. Standards-based fallback: the app's own .desktop Categories.
+    let cats = crate::desktop_apps::app_index().categories_for_wmclass(&full);
+    let cats = if cats.is_empty() {
+        crate::desktop_apps::app_index().categories_for_wmclass(&short)
+    } else {
+        cats
+    };
+    if cats.iter().any(|c| c == "terminalemulator") {
+        return WindowKind::Terminal;
+    }
+    if cats.iter().any(|c| c == "ide") {
+        return WindowKind::Ide;
+    }
+
+    WindowKind::Other
 }
 
 // ── KWin cache ───────────────────────────────────────────────────────────
@@ -173,11 +254,14 @@ pub(crate) fn set_kwin_cache(window: WindowContext) {
 // ── Public API ───────────────────────────────────────────────────────────
 
 /// Detect the currently focused window, using cache when fresh.
+/// Only two backends exist (KWin D-Bus scripting, X11). On other Wayland
+/// compositors (GNOME, wlroots) there is no detector — return None without
+/// wasting a doomed probe.
 pub fn detect() -> Option<WindowContext> {
-    let result = if super::is_wayland() {
-        detect_kwin()
-    } else {
-        detect_x11()
+    let result = match super::compositor() {
+        super::Compositor::KdeWayland => detect_kwin(),
+        super::Compositor::X11 => detect_x11(),
+        _ => None,
     };
     tracing::debug!(
         "active_window::detect: {:?}",
@@ -195,12 +279,14 @@ pub fn detect() -> Option<WindowContext> {
 /// may be stale if the watcher hasn't polled since the user switched windows.
 /// Updates the cache as a side effect so subsequent `detect()` calls are fast.
 pub(crate) fn detect_live() -> Option<WindowContext> {
-    let result = if super::is_wayland() {
-        let w = detect_kwin_live()?;
-        set_kwin_cache(w.clone());
-        Some(w)
-    } else {
-        detect_x11()
+    let result = match super::compositor() {
+        super::Compositor::KdeWayland => {
+            let w = detect_kwin_live()?;
+            set_kwin_cache(w.clone());
+            Some(w)
+        }
+        super::Compositor::X11 => detect_x11(),
+        _ => None,
     };
     tracing::debug!(
         "active_window::detect_live: {:?}",
@@ -267,6 +353,12 @@ fn detect_kwin_live() -> Option<WindowContext> {
     use dbus::blocking::SyncConnection;
     use dbus::channel::MatchingReceiver;
     use dbus::message::MatchRule;
+
+    // Defense in depth: never write the temp script or touch D-Bus outside
+    // KDE Wayland — org.kde.KWin doesn't exist on other compositors.
+    if !super::is_kde_wayland_session() {
+        return None;
+    }
 
     let conn = SyncConnection::new_session().ok()?;
     let bus_name = conn.unique_name().to_string();
@@ -425,6 +517,10 @@ fn window_key(w: &WindowContext) -> (Option<&str>, u32, &str) {
 /// Gate: Linux only.
 #[cfg(target_os = "linux")]
 pub async fn run_kwin_watcher(push_focus: impl Fn(WindowContext) + Send + 'static) {
+    if !super::is_kde_wayland_session() {
+        tracing::info!("[ctx] KWin watcher not started (not a KDE Wayland session)");
+        return;
+    }
     tracing::info!(
         "[ctx] KWin watcher armed (adaptive polling: fast=200ms, slow=2s±jitter, idle=8s±jitter)"
     );
@@ -624,5 +720,106 @@ pub(super) fn parse_wm_class(data: &[u8]) -> String {
         String::from_utf8_lossy(first).to_lowercase()
     } else {
         String::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_strips_reverse_dns_and_suffixes() {
+        assert_eq!(normalize_wm_class("org.kde.konsole"), "konsole");
+        assert_eq!(normalize_wm_class("dev.zed.Zed"), "zed");
+        assert_eq!(normalize_wm_class("com.mitchellh.ghostty"), "ghostty");
+        assert_eq!(normalize_wm_class("code-url-handler"), "code");
+        assert_eq!(
+            normalize_wm_class("gnome-terminal-server"),
+            "gnome-terminal"
+        );
+        assert_eq!(normalize_wm_class("kitty.desktop"), "kitty");
+        assert_eq!(normalize_wm_class("kitty"), "kitty");
+    }
+
+    #[test]
+    fn terminals_classified_exactly() {
+        for t in [
+            "kitty",
+            "Alacritty",
+            "org.kde.konsole",
+            "gnome-terminal-server",
+            "com.mitchellh.ghostty",
+            "foot",
+            "dev.warp.Warp",
+        ] {
+            assert!(is_terminal_class(t), "{t} should be a terminal");
+            assert!(!is_ide_class(t), "{t} must not be an IDE");
+        }
+    }
+
+    #[test]
+    fn ides_classified_exactly() {
+        for i in [
+            "code",
+            "code-url-handler",
+            "codium",
+            "cursor",
+            "windsurf",
+            "dev.zed.Zed",
+            "sublime_text",
+            "neovide",
+        ] {
+            assert!(is_ide_class(i), "{i} should be an IDE");
+            assert!(!is_terminal_class(i), "{i} must not be a terminal");
+        }
+    }
+
+    #[test]
+    fn jetbrains_family_prefix() {
+        // The prefix rule absorbs -ce suffixes and Toolbox UUID variants.
+        for i in [
+            "jetbrains-idea",
+            "jetbrains-idea-ce",
+            "jetbrains-pycharm-ce",
+            "jetbrains-rustrover",
+            "jetbrains-idea-a1b2c3d4",
+        ] {
+            assert!(
+                is_ide_class(i),
+                "{i} should classify as IDE via family rule"
+            );
+        }
+    }
+
+    #[test]
+    fn no_substring_false_positives() {
+        // The old `contains("code")` / `contains("st")` bugs must be gone.
+        assert!(!is_ide_class("qtcreator")); // contains no exact "code"
+        assert!(!is_ide_class("barcode-scanner")); // contains "code" substring
+        assert!(!is_ide_class("opcode-viewer"));
+        assert!(!is_terminal_class("netsoft-com.netsoft.hubstaff")); // contains "st"
+        assert!(!is_terminal_class("fastfetch"));
+        // Unrelated apps are Other.
+        assert_eq!(classify_window_class("firefox"), WindowKind::Other);
+        assert_eq!(
+            classify_window_class("org.gnome.Nautilus"),
+            WindowKind::Other
+        );
+    }
+
+    #[test]
+    fn extra_terminals_reapply_on_config_change() {
+        // Regression: EXTRA_TERMINALS was a OnceLock, so a second register call
+        // (a config change) was silently ignored. It's a Mutex now — the latest
+        // config wins. Using a distinctive class avoids clashing with the curated
+        // list or other tests.
+        register_extra_terminals(&["myterm-xyz".to_string()]);
+        assert_eq!(classify_window_class("myterm-xyz"), WindowKind::Terminal);
+        // A later config that drops it must take effect (not stuck on the first).
+        register_extra_terminals(&["otherterm-xyz".to_string()]);
+        assert_eq!(classify_window_class("myterm-xyz"), WindowKind::Other);
+        assert_eq!(classify_window_class("otherterm-xyz"), WindowKind::Terminal);
+        // Clean up so we don't leak into other tests.
+        register_extra_terminals(&[]);
     }
 }

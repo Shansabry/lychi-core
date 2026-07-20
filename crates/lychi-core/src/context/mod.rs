@@ -8,15 +8,17 @@
 //! terminal even when an IDE has focus.
 
 pub mod active_window;
-pub mod app_class;
-pub mod browser_context;
 pub mod cache;
 pub mod clipboard_detect;
+pub mod config;
 pub mod cwd;
 pub mod docker;
 pub mod git;
 pub mod ide;
+pub mod ide_config;
+pub mod ide_proc;
 pub mod metrics;
+pub mod multi_repo;
 pub mod network;
 pub mod pin;
 pub mod project;
@@ -37,7 +39,7 @@ pub const SOFT_STALE_SECS: u64 = 30;
 pub const HARD_STALE_SECS: u64 = 300; // 5 minutes
 
 /// The complete environmental context, refreshed on each summon.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, specta::Type)]
 pub struct EnvironmentContext {
     pub active_window: Option<WindowContext>,
     pub cwd: Option<String>,
@@ -59,9 +61,6 @@ pub struct EnvironmentContext {
     /// Detected clipboard content type (read on summon).
     #[serde(default)]
     pub clipboard: Option<clipboard_detect::ClipboardContentType>,
-    /// Parsed browser context (only set when a browser is focused).
-    #[serde(default)]
-    pub browser: Option<browser_context::BrowserContext>,
     /// Network context (WiFi SSID, VPN status).
     #[serde(default)]
     pub network: Option<network::NetworkContext>,
@@ -161,7 +160,9 @@ impl EnvironmentContext {
                 clipboard_detect::ClipboardContentType::Json => "JSON content".into(),
                 clipboard_detect::ClipboardContentType::GitHash(h) => format!("Git hash: {h}"),
                 clipboard_detect::ClipboardContentType::Uuid(u) => format!("UUID: {u}"),
-                clipboard_detect::ClipboardContentType::ErrorTrace => "Error/stack trace".into(),
+                clipboard_detect::ClipboardContentType::ErrorTrace(msg) => {
+                    format!("Error/stack trace: {msg}")
+                }
                 clipboard_detect::ClipboardContentType::Plain => "Plain text".into(),
             };
             lines.push(format!("- Clipboard: {desc}"));
@@ -183,7 +184,7 @@ impl EnvironmentContext {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct WindowContext {
     pub title: String,
     pub wm_class: String,
@@ -198,7 +199,7 @@ pub struct WindowContext {
     pub window_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct GitContext {
     pub repo_root: String,
     pub branch: String,
@@ -206,7 +207,7 @@ pub struct GitContext {
     pub remote: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, specta::Type)]
 pub enum ProjectKind {
     Rust,
     Node,
@@ -216,7 +217,7 @@ pub enum ProjectKind {
     Docker,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct ProjectScript {
     /// Command runner (e.g. "npm run", "make", "just").
     pub runner: String,
@@ -224,7 +225,7 @@ pub struct ProjectScript {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct ProjectContext {
     pub root: String,
     pub kind: ProjectKind,
@@ -249,12 +250,12 @@ pub struct ProjectContext {
     pub workspace_scripts: Vec<ProjectScript>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct DockerContext {
     pub containers: Vec<ContainerInfo>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct ContainerInfo {
     pub id: String,
     pub name: String,
@@ -292,6 +293,10 @@ impl std::fmt::Display for ActiveWindowSource {
 /// Informational only — not sent to AI, not serialized.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum IdeWorkspaceSource {
+    /// Ground truth from the IDE's process tree (`/proc/<pid>/cwd`+`cmdline`).
+    Proc,
+    /// From the IDE's own config/session state (e.g. VS Code storage.json).
+    Config,
     /// Resolved from the window title + disk search (this gather).
     Title,
     /// Satisfied from per-window workspace cache (fast path, no re-resolve).
@@ -306,6 +311,8 @@ pub enum IdeWorkspaceSource {
 impl std::fmt::Display for IdeWorkspaceSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Proc => f.write_str("proc"),
+            Self::Config => f.write_str("config"),
             Self::Title => f.write_str("title"),
             Self::Cached => f.write_str("cached"),
             Self::Pinned => f.write_str("pinned"),
@@ -372,6 +379,46 @@ pub fn is_wayland() -> bool {
     std::env::var("XDG_SESSION_TYPE")
         .map(|v| v == "wayland")
         .unwrap_or(false)
+}
+
+/// Compositor family the session runs under. Cached — env vars don't change
+/// at runtime. Used to gate compositor-specific probes: the KWin D-Bus
+/// detectors are pointless (temp-file write + doomed D-Bus connect) on
+/// GNOME/wlroots sessions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Compositor {
+    KdeWayland,
+    GnomeWayland,
+    OtherWayland,
+    X11,
+}
+
+#[cfg(target_os = "linux")]
+pub fn compositor() -> Compositor {
+    static COMPOSITOR: std::sync::OnceLock<Compositor> = std::sync::OnceLock::new();
+    *COMPOSITOR.get_or_init(|| {
+        if !is_wayland() {
+            return Compositor::X11;
+        }
+        let desktop = std::env::var("XDG_SESSION_DESKTOP")
+            .or_else(|_| std::env::var("XDG_CURRENT_DESKTOP"))
+            .map(|v| v.to_uppercase())
+            .unwrap_or_default();
+        if desktop.contains("KDE") {
+            Compositor::KdeWayland
+        } else if desktop.contains("GNOME") {
+            Compositor::GnomeWayland
+        } else {
+            Compositor::OtherWayland
+        }
+    })
+}
+
+/// True only on KDE Plasma Wayland — the one session type where the KWin
+/// D-Bus scripting detectors can work.
+#[cfg(target_os = "linux")]
+pub fn is_kde_wayland_session() -> bool {
+    compositor() == Compositor::KdeWayland
 }
 
 /// Snapshot the active window right now (before Lychi steals focus).
@@ -457,19 +504,24 @@ pub fn gather(pre_captured: Option<WindowContext>) -> EnvironmentContext {
                     cwd::detect(w.pid, &w.wm_class, &w.title)
                 } else if w.is_ide {
                     let (ws, src) =
-                        ide::detect_workspace(&w.title, &w.wm_class, w.window_id.as_deref());
+                        ide::detect_workspace(w.pid, &w.title, &w.wm_class, w.window_id.as_deref());
                     ide_workspace_source = src;
 
-                    // Store in per-window cache for future fast-path hits
-                    if let (Some(path), Some(wid)) = (&ws, &w.window_id) {
-                        let token = ide::extract_token(&w.title).unwrap_or("").to_string();
+                    // Store in per-window cache for future fast-path hits —
+                    // but only when the path is consistent with the title
+                    // token, so a fallback-resolved path can never poison the
+                    // cache against a token it doesn't belong to.
+                    if let (Some(path), Some(wid), Some(token)) =
+                        (&ws, &w.window_id, ide::extract_token(&w.title))
+                        && ide::path_matches_token(path, token)
+                    {
                         let marker = ide::which_project_marker(std::path::Path::new(path))
                             .unwrap_or_else(|| ".git".to_string());
                         workspace_cache::set(
                             wid,
                             workspace_cache::CachedWorkspace {
                                 path: path.clone(),
-                                token,
+                                token: token.to_string(),
                                 marker,
                                 resolved_at: std::time::Instant::now(),
                             },
@@ -488,8 +540,19 @@ pub fn gather(pre_captured: Option<WindowContext>) -> EnvironmentContext {
         let is_ide = window.as_ref().is_some_and(|w| w.is_ide);
         let needs_code_root = is_ide || pinned.is_some();
         let (code_root, code_root_source) = if needs_code_root {
+            // Active-file proxy hint: the IDE window title's subfolder token
+            // names the focused sub-repo when the workspace root holds several
+            // (e.g. `amt/` with three repos → the one the user is editing).
+            let title_token = window
+                .as_ref()
+                .filter(|w| w.is_ide)
+                .and_then(|w| ide::extract_token(&w.title));
+            let hint = ide::ActiveHint {
+                title_token,
+                terminal_cwd: None, // computed later in the pipeline; title suffices
+            };
             cwd.as_ref()
-                .and_then(|ws| ide::resolve_code_root(std::path::Path::new(ws)))
+                .and_then(|ws| ide::resolve_code_root(std::path::Path::new(ws), &hint))
                 .map(|(path, src)| (Some(path), src))
                 .unwrap_or((None, CodeRootSource::None))
         } else {
@@ -651,20 +714,6 @@ pub fn gather(pre_captured: Option<WindowContext>) -> EnvironmentContext {
         .map(|w| w.wm_class.clone())
         .or_else(|| stack_terminal.as_ref().map(|t| t.wm_class.clone()));
 
-    // Parse browser context when a browser is focused
-    let browser = window.as_ref().and_then(|w| {
-        if app_class::classify(&w.wm_class) == app_class::AppClass::Browser {
-            let ctx = browser_context::parse_title(&w.title);
-            if matches!(ctx, browser_context::BrowserContext::Unknown) {
-                None
-            } else {
-                Some(ctx)
-            }
-        } else {
-            None
-        }
-    });
-
     // Coherence check: does terminal_cwd belong to the same repository as cwd?
     //
     // Uses resolve_gitdir() which follows `.git` file pointers — correctly handles
@@ -714,7 +763,6 @@ pub fn gather(pre_captured: Option<WindowContext>) -> EnvironmentContext {
         docker: docker_ctx,
         hour: chrono::Local::now().hour() as u8,
         clipboard: clipboard_result,
-        browser,
         network: network_result,
         gather_ms: start.elapsed().as_millis() as u64,
         terminal_matches_workspace,

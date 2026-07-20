@@ -3,7 +3,7 @@ use std::process::Stdio;
 
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use lychi_core::action_registry::{ActionResult, CompletionItem};
+use lychi_core::action_registry::{CommandResultDto, CompletionItem};
 use lychi_core::db::frecency;
 use lychi_core::error::LychiError;
 
@@ -13,14 +13,19 @@ use crate::state::AppState;
 const PANEL_MUTATION_ACTIONS: &[&str] = &["note", "todo", "reminder"];
 
 #[tauri::command]
+#[specta::specta]
 pub async fn execute_command(
     input: String,
     confirmed: Option<bool>,
+    run_inline: Option<bool>,
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<ActionResult, LychiError> {
-    // Record in history + frecency for fuzzy search ranking
-    state.history.push(&state.db, &input)?;
+) -> Result<CommandResultDto, LychiError> {
+    // Frecency for fuzzy-search ranking is recorded up front — it reflects what
+    // the user typed/accepted, independent of the command's exit status.
+    // History (which drives suggestions/ghost autocomplete) is recorded LATER,
+    // only if the command succeeds, so failed commands (e.g. "run run htop" →
+    // "command not found") never get suggested back to the user.
     let trimmed = input.trim();
     if !trimmed.is_empty() {
         let _ = frecency::record(&state.db, &format!("history:{trimmed}"));
@@ -39,7 +44,27 @@ pub async fn execute_command(
                 let _ = frecency::record_workspace(&state.db, root, trimmed);
             }
         }
+        // Suggestion learning loop: executing a command we just suggested
+        // counts as acceptance — boosts it (record_suggestion) AND ticks the
+        // acceptance side of the CTR store (record_acceptance) so the panel
+        // self-tunes toward what the user actually picks.
+        if let Some(context_key) = executor_r.suggestion_acceptance(trimmed) {
+            tracing::debug!("[suggest] acceptance: '{trimmed}' in {context_key}");
+            let _ = frecency::record_suggestion(&state.db, &context_key, trimmed);
+            let _ = frecency::record_acceptance(&state.db, &context_key, trimmed);
+        }
         drop(executor_r);
+
+        // Learn the user's fallback preference: running an `ask …`/`web …` on a
+        // free-text query is choosing that escape hatch. Frecency then orders the
+        // two fallback rows so the preferred one leads next time.
+        let lower = trimmed.to_lowercase();
+        if let Some(action) = ["ask", "web"]
+            .into_iter()
+            .find(|a| lower.starts_with(&format!("{a} ")))
+        {
+            let _ = frecency::record_fallback_choice(&state.db, action);
+        }
     }
 
     // If context is soft-stale, kick off a background re-gather before routing.
@@ -70,19 +95,25 @@ pub async fn execute_command(
         }
     }
 
-    // Set terminal routing mode from config (read before executor lock)
-    {
+    // Build the per-run inputs threaded into the executor: terminal + routing
+    // mode come from config; `inline` (e.g. Shift+Enter) forces the next `run`
+    // command to capture output inline instead of opening a terminal. The
+    // executor prefers the context-detected terminal and falls back to
+    // `inputs.terminal`.
+    let inputs = {
         let config = state.config.read().await;
-        lychi_core::action_registry::handlers::shell_exec::set_terminal_routing(Some(
-            config.commands.terminal_routing.clone(),
-        ));
-    }
+        lychi_core::executor::RunInputs {
+            terminal: Some(config.commands.terminal.clone()),
+            terminal_routing: config.commands.terminal_routing.clone(),
+            inline: run_inline.unwrap_or(false),
+        }
+    };
 
     // Run through executor pipeline: resolve → validate → execute
     let executor = state.executor.read().await;
     let privacy = state.config.read().await.privacy.clone();
-    let mut exec = executor
-        .run(&input, confirmed.unwrap_or(false), &privacy)
+    let exec = executor
+        .run(&input, confirmed.unwrap_or(false), &privacy, &inputs)
         .await?;
 
     // Notify frontend when notes/todos/reminders are mutated by a handler
@@ -90,11 +121,16 @@ pub async fn execute_command(
         let _ = app.emit("lychi://notes-changed", ());
     }
 
+    // Flatten the handler result + executor envelope into the wire DTO. The
+    // launch/navigate logic below reads the flat fields (launch_desktop,
+    // focus_app, …) off this DTO.
+    let mut dto = CommandResultDto::build(exec.result, exec.envelope);
+
     // Launch desktop app. Primary path: GIO DesktopAppInfo + GDK AppLaunchContext,
     // which handles D-Bus activation, Terminal=true, and Wayland activation tokens.
     // Fallback: gtk-launch, which is what KDE Plasma uses and handles edge cases
     // that GIO misses on KDE/Wayland (session env, DBus activation for JetBrains, etc.).
-    if let Some(ref desktop_path) = exec.result.launch_desktop {
+    if let Some(ref desktop_path) = dto.launch_desktop {
         let path = desktop_path.clone();
         let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
 
@@ -188,9 +224,9 @@ pub async fn execute_command(
                 };
 
             if !fallback_ok {
-                exec.result.success = false;
-                exec.result.output = None;
-                exec.result.error = Some(format!(
+                dto.success = false;
+                dto.output = None;
+                dto.error = Some(format!(
                     "Failed to launch app: GIO: {gio_err}; gtk-launch also failed"
                 ));
             }
@@ -198,22 +234,32 @@ pub async fn execute_command(
     }
 
     // Smart-open: focus the running window if the app was already open.
-    if let Some(ref wm_class) = exec.result.focus_app {
+    if let Some(ref wm_class) = dto.focus_app {
         use lychi_core::action_registry::handlers::app_control;
         if let Err(e) = app_control::focus_by_class(wm_class) {
             tracing::warn!("[open] focus_by_class({wm_class}) failed: {e}");
         }
     }
 
-    Ok(exec.result)
+    // Record history only on success — never suggest a command that failed.
+    // (A terminal/app launch reports success once spawned, which is correct:
+    // the launch worked even if the program later exits non-zero.) Confirmation
+    // prompts returned early above, so they're recorded on the confirmed re-run.
+    if dto.success {
+        let _ = state.history.push(&state.db, &input);
+    }
+
+    Ok(dto)
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_completions(
     input: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<CompletionItem>, LychiError> {
+    let suggestions_cfg = state.config.read().await.suggestions.clone();
     let executor = state.executor.read().await;
-    let results = executor.completions(&input).await;
+    let results = executor.completions(&input, &suggestions_cfg).await;
     Ok(results)
 }

@@ -7,7 +7,9 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+};
 use crate::error::LychiError;
 
 pub struct CalcHandler;
@@ -76,6 +78,12 @@ impl CalcHandler {
 
 #[async_trait]
 impl ActionHandler for CalcHandler {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["calc"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "calc"
     }
@@ -84,76 +92,40 @@ impl ActionHandler for CalcHandler {
         "Evaluate math expressions, unit conversions, and currency conversions"
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let expr = args.trim();
         if expr.is_empty() {
-            return Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some(
-                    "Usage: calc <expression>, =<expression>, or <number> <unit> to <unit>"
-                        .to_string(),
-                ),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(ActionResult::err(
+                "Usage: calc <expression>, =<expression>, or <number> <unit> to <unit>".to_string(),
+            ));
+        }
+
+        // A currency conversion needs fresh rates. The startup fetch expires
+        // after the TTL, so refresh on demand here (execute is async) before
+        // converting — otherwise a stale cache would fail as "Invalid
+        // expression" even though the input is perfectly valid.
+        if matches!(parse_conversion(expr), Some(Conversion::Currency { .. })) && !rates_are_fresh()
+        {
+            fetch_exchange_rates().await;
+            if !rates_are_fresh() {
+                return Ok(ActionResult::err(
+                    "Couldn't fetch exchange rates — check your connection".to_string(),
+                ));
+            }
         }
 
         // Try conversion first (unit/currency)
         if let Some((_label, raw_value)) = Self::try_conversion(expr) {
-            return Ok(ActionResult {
-                success: true,
-                output: Some(raw_value),
-                error: None,
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: Some(OutputType::Status),
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(ActionResult::ok(raw_value, OutputType::Status));
         }
 
         // Fall back to math evaluation
         match Self::evaluate(expr) {
-            Some(result) => Ok(ActionResult {
-                success: true,
-                output: Some(Self::format_result(result)),
-                error: None,
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            }),
-            None => Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some(format!("Invalid expression: {expr}")),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            }),
+            Some(result) => Ok(ActionResult::ok(
+                Self::format_result(result),
+                OutputType::Status,
+            )),
+            None => Ok(ActionResult::err(format!("Invalid expression: {expr}"))),
         }
     }
 
@@ -163,7 +135,17 @@ impl ActionHandler for CalcHandler {
             return Vec::new();
         }
 
-        // Try conversion first
+        // If the user is typing a currency conversion but rates are stale, warm
+        // them in the background (fire-and-forget) so the live preview appears
+        // on a later keystroke and Enter is instant. Non-blocking — this pass
+        // still returns whatever it can compute now.
+        if matches!(parse_conversion(expr), Some(Conversion::Currency { .. })) && !rates_are_fresh()
+        {
+            tokio::spawn(fetch_exchange_rates());
+        }
+
+        // Try conversion first. Selecting the result re-evaluates via the calc
+        // handler (which shows the value in a result card, copyable).
         if let Some((label, _raw)) = Self::try_conversion(expr) {
             return vec![CompletionItem {
                 label,
@@ -171,6 +153,9 @@ impl ActionHandler for CalcHandler {
                 score: 1000,
                 description: None,
                 reason: None,
+                thumb_b64: None,
+                run: Some(format!("calc {expr}")),
+                ..Default::default()
             }];
         }
 
@@ -182,6 +167,9 @@ impl ActionHandler for CalcHandler {
                 score: 1000,
                 description: None,
                 reason: None,
+                thumb_b64: None,
+                run: Some(format!("calc {expr}")),
+                ..Default::default()
             }]
         } else {
             Vec::new()
@@ -868,6 +856,19 @@ static RATE_CACHE: Mutex<Option<RateCache>> = Mutex::new(None);
 
 const RATE_CACHE_TTL_SECS: u64 = 600; // 10 minutes
 
+/// Whether exchange rates are cached and within their TTL. When false, the
+/// caller should refresh via `fetch_exchange_rates()` before converting.
+fn rates_are_fresh() -> bool {
+    RATE_CACHE
+        .lock()
+        .ok()
+        .and_then(|c| {
+            c.as_ref()
+                .map(|c| c.fetched_at.elapsed().as_secs() <= RATE_CACHE_TTL_SECS)
+        })
+        .unwrap_or(false)
+}
+
 fn convert_currency(value: f64, from: &str, to: &str) -> Option<(f64, f64)> {
     let from_upper = from.to_uppercase();
     let to_upper = to.to_uppercase();
@@ -949,12 +950,60 @@ pub fn is_conversion_expression(input: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+
+    /// Serializes tests that mutate the shared RATE_CACHE static.
+    static RATE_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     #[test]
     fn test_math_evaluation() {
         assert_eq!(CalcHandler::evaluate("2+2"), Some(4.0));
         assert_eq!(CalcHandler::evaluate("sqrt(144)"), Some(12.0));
         assert!(CalcHandler::evaluate("invalid").is_none());
+    }
+
+    #[test]
+    fn currency_conversion_uses_cached_rates() {
+        let _g = RATE_TEST_LOCK.lock().unwrap();
+        // Seed a fresh cache (base USD) and verify conversion + freshness.
+        {
+            let mut cache = RATE_CACHE.lock().unwrap();
+            let mut rates = HashMap::new();
+            rates.insert("INR".to_string(), 80.0);
+            rates.insert("EUR".to_string(), 0.9);
+            *cache = Some(RateCache {
+                rates,
+                fetched_at: Instant::now(),
+                base: "USD".to_string(),
+            });
+        }
+        assert!(rates_are_fresh());
+        let (result, rate) = convert_currency(100.0, "usd", "inr").unwrap();
+        assert!((rate - 80.0).abs() < 1e-9);
+        assert!((result - 8000.0).abs() < 1e-6);
+        // Cross-rate through the USD base: 100 EUR → USD → INR.
+        let (eur_inr, _) = convert_currency(100.0, "eur", "inr").unwrap();
+        assert!((eur_inr - 100.0 * (80.0 / 0.9)).abs() < 1e-6);
+        *RATE_CACHE.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn stale_cache_is_not_fresh() {
+        let _g = RATE_TEST_LOCK.lock().unwrap();
+        {
+            let mut cache = RATE_CACHE.lock().unwrap();
+            *cache = Some(RateCache {
+                rates: HashMap::new(),
+                fetched_at: Instant::now() - Duration::from_secs(RATE_CACHE_TTL_SECS + 60),
+                base: "USD".to_string(),
+            });
+        }
+        assert!(!rates_are_fresh());
+        // A stale cache yields no conversion (caller must refresh first).
+        assert!(convert_currency(1.0, "usd", "eur").is_none());
+        // Clean up so other tests aren't affected by the stale entry.
+        *RATE_CACHE.lock().unwrap() = None;
     }
 
     #[test]

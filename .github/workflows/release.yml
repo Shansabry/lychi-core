@@ -1,0 +1,71 @@
+name: Release builds
+
+# Builds the Linux bundles (AppImage, deb, rpm) on Ubuntu 22.04 so the
+# AppImage keeps a glibc 2.35 baseline — do NOT build release artifacts on
+# newer distros or they won't run on older LTS systems.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    env:
+      # linuxdeploy's embedded strip breaks on modern toolchains (.relr.dyn)
+      NO_STRIP: "1"
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y \
+            build-essential curl wget file pkg-config patchelf git \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev libgtk-layer-shell-dev \
+            libssl-dev libdbus-1-dev xdg-utils desktop-file-utils
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install pnpm + Node
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Cache cargo + tauri bundler tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            ~/.cache/tauri
+          key: linux-release-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build CLI sidecar
+        run: |
+          cargo build --release -p lychi-cli
+          mkdir -p src-tauri/binaries
+          cp target/release/lychi src-tauri/binaries/lychi-x86_64-unknown-linux-gnu
+
+      - name: Build bundles (AppImage, deb, rpm)
+        run: pnpm exec tauri build --verbose
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lychi-linux-bundles
+          path: |
+            target/release/bundle/appimage/*.AppImage
+            target/release/bundle/deb/*.deb
+            target/release/bundle/rpm/*.rpm

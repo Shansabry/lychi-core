@@ -6,6 +6,7 @@ use lychi_core::error::LychiError;
 use crate::state::AppState;
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_context(
     state: State<'_, AppState>,
 ) -> Result<Option<EnvironmentContext>, LychiError> {

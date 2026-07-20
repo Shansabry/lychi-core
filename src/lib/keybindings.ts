@@ -18,7 +18,10 @@ export type ActionId =
 	| "tab_complete"
 	| "tab_back"
 	| "switch_scope"
-	| "web_search";
+	| "web_search"
+	| "run_inline"
+	| "copy_path"
+	| "screenshot";
 
 export const ACTION_LABELS: Record<ActionId, string> = {
 	toggle_history: "Toggle history",
@@ -32,6 +35,9 @@ export const ACTION_LABELS: Record<ActionId, string> = {
 	tab_back: "Go back / up folder",
 	switch_scope: "Switch result scope",
 	web_search: "Search web",
+	run_inline: "Run command inline",
+	copy_path: "Copy result path",
+	screenshot: "Quick screenshot",
 };
 
 export const ALL_ACTIONS: ActionId[] = Object.keys(ACTION_LABELS) as ActionId[];

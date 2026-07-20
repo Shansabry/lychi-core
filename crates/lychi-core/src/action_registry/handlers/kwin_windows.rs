@@ -24,6 +24,10 @@ pub struct WindowInfo {
     pub caption: String,
     pub resource_class: String,
     pub pid: u32,
+    /// KWin internalId (UUID) for per-window targeting.
+    pub internal_id: Option<String>,
+    /// Virtual desktop number (1-indexed), None if on all desktops.
+    pub desktop: Option<u32>,
 }
 
 /// Enumerate all windows via KWin D-Bus scripting.
@@ -79,6 +83,23 @@ for (var i = 0; i < wins.length; i++) {{
     run_kwin_script(&script)
 }
 
+/// Close a specific window by its KWin internalId (UUID).
+pub fn close_window_by_id(window_id: &str) -> Result<(), String> {
+    let script = format!(
+        r#"
+var wins = workspace.windowList();
+for (var i = 0; i < wins.length; i++) {{
+    if (wins[i].internalId && wins[i].internalId.toString() === "{}") {{
+        wins[i].closeWindow();
+        break;
+    }}
+}}
+"#,
+        window_id.replace('"', r#"\""#)
+    );
+    run_kwin_script(&script)
+}
+
 /// Close a window by resource class via KWin scripting.
 pub fn close_window(resource_class: &str) -> Result<(), String> {
     let script = format!(
@@ -101,6 +122,7 @@ fn enumerate_windows_inner() -> Result<Vec<WindowInfo>, String> {
     let bus_name = conn.unique_name().to_string();
 
     // JS script that enumerates windows and sends data back via callDBus
+    // Fields: resourceClass \t pid \t internalId \t desktop \t caption
     let script = format!(
         r#"
 var wins = workspace.windowList();
@@ -112,7 +134,10 @@ for (var i = 0; i < wins.length; i++) {{
     var p = w.pid ? w.pid : 0;
     if (cap === "" || p === 0) continue;
     if (rc.toLowerCase() === "lychi") continue;
-    result.push(rc + "\t" + p + "\t" + cap);
+    var iid = w.internalId ? w.internalId.toString() : "";
+    var desktops = w.desktops;
+    var desk = (desktops && desktops.length === 1) ? desktops[0].x11DesktopNumber : 0;
+    result.push(rc + "\t" + p + "\t" + iid + "\t" + desk + "\t" + cap);
 }}
 callDBus("{bus_name}", "/", "", "kwin_result", result.join("\n"));
 "#
@@ -185,21 +210,29 @@ callDBus("{bus_name}", "/", "", "kwin_result", result.join("\n"));
     );
     let _ = std::fs::remove_file(&script_path);
 
-    // Parse the tab-separated result
+    // Parse the tab-separated result: resourceClass \t pid \t internalId \t desktop \t caption
     let data = payload.ok_or("Timeout waiting for KWin script response")?;
 
     let mut windows = Vec::new();
     for line in data.lines() {
-        let parts: Vec<&str> = line.splitn(3, '\t').collect();
-        if parts.len() == 3 {
+        let parts: Vec<&str> = line.splitn(5, '\t').collect();
+        if parts.len() == 5 {
             let resource_class = parts[0].to_lowercase();
             let pid: u32 = parts[1].parse().unwrap_or(0);
-            let caption = parts[2].to_string();
+            let internal_id = if parts[2].is_empty() {
+                None
+            } else {
+                Some(parts[2].to_string())
+            };
+            let desktop: Option<u32> = parts[3].parse().ok().filter(|&d| d > 0);
+            let caption = parts[4].to_string();
             if pid > 0 && !caption.is_empty() {
                 windows.push(WindowInfo {
                     caption,
                     resource_class,
                     pid,
+                    internal_id,
+                    desktop,
                 });
             }
         }

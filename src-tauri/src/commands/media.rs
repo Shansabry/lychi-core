@@ -8,6 +8,7 @@ mod inner {
     /// Get playback status from all MPRIS media players.
     /// Also refreshes the player list to discover newly started/stopped players.
     #[tauri::command]
+    #[specta::specta]
     pub async fn media_get_status(
         state: State<'_, AppState>,
     ) -> Result<Vec<TrackInfo>, LychiError> {
@@ -28,6 +29,7 @@ mod inner {
 
     /// Send a transport control action to a specific player.
     #[tauri::command]
+    #[specta::specta]
     pub async fn media_control(
         bus_name: String,
         action: String,
@@ -49,6 +51,7 @@ mod inner {
 
     /// Seek to an absolute position in the current track of a specific player.
     #[tauri::command]
+    #[specta::specta]
     pub async fn media_seek(
         bus_name: String,
         track_id: String,
@@ -71,6 +74,7 @@ mod inner {
 
     /// Send a control action to all connected players (e.g. pause all).
     #[tauri::command]
+    #[specta::specta]
     pub async fn media_control_all(
         action: String,
         state: State<'_, AppState>,
@@ -91,6 +95,7 @@ mod inner {
 
     /// Refresh the player list (discovers new/removed players).
     #[tauri::command]
+    #[specta::specta]
     pub async fn media_refresh(state: State<'_, AppState>) -> Result<(), LychiError> {
         let mut guard = state.mpris.write().await;
         if let Some(manager) = guard.as_mut() {
@@ -108,6 +113,7 @@ mod inner {
     use lychi_core::error::LychiError;
 
     #[tauri::command]
+    #[specta::specta]
     pub async fn media_get_status() -> Result<Vec<()>, LychiError> {
         Err(LychiError::ExecutionFailed(
             "Media control not available (mpris feature disabled)".into(),
@@ -115,6 +121,7 @@ mod inner {
     }
 
     #[tauri::command]
+    #[specta::specta]
     pub async fn media_control(_bus_name: String, _action: String) -> Result<(), LychiError> {
         Err(LychiError::ExecutionFailed(
             "Media control not available (mpris feature disabled)".into(),
@@ -122,6 +129,7 @@ mod inner {
     }
 
     #[tauri::command]
+    #[specta::specta]
     pub async fn media_seek(
         _bus_name: String,
         _track_id: String,
@@ -133,6 +141,7 @@ mod inner {
     }
 
     #[tauri::command]
+    #[specta::specta]
     pub async fn media_control_all(_action: String) -> Result<usize, LychiError> {
         Err(LychiError::ExecutionFailed(
             "Media control not available (mpris feature disabled)".into(),
@@ -140,6 +149,7 @@ mod inner {
     }
 
     #[tauri::command]
+    #[specta::specta]
     pub async fn media_refresh() -> Result<(), LychiError> {
         Err(LychiError::ExecutionFailed(
             "Media control not available (mpris feature disabled)".into(),

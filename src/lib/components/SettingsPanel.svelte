@@ -23,12 +23,14 @@ let activeTab: "general" | "ai" | "projects" | "shortcuts" | "guide" | "about" =
 let appVersion = $state("");
 let layerShellSupported = $state(false);
 let activeWindowStrategy = $state("auto");
+let screenComposited = $state(true);
 
 let aiConfig: AiConfig = $state({
 	mode: "disabled",
 	provider: "anthropic",
 	model: "",
 	ollama_url: "",
+	ollama_model: "",
 	timeout_secs: 8,
 	max_tokens: 300,
 });
@@ -41,12 +43,15 @@ let generalConfig: GeneralConfig = $state({
 	window_y: null,
 	monitor_mode: "cursor",
 	window_strategy: "auto",
+	first_run_completed: false,
 });
 let commandsConfig: CommandsConfig = $state({
 	default_search_engine: "https://www.google.com/search?q=",
 	youtube_url: "https://www.youtube.com/results?search_query=",
 	shell: "/bin/bash",
 	terminal: "",
+	terminal_routing: "manual",
+	search_engines: {},
 });
 let privacyConfig: PrivacyConfig = $state({
 	allow_ip_geolocation: false,
@@ -72,6 +77,7 @@ onMount(() => {
 			appVersion = cached.appVersion;
 			layerShellSupported = cached.layerShellSupported;
 			activeWindowStrategy = cached.activeWindowStrategy;
+			screenComposited = cached.screenComposited;
 
 			generalTabRef?.initCustomShell(cached.commandsConfig.shell);
 			aiTabRef?.initModels(cached.aiConfig.mode);
@@ -155,6 +161,7 @@ function handleKeydown(e: KeyboardEvent) {
 				bind:privacyConfig
 				{layerShellSupported}
 				{activeWindowStrategy}
+				{screenComposited}
 				onsaveerror={(msg) => (saveError = msg)}
 			/>
 		{:else if activeTab === "ai"}
@@ -171,6 +178,7 @@ function handleKeydown(e: KeyboardEvent) {
 		{:else if activeTab === "shortcuts"}
 			<ShortcutsTab
 				bind:keybindingsConfig
+				bind:commandsConfig
 				onsaveerror={(msg) => (saveError = msg)}
 			/>
 		{:else if activeTab === "guide"}
@@ -188,7 +196,12 @@ function handleKeydown(e: KeyboardEvent) {
 <style>
 	.settings-panel {
 		display: flex;
-		max-height: 65vh;
+		/* Fill the height the parent <main> allows (main is max-height:60vh with
+		   overflow:hidden). A fixed vh here would exceed main and get clipped —
+		   min-height:0 lets the flex children shrink so .content scrolls fully. */
+		flex: 1;
+		min-height: 0;
+		max-height: 100%;
 		font-family: var(--font-mono);
 		font-size: 13px;
 		color: var(--fg);
@@ -233,6 +246,7 @@ function handleKeydown(e: KeyboardEvent) {
 	.content {
 		flex: 1;
 		min-width: 0;
+		min-height: 0;
 		padding: 12px 16px;
 		overflow-y: auto;
 	}

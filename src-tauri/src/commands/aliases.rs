@@ -7,12 +7,14 @@ use lychi_core::error::LychiError;
 use crate::state::AppState;
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_aliases(state: State<'_, AppState>) -> Result<Vec<AliasItem>, LychiError> {
     let store = AliasesStore::new();
     store.get_aliases(&state.db)
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn add_alias(
     name: String,
     command: String,
@@ -23,6 +25,7 @@ pub async fn add_alias(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn update_alias(
     name: String,
     command: String,
@@ -33,6 +36,7 @@ pub async fn update_alias(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn delete_alias(name: String, state: State<'_, AppState>) -> Result<(), LychiError> {
     let store = AliasesStore::new();
     store.delete_alias(&state.db, &name)

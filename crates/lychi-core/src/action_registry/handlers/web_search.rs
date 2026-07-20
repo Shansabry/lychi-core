@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem};
+use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, ExecContext};
 use crate::error::LychiError;
 
 const DEFAULT_SEARCH_URL: &str = "https://www.google.com/search?q=";
@@ -29,6 +29,12 @@ impl WebSearch {
 
 #[async_trait]
 impl ActionHandler for WebSearch {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["web"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "web"
     }
@@ -42,49 +48,22 @@ impl ActionHandler for WebSearch {
         if query.is_empty() {
             return Vec::new();
         }
-        vec![CompletionItem {
-            label: format!("Search web: {query}"),
-            icon_path: Some("__none__".to_string()),
-            score: 100,
-            description: Some("Enter · Ctrl+Enter".to_string()),
-            reason: None,
-        }]
+        vec![
+            CompletionItem::new(format!("Search web: {query}"), Some("__none__".into()), 100)
+                .with_run(format!("web {query}"))
+                .with_description("Enter · Ctrl+Enter"),
+        ]
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let query = args.trim();
         if query.is_empty() {
-            return Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some("Usage: web <search query>".to_string()),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(ActionResult::err("Usage: web <search query>".to_string()));
         }
 
         let url = format!("{}{}", self.search_url, urlencoding::encode(query));
 
-        Ok(ActionResult {
-            success: true,
-            output: None,
-            error: None,
-            duration_ms: 0,
-            routed_by: None,
-            open_url: Some(url),
-            needs_confirmation: None,
-            risk_level: None,
-            output_type: None,
-            executed_args: None,
-            launch_desktop: None,
-            focus_app: None,
-        })
+        // Pure navigation: opening the browser IS the result.
+        Ok(ActionResult::navigate(url, true))
     }
 }

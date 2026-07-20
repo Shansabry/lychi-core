@@ -1,35 +1,47 @@
 mod commands;
+#[cfg(target_os = "linux")]
+mod hotkey_portal;
 #[cfg(unix)]
 mod ipc_server;
+mod logging;
 mod platform;
+mod reactors;
 mod state;
 mod window;
 
 use state::AppState;
 use tauri::Manager;
 
+/// Socket path for the multi-call `--toggle` dispatch in main().
+#[cfg(unix)]
+pub fn ipc_socket_path() -> std::path::PathBuf {
+    platform::ipc_path()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Kept alive for the whole program — dropping it flushes and stops the
+    // non-blocking file-log worker, so buffered logs would be lost on exit.
+    let _log_guard = logging::init();
+    // Periodic resource/health snapshot (memory, threads, fds) to the log, so
+    // beta reports of sluggishness/RAM growth have data behind them.
+    logging::spawn_health_monitor(std::time::Duration::from_secs(300));
 
     platform::init_app();
 
     let app_state = AppState::new();
     let (hotkey, window_strategy, shell_path, project_dirs) = {
         let config = app_state.config.blocking_read();
-        lychi_core::context::active_window::register_extra_terminals(
-            &config.commands.extra_terminals,
-        );
-        lychi_core::context::ide::register_extra_markers(
-            &config.projects.extra_strong_markers,
-            &config.projects.extra_soft_markers,
-        );
-        lychi_core::context::pin::set(config.projects.pinned_workspace.clone());
+        // Apply all context-detection config (extra terminals/IDEs/markers +
+        // pinned workspace) atomically through one owned entry point.
+        lychi_core::context::config::ContextConfig {
+            extra_terminals: config.commands.extra_terminals.clone(),
+            extra_ides: config.commands.extra_ides.clone(),
+            extra_strong_markers: config.projects.extra_strong_markers.clone(),
+            extra_soft_markers: config.projects.extra_soft_markers.clone(),
+            pinned_workspace: config.projects.pinned_workspace.clone(),
+        }
+        .apply();
         (
             config.general.hotkey.clone(),
             config.general.window_strategy.clone(),
@@ -38,16 +50,10 @@ pub fn run() {
         )
     };
 
-    let app = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(w) = app.get_webview_window("main") {
-                window::toggle_window(&w);
-            }
-        }))
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .plugin(tauri_plugin_shell::init())
-        .manage(app_state)
-        .invoke_handler(tauri::generate_handler![
+    // Typesafe IPC: tauri-specta collects command + type signatures and (in debug)
+    // exports them to `src/lib/bindings.ts`, so the frontend can't drift from Rust.
+    let specta_builder =
+        tauri_specta::Builder::<tauri::Wry>::new().commands(tauri_specta::collect_commands![
             commands::execute::execute_command,
             commands::execute::get_completions,
             commands::history::get_history,
@@ -61,6 +67,7 @@ pub fn run() {
             commands::ai::get_masked_api_key,
             commands::ai::get_ai_status,
             commands::ai::check_ai_health,
+            commands::ai::list_ollama_models,
             commands::config::get_general_config,
             commands::config::save_general_config,
             commands::config::get_commands_config,
@@ -78,6 +85,9 @@ pub fn run() {
             commands::config::get_installed_terminals,
             commands::config::get_layer_shell_supported,
             commands::config::get_active_window_strategy,
+            commands::config::get_hotkey_status,
+            commands::config::get_autostart_enabled,
+            commands::config::set_autostart_enabled,
             commands::config::hide_launcher,
             commands::agent::get_agent_plan,
             commands::agent::store_agent_plan,
@@ -93,6 +103,8 @@ pub fn run() {
             commands::media::media_seek,
             commands::media::media_refresh,
             commands::open_uri::open_uri,
+            commands::reveal_path::reveal_path,
+            commands::reveal_path::open_path,
             commands::notes::get_all_notes,
             commands::notes::get_notes,
             commands::notes::add_note,
@@ -116,9 +128,92 @@ pub fn run() {
             commands::snippets::update_snippet,
             commands::snippets::delete_snippet,
             commands::context::get_context,
-        ])
+            commands::firebase_auth::firebase_sign_in,
+            commands::firebase_auth::firebase_sign_out,
+            commands::firebase_auth::firebase_get_user,
+            commands::firebase_auth::cloud_get_credits,
+        ]);
+
+    #[cfg(debug_assertions)]
+    specta_builder
+        .export(
+            // Map Rust u64/i64 (durations, timestamps, ids) to a JS `number`.
+            // Specta forbids this by default (values past 2^53 lose precision),
+            // but our u64 fields are millisecond durations / small counts that
+            // never approach that ceiling, so `number` is correct and ergonomic.
+            specta_typescript::Typescript::default()
+                .bigint(specta_typescript::BigIntExportBehavior::Number),
+            "../src/lib/bindings.ts",
+        )
+        .expect("failed to export typescript bindings");
+
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // Handle deep-link callbacks from another instance (Linux single-instance)
+            for arg in &args {
+                if arg.starts_with("lychi://") {
+                    let app_handle = app.clone();
+                    let url = arg.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) =
+                            commands::firebase_auth::handle_auth_callback(&app_handle, &url).await
+                        {
+                            tracing::warn!("deep-link auth callback failed: {e}");
+                        }
+                    });
+                    continue;
+                }
+            }
+            if let Some(w) = app.get_webview_window("main") {
+                window::toggle_window(&w);
+            }
+        }))
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_deep_link::init())
+        // Autostart entry launches with --hidden so login doesn't pop the launcher
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--hidden"]),
+        ))
+        .manage(app_state)
+        // Command handlers come from the tauri-specta builder (single source of
+        // truth for both dispatch and the generated TS bindings).
+        .invoke_handler(specta_builder.invoke_handler())
         .setup(move |app| {
+            // Wire specta events into the app (no-op today; ready for typed events).
+            specta_builder.mount_events(app);
             let handle = app.handle().clone();
+
+            // Deep-link handler for lychi:// callbacks (Firebase auth etc.)
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let auth_handle = handle.clone();
+                app.deep_link().on_open_url(move |event| {
+                    for url in event.urls() {
+                        let url_str = url.to_string();
+                        if url_str.starts_with("lychi://auth-callback") {
+                            let h = auth_handle.clone();
+                            tauri::async_runtime::spawn(async move {
+                                if let Err(e) =
+                                    commands::firebase_auth::handle_auth_callback(&h, &url_str)
+                                        .await
+                                {
+                                    tracing::warn!("auth callback handler failed: {e}");
+                                }
+                            });
+                        }
+                    }
+                });
+
+                // On Linux, register the URL scheme at runtime for dev builds
+                #[cfg(target_os = "linux")]
+                {
+                    if let Err(e) = app.deep_link().register_all() {
+                        tracing::warn!("deep-link register_all failed: {e}");
+                    }
+                }
+            }
 
             // Platform-specific window setup (layer-shell, skip-taskbar, etc.)
             if let Some(win) = app.get_webview_window("main") {
@@ -128,18 +223,34 @@ pub fn run() {
                     &win,
                     app_state.dismiss_armed.clone(),
                     app_state.summon_seq.clone(),
+                    app_state.armed_seq.clone(),
                 );
                 platform::setup_escape_handler(&win);
-                window::show_window(&win);
+                // --hidden: autostarted at login — stay in the background
+                // (tray + hotkey/`lychi --toggle` summon it later).
+                if !std::env::args().any(|a| a == "--hidden") {
+                    window::show_window(&win);
+                }
             }
 
             // Warm up caches in parallel for snappy first search
             tauri::async_runtime::spawn_blocking(|| {
-                commands::filesystem::warmup_fs_cache();
+                lychi_core::file_search::warmup_fs_cache();
             });
             tauri::async_runtime::spawn_blocking(|| {
                 lychi_core::action_registry::handlers::app_launcher::AppLauncher::warmup();
             });
+            // Bulk icon-path resolution runs on its own low-priority OS thread —
+            // NOT spawn_blocking — so this ~seconds-long pass (on desktops with
+            // many installed icon themes) never contends for the Tokio blocking
+            // pool and can't starve the first IPC. Query-time resolution is lazy
+            // and self-caching, so this is purely a "keep first hits warm" pass.
+            std::thread::Builder::new()
+                .name("lychi-icon-prewarm".to_string())
+                .spawn(|| {
+                    lychi_core::action_registry::handlers::app_launcher::AppLauncher::warmup_icons_background();
+                })
+                .expect("failed to spawn icon prewarm thread");
             let shell_for_warmup = shell_path.clone();
             tauri::async_runtime::spawn_blocking(move || {
                 lychi_core::action_registry::handlers::shell_exec::ShellExec::warmup(
@@ -162,6 +273,9 @@ pub fn run() {
                 lychi_core::context::window_stack::warmup();
             });
 
+            // Subscribe config reactors to the event bus (state-change fan-out).
+            app.state::<state::AppState>().wire_reactors();
+
             // Warm alias cache for transparent alias resolution in router
             let alias_db = app.state::<state::AppState>().db.clone();
             lychi_core::aliases::store::warm_cache(&alias_db);
@@ -170,6 +284,18 @@ pub fn run() {
             tauri::async_runtime::spawn(async {
                 lychi_core::action_registry::handlers::calc::fetch_exchange_rates().await;
             });
+
+            // Ensure clipboard images directory exists
+            std::fs::create_dir_all(lychi_core::paths::clipboard_images_dir()).ok();
+
+            // Orphan cleanup: remove image files not referenced by any clipboard entry
+            {
+                let orphan_db = app.state::<AppState>().db.clone();
+                let store = lychi_core::clipboard::store::ClipboardStore::new();
+                if let Ok(paths) = store.collect_image_paths(&orphan_db) {
+                    lychi_core::clipboard::image_utils::cleanup_orphans(&paths);
+                }
+            }
 
             // Background clipboard monitor — owns its OS thread (not the Tokio blocking pool)
             let clip_db = app.state::<AppState>().db.clone();
@@ -201,48 +327,84 @@ pub fn run() {
                 })
                 .expect("failed to spawn timer monitor thread");
 
-            // Register global shortcut
-            use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
-            let hotkey_str = hotkey.clone();
-            app.global_shortcut()
-                .on_shortcut(hotkey.as_str(), move |app, _shortcut, event| {
-                    if event.state == ShortcutState::Pressed
-                        && let Some(w) = app.get_webview_window("main")
-                    {
-                        window::toggle_window(&w);
-                    }
-                })?;
-            tracing::info!("Global shortcut registered: {hotkey_str}");
-
-            // System tray
-            use tauri::menu::{MenuBuilder, MenuItemBuilder};
-            use tauri::tray::TrayIconBuilder;
-            let show = MenuItemBuilder::with_id("show", "Show").build(app)?;
-            let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
-            let menu = MenuBuilder::new(app)
-                .item(&show)
-                .separator()
-                .item(&quit)
-                .build()?;
-            let tray_icon = app
-                .default_window_icon()
-                .cloned()
-                .ok_or_else(|| "No default window icon embedded in binary".to_string())?;
-            TrayIconBuilder::new()
-                .icon(tray_icon)
-                .menu(&menu)
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => {
-                        if let Some(w) = app.get_webview_window("main") {
+            // Register the global shortcut.
+            // - Wayland: via the XDG GlobalShortcuts portal (hotkey_portal.rs)
+            //   — compositor-level, full coverage, one-time consent dialog.
+            //   The X11 plugin is NOT used there (XWayland-only coverage and
+            //   double-fires alongside portal/DE bindings).
+            // - X11: via tauri-plugin-global-shortcut as before.
+            if lychi_core::context::is_wayland() {
+                let portal_handle = app.handle().clone();
+                let portal_hotkey = hotkey.clone();
+                tauri::async_runtime::spawn(async move {
+                    hotkey_portal::setup(portal_handle, portal_hotkey).await;
+                });
+            } else {
+                use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+                let hotkey_str = hotkey.clone();
+                let registration = app
+                    .global_shortcut()
+                    .on_shortcut(hotkey.as_str(), move |app, _shortcut, event| {
+                        if event.state == ShortcutState::Pressed
+                            && let Some(w) = app.get_webview_window("main")
+                        {
                             window::toggle_window(&w);
                         }
+                    });
+                match registration {
+                    Ok(()) => {
+                        app.state::<AppState>()
+                            .hotkey_registered
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        tracing::info!("Global shortcut registered: {hotkey_str}");
                     }
-                    "quit" => {
-                        app.exit(0);
+                    Err(e) => {
+                        tracing::warn!(
+                            "Global shortcut registration failed for {hotkey_str}: {e} — use `lychi --toggle` via a system shortcut"
+                        );
                     }
-                    _ => {}
-                })
-                .build(app)?;
+                }
+            }
+
+            // System tray. Non-fatal: libayatana-appindicator is dlopen'd at
+            // runtime and not bundled into the AppImage — on distros without
+            // it the tray fails, but the launcher itself must keep working.
+            let tray_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                use tauri::menu::{MenuBuilder, MenuItemBuilder};
+                use tauri::tray::TrayIconBuilder;
+                let show = MenuItemBuilder::with_id("show", "Show").build(app)?;
+                let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+                let menu = MenuBuilder::new(app)
+                    .item(&show)
+                    .separator()
+                    .item(&quit)
+                    .build()?;
+                let tray_icon = app
+                    .default_window_icon()
+                    .cloned()
+                    .ok_or_else(|| "No default window icon embedded in binary".to_string())?;
+                TrayIconBuilder::new()
+                    .icon(tray_icon)
+                    .menu(&menu)
+                    .on_menu_event(|app, event| match event.id().as_ref() {
+                        "show" => {
+                            if let Some(w) = app.get_webview_window("main") {
+                                window::toggle_window(&w);
+                            }
+                        }
+                        "quit" => {
+                            app.exit(0);
+                        }
+                        _ => {}
+                    })
+                    .build(app)?;
+                Ok(())
+            })();
+            if let Err(e) = tray_result {
+                tracing::warn!(
+                    "System tray unavailable: {e} — continuing without tray (is libayatana-appindicator installed?)"
+                );
+            }
 
             // Spawn IPC server (Unix domain sockets — Linux/macOS only)
             #[cfg(unix)]
@@ -255,9 +417,12 @@ pub fn run() {
                 });
             }
 
-            // Spawn KWin active-window watcher (keeps context cache warm on Wayland)
+            // Spawn KWin active-window watcher (keeps context cache warm).
+            // KDE Wayland only — the KWin D-Bus scripting API doesn't exist on
+            // GNOME/wlroots, and the watcher would burn a temp-file write plus
+            // a doomed D-Bus call every poll.
             #[cfg(target_os = "linux")]
-            if lychi_core::context::is_wayland() {
+            if lychi_core::context::is_kde_wayland_session() {
                 tauri::async_runtime::spawn(async move {
                     lychi_core::context::active_window::run_kwin_watcher(|ctx| {
                         if ctx.is_terminal {

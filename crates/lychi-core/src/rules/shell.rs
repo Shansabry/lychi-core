@@ -25,6 +25,9 @@ const DANGEROUS_PATTERNS: &[&str] = &[
     "reboot",
     "systemctl stop",
     "systemctl disable",
+    "docker stop",
+    "docker kill",
+    "docker rm",
     " > ",
     " >> ",
     ">/",
@@ -198,6 +201,42 @@ mod tests {
         assert!(matches!(
             rules.validate("cp file1 file2"),
             ValidationDecision::Confirm { .. }
+        ));
+    }
+
+    #[test]
+    fn docker_lifecycle_confirms_but_reads_are_safe() {
+        let rules = ShellRules::new();
+        // Service-affecting docker verbs require confirmation.
+        assert!(matches!(
+            rules.validate("docker stop api-db"),
+            ValidationDecision::Confirm { .. }
+        ));
+        assert!(matches!(
+            rules.validate("docker kill api-db"),
+            ValidationDecision::Confirm { .. }
+        ));
+        assert!(matches!(
+            rules.validate("docker rm api-db"),
+            ValidationDecision::Confirm { .. }
+        ));
+        // `exec` (interactive shell) also confirms — matches the `exec ` pattern.
+        assert!(matches!(
+            rules.validate("docker exec -it api-db sh"),
+            ValidationDecision::Confirm { .. }
+        ));
+        // Read-only / reversible verbs auto-execute.
+        assert!(matches!(
+            rules.validate("docker logs api-db"),
+            ValidationDecision::Execute
+        ));
+        assert!(matches!(
+            rules.validate("docker restart api-db"),
+            ValidationDecision::Execute
+        ));
+        assert!(matches!(
+            rules.validate("docker ps"),
+            ValidationDecision::Execute
         ));
     }
 

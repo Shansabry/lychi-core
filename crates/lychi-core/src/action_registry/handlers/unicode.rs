@@ -4,7 +4,9 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 use std::sync::{Mutex, OnceLock};
 
 use crate::action_registry::handlers::clipboard::write_to_clipboard;
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+};
 use crate::error::LychiError;
 
 /// Cached nucleo matcher.
@@ -123,6 +125,12 @@ impl UnicodeHandler {
 
 #[async_trait]
 impl ActionHandler for UnicodeHandler {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["unicode"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "unicode"
     }
@@ -131,23 +139,12 @@ impl ActionHandler for UnicodeHandler {
         "Search Unicode characters by name (u:arrow or unicode arrow)"
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let trimmed = args.trim();
         if trimmed.is_empty() {
-            return Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some("Usage: u:<name> or unicode <name>".to_string()),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(ActionResult::err(
+                "Usage: u:<name> or unicode <name>".to_string(),
+            ));
         }
 
         // Try to extract char from label format
@@ -164,70 +161,25 @@ impl ActionHandler for UnicodeHandler {
                 {
                     Some(e) => e.ch,
                     None => {
-                        return Ok(ActionResult {
-                            success: false,
-                            output: None,
-                            error: Some(format!("No Unicode character found for: {trimmed}")),
-                            duration_ms: 0,
-                            routed_by: None,
-                            open_url: None,
-                            needs_confirmation: None,
-                            risk_level: None,
-                            output_type: None,
-                            executed_args: None,
-                            launch_desktop: None,
-                            focus_app: None,
-                        });
+                        return Ok(ActionResult::err(format!(
+                            "No Unicode character found for: {trimmed}"
+                        )));
                     }
                 }
             }
         } else {
-            return Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some(format!("No Unicode character found for: {trimmed}")),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(ActionResult::err(format!(
+                "No Unicode character found for: {trimmed}"
+            )));
         };
 
         let ch_str = ch.to_string();
         match write_to_clipboard(&ch_str) {
-            Ok(()) => Ok(ActionResult {
-                success: true,
-                output: Some(format!("Copied {ch} (U+{:04X}) to clipboard", ch as u32)),
-                error: None,
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: Some(OutputType::Status),
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            }),
-            Err(e) => Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some(format!("Clipboard error: {e}")),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            }),
+            Ok(()) => Ok(ActionResult::ok(
+                format!("Copied {ch} (U+{:04X}) to clipboard", ch as u32),
+                OutputType::Status,
+            )),
+            Err(e) => Ok(ActionResult::err(format!("Clipboard error: {e}"))),
         }
     }
 
@@ -239,12 +191,13 @@ impl ActionHandler for UnicodeHandler {
             return POPULAR
                 .iter()
                 .enumerate()
-                .map(|(i, (ch, name))| CompletionItem {
-                    label: Self::format_label(*ch, name),
-                    icon_path: Some("__none__".to_string()),
-                    score: (POPULAR.len() - i) as u16,
-                    description: None,
-                    reason: None,
+                .map(|(i, (ch, name))| {
+                    CompletionItem::new(
+                        Self::format_label(*ch, name),
+                        Some("__none__".into()),
+                        (POPULAR.len() - i) as u16,
+                    )
+                    .with_run(format!("unicode {ch}"))
                 })
                 .collect();
         }
@@ -280,12 +233,13 @@ impl ActionHandler for UnicodeHandler {
         results
             .into_iter()
             .filter_map(|(i, score)| {
-                index.get(i).map(|entry| CompletionItem {
-                    label: Self::format_label(entry.ch, &entry.name),
-                    icon_path: Some("__none__".to_string()),
-                    score,
-                    description: None,
-                    reason: None,
+                index.get(i).map(|entry| {
+                    CompletionItem::new(
+                        Self::format_label(entry.ch, &entry.name),
+                        Some("__none__".into()),
+                        score,
+                    )
+                    .with_run(format!("unicode {}", entry.ch))
                 })
             })
             .collect()

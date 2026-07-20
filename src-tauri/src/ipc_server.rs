@@ -1,3 +1,4 @@
+use crate::state::AppState;
 use crate::window;
 use tauri::Manager;
 use tokio::io::AsyncBufReadExt;
@@ -27,10 +28,37 @@ pub async fn run(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Err
                     let reader = tokio::io::BufReader::new(stream);
                     let mut lines = reader.lines();
                     while let Ok(Some(line)) = lines.next_line().await {
-                        match line.trim() {
+                        let trimmed = line.trim();
+                        match trimmed {
                             "toggle" => {
                                 if let Some(w) = handle.get_webview_window("main") {
                                     window::toggle_window(&w);
+                                }
+                            }
+                            // Global screenshot trigger — fired via `lychi
+                            // --screenshot [mode]` bound to a desktop shortcut.
+                            // Runs the capture through the executor without ever
+                            // showing the launcher window.
+                            _ if trimmed.starts_with("screenshot") => {
+                                let mode = trimmed
+                                    .strip_prefix("screenshot")
+                                    .unwrap_or("")
+                                    .trim()
+                                    .to_string();
+                                let cmd = format!("screenshot {mode}");
+                                let state = handle.state::<AppState>();
+                                let executor = state.executor.read().await;
+                                let privacy = state.config.read().await.privacy.clone();
+                                if let Err(e) = executor
+                                    .run(
+                                        cmd.trim(),
+                                        true,
+                                        &privacy,
+                                        &lychi_core::executor::RunInputs::default(),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!("[ipc] screenshot failed: {e}");
                                 }
                             }
                             other => {

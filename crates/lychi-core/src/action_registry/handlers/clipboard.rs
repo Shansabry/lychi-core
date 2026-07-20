@@ -3,7 +3,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use redb::Database;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+};
 use crate::clipboard::store::ClipboardStore;
 use crate::error::LychiError;
 
@@ -50,6 +52,12 @@ impl ClipboardHandler {
 
 #[async_trait]
 impl ActionHandler for ClipboardHandler {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["clip", "clipboard"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "clip"
     }
@@ -58,30 +66,20 @@ impl ActionHandler for ClipboardHandler {
         "Browse and paste from clipboard history"
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let args = args.trim();
 
         // "clear" subcommand
         if args == "clear" {
             self.store.clear(&self.db)?;
-            return Ok(ActionResult {
-                success: true,
-                output: Some("Clipboard history cleared".to_string()),
-                error: None,
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: Some(OutputType::Status),
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(ActionResult::ok(
+                "Clipboard history cleared",
+                OutputType::Status,
+            ));
         }
 
         // Selection from completions — find matching entry and write it back to clipboard
-        if !args.is_empty() && args != "clear" {
+        if !args.is_empty() {
             let entries = self.store.get_entries(&self.db, 100)?;
             // Try UUID match first, then text prefix match (completions show truncated text)
             if let Some(entry) = entries.iter().find(|e| e.id == args).or_else(|| {
@@ -89,62 +87,42 @@ impl ActionHandler for ClipboardHandler {
                     e.text.starts_with(args) || args.starts_with(&Self::truncate_label(&e.text, 80))
                 })
             }) {
-                match write_to_clipboard(&entry.text) {
+                // Image entry — re-paste the image file
+                if let Some(ref img) = entry.image {
+                    if let Some(path) = self.store.get_image_path(&self.db, &entry.id)? {
+                        return match write_image_to_clipboard(&path) {
+                            Ok(()) => Ok(ActionResult::ok(
+                                format!("Copied image ({}x{})", img.width, img.height),
+                                OutputType::Status,
+                            )),
+                            Err(e) => Ok(ActionResult::err(format!(
+                                "Image clipboard write failed: {e}"
+                            ))),
+                        };
+                    }
+                    return Ok(ActionResult::err("Image file not found"));
+                }
+
+                // Text entry
+                return match write_to_clipboard(&entry.text) {
                     Ok(()) => {
                         let preview = Self::truncate_label(&entry.text, 60);
-                        return Ok(ActionResult {
-                            success: true,
-                            output: Some(format!("Copied: {preview}")),
-                            error: None,
-                            duration_ms: 0,
-                            routed_by: None,
-                            open_url: None,
-                            needs_confirmation: None,
-                            risk_level: None,
-                            output_type: Some(OutputType::Status),
-                            executed_args: None,
-                            launch_desktop: None,
-                            focus_app: None,
-                        });
+                        Ok(ActionResult::ok(
+                            format!("Copied: {preview}"),
+                            OutputType::Status,
+                        ))
                     }
-                    Err(e) => {
-                        return Ok(ActionResult {
-                            success: false,
-                            output: None,
-                            error: Some(format!("Clipboard write failed: {e}")),
-                            duration_ms: 0,
-                            routed_by: None,
-                            open_url: None,
-                            needs_confirmation: None,
-                            risk_level: None,
-                            output_type: None,
-                            executed_args: None,
-                            launch_desktop: None,
-                            focus_app: None,
-                        });
-                    }
-                }
+                    Err(e) => Ok(ActionResult::err(format!("Clipboard write failed: {e}"))),
+                };
             }
         }
 
         // Default: show clipboard count
         let count = self.store.count(&self.db)?;
-        Ok(ActionResult {
-            success: true,
-            output: Some(format!(
-                "{count} clipboard entries. Type 'clip' and browse, or 'clip clear' to erase."
-            )),
-            error: None,
-            duration_ms: 0,
-            routed_by: None,
-            open_url: None,
-            needs_confirmation: None,
-            risk_level: None,
-            output_type: Some(OutputType::Status),
-            executed_args: None,
-            launch_desktop: None,
-            focus_app: None,
-        })
+        Ok(ActionResult::ok(
+            format!("{count} clipboard entries. Type 'clip' and browse, or 'clip clear' to erase."),
+            OutputType::Status,
+        ))
     }
 
     async fn completions(&self, partial: &str) -> Vec<CompletionItem> {
@@ -161,20 +139,34 @@ impl ActionHandler for ClipboardHandler {
                 score: 0,
                 description: None,
                 reason: None,
+                thumb_b64: None,
+                // Nothing to copy — selecting just shows clipboard status.
+                run: Some("clip".to_string()),
+                ..Default::default()
             }];
         }
 
-        // If partial is empty or "clear", show entries as-is (most recent first)
+        // If partial is empty, show entries as-is (most recent first)
         if partial.is_empty() {
             return entries
                 .iter()
                 .enumerate()
-                .map(|(i, entry)| CompletionItem {
-                    label: Self::truncate_label(&entry.text, 80),
-                    icon_path: None,
-                    score: (1000 - i as u16).max(1),
-                    description: Some(Self::format_age(entry.created_at)),
-                    reason: None,
+                .map(|(i, entry)| {
+                    let is_image = entry.image.is_some();
+                    CompletionItem {
+                        label: Self::truncate_label(&entry.text, 80),
+                        icon_path: if is_image {
+                            Some("__clipboard_image__".into())
+                        } else {
+                            None
+                        },
+                        score: (1000 - i as u16).max(1),
+                        description: Some(Self::format_age(entry.created_at)),
+                        reason: None,
+                        thumb_b64: entry.image.as_ref().map(|img| img.thumb_b64.clone()),
+                        run: Some(format!("clip {}", entry.id)),
+                        ..Default::default()
+                    }
                 })
                 .collect();
         }
@@ -191,12 +183,22 @@ impl ActionHandler for ClipboardHandler {
         scored
             .iter()
             .enumerate()
-            .map(|(rank, (_, entry))| CompletionItem {
-                label: Self::truncate_label(&entry.text, 80),
-                icon_path: None,
-                score: (1000 - rank as u16).max(1),
-                description: Some(Self::format_age(entry.created_at)),
-                reason: None,
+            .map(|(rank, (_, entry))| {
+                let is_image = entry.image.is_some();
+                CompletionItem {
+                    label: Self::truncate_label(&entry.text, 80),
+                    icon_path: if is_image {
+                        Some("__clipboard_image__".into())
+                    } else {
+                        None
+                    },
+                    score: (1000 - rank as u16).max(1),
+                    description: Some(Self::format_age(entry.created_at)),
+                    reason: None,
+                    thumb_b64: entry.image.as_ref().map(|img| img.thumb_b64.clone()),
+                    run: Some(format!("clip {}", entry.id)),
+                    ..Default::default()
+                }
             })
             .collect()
     }
@@ -206,8 +208,6 @@ impl ActionHandler for ClipboardHandler {
 /// On Wayland, uses `wl-copy` (daemonizes, content survives process exit).
 /// On X11, uses arboard directly.
 pub(crate) fn write_to_clipboard(text: &str) -> Result<(), arboard::Error> {
-    // On Wayland, wl-copy is the reliable way — it forks a background process
-    // that serves the clipboard content until another app replaces it.
     if std::env::var("WAYLAND_DISPLAY").is_ok() {
         use std::io::Write;
         use std::process::{Command, Stdio};
@@ -226,11 +226,57 @@ pub(crate) fn write_to_clipboard(text: &str) -> Result<(), arboard::Error> {
                     description: format!("wl-copy stdin: {e}"),
                 })?;
         }
-        // Don't wait — wl-copy daemonizes itself
         drop(child);
         Ok(())
     } else {
         let mut cb = arboard::Clipboard::new()?;
         cb.set_text(text)
+    }
+}
+
+/// Write an image file to the system clipboard.
+/// On Wayland, uses `wl-copy --type image/png`.
+/// On X11, uses arboard `set_image()`.
+fn write_image_to_clipboard(path: &str) -> Result<(), arboard::Error> {
+    let png_bytes = std::fs::read(path).map_err(|e| arboard::Error::Unknown {
+        description: format!("read image: {e}"),
+    })?;
+
+    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("wl-copy")
+            .args(["--type", "image/png"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| arboard::Error::Unknown {
+                description: format!("wl-copy: {e}"),
+            })?;
+        if let Some(ref mut stdin) = child.stdin {
+            stdin
+                .write_all(&png_bytes)
+                .map_err(|e| arboard::Error::Unknown {
+                    description: format!("wl-copy stdin: {e}"),
+                })?;
+        }
+        drop(child);
+        Ok(())
+    } else {
+        // X11: decode PNG to RGBA, then use arboard
+        let (rgba, w, h) =
+            crate::clipboard::image_utils::decode_png_to_rgba(&png_bytes).map_err(|e| {
+                arboard::Error::Unknown {
+                    description: format!("PNG decode: {e}"),
+                }
+            })?;
+        let mut cb = arboard::Clipboard::new()?;
+        let img = arboard::ImageData {
+            width: w as usize,
+            height: h as usize,
+            bytes: std::borrow::Cow::Owned(rgba),
+        };
+        cb.set_image(img)
     }
 }

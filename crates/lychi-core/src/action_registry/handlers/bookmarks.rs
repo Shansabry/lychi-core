@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem};
+use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, ExecContext};
 use crate::error::LychiError;
 
 /// Cached nucleo matcher.
@@ -213,6 +213,12 @@ impl BookmarkHandler {
 
 #[async_trait]
 impl ActionHandler for BookmarkHandler {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["bm", "bookmark"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "bm"
     }
@@ -221,43 +227,17 @@ impl ActionHandler for BookmarkHandler {
         "Search and open browser bookmarks (bm <query>)"
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let trimmed = args.trim();
         if trimmed.is_empty() {
-            return Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some("Usage: bm <query>".to_string()),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(ActionResult::err("Usage: bm <query>".to_string()));
         }
 
         let bookmarks = get_bookmarks();
 
         // If the arg looks like a URL (from a completion's description), open it directly
         if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-            return Ok(ActionResult {
-                success: true,
-                output: None,
-                error: None,
-                duration_ms: 0,
-                routed_by: None,
-                open_url: Some(trimmed.to_string()),
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(ActionResult::navigate(trimmed.to_string(), false));
         }
 
         // Find best matching bookmark by title
@@ -272,34 +252,10 @@ impl ActionHandler for BookmarkHandler {
             });
 
         match found {
-            Some(bm) => Ok(ActionResult {
-                success: true,
-                output: None,
-                error: None,
-                duration_ms: 0,
-                routed_by: None,
-                open_url: Some(bm.url.clone()),
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            }),
-            None => Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some(format!("No bookmark found for: {trimmed}")),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            }),
+            Some(bm) => Ok(ActionResult::navigate(bm.url.clone(), false)),
+            None => Ok(ActionResult::err(format!(
+                "No bookmark found for: {trimmed}"
+            ))),
         }
     }
 
@@ -319,6 +275,9 @@ impl ActionHandler for BookmarkHandler {
                     score: (20 - i) as u16,
                     description: Some(Self::truncate_url(&bm.url, 60)),
                     reason: None,
+                    thumb_b64: None,
+                    run: Some(format!("bm {}", bm.url)),
+                    ..Default::default()
                 })
                 .collect();
         }
@@ -360,6 +319,9 @@ impl ActionHandler for BookmarkHandler {
                     score,
                     description: Some(Self::truncate_url(&bm.url, 60)),
                     reason: None,
+                    thumb_b64: None,
+                    run: Some(format!("bm {}", bm.url)),
+                    ..Default::default()
                 })
             })
             .collect()

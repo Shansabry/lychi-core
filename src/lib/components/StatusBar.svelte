@@ -2,6 +2,8 @@
 import {
 	ClipboardList,
 	Clock,
+	Lightbulb,
+	LoaderCircle,
 	Music,
 	Pause,
 	Play,
@@ -30,6 +32,9 @@ let {
 	onshowplan,
 	notesOpen = false,
 	hasPlan = false,
+	contextStale = false,
+	contextStaleHint = "",
+	contextRefreshing = false,
 }: {
 	result: CommandResult | null;
 	executing: boolean;
@@ -47,6 +52,9 @@ let {
 	onshowplan: () => void;
 	notesOpen?: boolean;
 	hasPlan?: boolean;
+	contextStale?: boolean;
+	contextStaleHint?: string;
+	contextRefreshing?: boolean;
 } = $props();
 
 let resultVisible = $derived(
@@ -82,6 +90,20 @@ async function togglePlayPause() {
 			{:else}
 				<span class="status error">ERR</span>
 			{/if}
+		{:else if contextRefreshing}
+			<!-- A background re-gather is actually in flight → honest spinner. -->
+			<span class="stale-hint refreshing">
+				<LoaderCircle size={11} strokeWidth={2} />
+				<span class="stale-text">updating context…</span>
+			</span>
+		{:else if contextStale}
+			<!-- Idle & stale: a dim bulb (NOT a spinner — nothing is loading; state
+			     refreshes on the next summon/command). Small label + hover detail,
+			     so it never crowds the suggestion list. -->
+			<span class="stale-hint" title={contextStaleHint}>
+				<Lightbulb size={11} strokeWidth={2} />
+				<span class="stale-text">context outdated</span>
+			</span>
 		{/if}
 	</div>
 
@@ -352,6 +374,41 @@ async function togglePlayPause() {
 		color: var(--ai);
 		display: flex;
 		align-items: center;
+	}
+
+	/* Context-staleness hint — dim and ambient, cursor:help to invite the hover. */
+	.stale-hint {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		color: var(--fg-muted);
+		opacity: 0.5;
+		cursor: help;
+		transition: opacity 120ms ease;
+	}
+
+	.stale-hint:hover {
+		opacity: 0.85;
+	}
+
+	.stale-text {
+		font-size: 10px;
+		white-space: nowrap;
+	}
+
+	/* Active refresh: a real spinner (nothing help-able, so default cursor). */
+	.stale-hint.refreshing {
+		cursor: default;
+		opacity: 0.6;
+	}
+
+	.stale-hint.refreshing :global(svg) {
+		animation: spin 700ms linear infinite;
+	}
+
+	@keyframes spin {
+		from { transform: rotate(0deg); }
+		to { transform: rotate(360deg); }
 	}
 
 </style>

@@ -1,8 +1,21 @@
 # Lychi
 
-A local-first, Linux-first desktop command launcher. Think Spotlight/Raycast for Linux.
+A local-first, Linux-only desktop command launcher. Think Spotlight/Raycast for Linux — keyboard-driven, privacy-friendly, AI optional (BYO key or local Ollama).
 
 Built with **Tauri v2** (Rust backend) + **Svelte 5** (SvelteKit frontend), distributed as an **AppImage**.
+
+## Desktop Environment Support
+
+Lychi picks the best window strategy for your session automatically:
+
+| Session | Strategy |
+|---------|----------|
+| wlroots compositors (Hyprland, Sway, …) | wlr-layer-shell overlay |
+| KDE Plasma Wayland | toplevel window (KWin layer-shell focus is unreliable) |
+| GNOME Wayland | fullscreen-transparent toplevel (Mutter has no layer-shell) |
+| X11 (KDE, XFCE, Cinnamon, MATE, …) | fullscreen overlay, or a compact opaque window when compositing is off |
+
+**Wayland hotkey note:** Wayland doesn't let apps register global hotkeys. Bind a system shortcut to `lychi --toggle` in your desktop's keyboard settings — Lychi shows a first-run tip explaining this.
 
 ## Prerequisites
 
@@ -158,7 +171,7 @@ max_entries = 500
 deduplicate = true
 
 [ai]
-mode = "disabled"       # "disabled", "byo"
+mode = "disabled"       # "disabled", "byo", "ollama"
 provider = "openai"     # "openai", "anthropic", "groq"
 model = "gpt-4o-mini"
 ```
@@ -206,6 +219,10 @@ Commands are extensible via the `ActionHandler` trait + `ActionRegistry` dispatc
 | `pnpm format:rust` | `cargo fmt --all` | Format Rust code |
 | `pnpm clippy` | `cargo clippy --workspace` | Lint Rust code |
 
+## Contributing
+
+Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the dev workflow, architecture rules, and performance budgets.
+
 ## License
 
-UNLICENSED
+[GPL-3.0](LICENSE) — forks and contributions must remain open source.

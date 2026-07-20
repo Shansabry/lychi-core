@@ -1,6 +1,10 @@
 use lychi_core::action_registry::CompletionItem;
 use lychi_core::error::LychiError;
-use std::path::{Path, PathBuf};
+use lychi_core::file_search::{
+    self, DirEntry, FileSearchBatch, FileSearchResult, MountPoint, build_result_modified,
+    finalize_row, frecency_recency_bonus, search_display_label, section_header,
+};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -11,55 +15,6 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::state::AppState;
 
-/// Resolve a partial path to an absolute path.
-/// - `/...` → absolute path as-is
-/// - `~/...` → expand ~ to home
-/// - anything else → treat as relative to home directory (e.g. `Do` → `~/Do`)
-fn resolve_path(raw: &str) -> PathBuf {
-    if raw.starts_with('/') {
-        PathBuf::from(raw)
-    } else if let Some(rest) = raw.strip_prefix("~/") {
-        dirs::home_dir()
-            .map(|h| h.join(rest))
-            .unwrap_or_else(|| PathBuf::from(raw))
-    } else if raw == "~" {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from(raw))
-    } else {
-        // Bare name like "Do" → treat as ~/Do
-        dirs::home_dir()
-            .map(|h| h.join(raw))
-            .unwrap_or_else(|| PathBuf::from(raw))
-    }
-}
-
-/// Build a display label using `~/` prefix for home-relative paths.
-fn build_label(original_partial: &str, entry_name: &str, is_dir: bool) -> String {
-    let trailing = if is_dir { "/" } else { "" };
-
-    // Determine the directory prefix from the partial path
-    let prefix = if original_partial.starts_with('/') {
-        // Absolute path — keep as-is
-        match original_partial.rfind('/') {
-            Some(idx) => original_partial[..=idx].to_string(),
-            None => "/".to_string(),
-        }
-    } else if original_partial.starts_with("~/") {
-        // Already has ~/ prefix — use directory portion as-is
-        match original_partial.rfind('/') {
-            Some(idx) => original_partial[..=idx].to_string(),
-            None => "~/".to_string(),
-        }
-    } else {
-        // Bare name or ~ — prefix with ~/
-        match original_partial.rfind('/') {
-            Some(idx) => format!("~/{}", &original_partial[..=idx]),
-            None => "~/".to_string(),
-        }
-    };
-
-    format!("{prefix}{entry_name}{trailing}")
-}
-
 /// Given the text after `@`, return filesystem completions.
 ///
 /// - Empty or `~` → list home directory
@@ -67,272 +22,38 @@ fn build_label(original_partial: &str, entry_name: &str, is_dir: bool) -> String
 /// - `/...` → absolute path
 /// - Directories sort before files, max 10 results
 #[tauri::command]
+#[specta::specta]
 pub async fn list_path_completions(partial: String) -> Result<Vec<CompletionItem>, LychiError> {
-    tauri::async_runtime::spawn_blocking(move || list_path_completions_sync(partial))
+    tauri::async_runtime::spawn_blocking(move || file_search::list_path_completions_sync(partial))
         .await
         .map_err(|e| LychiError::ExecutionFailed(format!("path completions task panicked: {e}")))?
-}
-
-fn list_path_completions_sync(partial: String) -> Result<Vec<CompletionItem>, LychiError> {
-    let raw = partial.trim();
-
-    let (dir_to_list, stem_filter): (PathBuf, String) =
-        if raw.is_empty() || raw == "~" || raw == "~/" {
-            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-            (home, String::new())
-        } else {
-            let resolved = resolve_path(raw);
-            if raw.ends_with('/') {
-                (resolved, String::new())
-            } else {
-                let parent = resolved
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| PathBuf::from("/"));
-                let stem = resolved
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                (parent, stem)
-            }
-        };
-
-    if !dir_to_list.exists() || !dir_to_list.is_dir() {
-        return Ok(Vec::new());
-    }
-
-    // Set up fuzzy matcher when there's a filter query
-    let mut matcher = Matcher::new(MatcherConfig::DEFAULT);
-    let pattern = if !stem_filter.is_empty() {
-        Some(Atom::new(
-            &stem_filter,
-            CaseMatching::Ignore,
-            Normalization::Smart,
-            AtomKind::Fuzzy,
-            false,
-        ))
-    } else {
-        None
-    };
-
-    let read_dir = std::fs::read_dir(&dir_to_list)?;
-
-    let mut entries: Vec<CompletionItem> = read_dir
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().into_string().ok()?;
-            // Skip hidden files unless the user is explicitly typing a dot
-            if name.starts_with('.') && !stem_filter.starts_with('.') {
-                return None;
-            }
-            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-
-            // Fuzzy match when there's a filter, otherwise show all
-            let match_score = if let Some(ref p) = pattern {
-                let mut buf = Vec::new();
-                let haystack = Utf32Str::new(&name, &mut buf);
-                match p.score(haystack, &mut matcher) {
-                    Some(s) => s,
-                    None => return None,
-                }
-            } else {
-                0
-            };
-
-            let label = build_label(raw, &name, is_dir);
-            let description = if is_dir {
-                Some("Folder".into())
-            } else {
-                name.rsplit('.')
-                    .next()
-                    .filter(|ext| !ext.is_empty() && ext.len() < 6 && *ext != name)
-                    .map(|ext| ext.to_uppercase())
-            };
-            // Dirs get a large boost so they sort first, plus fuzzy score
-            let score = if is_dir {
-                1000 + match_score
-            } else {
-                match_score
-            };
-            Some(CompletionItem {
-                label,
-                icon_path: if is_dir {
-                    Some("__folder__".into())
-                } else {
-                    None
-                },
-                score,
-                description,
-                reason: None,
-            })
-        })
-        .collect();
-
-    // Sort by score descending (dirs first due to 1000+ boost, then by match quality)
-    entries.sort_by(|a, b| b.score.cmp(&a.score));
-
-    entries.truncate(15);
-    Ok(entries)
 }
 
 /// List subdirectories of the given path (directories only, absolute paths).
 /// Used by the in-app folder picker to avoid the native GTK dialog which
 /// crashes on Wayland layer-shell surfaces.
 #[tauri::command]
+#[specta::specta]
 pub async fn list_directories(path: String) -> Result<Vec<DirEntry>, LychiError> {
-    tauri::async_runtime::spawn_blocking(move || list_directories_sync(path))
+    tauri::async_runtime::spawn_blocking(move || file_search::list_directories_sync(path))
         .await
         .map_err(|e| LychiError::ExecutionFailed(format!("list_directories task panicked: {e}")))?
 }
 
-fn list_directories_sync(path: String) -> Result<Vec<DirEntry>, LychiError> {
-    let dir = if path.is_empty() {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
-    } else {
-        resolve_path(&path)
-    };
-
-    if !dir.exists() || !dir.is_dir() {
-        return Ok(Vec::new());
-    }
-
-    let read_dir = std::fs::read_dir(&dir)?;
-
-    let mut entries: Vec<DirEntry> = read_dir
-        .flatten()
-        .filter_map(|entry| {
-            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-            if !is_dir {
-                return None;
-            }
-            let name = entry.file_name().into_string().ok()?;
-            if name.starts_with('.') {
-                return None;
-            }
-            let path = entry.path().to_string_lossy().to_string();
-            Some(DirEntry { name, path })
-        })
-        .collect();
-
-    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    Ok(entries)
-}
-
-#[derive(serde::Serialize)]
-pub struct DirEntry {
-    pub name: String,
-    pub path: String,
-}
-
-// --- Recursive file search ---
-
-#[derive(Clone, serde::Serialize)]
-pub struct MountPoint {
-    pub path: String,
-    pub label: String,
-}
-
-#[derive(Clone, serde::Serialize)]
-pub struct FileSearchResult {
-    pub label: String,
-    pub full_path: String,
-    pub is_dir: bool,
-    pub score: u16,
-    pub description: Option<String>,
-    pub size_bytes: Option<u64>,
-    pub modified_secs: Option<u64>,
-}
-
-#[derive(Clone, serde::Serialize)]
-pub struct FileSearchBatch {
-    pub search_id: u64,
-    pub results: Vec<FileSearchResult>,
-    pub done: bool,
-    pub has_ignore_rules: bool,
-}
-
 /// Detect real mounted filesystems. Home directory is always first.
 #[tauri::command]
+#[specta::specta]
 pub async fn get_mount_points() -> Result<Vec<MountPoint>, LychiError> {
-    tauri::async_runtime::spawn_blocking(get_mount_points_sync)
+    tauri::async_runtime::spawn_blocking(file_search::get_mount_points_sync)
         .await
         .map_err(|e| LychiError::ExecutionFailed(format!("get_mount_points task panicked: {e}")))?
 }
 
-fn get_mount_points_sync() -> Result<Vec<MountPoint>, LychiError> {
-    let home = dirs::home_dir()
-        .map(|h| h.to_string_lossy().to_string())
-        .unwrap_or_else(|| "/home".into());
-
-    let mut mounts = vec![MountPoint {
-        path: home.clone(),
-        label: "Home".into(),
-    }];
-
-    if let Ok(content) = std::fs::read_to_string("/proc/mounts") {
-        let real_fs: &[&str] = &[
-            "ext4", "ext3", "btrfs", "xfs", "ntfs", "ntfs3", "vfat", "exfat", "f2fs", "zfs",
-        ];
-        let skip_paths: &[&str] = &["/boot", "/efi", "/boot/efi"];
-
-        for line in content.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 3 {
-                continue;
-            }
-            let mountpoint = parts[1];
-            let fstype = parts[2];
-
-            if !real_fs.contains(&fstype) {
-                continue;
-            }
-            if skip_paths.iter().any(|s| mountpoint.starts_with(s)) {
-                continue;
-            }
-            if mountpoint == "/" || mountpoint == home {
-                continue;
-            }
-            if home.starts_with(mountpoint) {
-                continue;
-            }
-
-            let label = Path::new(mountpoint)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(mountpoint)
-                .to_string();
-
-            mounts.push(MountPoint {
-                path: mountpoint.to_string(),
-                label,
-            });
-        }
-    }
-
-    Ok(mounts)
-}
-
-/// Build a display label for a search result path.
-fn search_display_label(path: &Path, is_dir: bool, home: Option<&Path>) -> String {
-    let display = if let Some(home) = home {
-        if let Ok(rel) = path.strip_prefix(home) {
-            format!("~/{}", rel.display())
-        } else {
-            path.display().to_string()
-        }
-    } else {
-        path.display().to_string()
-    };
-    if is_dir {
-        format!("{display}/")
-    } else {
-        display
-    }
-}
-
-/// Start a recursive fuzzy file search. Results are streamed via events.
+/// Start a file search. An empty query is a directory *listing* (fast depth-1
+/// readdir, unchanged). A non-empty query is a *fuzzy search* served by the
+/// persistent per-scope nucleo index — instant per keystroke, no re-walk.
 #[tauri::command]
+#[specta::specta]
 pub async fn start_file_search(
     query: String,
     scope: String,
@@ -341,18 +62,202 @@ pub async fn start_file_search(
     state: State<'_, AppState>,
 ) -> Result<(), LychiError> {
     state.active_file_search.store(search_id, Ordering::SeqCst);
-
     let active_id = state.active_file_search.clone();
+    let db = state.db.clone();
+
+    // Empty query → directory listing. Keep the direct depth-1 walk (no index
+    // needed; listing should show everything including ignored folders).
+    if query.trim().is_empty() {
+        tauri::async_runtime::spawn_blocking(move || {
+            walk_and_emit(&query, &scope, search_id, &active_id, &db, &app);
+        });
+        return Ok(());
+    }
+
+    // Fuzzy search via the persistent index. Get/build the scope's engine, then
+    // match. `notify` re-runs the search when more of the index streams in, so
+    // results fill as the background walk progresses.
+    let store = state.file_index.clone();
+    let app_notify = app.clone();
+    let scope_notify = scope.clone();
+    let query_notify = query.clone();
+    let db_notify = db.clone();
+    let active_notify = active_id.clone();
+    let store_notify = store.clone();
+    let notify: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        // Only re-emit if this scope's search is still the active one.
+        if active_notify.load(Ordering::Relaxed) == search_id {
+            emit_index_results(
+                &store_notify,
+                &scope_notify,
+                &query_notify,
+                search_id,
+                &db_notify,
+                &app_notify,
+            );
+        }
+    });
 
     tauri::async_runtime::spawn_blocking(move || {
-        walk_and_emit(&query, &scope, search_id, &active_id, &app);
+        let index = store.get_or_build(&scope, notify);
+        // Run the match, then emit whatever's matched so far. The notify
+        // callback handles later fills as indexing completes.
+        if let Ok(mut idx) = index.lock() {
+            idx.search(&query, 10);
+        }
+        emit_index_results(&store, &scope, &query, search_id, &db, &app);
     });
 
     Ok(())
 }
 
+/// Read the current matches from the scope's index, RE-RANK them with explicit
+/// match tiers (Spotlight/Raycast/fzf model — see `lychi_core::file_search_score`),
+/// split into Folders and Files groups, and emit with section-header rows.
+///
+/// nucleo is used only as a fast candidate *generator* (its parallel walk +
+/// fuzzy filter narrows millions of paths to the matching set); ranking is ours,
+/// because nucleo's path-scheme score ties a folder with its own children.
+fn emit_index_results(
+    store: &Arc<lychi_core::file_search::FileIndexStore>,
+    scope: &str,
+    query: &str,
+    search_id: u64,
+    db: &Arc<redb::Database>,
+    app: &AppHandle,
+) {
+    use lychi_core::file_search_score::{MatchScore, classify};
+
+    // Per group; folders and files are ranked independently, so each can fill
+    // its own section without one starving the other.
+    const PER_GROUP: usize = 25;
+    // Over-fetch from nucleo: it fuzzy-filtered already, so this pool is "paths
+    // that match at all". We re-rank the whole pool, then take the best per group.
+    const CANDIDATE_POOL: usize = 400;
+
+    let (items, done) = {
+        let Some(index) = store.peek(scope) else {
+            return;
+        };
+        let Ok(mut idx) = index.lock() else {
+            return;
+        };
+        // Pull any newly-injected/matched items into the snapshot before reading.
+        idx.refresh(10);
+        (idx.top(CANDIDATE_POOL), idx.is_complete())
+    };
+
+    let frecency_scores = lychi_core::db::frecency::get_scores(db);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let home = dirs::home_dir();
+
+    // Classify every candidate into a match tier + in-tier signals. Anything the
+    // scorer rejects (query hits neither name nor any ancestor dir) is dropped —
+    // an extra guard on top of nucleo's own filter.
+    struct Row {
+        score: MatchScore,
+        bonus: u16,
+        is_dir: bool,
+        result: FileSearchResult,
+    }
+    let mut rows: Vec<Row> = items
+        .into_iter()
+        .filter_map(|d| {
+            let score = classify(query, &d.file_name, &d.rel_path)?;
+            let bonus = frecency_recency_bonus(
+                frecency_scores.get(&d.full_path).copied(),
+                d.modified_secs,
+                now_secs,
+            );
+            let path = Path::new(&d.full_path);
+            let description = if d.is_dir {
+                Some("Folder".to_string())
+            } else {
+                d.file_name
+                    .rsplit('.')
+                    .next()
+                    .filter(|ext| !ext.is_empty() && ext.len() < 6 && *ext != d.file_name)
+                    .map(|ext| ext.to_uppercase())
+            };
+            Some(Row {
+                score,
+                bonus,
+                is_dir: d.is_dir,
+                result: FileSearchResult {
+                    label: search_display_label(path, d.is_dir, home.as_deref()),
+                    full_path: d.full_path.clone(),
+                    is_dir: d.is_dir,
+                    score: 0, // set below from final display rank
+                    description,
+                    size_bytes: d.size_bytes,
+                    modified_secs: d.modified_secs,
+                },
+            })
+        })
+        .collect();
+
+    // Rank: tier (best first) → shorter filename → shallower path → more used.
+    // This is fzf's `--tiebreak=pathname,length` plus a Raycast usage layer, but
+    // gated under a discrete tier so a real filename match always beats a
+    // path-only one (the parent-vs-children fix is structural, not a tiebreak).
+    let rank = |a: &Row, b: &Row| {
+        a.score
+            .tier
+            .cmp(&b.score.tier) // lower tier value = better match
+            .then_with(|| a.score.name_len.cmp(&b.score.name_len)) // shorter name first
+            .then_with(|| a.score.depth.cmp(&b.score.depth)) // shallower first
+            .then_with(|| b.bonus.cmp(&a.bonus)) // more used first
+            .then_with(|| a.result.label.cmp(&b.result.label)) // stable
+    };
+
+    let (mut folders, mut files): (Vec<Row>, Vec<Row>) = rows.drain(..).partition(|r| r.is_dir);
+    folders.sort_by(&rank);
+    files.sort_by(&rank);
+    folders.truncate(PER_GROUP);
+    files.truncate(PER_GROUP);
+
+    // Build the emitted list: a "folders" section header, the folders, then a
+    // "files" section header, then the files. Headers use the `__separator__`
+    // sentinel the CompletionsList already renders (centered label between
+    // lines) — no new UI. A section is omitted entirely when it has no matches,
+    // so an all-files or all-folders query shows just the one group.
+    //
+    // Display score is a single descending integer so the frontend's own
+    // score-sort preserves exactly this order (headers get a score above their
+    // section's items but below the previous section's, keeping them in place).
+    let mut out: Vec<FileSearchResult> = Vec::with_capacity(folders.len() + files.len() + 2);
+    let mut next_score: u16 = (folders.len() + files.len() + 4) as u16;
+
+    if !folders.is_empty() {
+        out.push(section_header("folders", &mut next_score));
+        for row in folders {
+            out.push(finalize_row(row.result, &mut next_score));
+        }
+    }
+    if !files.is_empty() {
+        out.push(section_header("files", &mut next_score));
+        for row in files {
+            out.push(finalize_row(row.result, &mut next_score));
+        }
+    }
+
+    let _ = app.emit(
+        "lychi://file-search-results",
+        FileSearchBatch {
+            search_id,
+            results: out,
+            done,
+            has_ignore_rules: false,
+        },
+    );
+}
+
 /// Cancel any in-flight file search.
 #[tauri::command]
+#[specta::specta]
 pub async fn cancel_file_search(state: State<'_, AppState>) -> Result<(), LychiError> {
     state.active_file_search.store(0, Ordering::SeqCst);
     Ok(())
@@ -363,12 +268,24 @@ fn walk_and_emit(
     scope: &str,
     search_id: u64,
     active_id: &Arc<std::sync::atomic::AtomicU64>,
+    db: &Arc<redb::Database>,
     app: &AppHandle,
 ) {
     const BATCH_SIZE: usize = 10;
     const MAX_RESULTS: usize = 50;
 
     let is_listing = query.is_empty();
+
+    // Usage-driven ranking signal: files the user has actually opened (recorded
+    // by the `file` handler under their absolute path) get a frecency bonus, so
+    // a familiar file outranks a fuzzy-equal stranger — the Raycast/Alfred
+    // standard. Fetched once per search (all keys); file paths are absolute so
+    // they don't collide with the prefixed keys (history:/ws:/sug:).
+    let frecency_scores = lychi_core::db::frecency::get_scores(db);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let wants_hidden = query.starts_with('.');
     let query_has_slash = query.contains('/');
     let home = dirs::home_dir();
@@ -396,7 +313,16 @@ fn walk_and_emit(
         .git_global(false)
         .git_exclude(false)
         .follow_links(false)
-        .max_depth(Some(if is_listing { 1 } else { MAX_SEARCH_DEPTH }));
+        .max_depth(Some(if is_listing { 1 } else { MAX_SEARCH_DEPTH }))
+        // Honor `.gitignore` / `.ignore` even outside a git repo. The `ignore`
+        // crate normally only applies `.gitignore` inside an actual git repo, so
+        // a project with a `.gitignore` (e.g. listing `node_modules/`) but no
+        // `.git` — common for vendored or copied project trees — would flood
+        // results with dependency trees, burying real matches. `require_git(false)`
+        // makes the project's OWN ignore rules apply regardless of git status:
+        // fully adaptive to whatever each folder declares, zero hardcoded names.
+        // Only during search — listing a directory should still show everything.
+        .require_git(is_listing);
     let walker = builder.build();
 
     // Helper: build a result from a walk entry
@@ -488,9 +414,10 @@ fn walk_and_emit(
         return;
     }
 
-    // Fuzzy search: stream results in batches for responsive UI
-    let mut batch: Vec<FileSearchResult> = Vec::with_capacity(BATCH_SIZE);
-    let mut total_sent: usize = 0;
+    // Fuzzy search: gather all matches, globally sort at the end. A fast first
+    // preview batch keeps the UI responsive without sacrificing final ordering.
+    let mut matches: Vec<FileSearchResult> = Vec::with_capacity(BATCH_SIZE * 4);
+    let mut sent_first = false;
 
     for entry in walker {
         if active_id.load(Ordering::Relaxed) != search_id {
@@ -526,13 +453,23 @@ fn walk_and_emit(
         let path_haystack = Utf32Str::new(&rel, &mut buf);
         let path_score = pattern.score(path_haystack, &mut matcher);
 
-        let score = match (name_score, path_score) {
+        let match_score = match (name_score, path_score) {
             (Some(ns), _) => ns.saturating_add(100), // filename match: boosted
             (None, Some(ps)) if query_has_slash => ps, // path match: only when query has '/'
             _ => continue,
         };
 
-        batch.push(build_result(
+        // Blend in usage frecency + recency so a file the user opens often (or
+        // touched recently) outranks a fuzzy-equal stranger.
+        let full_path = path.to_string_lossy();
+        let bonus = frecency_recency_bonus(
+            frecency_scores.get(full_path.as_ref()).copied(),
+            build_result_modified(&entry),
+            now_secs,
+        );
+        let score = match_score.saturating_add(bonus);
+
+        matches.push(build_result(
             &entry,
             file_name,
             is_dir,
@@ -540,59 +477,44 @@ fn walk_and_emit(
             home.as_deref(),
         ));
 
-        // Emit first batch sooner (3 items) for faster perceived response
-        let effective_batch = if total_sent == 0 { 3 } else { BATCH_SIZE };
-        if batch.len() >= effective_batch {
-            batch.sort_by(|a, b| b.score.cmp(&a.score));
+        // Stream a fast FIRST batch for perceived responsiveness: emit the top
+        // few as soon as we have them, so the user sees results immediately.
+        // The final emit re-sends the FULL globally-sorted list, so any better
+        // match found later lands in the right position (fixes the per-batch
+        // ordering artifact).
+        if !sent_first && matches.len() >= 3 {
+            let mut preview = matches.clone();
+            preview.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.label.cmp(&b.label)));
+            preview.truncate(3);
             let _ = app.emit(
                 "lychi://file-search-results",
                 FileSearchBatch {
                     search_id,
-                    results: std::mem::take(&mut batch),
+                    results: preview,
                     done: false,
                     has_ignore_rules,
                 },
             );
-            total_sent += effective_batch;
-            if total_sent >= MAX_RESULTS {
-                break;
-            }
+            sent_first = true;
+        }
+        if matches.len() >= MAX_RESULTS * 4 {
+            // Enough candidates gathered to pick a stable top-N; stop walking.
+            break;
         }
     }
 
-    batch.sort_by(|a, b| b.score.cmp(&a.score));
+    // Global sort: score desc, then label asc as a stable tie-breaker so
+    // equal-score results have a deterministic order (not walk order).
+    matches.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.label.cmp(&b.label)));
+    matches.truncate(MAX_RESULTS);
+
     let _ = app.emit(
         "lychi://file-search-results",
         FileSearchBatch {
             search_id,
-            results: batch,
+            results: matches,
             done: true,
             has_ignore_rules,
         },
-    );
-}
-
-/// Pre-walk home directory to warm the OS filesystem cache.
-/// Called once at startup in a background thread so the first user search hits warm cache.
-pub fn warmup_fs_cache() {
-    let Some(home) = dirs::home_dir() else { return };
-    let walker = WalkBuilder::new(&home)
-        .hidden(true)
-        .ignore(true)
-        .git_ignore(true)
-        .git_global(false)
-        .git_exclude(false)
-        .follow_links(false)
-        .build();
-    let mut count = 0u64;
-    for _ in walker {
-        count += 1;
-        if count >= 100_000 {
-            break;
-        }
-    }
-    tracing::debug!(
-        "FS cache warmup: visited {count} entries under {}",
-        home.display()
     );
 }

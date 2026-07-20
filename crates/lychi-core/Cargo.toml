@@ -10,6 +10,7 @@ mpris = ["dep:zbus", "dep:futures-util", "dep:futures-core"]
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+specta = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -22,18 +23,27 @@ redb = { workspace = true }
 uuid = { workspace = true }
 postcard = { workspace = true }
 urlencoding = "2.1"
-which = "7"
-nix = { version = "0.29", features = ["signal", "process"] }
+which = "8"
+nix = { version = "0.31", features = ["signal", "process"] }
 dirs = "6"
+ignore = "0.4"
 nucleo-matcher = "0.3.1"
+nucleo = "0.5"
 freedesktop-icons = "0.4"
 arc-swap = "1"
-notify = "6"
+notify = "8"
 meval = "0.2"
 arboard = "3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff"] }
+base64 = "0.22"
+sha2 = "0.10"
+md-5 = "0.10"
+hex = "0.4"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+getrandom = "0.4"
 notify-rust = "4"
-emojis = "0.6"
-unicode_names2 = "1"
+emojis = "0.9"
+unicode_names2 = "3"
 reqwest = { version = "0.13", features = ["json", "query"] }
 zbus = { version = "5", features = ["tokio"], optional = true }
 futures-util = { version = "0.3", optional = true }

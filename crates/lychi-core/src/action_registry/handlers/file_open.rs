@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use redb::Database;
 
-use crate::action_registry::{ActionHandler, ActionResult};
+use crate::action_registry::{ActionHandler, ActionResult, ExecContext, OutputType};
 use crate::db::frecency;
 use crate::error::LychiError;
 
@@ -31,6 +31,12 @@ impl FileOpen {
 
 #[async_trait]
 impl ActionHandler for FileOpen {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["file"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "file"
     }
@@ -39,42 +45,21 @@ impl ActionHandler for FileOpen {
         "Open a file or folder in the default application"
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let path_str = args.trim();
         if path_str.is_empty() {
-            return Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some("Usage: file <path> or type a path starting with / or ~/".to_string()),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(ActionResult::err(
+                "Usage: file <path> or type a path starting with / or ~/".to_string(),
+            ));
         }
 
         let expanded = Self::expand_path(path_str);
 
         if !expanded.exists() {
-            return Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some(format!("Path not found: {}", expanded.display())),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(ActionResult::err(format!(
+                "Path not found: {}",
+                expanded.display()
+            )));
         }
 
         // Record frecency access
@@ -83,19 +68,9 @@ impl ActionHandler for FileOpen {
         // Convert to file:// URI for GDK-based opening on the frontend
         let file_uri = format!("file://{}", expanded.display());
 
-        Ok(ActionResult {
-            success: true,
-            output: Some(format!("Opened {}", expanded.display())),
-            error: None,
-            duration_ms: 0,
-            routed_by: None,
-            open_url: Some(file_uri),
-            needs_confirmation: None,
-            risk_level: None,
-            output_type: None,
-            executed_args: None,
-            launch_desktop: None,
-            focus_app: None,
-        })
+        Ok(
+            ActionResult::ok(format!("Opened {}", expanded.display()), OutputType::Status)
+                .with_link(file_uri),
+        )
     }
 }

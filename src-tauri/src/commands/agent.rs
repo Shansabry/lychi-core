@@ -1,11 +1,12 @@
 use crate::state::AppState;
-use lychi_core::action_registry::ActionResult;
+use lychi_core::action_registry::CommandResultDto;
 use lychi_core::error::LychiError;
 use lychi_core::providers::AgentPlan;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_agent_plan(
     input: String,
     state: State<'_, AppState>,
@@ -14,15 +15,16 @@ pub async fn get_agent_plan(
     Ok(executor.try_plan(&input).await)
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, specta::Type)]
 pub struct StepEvent {
     pub plan_id: String,
     pub step_index: usize,
     pub status: String,
-    pub result: Option<ActionResult>,
+    pub result: Option<CommandResultDto>,
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn execute_agent_plan(
     plan_id: String,
     app: AppHandle,
@@ -55,10 +57,15 @@ pub async fn execute_agent_plan(
         // Execute step through the executor pipeline (resolve → validate → execute)
         // Plan steps are pre-confirmed (confirmed=true) since user approved the plan
         let exec = executor
-            .run(&format!("{} {}", step.action_id, step.args), true, &privacy)
+            .run(
+                &format!("{} {}", step.action_id, step.args),
+                true,
+                &privacy,
+                &lychi_core::executor::RunInputs::default(),
+            )
             .await;
 
-        let result = match exec {
+        let result: CommandResultDto = match exec {
             Ok(exec) => {
                 // Notify frontend when notes/todos/reminders are mutated by a plan step
                 if exec.result.success
@@ -66,21 +73,12 @@ pub async fn execute_agent_plan(
                 {
                     let _ = app.emit("lychi://notes-changed", ());
                 }
-                exec.result
+                CommandResultDto::build(exec.result, exec.envelope)
             }
-            Err(e) => ActionResult {
+            Err(e) => CommandResultDto {
                 success: false,
-                output: None,
                 error: Some(e.to_string()),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
+                ..Default::default()
             },
         };
 
@@ -115,6 +113,7 @@ pub async fn execute_agent_plan(
 
 /// Store a plan as pending so execute_agent_plan can find it.
 #[tauri::command]
+#[specta::specta]
 pub async fn store_agent_plan(
     plan: AgentPlan,
     state: State<'_, AppState>,

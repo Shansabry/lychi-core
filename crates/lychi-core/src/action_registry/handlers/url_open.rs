@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::action_registry::{ActionHandler, ActionResult};
+use crate::action_registry::{ActionHandler, ActionResult, ExecContext};
 use crate::error::LychiError;
 
 pub struct UrlOpen;
@@ -28,6 +28,12 @@ impl UrlOpen {
 
 #[async_trait]
 impl ActionHandler for UrlOpen {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["url"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "url"
     }
@@ -36,40 +42,16 @@ impl ActionHandler for UrlOpen {
         "Open a URL in the default browser"
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let url_str = args.trim();
         if url_str.is_empty() {
-            return Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some("Usage: url <address> or type a URL directly".to_string()),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(ActionResult::err(
+                "Usage: url <address> or type a URL directly".to_string(),
+            ));
         }
 
         let url = Self::normalize_url(url_str);
 
-        Ok(ActionResult {
-            success: true,
-            output: None,
-            error: None,
-            duration_ms: 0,
-            routed_by: None,
-            open_url: Some(url),
-            needs_confirmation: None,
-            risk_level: None,
-            output_type: None,
-            executed_args: None,
-            launch_desktop: None,
-            focus_app: None,
-        })
+        Ok(ActionResult::navigate(url, true))
     }
 }

@@ -1,6 +1,5 @@
 <script lang="ts">
 import { LoaderCircle } from "lucide-svelte";
-import { fuzzyRank } from "$lib/fuzzy";
 import { matchesAction, normalizeKey } from "$lib/keybindings";
 
 let {
@@ -20,10 +19,13 @@ let {
 	atMode = false,
 	atStart = -1,
 	searchMode = false,
+	aiEnabled = false,
 	scopeCount = 0,
 	ontabscope = () => {},
 	ontabcomplete = () => {},
 	onshifttabback = () => {},
+	ondrillinto = () => {},
+	oncopypath = () => {},
 	contextPill = "",
 	contextLoading = false,
 	searchGhost = "",
@@ -31,7 +33,7 @@ let {
 	history = [],
 }: {
 	value: string;
-	onsubmit: (opts?: { ctrlKey?: boolean }) => void;
+	onsubmit: (opts?: { ctrlKey?: boolean; runInline?: boolean }) => void;
 	onarrowup: () => void;
 	onarrowdown: () => void;
 	ondismiss: () => void;
@@ -46,10 +48,13 @@ let {
 	atMode: boolean;
 	atStart: number;
 	searchMode?: boolean;
+	aiEnabled?: boolean;
 	scopeCount?: number;
 	ontabscope?: () => void;
 	ontabcomplete?: () => void;
 	onshifttabback?: () => void;
+	ondrillinto?: () => void;
+	oncopypath?: () => void;
 	contextPill?: string;
 	contextLoading?: boolean;
 	searchGhost?: string;
@@ -103,17 +108,13 @@ let ghost: Ghost = $derived.by(() => {
 	}
 	if (searchMode) return null;
 	const lower = value.toLowerCase();
-	// Prefix match wins (most recent first)
+	// Ghost/inline autocomplete may ONLY show a literal prefix-extension of what
+	// the user typed (browser-omnibox rule). A fuzzy, non-prefix match (e.g.
+	// "run top" -> "run htop") must NOT appear as ghost — accepting it would run
+	// something the user didn't type. Prefix matches only, most recent first.
 	for (let i = history.length - 1; i >= 0; i--) {
 		if (history[i].toLowerCase().startsWith(lower) && history[i] !== value) {
 			return { kind: "suffix", suffix: history[i].slice(value.length) };
-		}
-	}
-	// Fuzzy fallback — only for meaningful queries
-	if (value.length >= 3) {
-		const matches = fuzzyRank(value, history);
-		if (matches.length > 0 && matches[0].value !== value) {
-			return { kind: "fuzzy", full: matches[0].value };
 		}
 	}
 	return null;
@@ -131,24 +132,37 @@ $effect(() => {
 	}
 });
 
-// Animated placeholder suggestions
-const SUGGESTIONS = [
+// Animated placeholder suggestions. Split so we never advertise a capability
+// the current setup can't deliver:
+//   • BASE — deterministic commands that ALWAYS work (no AI, real handlers).
+//   • AI_ONLY — natural-language phrases that need an AI provider; without one
+//     they'd silently become a web search, so they only show when AI is on.
+const BASE_SUGGESTIONS = [
 	"open firefox",
 	"web how to make pasta",
 	"yt lofi hip hop",
 	"=256 * 1024",
 	">ls -la ~/Downloads",
-	"resize @~/Photos/img.jpg to 800x600",
-	"spotify next",
-	"what's the weather today?",
-	"summarize my last meeting notes",
+	"resize ~/Photos/img.jpg to 800x600",
+	"summarize <paste text here>",
 	"convert 100 USD to EUR",
-	"create a new project folder",
-	"find large files in Downloads",
-	"pause all music",
+	"define ephemeral",
+	"weather tokyo",
+	"spotify next",
 	"github.com",
 	"snip email-intro",
 ];
+const AI_ONLY_SUGGESTIONS = [
+	"what's the weather today?",
+	"find large files in Downloads",
+	"create a new project folder",
+	"pause all music",
+	"summarize my meeting notes",
+];
+// The active list depends on whether AI is configured.
+let SUGGESTIONS = $derived(
+	aiEnabled ? [...BASE_SUGGESTIONS, ...AI_ONLY_SUGGESTIONS] : BASE_SUGGESTIONS,
+);
 
 // Fisher-Yates shuffle
 function shuffle<T>(arr: T[]): T[] {
@@ -268,9 +282,24 @@ function handleKeydown(e: KeyboardEvent) {
 	) {
 		e.preventDefault();
 		acceptGhost();
+	} else if (
+		e.key === "ArrowRight" &&
+		searchMode &&
+		inputEl &&
+		inputEl.selectionStart === value.length
+	) {
+		// Search mode, cursor at end, no ghost → drill into the selected folder.
+		e.preventDefault();
+		ondrillinto();
+	} else if (matchesAction(e, "copy_path") && searchMode) {
+		e.preventDefault();
+		oncopypath();
 	} else if (matchesAction(e, "web_search")) {
 		e.preventDefault();
 		onsubmit({ ctrlKey: true });
+	} else if (matchesAction(e, "run_inline")) {
+		e.preventDefault();
+		onsubmit({ runInline: true });
 	} else if (matchesAction(e, "submit") && !e.shiftKey) {
 		e.preventDefault();
 		onsubmit({ ctrlKey: false });

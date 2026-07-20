@@ -1,5 +1,6 @@
 <script lang="ts">
 import { invoke } from "@tauri-apps/api/core";
+import { LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { onMount } from "svelte";
 import AgentPlanPanel from "$lib/components/AgentPlanPanel.svelte";
@@ -27,16 +28,21 @@ import {
 	executeCommand,
 	getActiveWindowStrategy,
 	getAgentPlan,
+	getAiStatus,
 	getCompletions,
 	getContext,
 	getHideOnBlur,
 	getHistory,
+	getHotkeyStatus,
 	getMountPoints,
 	grantPrivacyConsent,
 	hideWindow,
 	listPathCompletions,
 	mediaGetStatus,
+	openPath,
 	openUri,
+	revealPath,
+	saveGeneralConfig,
 	saveWindowPosition,
 	startFileSearch,
 } from "$lib/ipc";
@@ -57,6 +63,11 @@ let completions: CompletionItem[] = $state([]);
 let completionIndex = $state(-1);
 let debounceTimer: ReturnType<typeof setTimeout> | undefined;
 let completionGen = 0;
+// True while a completions query is in flight. Drives a subtle skeleton in the
+// results area for the narrow window where the first query (cold start) hasn't
+// returned yet — non-blocking, vanishes the instant results arrive. The launcher
+// stays fully typeable throughout; this is a hint, not a loading gate.
+let completionsPending = $state(false);
 
 // @ file reference mode (browse — point to a file in a command)
 let atMode = $state(false);
@@ -99,12 +110,96 @@ let atPathContext = $derived.by(() => {
 let settingsOpen = $state(false);
 let hideOnBlur = $state(true);
 let windowStrategy = $state("x11"); // "layer-shell" or "x11" — drives layout mode
+// Non-composited X11 (xfwm4/Marco with compositing off): the window is a
+// compact opaque rofi-style box sized to content — transparency would render
+// black. Drives the .compact/.no-compositor layout and dynamic window resize.
+let compactMode = $state(false);
+let launcherRowEl: HTMLDivElement | undefined = $state();
+
+// Keep the compact window's height matched to content (rofi-style resize).
+$effect(() => {
+	if (!compactMode || !launcherRowEl || !("__TAURI_INTERNALS__" in window)) return;
+	const el = launcherRowEl;
+	const win = getCurrentWindow();
+	let lastH = 0;
+	const observer = new ResizeObserver(() => {
+		const maxH = Math.round(window.screen.height * 0.6);
+		const h = Math.min(Math.ceil(el.getBoundingClientRect().height), maxH);
+		if (h > 0 && h !== lastH) {
+			lastH = h;
+			win.setSize(new LogicalSize(680, h)).catch(() => {});
+		}
+	});
+	observer.observe(el);
+	return () => observer.disconnect();
+});
+// First-run Wayland onboarding: shown when the in-app hotkey can't work
+// system-wide and the user hasn't dismissed the tip yet.
+let hotkeyBannerVisible = $state(false);
+let hotkeyBannerCopied = $state(false);
+let loadedGeneralConfig: import("$lib/ipc").GeneralConfig | null = null;
+
+function dismissHotkeyBanner() {
+	hotkeyBannerVisible = false;
+	if (loadedGeneralConfig && !loadedGeneralConfig.first_run_completed) {
+		loadedGeneralConfig.first_run_completed = true;
+		saveGeneralConfig(loadedGeneralConfig).catch((err) => {
+			console.error("[onboarding] failed to persist banner dismissal:", err);
+		});
+	}
+}
+
+async function copyToggleCommand() {
+	try {
+		await navigator.clipboard.writeText("lychi --toggle");
+		hotkeyBannerCopied = true;
+		setTimeout(() => {
+			hotkeyBannerCopied = false;
+		}, 1500);
+	} catch (err) {
+		console.error("[onboarding] clipboard write failed:", err);
+	}
+}
 // Prevents stale-completions flash: kept false until summon clears state, so the
 // first compositor frame is always a clean empty launcher.
 let launcherReady = $state(false);
 
+// Context-staleness indicator (shown as a dim glyph in the status bar, not a
+// warning row). Set from a `__context_stale__` sentinel in the completions.
+let contextStale = $state(false);
+let contextStaleHint = $state("");
+// True only while a background context re-gather is actually in flight (between
+// the `context-stale` and `context-ready` events) — drives the "updating
+// context…" spinner, distinct from the idle "context outdated" bulb.
+let contextRefreshing = $state(false);
+
+/**
+ * Pull a `__context_stale__` sentinel out of zero-state completions: sets the
+ * status-bar indicator and returns the list WITHOUT it, so staleness shows as a
+ * quiet glyph instead of an invasive warning row. Returns results unchanged
+ * when the sentinel is absent (and clears the indicator).
+ */
+function extractContextStale(results: CompletionItem[]): CompletionItem[] {
+	const stale = results.find((c) => c.icon_path === "__context_stale__");
+	contextStale = !!stale;
+	contextStaleHint = stale?.description ?? "";
+	return stale ? results.filter((c) => c.icon_path !== "__context_stale__") : results;
+}
+
+// Transient confirmation shown in the completions hints bar (e.g. "Path copied").
+let flashMessage = $state("");
+let flashTimer: ReturnType<typeof setTimeout> | undefined;
+function flashHint(msg: string) {
+	flashMessage = msg;
+	clearTimeout(flashTimer);
+	flashTimer = setTimeout(() => {
+		flashMessage = "";
+	}, 1400);
+}
+
 let pendingPlan: AgentPlan | null = $state(null);
 let planPanelRef: AgentPlanPanel | undefined = $state(undefined);
+let resultPanelRef: ResultPanel | undefined = $state(undefined);
 // C1/C15: generation counter for AI routing — ESC increments to cancel stale responses
 let routingGeneration = 0;
 let mediaOpen = $state(false);
@@ -113,6 +208,10 @@ let pendingNoteText: string | null = $state(null);
 let initialNotesTab: "notes" | "todos" | "reminders" | "timers" | "snippets" | undefined =
 	$state(undefined);
 let mediaPlayers: TrackInfo[] = $state([]);
+// Whether an AI provider is actually configured — gates the natural-language
+// placeholder suggestions so we never advertise AI-only actions to a user who
+// has no key (they'd silently web-search instead).
+let aiEnabled = $state(false);
 let envContext: EnvironmentContext | null = $state(null);
 let contextLoading = $state(false);
 let contextLoadingTimer: ReturnType<typeof setTimeout> | undefined;
@@ -327,21 +426,52 @@ function handleInput(val: string) {
 	const trimmed = val.trim();
 	if (trimmed.length < 1 && !envContext) {
 		completionGen++;
+		completionsPending = false;
 		completions = [];
 		completionIndex = -1;
 		return;
 	}
 
 	const gen = ++completionGen;
+	completionsPending = true;
 	getCompletions(trimmed)
-		.then((results) => {
+		.then((rawResults) => {
 			if (gen !== completionGen) return;
+			completionsPending = false;
+			const results = extractContextStale(rawResults);
 			completions = results;
-			completionIndex = results.length > 0 ? 0 : -1;
+			// Omnibox rule (Chromium `allowed_to_be_default_match`): only
+			// auto-select a suggestion whose text is a prefix-extension of what
+			// the user literally typed. Otherwise select nothing, so plain Enter
+			// runs the typed input — never a non-prefix match. e.g. "run top"
+			// must NOT auto-run the history entry "run htop".
+			completionIndex = defaultMatchIndex(results, trimmed);
 		})
 		.catch((err) => {
+			if (gen === completionGen) completionsPending = false;
 			console.error("[completions] error:", err);
 		});
+}
+
+/**
+ * Index of the completion eligible to be Enter's default, or -1 if none.
+ * A candidate qualifies only when it forward-completes the typed input —
+ * its command (`run`/`fill`) or label starts with the input, case-insensitively.
+ * Separators and info rows are never eligible. This is the browser-omnibox
+ * model: with no explicit arrow-selection, Enter runs the typed input unless a
+ * true prefix-completion exists.
+ */
+function defaultMatchIndex(results: CompletionItem[], input: string): number {
+	const q = input.trim().toLowerCase();
+	if (!q) return results.length > 0 ? 0 : -1;
+	for (let i = 0; i < results.length; i++) {
+		const c = results[i];
+		if (c.icon_path === "__separator__" || c.icon_path === "__info__") continue;
+		// The text this row would act on — prefer the exact command it carries.
+		const candidate = (c.run ?? c.fill ?? c.label).toLowerCase();
+		if (candidate.startsWith(q)) return i;
+	}
+	return -1;
 }
 
 onMount(() => {
@@ -350,6 +480,9 @@ onMount(() => {
 	});
 	getHideOnBlur().then((v) => {
 		hideOnBlur = v;
+	});
+	getAiStatus().then((s) => {
+		aiEnabled = s.has_ai_router;
 	});
 	getMountPoints().then((mounts) => {
 		mountPoints = mounts;
@@ -360,6 +493,22 @@ onMount(() => {
 	Promise.all([preloadAll(), getCompletions("__warmup__").catch(() => {})])
 		.then(([[settings]]) => {
 			loadKeybindings(settings.keybindingsConfig);
+			loadedGeneralConfig = settings.generalConfig;
+			compactMode = settings.activeWindowStrategy === "x11" && !settings.screenComposited;
+			// First-run onboarding: on Wayland the in-app hotkey only fires over
+			// XWayland windows — point the user at a DE-bound `lychi --toggle`.
+			if (!settings.generalConfig.first_run_completed) {
+				getHotkeyStatus()
+					.then((status) => {
+						if (status.session_type === "wayland" && !status.reliable) {
+							hotkeyBannerVisible = true;
+						} else {
+							// Hotkey works — mark onboarding done silently
+							dismissHotkeyBanner();
+						}
+					})
+					.catch(() => {});
+			}
 		})
 		.finally(() => {
 			backendReady = true;
@@ -374,6 +523,16 @@ onMount(() => {
 	(async () => {
 		const win = getCurrentWindow();
 
+		// Self-heal: if the window was mapped before these listeners attached
+		// (cold start — the summon/shown events fired into the void), become
+		// visible/clickable now instead of staying an invisible click-blocker.
+		win
+			.isVisible()
+			.then((visible) => {
+				if (visible) launcherReady = true;
+			})
+			.catch(() => {});
+
 		// Listen for agent step events
 		const unlistenStep = await win.listen<StepEvent>("lychi://agent-step", (e) => {
 			planPanelRef?.handleStepEvent(e.payload);
@@ -385,6 +544,14 @@ onMount(() => {
 			}
 		});
 		unlisteners.push(unlistenStep);
+
+		// Ready signal — emitted post-map (with a 150ms watchdog re-emit).
+		// Idempotent: only flips visibility readiness. Without it, a lost
+		// summon leaves an invisible surface that blocks all desktop clicks.
+		const unlistenShown = await win.listen("lychi://shown", () => {
+			launcherReady = true;
+		});
+		unlisteners.push(unlistenShown);
 
 		// Listen for summon event from Rust (global shortcut / IPC toggle)
 		const unlistenSummon = await win.listen("lychi://summon", () => {
@@ -427,9 +594,17 @@ onMount(() => {
 		});
 		unlisteners.push(unlistenSummon);
 
+		// A background context re-gather has STARTED (fired by execute_command
+		// when it runs against stale context) — show "updating context…".
+		const unlistenContextStale = await win.listen("lychi://context-stale", () => {
+			contextRefreshing = true;
+		});
+		unlisteners.push(unlistenContextStale);
+
 		// Listen for context-ready event from async context gathering
 		const unlistenContext = await win.listen<EnvironmentContext>("lychi://context-ready", (e) => {
 			envContext = e.payload;
+			contextRefreshing = false;
 			clearTimeout(contextLoadingTimer);
 			contextLoading = false;
 			// Fetch context suggestions only if the input is still empty.
@@ -439,8 +614,9 @@ onMount(() => {
 			if (inputValue.trim().length < 1) {
 				const gen = ++completionGen;
 				getCompletions("")
-					.then((results) => {
+					.then((rawResults) => {
 						if (gen !== completionGen) return;
+						const results = extractContextStale(rawResults);
 						completions = results;
 						completionIndex = results.length > 0 ? 0 : -1;
 					})
@@ -477,12 +653,18 @@ onMount(() => {
 					metaUpdates.set(r.label, { size_bytes: r.size_bytes, modified_secs: r.modified_secs });
 				}
 
-				const newItems: CompletionItem[] = batch.results.map((r) => ({
-					label: r.label,
-					icon_path: r.is_dir ? "__folder__" : null,
-					score: r.score,
-					description: r.description ?? null,
-				}));
+				// A section-header row (backend tags it with description "__separator__").
+				// Rendered by CompletionsList as a centered label between lines; not
+				// selectable. Everything else is a normal file/folder result.
+				const newItems: CompletionItem[] = batch.results.map((r) => {
+					const isSep = r.description === "__separator__";
+					return {
+						label: r.label,
+						icon_path: isSep ? "__separator__" : r.is_dir ? "__folder__" : null,
+						score: r.score,
+						description: isSep ? null : (r.description ?? null),
+					};
+				});
 
 				const isDone = batch.done;
 
@@ -492,17 +674,28 @@ onMount(() => {
 					fileMetaMap = metaUpdates;
 					if (batch.has_ignore_rules) ignoreActive = true;
 
-					completions = [...completions, ...newItems]
-						.sort((a, b) => {
-							const aDir = a.icon_path === "__folder__" ? 1 : 0;
-							const bDir = b.icon_path === "__folder__" ? 1 : 0;
-							if (bDir !== aDir) return bDir - aDir; // folders first
-							return b.score - a.score; // then by score
+					// Each batch carries the FULL ranked snapshot for this search (the
+					// index re-emits the whole top-N as it fills), already ordered by
+					// the backend — fzf/Raycast standard: the backend owns ranking, the
+					// UI just renders. REPLACE, don't append (appending re-adds the
+					// same paths every emit → duplicates). Dedup by full_path as a
+					// guard; preserve the backend's order (no re-sort). Section headers
+					// (empty full_path) are kept verbatim — never deduped away.
+					const seen = new Set<string>();
+					completions = newItems
+						.filter((item) => {
+							if (item.icon_path === "__separator__") return true;
+							const key = pathUpdates.get(item.label) ?? item.label;
+							if (seen.has(key)) return false;
+							seen.add(key);
+							return true;
 						})
 						.slice(0, 20);
 
-					if (completions.length > 0 && completionIndex < 0) {
-						completionIndex = 0;
+					// Auto-select the first SELECTABLE row (skip a leading section header).
+					if (completionIndex < 0) {
+						const first = completions.findIndex((c) => c.icon_path !== "__separator__");
+						if (first >= 0) completionIndex = first;
 					}
 
 					if (isDone) {
@@ -514,12 +707,36 @@ onMount(() => {
 		);
 		unlisteners.push(unlistenFileSearch);
 
-		// Prevent WebKitGTK from stealing tab_back for native focus navigation
+		// Window-level key handling (capture phase) — needed for actions that
+		// must work even when DOM focus has left the input (e.g. after a
+		// command runs and the result panel is showing).
 		window.addEventListener(
 			"keydown",
 			(e) => {
+				// Prevent WebKitGTK from stealing tab_back for native focus nav
 				if (matchesAction(e, "tab_back")) {
 					e.preventDefault();
+					return;
+				}
+				// Browse the current result's inline URL via the user-assigned
+				// open_inline_url binding — focus-independent so it fires from
+				// the result panel too.
+				if (lastResult?.open_url && matchesAction(e, "open_inline_url")) {
+					e.preventDefault();
+					openInlineUrl();
+				}
+				// Copy a shown QR image with the copy_path shortcut (Ctrl+Shift+C).
+				// Only when a QR result is visible and not in file-search mode
+				// (there the same binding copies the selected path — no conflict).
+				if (!searchMode && lastResult?.output_type === "svg" && matchesAction(e, "copy_path")) {
+					e.preventDefault();
+					resultPanelRef?.copyQr();
+				}
+				// Quick screenshot (Ctrl+Shift+P): hide Lychi so it's not in the
+				// shot, then capture a region. Fires from anywhere in the window.
+				if (matchesAction(e, "screenshot")) {
+					e.preventDefault();
+					quickScreenshot();
 				}
 			},
 			true,
@@ -571,15 +788,30 @@ onMount(() => {
 	};
 });
 
-async function handleSubmit(opts?: { ctrlKey?: boolean }) {
+async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 	const trimmed = inputValue.trim();
 	// Allow submit when input is empty but a context suggestion is selected
 	const hasSelectedCompletion = completions.length > 0 && completionIndex >= 0;
 	if ((!trimmed && !hasSelectedCompletion) || isExecuting || !backendReady) return;
 
+	// In / search mode, Ctrl+Enter reveals the selected result in the file
+	// manager (not web search — the input is a path like "/Android/", never a
+	// query). Plain Enter opens; handled below via handleCompletionSelect.
+	if (opts?.ctrlKey && searchMode) {
+		if (hasSelectedCompletion) revealSelected();
+		return;
+	}
+
 	// Ctrl+Enter: force web search regardless of completions or routing
 	if (opts?.ctrlKey && trimmed) {
 		await runCommand(`web ${trimmed}`);
+		return;
+	}
+
+	// Shift+Enter: capture a `run` command's output inline instead of a
+	// terminal (terminal is the default). Ignored by non-run handlers.
+	if (opts?.runInline && trimmed) {
+		await runCommand(trimmed, { runInline: true });
 		return;
 	}
 
@@ -650,9 +882,11 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 		return;
 	}
 
-	// In search mode, auto-select first result if none explicitly selected
+	// In search mode, auto-select first selectable result (skip a leading
+	// section header) if none explicitly selected.
 	if (searchMode && completions.length > 0 && completionIndex < 0) {
-		completionIndex = 0;
+		const first = completions.findIndex((c) => c.icon_path !== "__separator__");
+		completionIndex = first >= 0 ? first : 0;
 	}
 
 	// Colon triggers (e.g. "al:list", "tz:tokyo") — send directly to backend, skip completion selection
@@ -672,6 +906,7 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 					output: selected.label.slice(2),
 					error: null,
 					duration_ms: 0,
+					auto_open: false,
 				};
 				inputValue = "";
 				completions = [];
@@ -691,6 +926,23 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 				handleCompletionSelect(selected.label, opts?.ctrlKey);
 				return;
 			}
+			// The backend declared the exact command to run (search handlers,
+			// emoji, etc.) — run it verbatim. No label reverse-parsing, no
+			// prefix guessing. This is the single scalable path.
+			// Argument-needing hint (e.g. "volume <n>"): insert the runnable
+			// prefix into the input so the user types the value, then Enter
+			// runs it. Tab-to-complete, a la Raycast/Alfred.
+			if (selected.fill) {
+				inputValue = selected.fill;
+				completions = [];
+				completionIndex = -1;
+				handleInput(inputValue);
+				return;
+			}
+			if (selected.run) {
+				await runCommand(selected.run);
+				return;
+			}
 			// Check if input has an explicit prefix (e.g. "spotify ", "system ", "media ")
 			// If so, append the selected completion to the prefix.
 			// But if the first word isn't a known handler prefix, this is a natural
@@ -703,6 +955,7 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 				"browse",
 				"clip",
 				"clipboard",
+				"clear",
 				"close",
 				"emoji",
 				"focus",
@@ -750,7 +1003,14 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 			if (spaceIdx !== -1) {
 				const prefix = trimmed.slice(0, spaceIdx).toLowerCase();
 				if (KNOWN_PREFIXES.has(prefix)) {
-					await runCommand(`${prefix} ${selected.label}`);
+					// Don't re-prefix if the label already carries the prefix
+					// (e.g. input "run htop", label "run htop") — that would
+					// produce "run run htop". Run the label as-is in that case.
+					if (selected.label.toLowerCase().startsWith(`${prefix} `)) {
+						await runCommand(selected.label);
+					} else {
+						await runCommand(`${prefix} ${selected.label}`);
+					}
 				} else {
 					// Natural language — let the backend route the original input
 					await runCommand(trimmed);
@@ -758,12 +1018,6 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 			} else if (KNOWN_PREFIXES.has(lower)) {
 				// Input is a bare prefix (e.g. "clip", "focus") — send prefix + selected label
 				await runCommand(`${lower} ${selected.label}`);
-			} else if (selected.icon_path === "__web__" || selected.label.startsWith("Search web:")) {
-				// Web search completion — extract query and run directly
-				const query = selected.label.startsWith("Search web:")
-					? selected.label.slice("Search web:".length).trim()
-					: selected.label;
-				await runCommand(`web ${query}`);
 			} else if (selected.icon_path === "__context__") {
 				// Context suggestion — label is a complete command (e.g. "git commit", "run cargo build")
 				await runCommand(selected.label);
@@ -779,8 +1033,22 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 		}
 	}
 
-	// In search mode, don't fall through to command execution
-	if (searchMode) return;
+	// In search mode with nothing selectable to act on, the user may have typed
+	// or pasted a literal absolute path (e.g. "/home/sab/Android/Sdk"). Try to
+	// open it directly; only if it doesn't exist do we give up (no silent no-op
+	// on a valid path). The leading "/" is the search-mode trigger AND the root
+	// of an absolute path, so the input value is the path as-is.
+	if (searchMode) {
+		const opened = await openPath(trimmed);
+		if (opened) {
+			inputValue = "";
+			completions = [];
+			completionIndex = -1;
+			cancelFileSearch();
+			await hide();
+		}
+		return;
+	}
 
 	// C1/C15: Race AI plan against a short timeout.
 	// If AI responds within 200ms, use the plan. Otherwise, execute immediately.
@@ -826,7 +1094,7 @@ async function handleSubmit(opts?: { ctrlKey?: boolean }) {
 	await commandPromise;
 }
 
-async function runCommand(command: string) {
+async function runCommand(command: string, opts?: { runInline?: boolean }) {
 	if (isExecuting) return;
 	isExecuting = true;
 	completions = [];
@@ -837,7 +1105,7 @@ async function runCommand(command: string) {
 	notesOpen = false;
 	try {
 		lastCommand = command;
-		lastResult = await executeCommand(command);
+		lastResult = await executeCommand(command, undefined, opts?.runInline);
 		// If confirmation is needed, show the confirm panel and wait for user decision
 		if (lastResult.needs_confirmation) {
 			return;
@@ -846,7 +1114,7 @@ async function runCommand(command: string) {
 		inputValue = "";
 		// If the backend wants us to open a URI, use GDK (proper Wayland focus transfer)
 		// But if output is also present (e.g. "ask" handler), show inline result instead
-		if (lastResult.open_url && !lastResult.output) {
+		if (lastResult.open_url && (lastResult.auto_open || !lastResult.output)) {
 			await hide();
 			await openUri(lastResult.open_url);
 		} else if (lastResult.output === "__media_panel__") {
@@ -910,6 +1178,7 @@ async function runCommand(command: string) {
 			output: null,
 			error: String(err),
 			duration_ms: 0,
+			auto_open: false,
 		};
 	} finally {
 		isExecuting = false;
@@ -931,14 +1200,20 @@ async function handleConfirm() {
 		lastResult = await executeCommand(lastCommand, true);
 		historyEntries = [...historyEntries, lastCommand];
 		inputValue = "";
-		if (lastResult.open_url && !lastResult.output) {
+		if (lastResult.open_url && (lastResult.auto_open || !lastResult.output)) {
 			await hide();
 			await openUri(lastResult.open_url);
 		} else if (lastResult.success && !lastResult.output) {
 			await hide();
 		}
 	} catch (err) {
-		lastResult = { success: false, output: null, error: String(err), duration_ms: 0 };
+		lastResult = {
+			success: false,
+			output: null,
+			error: String(err),
+			duration_ms: 0,
+			auto_open: false,
+		};
 	} finally {
 		isExecuting = false;
 	}
@@ -960,21 +1235,52 @@ async function openFileByLabel(label: string) {
 	await openUri(`file://${label}`);
 }
 
+/** Drill into a folder result — browse its contents inside Lychi (Tab / →). */
+function drillIntoFolder(item: CompletionItem) {
+	let path = item.label;
+	if (path.startsWith("~/")) {
+		path = path.slice(2); // ~/Downloads/ → Downloads/
+	} else if (activeScope && path.startsWith(activeScope)) {
+		path = path.slice(activeScope.length); // /mnt/DevSSD/Colris/ → Colris/
+		if (path.startsWith("/")) path = path.slice(1);
+	}
+	// Prepend a single leading slash for scope-relative paths, but never double
+	// it: an absolute label (that didn't match the scope-strip branch above)
+	// already starts with `/`.
+	inputValue = path.startsWith("/") ? path : `/${path}`;
+	handleInput(inputValue);
+}
+
+/** Reveal the selected search result in the file manager (Ctrl+Enter). */
+async function revealSelected() {
+	const item = completions[completionIndex];
+	if (!item) return;
+	const full = resolveFullPath(item.label);
+	if (!full) return;
+	await hide();
+	await revealPath(full);
+}
+
+/** Copy the selected search result's full path, flashing a confirmation. */
+async function copySelectedPath() {
+	const item = completions[completionIndex];
+	if (!item) return;
+	const full = resolveFullPath(item.label);
+	if (!full) return;
+	try {
+		await navigator.clipboard.writeText(full);
+		flashHint("Path copied");
+	} catch (err) {
+		console.error("[copy-path] clipboard write failed:", err);
+	}
+}
+
 function handleCompletionSelect(label: string, forceOpen?: boolean) {
-	// / search mode — drill into folders (Enter), or open in file manager (Ctrl+Enter)
+	// / search mode — Enter opens the folder/file; Ctrl+Enter (forceOpen) reveals
+	// it in the file manager. Drilling into a folder is Tab / → (see drillIntoFolder).
 	if (searchMode) {
-		const item = completions[completionIndex];
-		if (item?.icon_path === "__folder__" && !forceOpen) {
-			// Make label relative to active scope for the input value
-			let path = item.label;
-			if (path.startsWith("~/")) {
-				path = path.slice(2); // ~/Downloads/ → Downloads/
-			} else if (activeScope && path.startsWith(activeScope)) {
-				path = path.slice(activeScope.length); // /mnt/DevSSD/Colris/ → Colris/
-				if (path.startsWith("/")) path = path.slice(1);
-			}
-			inputValue = `/${path}`;
-			handleInput(inputValue);
+		if (forceOpen) {
+			revealSelected();
 		} else {
 			openFileByLabel(label);
 		}
@@ -1021,12 +1327,18 @@ function handleCompletionSelect(label: string, forceOpen?: boolean) {
 		return;
 	}
 
-	// Web search completion — extract query and run directly
-	if (item?.icon_path === "__web__" || label.startsWith("Search web:")) {
-		const query = label.startsWith("Search web:")
-			? label.slice("Search web:".length).trim()
-			: label;
-		runCommand(`web ${query}`);
+	// Argument-needing hint — fill the input rather than execute (matches
+	// Enter-submit behaviour). Tab-to-complete.
+	if (item?.fill) {
+		inputValue = item.fill;
+		handleInput(inputValue);
+		return;
+	}
+
+	// Backend-declared command wins — run it verbatim (search handlers, emoji,
+	// etc.). Keeps click-select identical to Enter-submit; no label parsing.
+	if (item?.run) {
+		runCommand(item.run);
 		return;
 	}
 
@@ -1148,7 +1460,10 @@ function handleArrowUp() {
 		let next = completionIndex - 1;
 		// Skip separator items
 		while (next >= 0 && completions[next]?.icon_path === "__separator__") next--;
-		completionIndex = Math.max(0, next);
+		// If we ran off the top onto (or past) a leading header, stay put rather
+		// than landing on a non-selectable separator.
+		if (next < 0 || completions[next]?.icon_path === "__separator__") return;
+		completionIndex = next;
 	}
 }
 
@@ -1166,6 +1481,34 @@ async function hide() {
 	await hideWindow();
 }
 
+// Quick screenshot trigger (bound to the `screenshot` keybinding). Lychi must
+// leave the screen before the capture starts, or it lands in the shot — so we
+// hide first, wait a beat for the compositor to actually unmap the surface,
+// then fire `screenshot area`. Runs via executeCommand directly (not
+// runCommand) because the window is already hidden — no panel/history churn.
+async function quickScreenshot() {
+	inputValue = "";
+	completions = [];
+	completionIndex = -1;
+	await hide();
+	// Give the compositor a moment to remove the window before capturing.
+	await new Promise((r) => setTimeout(r, 180));
+	try {
+		await executeCommand("screenshot area");
+	} catch (err) {
+		console.error("[screenshot] quick trigger failed:", err);
+	}
+}
+
+// "Browse" — open the current result's inline URL in the browser. Bound to
+// the user-assigned open_inline_url keybinding and the ResultPanel button.
+async function openInlineUrl() {
+	if (lastResult?.open_url) {
+		await hide();
+		await openUri(lastResult.open_url);
+	}
+}
+
 async function handleDismiss() {
 	// C15: Cancel in-flight AI routing immediately on ESC
 	if (isRouting) {
@@ -1176,9 +1519,23 @@ async function handleDismiss() {
 }
 </script>
 
-<div class="launcher-wrapper" class:layer-shell={windowStrategy === 'layer-shell'} class:not-ready={!launcherReady} role="presentation" onmousedown={(e) => { if ((windowStrategy === 'x11' || windowStrategy === 'toplevel') && e.target === e.currentTarget) hide(); }}>
-	<div class="launcher-row">
+<div class="launcher-wrapper" class:layer-shell={windowStrategy === 'layer-shell'} class:compact={compactMode} class:not-ready={!launcherReady} role="presentation" onmousedown={(e) => { if (!compactMode && (windowStrategy === 'x11' || windowStrategy === 'toplevel') && e.target === e.currentTarget) hide(); }} onwheel={(e) => { if (e.target === e.currentTarget) e.preventDefault(); }}>
+	<div class="launcher-row" bind:this={launcherRowEl}>
 	<main>
+		{#if hotkeyBannerVisible}
+			<div class="hotkey-banner">
+				<span class="hotkey-banner-text">
+					Tip: global hotkeys are limited on Wayland. For reliable summoning, bind
+					<code>lychi --toggle</code> to a shortcut in your desktop's keyboard settings.
+				</span>
+				<button class="hotkey-banner-btn" onclick={copyToggleCommand}>
+					{hotkeyBannerCopied ? "Copied" : "Copy command"}
+				</button>
+				<button class="hotkey-banner-btn dismiss" onclick={dismissHotkeyBanner}>
+					Got it
+				</button>
+			</div>
+		{/if}
 		<CommandInput
 			bind:value={inputValue}
 			onsubmit={handleSubmit}
@@ -1198,22 +1555,14 @@ async function handleDismiss() {
 			{atMode}
 			{atStart}
 			{searchMode}
+			{aiEnabled}
 			scopeCount={mountPoints.length}
 			ontabscope={() => handleScopeChange((scopeIndex + 1) % mountPoints.length)}
 			ontabcomplete={() => {
 				if (completions.length > 0 && completionIndex >= 0) {
 					const item = completions[completionIndex];
 					if (searchMode && item.icon_path === "__folder__") {
-						// Drill into folder — make label relative to active scope
-						let path = item.label;
-						if (path.startsWith("~/")) {
-							path = path.slice(2);
-						} else if (activeScope && path.startsWith(activeScope)) {
-							path = path.slice(activeScope.length);
-							if (path.startsWith("/")) path = path.slice(1);
-						}
-						inputValue = `/${path}`;
-						handleInput(inputValue);
+						drillIntoFolder(item);
 					} else if (searchMode) {
 						// File in search mode — open it
 						openFileByLabel(item.label);
@@ -1221,6 +1570,18 @@ async function handleDismiss() {
 						// Browse mode — existing behavior
 						handleCompletionSelect(item.label);
 					}
+				}
+			}}
+			ondrillinto={() => {
+				// Arrow-right → drill into the selected folder (search mode only).
+				if (searchMode && completions.length > 0 && completionIndex >= 0) {
+					const item = completions[completionIndex];
+					if (item?.icon_path === "__folder__") drillIntoFolder(item);
+				}
+			}}
+			oncopypath={() => {
+				if (searchMode && completions.length > 0 && completionIndex >= 0) {
+					copySelectedPath();
 				}
 			}}
 			onshifttabback={() => {
@@ -1272,7 +1633,7 @@ async function handleDismiss() {
 		<div class:panel-hidden={!mediaOpen}>
 			<MediaPanel ondismiss={() => { mediaOpen = false; }} players={mediaPlayers} />
 		</div>
-		<div class:panel-hidden={!settingsOpen}>
+		<div class="settings-wrapper" class:panel-hidden={!settingsOpen}>
 			<SettingsPanel ondismiss={() => { settingsOpen = false; }} />
 		</div>
 		{#if pendingPlan}
@@ -1299,21 +1660,29 @@ async function handleDismiss() {
 				searchMode={searchMode}
 				metaMap={searchMode ? fileMetaMap : undefined}
 				ignoreActive={searchMode && ignoreActive}
+				{flashMessage}
 			/>
 			{#if completions.length === 0 && atMode && atNoResults}
 				<div class="empty-state">Empty folder</div>
 			{:else if completions.length === 0 && searchMode && !searchDone}
 				<div class="empty-state">Searching...</div>
+			{:else if completions.length === 0 && completionsPending && !atMode && !searchMode && inputValue.trim().length > 0}
+				<!-- Cold-start hint: the first query hasn't returned yet. Subtle,
+				     non-blocking skeleton that vanishes the instant results arrive.
+				     Input stays fully usable. -->
+				<div class="skeleton-list" aria-hidden="true">
+					{#each Array(4) as _, i (i)}
+						<div class="skeleton-row">
+							<div class="skeleton-icon"></div>
+							<div class="skeleton-bar" style="width: {70 - i * 12}%"></div>
+						</div>
+					{/each}
+				</div>
 			{/if}
 			{#if lastResult}
-				<ResultPanel result={lastResult} command={lastCommand}
+				<ResultPanel bind:this={resultPanelRef} result={lastResult} command={lastCommand}
 				onconfirm={handleConfirm} ondismiss={handleConfirmDismiss}
-				onopenurl={async () => {
-					if (lastResult?.open_url) {
-						await hide();
-						await openUri(lastResult.open_url);
-					}
-				}}
+				onopenurl={openInlineUrl}
 				onopenfile={(path) => runCommand(`file ${path}`)} />
 			{/if}
 		{/if}
@@ -1334,6 +1703,9 @@ async function handleDismiss() {
 		onshowresult={handleShowResult}
 		onshowplan={handleShowPlan}
 		hasPlan={!!pendingPlan}
+		{contextStale}
+		{contextStaleHint}
+		{contextRefreshing}
 		/>
 	</main>
 	{#if showPreview}
@@ -1350,6 +1722,9 @@ async function handleDismiss() {
 		justify-content: center;
 		padding-top: 18vh;
 		background: transparent;
+		/* Fullscreen-transparent toplevel (GNOME Wayland): keep scroll events
+		   from leaking through the backdrop to windows behind us */
+		overscroll-behavior: none;
 	}
 
 	/* Hide until summon event clears stale state — prevents flash of previous completions */
@@ -1373,11 +1748,88 @@ async function handleDismiss() {
 		max-height: calc(100vh - 40px);
 	}
 
+	/* Non-composited X11 compact mode: the window IS the launcher (rofi-style).
+	   No alpha anywhere — semi-transparent pixels render black without a
+	   compositor — so: opaque background, no shadow, square corners, and the
+	   window is resized to content height from a ResizeObserver. */
+	.launcher-wrapper.compact {
+		width: 100vw;
+		height: auto;
+		padding: 0;
+		justify-content: flex-start;
+		background: var(--bg);
+	}
+
+	.launcher-wrapper.compact .launcher-row,
+	.launcher-wrapper.compact main {
+		width: 100vw;
+		max-width: 100vw;
+	}
+
+	.launcher-wrapper.compact main {
+		max-height: none;
+		border: none;
+		border-radius: 0;
+		box-shadow: none;
+		animation: none;
+	}
+
+	/* Preview panel sits beside the bar and would be clipped by the compact
+	   window — hide it (file previews need a composited session). */
+	.launcher-wrapper.compact :global(.preview-panel) {
+		display: none;
+	}
+
 	.launcher-row {
 		position: relative;
 		width: 680px;
 		max-width: calc(100vw - 40px);
 		align-self: flex-start;
+	}
+
+	/* First-run Wayland hotkey tip — shown once, dismissed persistently */
+	.hotkey-banner {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 8px 12px;
+		font-size: 11px;
+		color: var(--fg-muted);
+		background: var(--bg-secondary);
+		border-bottom: 1px solid var(--border);
+	}
+
+	.hotkey-banner-text {
+		flex: 1;
+		line-height: 1.4;
+	}
+
+	.hotkey-banner-text code {
+		font-family: var(--font-mono);
+		background: var(--bg);
+		padding: 1px 4px;
+		border-radius: 3px;
+		user-select: all;
+	}
+
+	.hotkey-banner-btn {
+		background: transparent;
+		color: var(--accent);
+		border: 1px solid var(--border);
+		border-radius: 4px;
+		padding: 3px 8px;
+		font-size: 11px;
+		cursor: pointer;
+		flex-shrink: 0;
+		transition: background 100ms ease;
+	}
+
+	.hotkey-banner-btn:hover {
+		background: var(--border);
+	}
+
+	.hotkey-banner-btn.dismiss {
+		color: var(--fg-muted);
 	}
 
 	main {
@@ -1402,12 +1854,71 @@ async function handleDismiss() {
 		will-change: transform;
 	}
 
+	/* When visible, the settings wrapper must fill main's height so the panel's
+	   inner .content is the scroller and the bottom (add row) isn't clipped by
+	   main's overflow:hidden. min-height:0 lets its flex child shrink to scroll. */
+	.settings-wrapper {
+		display: flex;
+		flex-direction: column;
+		flex: 1;
+		min-height: 0;
+	}
+
 	.empty-state {
 		padding: 12px 20px;
 		font-family: var(--font-mono);
 		font-size: 13px;
 		color: var(--fg-muted);
 		opacity: 0.6;
+	}
+
+	/* Cold-start skeleton — shimmering placeholder rows shown only while the
+	   first query is in flight. Deliberately understated: it reads as "results
+	   are coming", not "the app is broken/loading". */
+	.skeleton-list {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		padding: 6px 12px;
+	}
+
+	.skeleton-row {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 7px 8px;
+	}
+
+	.skeleton-icon,
+	.skeleton-bar {
+		background: linear-gradient(
+			90deg,
+			var(--bg-secondary) 25%,
+			var(--border) 50%,
+			var(--bg-secondary) 75%
+		);
+		background-size: 200% 100%;
+		animation: skeleton-shimmer 1.2s ease-in-out infinite;
+		border-radius: 4px;
+	}
+
+	.skeleton-icon {
+		width: 20px;
+		height: 20px;
+		flex-shrink: 0;
+	}
+
+	.skeleton-bar {
+		height: 10px;
+	}
+
+	@keyframes skeleton-shimmer {
+		0% {
+			background-position: 200% 0;
+		}
+		100% {
+			background-position: -200% 0;
+		}
 	}
 
 	:global(main.lychi-closing) {

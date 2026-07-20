@@ -1,0 +1,635 @@
+//! Contextual suggestion engine ("the suggestion brain").
+//!
+//! Industry-pattern pipeline, fully local and deterministic:
+//!
+//! ```text
+//! providers (rule-based priors)          — git, project, docker, clipboard…
+//!   → learned boost (context-keyed       — Alfred-style latching backed by
+//!     acceptance frecency)                 the Firefox frecency formula
+//!   → dedupe → confidence gate → cap 8   — Raycast-style shortlist discipline
+//! ```
+//!
+//! Learning loop: the executor records which suggested commands the user
+//! actually runs (`sug:{context_key}:{command}` in the frecency store).
+//! Next time in the same context (project root, else focused app), accepted
+//! suggestions outrank the static rulebook. `typed_matches()` blends the
+//! same candidates into normal completions while typing (omnibox-style).
+//!
+//! No AI, no network, sub-millisecond — ranking must stay explainable and
+//! inside the C13 performance budget.
+
+mod providers;
+mod scoring;
+
+use std::sync::Arc;
+
+use redb::Database;
+
+use crate::action_registry::CompletionItem;
+use crate::db::frecency;
+
+use super::EnvironmentContext;
+use providers::{Candidate, ProviderTier, SuggestCtx, providers};
+
+/// Cap on frecency recents shown on the empty prompt.
+const MAX_COLD_RECENTS: usize = 8;
+
+// ── Tuning ──────────────────────────────────────────────────────────────
+
+/// Suggestions scoring below this after the learned boost are dropped —
+/// silence beats junk (a panel of weak guesses trains the user to ignore it).
+const CONFIDENCE_GATE: u16 = 55;
+/// Hard cap on the shortlist (Raycast-style: few and strong).
+const MAX_SUGGESTIONS: usize = 8;
+/// No single provider may flood the shortlist.
+const MAX_PER_PROVIDER: usize = 4;
+/// Maximum score points a fully-learned habit adds on top of the prior.
+const LEARNED_BOOST_MAX: f64 = 40.0;
+/// Cap on context matches blended into typed completions.
+const MAX_TYPED_MATCHES: usize = 2;
+
+// ── Suggestion Reason ───────────────────────────────────────────────────
+
+/// Why a particular suggestion was generated. Structured so the engine can
+/// produce user-facing strings, debug strings, and scoring features from
+/// the same data.
+#[derive(Debug, Clone)]
+pub enum SuggestionReason {
+    /// Git working tree has uncommitted changes.
+    GitDirty,
+    /// Git working tree is clean — push/pull are the natural next actions.
+    GitClean,
+    /// On a non-default branch (not main/master).
+    GitFeatureBranch { branch: String },
+    /// A project script was discovered (npm run dev, cargo build, etc.).
+    ProjectScript { runner: String },
+    /// Install command for the detected package manager.
+    ProjectInstall { pm: String },
+    /// Project has a docker-compose.yml / compose.yml.
+    DockerCompose,
+    /// Docker daemon has running containers.
+    DockerRunning { count: usize },
+    /// User is deep in a project subdirectory.
+    DirectoryDepth { project_name: String },
+    /// Clipboard contains actionable content.
+    ClipboardContent { content_type: String },
+    /// Command previously run in this workspace.
+    WorkspaceMemory { project: String },
+    /// Pinned workspace is active or detection failed (pin hint).
+    PinnedWorkspace,
+}
+
+impl SuggestionReason {
+    /// Short user-facing string for display in the UI.
+    pub fn user_reason(&self) -> String {
+        match self {
+            Self::GitDirty => "Uncommitted changes".into(),
+            Self::GitClean => "Up to date".into(),
+            Self::GitFeatureBranch { branch } => format!("On {branch}"),
+            Self::ProjectScript { runner } => format!("{runner} script"),
+            Self::ProjectInstall { pm } => format!("{pm} project"),
+            Self::DockerCompose => "Compose project".into(),
+            Self::DockerRunning { count } => {
+                format!("{count} container{}", if *count == 1 { "" } else { "s" })
+            }
+            Self::DirectoryDepth { project_name } => format!("In {project_name}/"),
+            Self::ClipboardContent { content_type } => format!("Clipboard: {content_type}"),
+            Self::WorkspaceMemory { project } => format!("Recent in {project}"),
+            Self::PinnedWorkspace => "Pinned workspace".into(),
+        }
+    }
+
+    /// Verbose string for `ctx` debug output.
+    pub fn debug_reason(&self) -> String {
+        match self {
+            Self::GitDirty => "git.dirty=true".into(),
+            Self::GitClean => "git.dirty=false".into(),
+            Self::GitFeatureBranch { branch } => format!("branch={branch} (not main/master)"),
+            Self::ProjectScript { runner } => format!("script.runner={runner}"),
+            Self::ProjectInstall { pm } => format!("project.pm={pm}"),
+            Self::DockerCompose => "project.has_compose=true".into(),
+            Self::DockerRunning { count } => format!("docker.containers={count}"),
+            Self::DirectoryDepth { project_name } => {
+                format!("cwd depth>=1 in {project_name}")
+            }
+            Self::ClipboardContent { content_type } => {
+                format!("clipboard.type={content_type}")
+            }
+            Self::WorkspaceMemory { project } => format!("workspace={project}"),
+            Self::PinnedWorkspace => "workspace.pinned=true".into(),
+        }
+    }
+}
+
+// ── Context key ─────────────────────────────────────────────────────────
+
+/// The learning bucket for the current environment: acceptance is keyed by
+/// project root when in a project, else by the focused app, else global.
+pub fn context_key(env: &EnvironmentContext) -> String {
+    if let Some(ref project) = env.project {
+        return format!("proj:{}", project.root.trim_end_matches('/'));
+    }
+    if let Some(ref win) = env.active_window {
+        return format!("app:{}", win.wm_class);
+    }
+    "global".to_string()
+}
+
+/// The workspace root used to key workspace-memory frecency: the project root
+/// if in a project, else the cwd. Mirrors `MemoryProvider`'s derivation so the
+/// affinity lookup in `rank()` matches the keys memory candidates were stored
+/// under. `None` when neither is known.
+fn workspace_root(env: &EnvironmentContext) -> Option<String> {
+    env.project
+        .as_ref()
+        .map(|p| p.root.clone())
+        .or_else(|| env.cwd.clone())
+}
+
+// ── Public API ──────────────────────────────────────────────────────────
+
+/// The zero-state (empty prompt) shortlist. Shows ONLY what the user has
+/// actually used or explicitly did — frecency recents, workspace memory, and
+/// clipboard actions — never speculative context-derived commands. This is the
+/// industry-standard empty-state (Raycast/Alfred/Chrome ZPS): recents cold,
+/// context after intent. If nothing qualifies, returns a single hint row.
+///
+/// Pass `db` to enable recents/learned ranking and workspace memory (None in
+/// tests → cold-eligible providers with no db yield nothing).
+pub fn suggest(env: &EnvironmentContext, db: Option<&Arc<Database>>) -> Vec<CompletionItem> {
+    // Cold-eligible providers: workspace memory (usage-driven) + clipboard
+    // (explicit recent action). Ranked with the learned blend.
+    let mut items: Vec<CompletionItem> =
+        rank(collect(env, db, ProviderTier::ColdEligible), env, db)
+            .into_iter()
+            .map(|c| c.into_completion_item())
+            .collect();
+
+    // Global frecency recents: commands the user has actually run, ranked by
+    // recency×frequency. These carry the zero-state.
+    let mut seen: std::collections::HashSet<String> =
+        items.iter().map(|i| i.label.clone()).collect();
+    for item in frecency_recents(db) {
+        if items.len() >= MAX_COLD_RECENTS {
+            break;
+        }
+        if seen.insert(item.label.clone()) {
+            items.push(item);
+        }
+    }
+    items.truncate(MAX_COLD_RECENTS);
+
+    // Nothing to show (brand-new user / empty context) → one honest hint,
+    // never a wall of speculative priors.
+    if items.is_empty() {
+        return vec![hint_item()];
+    }
+    items
+}
+
+/// Frecency recents from history: `history:{cmd}` keys, newest×most-frequent
+/// first. `run` set verbatim; `__history__` icon keeps them out of the
+/// `__context__` acceptance-loop filter.
+fn frecency_recents(db: Option<&Arc<Database>>) -> Vec<CompletionItem> {
+    let Some(db) = db else {
+        return Vec::new();
+    };
+    let mut scored: Vec<(String, f64)> = frecency::get_scores_with_affinity(db)
+        .into_iter()
+        .filter_map(|(key, score)| key.strip_prefix("history:").map(|c| (c.to_string(), score)))
+        .filter(|(cmd, _)| !cmd.is_empty())
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored
+        .into_iter()
+        .take(MAX_COLD_RECENTS)
+        .map(|(cmd, _)| {
+            CompletionItem::new(cmd.clone(), Some("__history__".to_string()), 0).with_run(cmd)
+        })
+        .collect()
+}
+
+/// The empty-state hint shown to a brand-new user with no recents.
+fn hint_item() -> CompletionItem {
+    CompletionItem {
+        label: "Type a command, or search the web".to_string(),
+        icon_path: Some("__info__".to_string()),
+        score: 0,
+        description: Some("Your recent commands will appear here".to_string()),
+        ..Default::default()
+    }
+}
+
+/// Context actions matching the typed input — the home for context-derived
+/// suggestions (git/docker/project/navigation), gated behind a matching
+/// keyword. Called by the executor for input ≥ 2 chars. A candidate matches if
+/// the typed needle is a substring of its command OR fuzzy-matches the
+/// provider's domain keywords.
+pub fn typed_matches(
+    env: &EnvironmentContext,
+    db: Option<&Arc<Database>>,
+    input: &str,
+) -> Vec<CompletionItem> {
+    let needle = input.trim().to_lowercase();
+    if needle.len() < 2 {
+        return Vec::new();
+    }
+    let matching: Vec<(&'static str, Candidate)> = collect(env, db, ProviderTier::TypedOnly)
+        .into_iter()
+        .filter(|(provider, c)| candidate_matches(&needle, c, provider))
+        .collect();
+
+    let mut ranked = rank(matching, env, db);
+    ranked.truncate(MAX_TYPED_MATCHES);
+    ranked
+        .into_iter()
+        .map(|c| c.into_completion_item())
+        .collect()
+}
+
+/// Whether a context candidate is a match for the typed needle: literal
+/// substring of the command, or a fuzzy hit on its provider's keywords.
+fn candidate_matches(needle: &str, c: &Candidate, provider_id: &str) -> bool {
+    if c.command.to_lowercase().contains(needle) {
+        return true;
+    }
+    keywords_for(provider_id)
+        .iter()
+        .any(|kw| fuzzy_subsequence(needle, kw))
+}
+
+// ── Pipeline ────────────────────────────────────────────────────────────
+
+/// Run providers of the requested tier and collect candidates with provenance.
+/// `tier` gates *which* providers run — cold-eligible (usage-driven/explicit)
+/// vs typed-only (context actions shown after a matching keyword).
+fn collect(
+    env: &EnvironmentContext,
+    db: Option<&Arc<Database>>,
+    tier: ProviderTier,
+) -> Vec<(&'static str, Candidate)> {
+    let ctx = SuggestCtx {
+        env,
+        db,
+        in_dev_window: env
+            .active_window
+            .as_ref()
+            .is_some_and(|w| w.is_terminal || w.is_ide),
+    };
+
+    let mut out = Vec::new();
+    for provider in providers() {
+        if provider.tier() != tier {
+            continue;
+        }
+        if !ctx.in_dev_window && !provider.universal() {
+            continue;
+        }
+        for candidate in provider.suggest(&ctx) {
+            out.push((provider.id(), candidate));
+        }
+    }
+    out
+}
+
+/// The domain keywords a provider declares, looked up by its id.
+fn keywords_for(provider_id: &str) -> &'static [&'static str] {
+    providers()
+        .iter()
+        .find(|p| p.id() == provider_id)
+        .map(|p| p.keywords())
+        .unwrap_or(&[])
+}
+
+/// Case-insensitive subsequence match: is every char of `needle` found in
+/// `haystack` in order? A cheap fuzzy test (no new dep) — "cont" ⊂ "container",
+/// "dpnd" ⊂ "dependencies". Used to match typed input against provider
+/// keywords for candidacy (never ranking).
+fn fuzzy_subsequence(needle: &str, haystack: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let mut chars = haystack.chars().flat_map(|c| c.to_lowercase());
+    for want in needle.chars().flat_map(|c| c.to_lowercase()) {
+        loop {
+            match chars.next() {
+                Some(h) if h == want => break,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
+/// Blend priors with learned acceptance, dedupe, gate, cap.
+fn rank(
+    candidates: Vec<(&'static str, Candidate)>,
+    env: &EnvironmentContext,
+    db: Option<&Arc<Database>>,
+) -> Vec<Candidate> {
+    let ctx_key = context_key(env);
+    let learned = db
+        .map(|db| frecency::get_suggestion_scores(db, &ctx_key))
+        .unwrap_or_default();
+    // Impression stats drive CTR demotion (self-tuning). (accepts, impressions)
+    // per command; empty without a db → cold-start neutral for every candidate.
+    let impressions = db
+        .map(|db| frecency::get_impression_stats(db, &ctx_key))
+        .unwrap_or_default();
+    // Per-command circadian affinity for this workspace's remembered commands,
+    // so cold-path workspace-memory suggestions get the same "knows your
+    // routine" tiebreak the frecency recents already receive. Commands with no
+    // workspace history (clipboard, typed-context) fall through to 1.0 neutral.
+    let ws_affinity = db
+        .zip(workspace_root(env))
+        .map(|(db, root)| frecency::get_workspace_affinity(db, &root))
+        .unwrap_or_default();
+
+    // Score via the pure ranker: prior + learned boost, modulated by acceptance
+    // CTR (demotes chronically-ignored) and time affinity. `Suppress` drops out.
+    let mut scored: Vec<(&'static str, f64, Candidate)> = candidates
+        .into_iter()
+        .filter_map(|(provider, c)| {
+            let boost = learned.get(&c.command).copied().unwrap_or(0.0) * LEARNED_BOOST_MAX;
+            let (accepts, imps) = impressions.get(&c.command).copied().unwrap_or((0, 0));
+            let affinity = ws_affinity.get(&c.command).copied().unwrap_or(1.0);
+            match scoring::score_suggestion(c.relevance, boost, accepts, imps, affinity) {
+                scoring::ScoredOutcome::Suppress => None,
+                scoring::ScoredOutcome::Rank(score) if score >= CONFIDENCE_GATE as f64 => {
+                    Some((provider, score, c))
+                }
+                scoring::ScoredOutcome::Rank(_) => None,
+            }
+        })
+        .collect();
+
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Dedupe by command (keep highest-scored) and cap per provider + total.
+    let mut seen_commands: Vec<String> = Vec::new();
+    let mut per_provider: std::collections::HashMap<&'static str, usize> =
+        std::collections::HashMap::new();
+    let mut out = Vec::new();
+    for (provider, _score, candidate) in scored {
+        if out.len() >= MAX_SUGGESTIONS {
+            break;
+        }
+        if seen_commands.contains(&candidate.command) {
+            continue;
+        }
+        let count = per_provider.entry(provider).or_insert(0);
+        if *count >= MAX_PER_PROVIDER {
+            continue;
+        }
+        *count += 1;
+        seen_commands.push(candidate.command.clone());
+        out.push(candidate);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::providers::Candidate;
+    use super::*;
+
+    fn cand(cmd: &str, relevance: u16) -> Candidate {
+        Candidate {
+            command: cmd.into(),
+            description: cmd.into(),
+            relevance,
+            reason: SuggestionReason::GitDirty,
+        }
+    }
+
+    fn empty_env() -> EnvironmentContext {
+        EnvironmentContext::default()
+    }
+
+    #[test]
+    fn rank_gates_low_confidence() {
+        let out = rank(
+            vec![("git", cand("weak", 40)), ("git", cand("strong", 90))],
+            &empty_env(),
+            None,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].command, "strong");
+    }
+
+    #[test]
+    fn rank_dedupes_and_caps() {
+        let mut input = vec![("git", cand("dup", 90)), ("proj", cand("dup", 80))];
+        for i in 0..20 {
+            input.push(("mem", cand(&format!("cmd{i}"), 70)));
+        }
+        let out = rank(input, &empty_env(), None);
+        assert!(out.len() <= MAX_SUGGESTIONS);
+        assert_eq!(out.iter().filter(|c| c.command == "dup").count(), 1);
+        // per-provider cap: at most 4 from "mem"
+        assert!(out.iter().filter(|c| c.command.starts_with("cmd")).count() <= MAX_PER_PROVIDER);
+    }
+
+    #[test]
+    fn context_key_prefers_project() {
+        let mut env = empty_env();
+        env.active_window = Some(super::super::WindowContext {
+            title: "t".into(),
+            wm_class: "firefox".into(),
+            pid: 1,
+            is_terminal: false,
+            is_ide: false,
+            window_id: None,
+        });
+        assert_eq!(context_key(&env), "app:firefox");
+        env.project = Some(super::super::ProjectContext {
+            root: "/home/u/proj/".into(),
+            kind: super::super::ProjectKind::Rust,
+            has_compose: false,
+            scripts: vec![],
+            package_manager: None,
+            workspace_root: None,
+            workspace_scripts: vec![],
+        });
+        assert_eq!(context_key(&env), "proj:/home/u/proj");
+    }
+
+    // ── End-to-end engine behavior ──────────────────────────────────────
+
+    fn dev_env() -> EnvironmentContext {
+        let mut env = empty_env();
+        env.active_window = Some(super::super::WindowContext {
+            title: "term".into(),
+            wm_class: "org.gnome.terminal".into(),
+            pid: 1,
+            is_terminal: true,
+            is_ide: false,
+            window_id: None,
+        });
+        env.git = Some(super::super::GitContext {
+            repo_root: "/home/u/proj".into(),
+            branch: "main".into(),
+            dirty: true,
+            remote: None,
+        });
+        env
+    }
+
+    #[test]
+    fn zero_state_never_shows_speculative_context() {
+        // Dirty git repo, terminal focused, but NO history/recents. The
+        // zero-state must NOT surface git commit/diff/etc. — context actions
+        // are typed-gated now. Only the hint should show.
+        let items = suggest(&dev_env(), None);
+        assert!(
+            !items.iter().any(|i| i.label.starts_with("git ")),
+            "zero-state must not show speculative git commands"
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].icon_path.as_deref(), Some("__info__"));
+    }
+
+    #[test]
+    fn zero_state_shows_only_recents() {
+        let db = crate::db::open_test_database();
+        // The user has actually run these commands.
+        frecency::record(&db, "history:open firefox").unwrap();
+        frecency::record(&db, "history:web rust docs").unwrap();
+        let items = suggest(&dev_env(), Some(&db));
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"open firefox"));
+        assert!(labels.contains(&"web rust docs"));
+        // And NOT speculative git commands, despite the dirty repo.
+        assert!(!items.iter().any(|i| i.label.starts_with("git ")));
+        // Recents carry the exact run command and history provenance.
+        let ff = items.iter().find(|i| i.label == "open firefox").unwrap();
+        assert_eq!(ff.run.as_deref(), Some("open firefox"));
+        assert_eq!(ff.icon_path.as_deref(), Some("__history__"));
+    }
+
+    #[test]
+    fn zero_state_hint_for_new_user() {
+        // Empty store, empty context → a single honest hint, never junk.
+        let items = suggest(&empty_env(), None);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].icon_path.as_deref(), Some("__info__"));
+    }
+
+    #[test]
+    fn suggest_non_dev_window_skips_dev_providers() {
+        let mut env = dev_env();
+        // Browser focused: git context exists but window isn't a dev window.
+        env.active_window.as_mut().unwrap().is_terminal = false;
+        let items = suggest(&env, None);
+        assert!(
+            !items.iter().any(|i| i.label.starts_with("git ")),
+            "git suggestions must not appear outside dev windows"
+        );
+    }
+
+    #[test]
+    fn suggest_clipboard_error_carries_real_query() {
+        let mut env = empty_env();
+        env.clipboard = Some(
+            super::super::clipboard_detect::ClipboardContentType::ErrorTrace(
+                "TypeError: x is undefined".into(),
+            ),
+        );
+        let items = suggest(&env, None);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "web TypeError: x is undefined");
+    }
+
+    #[test]
+    fn learned_boost_reorders_typed_context() {
+        let db = crate::db::open_test_database();
+        let env = dev_env(); // context_key = app:org.gnome.terminal (no project)
+        // User habitually accepts "git stash" (prior 85, below git commit's 100).
+        // Context actions are typed-gated now — assert via typed_matches("git").
+        for _ in 0..10 {
+            frecency::record_suggestion(&db, &context_key(&env), "git stash").unwrap();
+        }
+        let items = typed_matches(&env, Some(&db), "git");
+        assert_eq!(
+            items[0].label, "git stash",
+            "accepted suggestion must outrank higher static prior"
+        );
+    }
+
+    #[test]
+    fn typed_matches_filters_and_caps() {
+        let env = dev_env();
+        let matches = typed_matches(&env, None, "git");
+        assert!(!matches.is_empty());
+        assert!(matches.len() <= MAX_TYPED_MATCHES);
+        assert!(matches.iter().all(|m| m.label.contains("git")));
+        assert!(typed_matches(&env, None, "zzzz").is_empty());
+        // Below 2 chars: no blend
+        assert!(typed_matches(&env, None, "g").is_empty());
+    }
+
+    #[test]
+    fn typed_docker_surfaces_docker_actions() {
+        let mut env = dev_env();
+        env.docker = Some(super::super::DockerContext {
+            containers: vec![super::super::ContainerInfo {
+                id: "abc123".into(),
+                name: "yusbuild-db".into(),
+                image: "postgres".into(),
+                status: "running".into(),
+            }],
+        });
+        // Typing "docker" surfaces docker actions…
+        let docker = typed_matches(&env, None, "docker");
+        assert!(docker.iter().any(|m| m.label == "run docker ps"));
+        // …but typing "git" does not.
+        let git = typed_matches(&env, None, "git");
+        assert!(!git.iter().any(|m| m.label.contains("docker")));
+    }
+
+    #[test]
+    fn fuzzy_subsequence_matches_in_order() {
+        assert!(fuzzy_subsequence("cont", "container"));
+        assert!(fuzzy_subsequence("dpnd", "dependencies"));
+        assert!(!fuzzy_subsequence("xyz", "container"));
+        assert!(!fuzzy_subsequence("tac", "cat")); // order matters
+        assert!(fuzzy_subsequence("", "anything"));
+    }
+
+    #[test]
+    fn workspace_root_derives_from_project_then_cwd() {
+        // The affinity lookup in rank() must key on the SAME root MemoryProvider
+        // stores under: project root first, else cwd.
+        let mut env = empty_env();
+        env.cwd = Some("/home/u/loose".into());
+        assert_eq!(workspace_root(&env).as_deref(), Some("/home/u/loose"));
+        env.project = Some(super::super::ProjectContext {
+            root: "/home/u/proj".into(),
+            kind: super::super::ProjectKind::Rust,
+            has_compose: false,
+            scripts: vec![],
+            package_manager: None,
+            workspace_root: None,
+            workspace_scripts: vec![],
+        });
+        assert_eq!(workspace_root(&env).as_deref(), Some("/home/u/proj"));
+    }
+
+    #[test]
+    fn keyword_match_surfaces_context_without_literal_substring() {
+        let mut env = dev_env();
+        env.docker = Some(super::super::DockerContext {
+            containers: vec![super::super::ContainerInfo {
+                id: "abc".into(),
+                name: "db".into(),
+                image: "postgres".into(),
+                status: "running".into(),
+            }],
+        });
+        // "container" is nowhere in "run docker ps", but it's a docker keyword,
+        // so typing it still surfaces the docker action.
+        let m = typed_matches(&env, None, "container");
+        assert!(m.iter().any(|i| i.label == "run docker ps"));
+    }
+}

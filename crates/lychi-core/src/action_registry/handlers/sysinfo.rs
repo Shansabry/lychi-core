@@ -4,7 +4,9 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+};
 use crate::error::LychiError;
 
 pub struct SysInfoHandler;
@@ -38,6 +40,32 @@ const SUBCOMMANDS: &[&str] = &[
 
 #[async_trait]
 impl ActionHandler for SysInfoHandler {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::{ArgTransform, Trigger};
+        static TRIGGERS: &[Trigger] = &[
+            Trigger::keywords(&["sysinfo"]),
+            // Bare-word shortcuts ignore any trailing args and use the keyword.
+            Trigger::new(
+                &[
+                    "ip",
+                    "cpu",
+                    "mem",
+                    "disk",
+                    "temp",
+                    "gpu",
+                    "battery",
+                    "net",
+                    "audio",
+                    "display",
+                    "os",
+                    "speedtest",
+                ],
+                ArgTransform::KeywordOnly,
+            ),
+        ];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "sysinfo"
     }
@@ -46,7 +74,7 @@ impl ActionHandler for SysInfoHandler {
         "System info — ip, cpu, mem, disk, temp, gpu, battery, net, audio, display, os"
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let start = Instant::now();
         let cmd = args.trim().to_lowercase();
 
@@ -120,34 +148,8 @@ impl ActionHandler for SysInfoHandler {
         let duration_ms = start.elapsed().as_millis() as u64;
 
         match output {
-            Ok(text) => Ok(ActionResult {
-                success: true,
-                output: Some(text),
-                error: None,
-                duration_ms,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: Some(OutputType::Terminal),
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            }),
-            Err(e) => Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some(e),
-                duration_ms,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            }),
+            Ok(text) => Ok(ActionResult::ok(text, OutputType::Terminal).with_duration(duration_ms)),
+            Err(e) => Ok(ActionResult::err(e).with_duration(duration_ms)),
         }
     }
 
@@ -162,6 +164,9 @@ impl ActionHandler for SysInfoHandler {
                 score: if s.starts_with(&lower) { 100 } else { 50 },
                 description: None,
                 reason: None,
+                thumb_b64: None,
+                run: Some(format!("sysinfo {s}")),
+                ..Default::default()
             })
             .collect()
     }

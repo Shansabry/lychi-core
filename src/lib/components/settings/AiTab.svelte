@@ -1,7 +1,18 @@
 <script lang="ts">
+import { listen } from "@tauri-apps/api/event";
 import { onMount } from "svelte";
-import type { AiConfig } from "$lib/ipc";
-import { checkAiHealth, getMaskedApiKey, saveAiConfig, setApiKey } from "$lib/ipc";
+import type { AiConfig, CreditBalance, FirebaseUser, OllamaModelInfo } from "$lib/ipc";
+import {
+	checkAiHealth,
+	cloudGetCredits,
+	firebaseGetUser,
+	firebaseSignIn,
+	firebaseSignOut,
+	getMaskedApiKey,
+	listOllamaModels,
+	saveAiConfig,
+	setApiKey,
+} from "$lib/ipc";
 import Select from "../Select.svelte";
 
 let {
@@ -18,6 +29,20 @@ let editingKey = $state(false);
 let confirmingClear = $state(false);
 let healthStatus: "checking" | "healthy" | "error" | "disabled" = $state("disabled");
 let saving = $state(false);
+
+// Ollama state
+let ollamaModels: OllamaModelInfo[] = $state([]);
+let ollamaFetchError: string | null = $state(null);
+
+// Lychi Cloud is disabled for launch (BYOK + Ollama only) — flip this when
+// lychi-cloud ships (Phase 2.3). Typed as boolean so TS doesn't narrow the
+// gated markup to unreachable.
+const CLOUD_ENABLED: boolean = false;
+
+// Cloud state
+let cloudUser: FirebaseUser | null = $state(null);
+let cloudCredits: CreditBalance | null = $state(null);
+let cloudLoading = $state(false);
 
 type ModelEntry = { value: string; label: string };
 type ModelManifest = Record<string, ModelEntry[]>;
@@ -50,12 +75,78 @@ let models = $derived(providerModels[aiConfig.provider] ?? []);
 
 onMount(() => {
 	initModels(aiConfig.mode);
+
+	// Listen for deep-link auth callback — refresh cloud user when sign-in completes
+	const unlistenSignIn = listen("lychi://firebase-signed-in", () => {
+		refreshCloudUser();
+	});
+	const unlistenSignOut = listen("lychi://firebase-signed-out", () => {
+		cloudUser = null;
+		cloudCredits = null;
+	});
+
+	return () => {
+		unlistenSignIn.then((u) => u());
+		unlistenSignOut.then((u) => u());
+	};
 });
 
 export async function initModels(aiMode: string) {
-	providerModels = await fetchModels(aiMode);
+	if (aiMode === "ollama") {
+		fetchOllamaModels();
+	} else if (aiMode === "cloud") {
+		if (CLOUD_ENABLED) refreshCloudUser();
+	} else {
+		providerModels = await fetchModels(aiMode);
+		refreshMaskedKey(aiConfig.provider);
+	}
 	refreshHealth();
-	refreshMaskedKey(aiConfig.provider);
+}
+
+async function refreshCloudUser() {
+	try {
+		cloudUser = await firebaseGetUser();
+		if (cloudUser) {
+			refreshCloudCredits();
+		} else {
+			cloudCredits = null;
+		}
+	} catch {
+		cloudUser = null;
+		cloudCredits = null;
+	}
+}
+
+async function refreshCloudCredits() {
+	try {
+		cloudCredits = await cloudGetCredits();
+	} catch {
+		cloudCredits = null;
+	}
+}
+
+async function handleCloudSignIn() {
+	cloudLoading = true;
+	try {
+		await firebaseSignIn();
+	} catch (err) {
+		onsaveerror(`Sign in failed: ${err}`);
+	} finally {
+		cloudLoading = false;
+	}
+}
+
+async function handleCloudSignOut() {
+	cloudLoading = true;
+	try {
+		await firebaseSignOut();
+		cloudUser = null;
+		cloudCredits = null;
+	} catch (err) {
+		onsaveerror(`Sign out failed: ${err}`);
+	} finally {
+		cloudLoading = false;
+	}
 }
 
 async function fetchModels(aiMode: string): Promise<ModelManifest> {
@@ -114,10 +205,34 @@ async function saveAi() {
 	}
 }
 
+async function fetchOllamaModels() {
+	ollamaFetchError = null;
+	try {
+		ollamaModels = await listOllamaModels();
+		if (ollamaModels.length > 0 && !aiConfig.ollama_model) {
+			aiConfig.ollama_model = ollamaModels[0].name;
+			saveAi();
+		}
+	} catch (e) {
+		ollamaModels = [];
+		ollamaFetchError = `Cannot connect to Ollama at ${aiConfig.ollama_url}`;
+	}
+}
+
+function formatSize(bytes: number): string {
+	if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
+	if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(0)} MB`;
+	return `${bytes} B`;
+}
+
 async function handleModeChange(val: string) {
 	aiConfig.mode = val;
 	await saveAi();
-	if (val !== "disabled") {
+	if (val === "ollama") {
+		fetchOllamaModels();
+	} else if (val === "cloud") {
+		if (CLOUD_ENABLED) refreshCloudUser();
+	} else if (val !== "disabled") {
 		cachedManifest = null;
 		providerModels = await fetchModels(val);
 	}
@@ -137,6 +252,16 @@ async function handleProviderChange(val: string) {
 async function handleModelChange(val: string) {
 	aiConfig.model = val;
 	await saveAi();
+}
+
+async function handleOllamaModelChange(val: string) {
+	aiConfig.ollama_model = val;
+	await saveAi();
+}
+
+async function handleOllamaUrlChange() {
+	await saveAi();
+	fetchOllamaModels();
 }
 
 async function handleSetApiKey() {
@@ -188,13 +313,169 @@ export function dismissConfirm() {
 		value={aiConfig.mode}
 		options={[
 			{ value: "disabled", label: "Disabled" },
+			// Lychi Cloud is hidden until lychi-cloud ships (Phase 2.3) —
+			// launch supports BYOK + Ollama only. The entry below only appears
+			// if an existing config still has mode="cloud".
+			...(aiConfig.mode === "cloud"
+				? [{ value: "cloud", label: "Lychi Cloud (coming soon)" }]
+				: []),
+			{ value: "ollama", label: "Ollama (Local)" },
 			{ value: "byo", label: "BYO API Key" },
 		]}
 		onchange={handleModeChange}
 	/>
 </div>
 
-{#if aiConfig.mode === "byo"}
+{#if aiConfig.mode === "cloud"}
+	<div class="field-hint">
+		Lychi Cloud isn't available yet — switch to Ollama (local) or BYO API key.
+	</div>
+{/if}
+{#if CLOUD_ENABLED && aiConfig.mode === "cloud"}
+	{#if cloudUser}
+		<div class="field">
+			<span class="field-label">Signed in as</span>
+			<span class="cloud-email">{cloudUser.email}</span>
+		</div>
+
+		{#if cloudCredits}
+			<div class="field">
+				<span class="field-label">Credits</span>
+				<div class="credit-info">
+					<span class="credit-balance">{cloudCredits.balance.toLocaleString()}</span>
+					<span class="credit-meta">/ {cloudCredits.plan} plan</span>
+				</div>
+			</div>
+			{#if cloudCredits.bonus_pool > 0}
+				<div class="field">
+					<span class="field-label">Bonus pool</span>
+					<span class="credit-meta">{cloudCredits.bonus_pool.toLocaleString()}</span>
+				</div>
+			{/if}
+		{/if}
+
+		<div class="field">
+			<span class="field-label"></span>
+			<button class="set-btn clear-btn" onclick={handleCloudSignOut} disabled={cloudLoading}>
+				Sign out
+			</button>
+		</div>
+
+		<div class="field">
+			<span class="field-label">Status</span>
+			<div class="health-status">
+				<span
+					class="health-dot"
+					class:healthy={healthStatus === "healthy"}
+					class:error={healthStatus === "error"}
+					class:checking={healthStatus === "checking"}
+				></span>
+				<span class="health-label">
+					{#if healthStatus === "checking"}
+						Checking...
+					{:else if healthStatus === "healthy"}
+						Connected
+					{:else if healthStatus === "error"}
+						Not connected
+					{:else}
+						Disabled
+					{/if}
+				</span>
+			</div>
+		</div>
+	{:else}
+		<div class="field">
+			<span class="field-label">Account</span>
+			<button class="set-btn" onclick={handleCloudSignIn} disabled={cloudLoading}>
+				{cloudLoading ? "Opening browser..." : "Sign in with Google"}
+			</button>
+		</div>
+		<div class="cloud-hint">
+			Opens your browser to sign in. You'll be redirected back to Lychi automatically.
+		</div>
+	{/if}
+{:else if aiConfig.mode === "ollama"}
+	<div class="field">
+		<label for="ollama-url">URL</label>
+		<input
+			id="ollama-url"
+			type="text"
+			bind:value={aiConfig.ollama_url}
+			placeholder="http://localhost:11434"
+			spellcheck="false"
+			onchange={handleOllamaUrlChange}
+		/>
+	</div>
+
+	<div class="field">
+		<label for="ollama-model">Model</label>
+		{#if ollamaModels.length > 0}
+			<Select
+				id="ollama-model"
+				value={aiConfig.ollama_model ?? ""}
+				options={ollamaModels.map(m => ({
+					value: m.name,
+					label: `${m.name} — ${formatSize(m.size)}`,
+				}))}
+				onchange={handleOllamaModelChange}
+			/>
+		{:else if ollamaFetchError}
+			<span class="ollama-hint error">{ollamaFetchError}</span>
+		{:else}
+			<span class="ollama-hint">No models found — run <code>ollama pull &lt;model&gt;</code></span>
+		{/if}
+	</div>
+
+	<div class="field">
+		<label for="ollama-timeout">Timeout</label>
+		<div class="number-row">
+			<input
+				id="ollama-timeout"
+				type="number"
+				min="2"
+				max="120"
+				bind:value={aiConfig.timeout_secs}
+				onchange={saveAi}
+			/>
+			<span class="unit-label">s</span>
+		</div>
+	</div>
+
+	<div class="field">
+		<label for="ollama-max-tokens">Max Tokens</label>
+		<input
+			id="ollama-max-tokens"
+			type="number"
+			min="100"
+			max="4000"
+			bind:value={aiConfig.max_tokens}
+			onchange={saveAi}
+		/>
+	</div>
+
+	<div class="field">
+		<span class="field-label">Status</span>
+		<div class="health-status">
+			<span
+				class="health-dot"
+				class:healthy={healthStatus === "healthy"}
+				class:error={healthStatus === "error"}
+				class:checking={healthStatus === "checking"}
+			></span>
+			<span class="health-label">
+				{#if healthStatus === "checking"}
+					Checking...
+				{:else if healthStatus === "healthy"}
+					Connected
+				{:else if healthStatus === "error"}
+					Not connected
+				{:else}
+					Disabled
+				{/if}
+			</span>
+		</div>
+	</div>
+{:else if aiConfig.mode === "byo"}
 	<div class="field">
 		<label for="ai-provider">Provider</label>
 		<Select
@@ -457,5 +738,69 @@ export function dismissConfirm() {
 	@keyframes pulse {
 		0%, 100% { opacity: 1; }
 		50% { opacity: 0.4; }
+	}
+
+	input[type="text"] {
+		background: var(--bg-secondary);
+		color: var(--fg);
+		border: 1px solid var(--border);
+		border-radius: 4px;
+		padding: 5px 8px;
+		font-family: var(--font-mono);
+		font-size: 12px;
+		outline: none;
+		flex: 1;
+		min-width: 0;
+	}
+
+	input[type="text"]:focus {
+		border-color: var(--fg-muted);
+	}
+
+	.ollama-hint {
+		font-size: 11px;
+		color: var(--fg-muted);
+	}
+
+	.cloud-email {
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--fg);
+	}
+
+	.credit-info {
+		display: flex;
+		align-items: baseline;
+		gap: 6px;
+	}
+
+	.credit-balance {
+		font-family: var(--font-mono);
+		font-size: 14px;
+		color: var(--accent);
+		font-weight: 600;
+	}
+
+	.credit-meta {
+		font-size: 11px;
+		color: var(--fg-muted);
+	}
+
+	.cloud-hint {
+		font-size: 11px;
+		color: var(--fg-muted);
+		padding: 4px 0 8px 132px;
+		line-height: 1.5;
+	}
+
+	.ollama-hint.error {
+		color: var(--error);
+	}
+
+	.ollama-hint code {
+		font-family: var(--font-mono);
+		background: var(--bg-secondary);
+		padding: 1px 4px;
+		border-radius: 2px;
 	}
 </style>

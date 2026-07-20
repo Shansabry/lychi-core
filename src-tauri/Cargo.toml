@@ -9,7 +9,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 default = ["mpris"]
-mpris = ["lychi-core/mpris", "dep:futures-util"]
+mpris = ["lychi-core/mpris"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -19,22 +19,42 @@ lychi-core = { path = "../crates/lychi-core" }
 redb = { workspace = true }
 dirs = "6"
 tauri = { version = "2", features = ["protocol-asset", "tray-icon"] }
+# Generated, typesafe IPC bindings — Rust command/type defs → src/lib/bindings.ts.
+specta = { workspace = true }
+tauri-specta = { version = "2.0.0-rc", features = ["derive", "typescript"] }
+specta-typescript = "0.0.9"
 tauri-plugin-shell = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-single-instance = "2"
+tauri-plugin-deep-link = "2"
+tauri-plugin-autostart = "2"
 libc = "0.2"
-keyring = { version = "3", features = ["sync-secret-service"] }
+keyring = "4"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-futures-util = { version = "0.3", optional = true }
+tracing-appender = { workspace = true }
+futures-util = "0.3"
 ignore = "0.4"
 nucleo-matcher = "0.3.1"
+nucleo = "0.5"
+notify = "8"
 base64 = "0.22"
+async-trait = { workspace = true }
+reqwest = { version = "0.13", features = ["json"] }
+url = "2"
+zbus = { version = "5", features = ["tokio"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# KDE plasma-shell protocol: hide the toplevel window from taskbar/switcher
+# on KDE Wayland (skip_taskbar_hint only sets X11 atoms — tauri#9829 / I-009)
+# XDG GlobalShortcuts portal — compositor-level hotkey on Wayland
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "global_shortcuts"] }
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 gtk = "0.18"
 gdk = "0.18"
 gio = "0.18"

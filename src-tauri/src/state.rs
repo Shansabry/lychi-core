@@ -8,31 +8,46 @@ use lychi_core::action_registry::handlers::aliases::AliasHandler;
 use lychi_core::action_registry::handlers::app_control::AppControlHandler;
 use lychi_core::action_registry::handlers::app_launcher::AppLauncher;
 use lychi_core::action_registry::handlers::ask::AskHandler;
+use lychi_core::action_registry::handlers::bang::BangHandler;
 use lychi_core::action_registry::handlers::bookmarks::BookmarkHandler;
 use lychi_core::action_registry::handlers::browse::BrowseHandler;
 use lychi_core::action_registry::handlers::calc::CalcHandler;
+use lychi_core::action_registry::handlers::clear::ClearHandler;
 use lychi_core::action_registry::handlers::clipboard::ClipboardHandler;
+use lychi_core::action_registry::handlers::clipboard_transform::ClipboardTransformHandler;
+use lychi_core::action_registry::handlers::color::ColorHandler;
 use lychi_core::action_registry::handlers::context_debug::ContextDebugHandler;
+use lychi_core::action_registry::handlers::define::DefineHandler;
+use lychi_core::action_registry::handlers::dev_utils::DevUtilsHandler;
 use lychi_core::action_registry::handlers::emoji::EmojiHandler;
 use lychi_core::action_registry::handlers::file_open::FileOpen;
+use lychi_core::action_registry::handlers::generate::GenerateHandler;
 #[cfg(feature = "mpris")]
 use lychi_core::action_registry::handlers::media::MediaHandler;
 use lychi_core::action_registry::handlers::notes::{NotesHandler, TodoHandler};
+use lychi_core::action_registry::handlers::packages::PackagesHandler;
 use lychi_core::action_registry::handlers::pin_workspace::PinWorkspaceHandler;
 use lychi_core::action_registry::handlers::project_open::ProjectOpen;
+use lychi_core::action_registry::handlers::qr::QrHandler;
 use lychi_core::action_registry::handlers::reminders::RemindersHandler;
+use lychi_core::action_registry::handlers::resize_image::ResizeImageHandler;
+use lychi_core::action_registry::handlers::screenshot::ScreenshotHandler;
+use lychi_core::action_registry::handlers::services::{ServicesHandler, ServicesListHandler};
 use lychi_core::action_registry::handlers::shell_exec::ShellExec;
 use lychi_core::action_registry::handlers::snippets::SnippetsHandler;
+use lychi_core::action_registry::handlers::ssh::SshHandler;
 use lychi_core::action_registry::handlers::symbol::SymbolHandler;
 use lychi_core::action_registry::handlers::sysinfo::SysInfoHandler;
 use lychi_core::action_registry::handlers::system::SystemCommand;
 use lychi_core::action_registry::handlers::time::TimeHandler;
 use lychi_core::action_registry::handlers::timer::{TimerHandler, TimerState};
+use lychi_core::action_registry::handlers::translate::TranslateHandler;
 use lychi_core::action_registry::handlers::unicode::UnicodeHandler;
 use lychi_core::action_registry::handlers::url_open::UrlOpen;
 use lychi_core::action_registry::handlers::weather::WeatherHandler;
 use lychi_core::action_registry::handlers::weather_ask::WeatherAskHandler;
 use lychi_core::action_registry::handlers::web_search::WebSearch;
+use lychi_core::action_registry::handlers::window_switcher::WindowSwitcherHandler;
 use lychi_core::action_registry::handlers::youtube::YouTube;
 use lychi_core::action_registry::registry::ActionRegistry;
 use lychi_core::config::Config;
@@ -44,6 +59,7 @@ use lychi_core::intent::ai_router::AiRouter;
 use lychi_core::mpris::MprisManager;
 use lychi_core::paths;
 use lychi_core::providers::byo::{BYOClient, BYOProvider};
+use lychi_core::providers::ollama::OllamaClient;
 use lychi_core::providers::{AgentPlan, AiProvider};
 use lychi_core::rules::RulesEngine;
 
@@ -54,6 +70,9 @@ pub struct AppState {
     pub config: Arc<RwLock<Config>>,
     pub pending_plan: Arc<RwLock<Option<AgentPlan>>>,
     pub active_file_search: Arc<AtomicU64>,
+    /// Persistent per-scope fuzzy file indexes (nucleo engines). Built lazily on
+    /// first search of a scope, reused across keystrokes for instant matching.
+    pub file_index: Arc<lychi_core::file_search::FileIndexStore>,
     pub timer_state: TimerState,
     /// Dismiss-on-blur armed flag. Set true when the user interacts with the
     /// launcher (key press, pointer click). Reset on hide. Focus-out only
@@ -64,6 +83,17 @@ pub struct AppState {
     /// Focus handlers check this to ignore stale events from previous summon
     /// cycles (e.g. rapid double-summon).
     pub summon_seq: Arc<AtomicU64>,
+    /// The summon_seq value captured when dismiss_armed was set. Focus-out
+    /// only dismisses when this matches the CURRENT summon_seq — a stale
+    /// focus-out from a previous summon cycle can never close a fresh window.
+    pub armed_seq: Arc<AtomicU64>,
+    /// Whether the global shortcut plugin successfully registered the hotkey.
+    /// Registration failure is non-fatal (common on Wayland); the frontend
+    /// reads this via get_hotkey_status to guide users to `lychi --toggle`.
+    pub hotkey_registered: Arc<AtomicBool>,
+    /// Whether the hotkey is bound through the XDG GlobalShortcuts portal —
+    /// compositor-level and therefore reliable even on Wayland.
+    pub portal_bound: Arc<AtomicBool>,
     /// Shutdown signal for the clipboard monitor OS thread. Set to false on exit
     /// to stop the monitor before D-Bus/arboard teardown begins.
     pub clipboard_running: Arc<AtomicBool>,
@@ -74,6 +104,10 @@ pub struct AppState {
     /// Limits concurrent heavy spawn_blocking tasks (file preview, future indexing)
     /// to prevent burst-load exhaustion of the blocking thread pool.
     pub heavy_sem: Arc<tokio::sync::Semaphore>,
+    /// Domain-event bus — state-change propagation spine. Config saves and other
+    /// state changes emit here; subsystems subscribe once (in `wire_reactors`)
+    /// and react to their own concern, so no command has to poke them directly.
+    pub event_bus: Arc<lychi_core::events::EventBus>,
     #[cfg(feature = "mpris")]
     pub mpris: Arc<RwLock<Option<MprisManager>>>,
 }
@@ -168,12 +202,19 @@ impl AppState {
         registry.register(Box::new(ShellExec::with_shell(
             config.commands.shell.clone(),
         )));
-        // Set the terminal emulator for `run` commands that open a real terminal window
-        lychi_core::action_registry::handlers::shell_exec::set_terminal(Some(
-            config.commands.terminal.clone(),
-        ));
+        // The terminal emulator for `run` commands now flows per-run via
+        // `RunInputs` (built in execute.rs from config), not a global setter.
         registry.register(Box::new(CalcHandler::new()));
+        registry.register(Box::new(DefineHandler::new()));
+        registry.register(Box::new(DevUtilsHandler::new()));
+        registry.register(Box::new(QrHandler::new()));
+        registry.register(Box::new(ResizeImageHandler::new()));
+        registry.register(Box::new(ScreenshotHandler::new()));
+        registry.register(Box::new(ServicesHandler::new()));
+        registry.register(Box::new(ServicesListHandler::new()));
+        registry.register(Box::new(PackagesHandler::new()));
         registry.register(Box::new(ClipboardHandler::new(db.clone())));
+        registry.register(Box::new(ClearHandler::new(db.clone())));
         registry.register(Box::new(FileOpen::new(db.clone())));
         registry.register(Box::new(UrlOpen::new()));
         #[cfg(feature = "mpris")]
@@ -197,6 +238,10 @@ impl AppState {
         registry.register(Box::new(BrowseHandler::new()));
         registry.register(Box::new(ContextDebugHandler::new()));
         registry.register(Box::new(PinWorkspaceHandler));
+        registry.register(Box::new(GenerateHandler::new()));
+        registry.register(Box::new(SshHandler::new()));
+        registry.register(Box::new(ColorHandler::new()));
+        registry.register(Box::new(WindowSwitcherHandler::new(db.clone())));
         let weather_handler = Arc::new(WeatherHandler::new(
             config.weather.unit.clone(),
             config.weather.default_location.clone(),
@@ -216,6 +261,37 @@ impl AppState {
                     None
                 }
             }
+        } else if config.ai.mode == "ollama" {
+            if config.ai.ollama_model.is_empty() {
+                tracing::warn!("Ollama mode enabled but no model selected");
+                None
+            } else {
+                let client = OllamaClient::new(
+                    config.ai.ollama_url.clone(),
+                    config.ai.ollama_model.clone(),
+                    config.ai.max_tokens,
+                );
+                tracing::info!(
+                    "AI initialized (Ollama: {} @ {})",
+                    config.ai.ollama_model,
+                    config.ai.ollama_url
+                );
+                Some(Arc::new(client))
+            }
+        } else if config.ai.mode == "cloud" {
+            let provider =
+                std::sync::Arc::new(crate::commands::firebase_auth::KeyringTokenProvider::new());
+            if !provider.is_signed_in() {
+                tracing::warn!("Cloud mode enabled but user not signed in");
+                None
+            } else {
+                let client = lychi_core::providers::cloud::CloudClient::new(
+                    "https://api.lychi.app".to_string(),
+                    provider,
+                );
+                tracing::info!("AI initialized (Cloud: api.lychi.app)");
+                Some(Arc::new(client))
+            }
         } else {
             None
         };
@@ -228,6 +304,16 @@ impl AppState {
             weather_handler,
             ai_provider.clone(),
         )));
+        registry.register(Box::new(ClipboardTransformHandler::new(
+            ai_provider.clone(),
+        )));
+        registry.register(Box::new(TranslateHandler::new(ai_provider.clone())));
+
+        // Custom search-engine shortcuts ("bangs") — user-extensible via config.
+        let bang_keywords: Vec<String> = config.commands.search_engines.keys().cloned().collect();
+        registry.register(Box::new(BangHandler::new(
+            config.commands.search_engines.clone(),
+        )));
 
         let ai_router = ai_provider.map(|p| {
             AiRouter::new_shared(p, std::time::Duration::from_secs(config.ai.timeout_secs))
@@ -237,7 +323,8 @@ impl AppState {
 
         let resolver = IntentResolver::new(ai_router);
         let rules = RulesEngine::new();
-        let executor = Executor::new(registry, rules, resolver, history.clone(), db.clone());
+        let mut executor = Executor::new(registry, rules, resolver, history.clone(), db.clone());
+        executor.set_bang_keywords(bang_keywords);
 
         Self {
             executor: Arc::new(RwLock::new(executor)),
@@ -246,16 +333,33 @@ impl AppState {
             config: Arc::new(RwLock::new(config)),
             pending_plan: Arc::new(RwLock::new(None)),
             active_file_search: Arc::new(AtomicU64::new(0)),
+            file_index: Arc::new(lychi_core::file_search::FileIndexStore::default()),
             timer_state,
             dismiss_armed: Arc::new(AtomicBool::new(false)),
             summon_seq: Arc::new(AtomicU64::new(0)),
+            armed_seq: Arc::new(AtomicU64::new(0)),
+            hotkey_registered: Arc::new(AtomicBool::new(false)),
+            portal_bound: Arc::new(AtomicBool::new(false)),
             clipboard_running: Arc::new(AtomicBool::new(true)),
             timer_running: Arc::new(AtomicBool::new(true)),
             app_index_watcher_running: Arc::new(AtomicBool::new(true)),
             heavy_sem: Arc::new(tokio::sync::Semaphore::new(3)),
+            event_bus: Arc::new(lychi_core::events::EventBus::new()),
             #[cfg(feature = "mpris")]
             mpris,
         }
+    }
+
+    /// Subscribe the config reactors to the event bus. Called once after the app
+    /// is set up. Each reactor owns exactly the state it manages (via `Arc`
+    /// clones), so a `ConfigChanged` emit fans out to whoever cares without the
+    /// emitting command knowing they exist.
+    pub fn wire_reactors(&self) {
+        crate::reactors::register_config_reactors(
+            &self.event_bus,
+            self.executor.clone(),
+            self.config.clone(),
+        );
     }
 
     fn init_byo_client(

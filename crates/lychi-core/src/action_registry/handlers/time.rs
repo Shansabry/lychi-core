@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use chrono::{Datelike, Local, NaiveTime, Offset, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType, RiskLevel};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType, RiskLevel,
+};
 use crate::error::LychiError;
 
 pub struct TimeHandler;
@@ -425,6 +427,15 @@ pub fn is_tz_conversion(input: &str) -> bool {
 
 #[async_trait]
 impl ActionHandler for TimeHandler {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::{ArgTransform, Trigger};
+        static TRIGGERS: &[Trigger] = &[Trigger::new(
+            &["time", "tz", "clock"],
+            ArgTransform::StripLeading("in "),
+        )];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "time"
     }
@@ -437,7 +448,7 @@ impl ActionHandler for TimeHandler {
         RiskLevel::Low
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let input = args.trim();
         let start = std::time::Instant::now();
 
@@ -463,34 +474,10 @@ impl ActionHandler for TimeHandler {
         let duration_ms = start.elapsed().as_millis() as u64;
 
         match result {
-            Ok(output) => Ok(ActionResult {
-                success: true,
-                output: Some(output),
-                error: None,
-                duration_ms,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: Some(OutputType::Status),
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            }),
-            Err(e) => Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some(e),
-                duration_ms,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            }),
+            Ok(output) => {
+                Ok(ActionResult::ok(output, OutputType::Status).with_duration(duration_ms))
+            }
+            Err(e) => Ok(ActionResult::err(e).with_duration(duration_ms)),
         }
     }
 
@@ -534,6 +521,9 @@ impl ActionHandler for TimeHandler {
                         score: 90,
                         description: Some(format!("{time_str} {abbr}{dst_tag} · {offset}")),
                         reason: None,
+                        thumb_b64: None,
+                        run: Some(format!("time {display}")),
+                        ..Default::default()
                     });
                 }
             }
@@ -557,6 +547,9 @@ impl ActionHandler for TimeHandler {
                     score,
                     description: Some(format!("{time_str} {abbr}{dst_tag} · {offset}")),
                     reason: None,
+                    thumb_b64: None,
+                    run: Some(format!("time {display}")),
+                    ..Default::default()
                 });
             }
         }
@@ -577,6 +570,9 @@ impl ActionHandler for TimeHandler {
                     score,
                     description: Some(format!("{time_str}{dst_tag} · {offset}")),
                     reason: None,
+                    thumb_b64: None,
+                    run: Some(format!("time {display}")),
+                    ..Default::default()
                 });
             }
         }

@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use redb::Database;
 
-use crate::action_registry::handlers::icons::resolve_icon;
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem};
+use crate::action_registry::handlers::icons::resolve_icon_cached;
+use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, ExecContext};
 use crate::db::frecency;
 use crate::desktop_apps::{AUTO_LAUNCH_THRESHOLD, app_index};
 use crate::error::LychiError;
@@ -19,25 +19,41 @@ impl AppLauncher {
         Self { db }
     }
 
-    /// Pre-warm the AppIndex and resolve all icon paths.
-    /// Call from `spawn_blocking` at startup so the first query is instant.
+    /// Pre-warm the AppIndex and icon theme metadata. Fast (a few ms) — this is
+    /// the part that must be ready before the first query. Icon *path* resolution
+    /// is NOT done here: it's lazy per-result on query (see `completions`) and
+    /// bulk-primed off the critical path by `warmup_icons_background`.
     pub fn warmup() {
         let t0 = Instant::now();
         super::icons::warmup_icons();
         let index = app_index();
-        let t_index = t0.elapsed();
+        tracing::info!(
+            "[app_launcher] warmup done: {:.0}ms ({} apps, icons resolved lazily)",
+            t0.elapsed().as_secs_f64() * 1000.0,
+            index.entries.len()
+        );
+    }
 
-        // Pre-resolve icon paths
+    /// Resolve every app's icon path into its per-entry cache. Idempotent and
+    /// cheap to re-run (each `OnceLock` fills once). Meant to run on a dedicated
+    /// low-priority thread AFTER the window is ready — so the icons the user
+    /// scrolls to are already primed, without this ~seconds-long pass ever
+    /// blocking the window or starving the first IPC (the old `spawn_blocking`
+    /// eager loop did both). Lazy per-query resolution is the correctness
+    /// guarantee; this is just an optimization to keep first hits warm.
+    pub fn warmup_icons_background() {
+        let t0 = Instant::now();
+        let index = app_index();
         for entry in &index.entries {
             let _ = entry
                 .icon_path
-                .get_or_init(|| entry.icon.as_deref().and_then(resolve_icon));
+                .get_or_init(|| entry.icon.as_deref().and_then(resolve_icon_cached));
         }
-
+        // Persist the resolved paths so the next launch starts warm (turns the
+        // repeat-launch cost of this pass from seconds into a file read).
+        super::icons::save_icon_cache();
         tracing::info!(
-            "[app_launcher] warmup done: index={:.0}ms icons={:.0}ms total={:.0}ms ({} apps)",
-            t_index.as_secs_f64() * 1000.0,
-            (t0.elapsed() - t_index).as_secs_f64() * 1000.0,
+            "[app_launcher] background icon prewarm done: {:.0}ms ({} apps)",
             t0.elapsed().as_secs_f64() * 1000.0,
             index.entries.len()
         );
@@ -54,14 +70,12 @@ impl ActionHandler for AppLauncher {
         "Launch a desktop application"
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let query = args.trim();
         if query.is_empty() {
-            return Ok(ActionResult {
-                success: false,
-                error: Some("Usage: open <application name>".to_string()),
-                ..Default::default()
-            });
+            return Ok(ActionResult::err(
+                "Usage: open <application name>".to_string(),
+            ));
         }
 
         let start = Instant::now();
@@ -81,13 +95,8 @@ impl ActionHandler for AppLauncher {
 
         let Some(entry) = entry else {
             // No confident match — soft failure so executor can fall back to web
-            return Ok(ActionResult {
-                duration_ms: start.elapsed().as_millis() as u64,
-                ..Default::default()
-            });
+            return Ok(ActionResult::empty_ok().with_duration(start.elapsed().as_millis() as u64));
         };
-
-        let duration_ms = start.elapsed().as_millis() as u64;
 
         // Record frecency access (fire-and-forget)
         let key = entry.name.to_lowercase();
@@ -117,21 +126,9 @@ impl ActionHandler for AppLauncher {
                 "[open] {} already running — focusing (wm_class={wm_class})",
                 entry.name
             );
-            Ok(ActionResult {
-                success: true,
-                output: Some(format!("Focused {}", entry.name)),
-                focus_app: Some(wm_class),
-                duration_ms,
-                ..Default::default()
-            })
+            Ok(ActionResult::focus_app(wm_class))
         } else {
-            Ok(ActionResult {
-                success: true,
-                output: Some(format!("Launched {}", entry.name)),
-                launch_desktop: Some(entry.desktop_path.clone()),
-                duration_ms,
-                ..Default::default()
-            })
+            Ok(ActionResult::launch_desktop(entry.desktop_path.clone()))
         }
     }
 
@@ -151,7 +148,15 @@ impl ActionHandler for AppLauncher {
             .into_iter()
             .map(|(id, app_score)| {
                 let entry = index.entry(id);
-                let icon_path = entry.icon_path.get().cloned().flatten();
+                // Resolve this result's icon lazily, on demand. Only the handful
+                // of results actually shown for a query pay the cost, and each
+                // entry's OnceLock caches it forever after the first resolve — so
+                // we don't eagerly resolve all ~160 apps' icons at startup (that
+                // was ~6.5s of the warmup, for icons the user mostly never sees).
+                let icon_path = entry
+                    .icon_path
+                    .get_or_init(|| entry.icon.as_deref().and_then(resolve_icon_cached))
+                    .clone();
                 let key = entry.name.to_lowercase();
                 let frecency_val = frecency_scores.get(&key).copied().unwrap_or(0.0);
 
@@ -169,12 +174,22 @@ impl ActionHandler for AppLauncher {
                     score: blended,
                     description,
                     reason: None,
+                    thumb_b64: None,
+                    run: Some(format!("open {}", entry.name)),
+                    ..Default::default()
                 }
             })
             .collect();
 
-        // Re-sort by blended score and take top 8
-        items.sort_by(|a, b| b.score.cmp(&a.score));
+        // Re-sort by blended score; deterministic last-resort tiebreak
+        // (shorter label, then name) only when blended scores are equal —
+        // a determinism guarantee, not a ranking opinion.
+        items.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| a.label.len().cmp(&b.label.len()))
+                .then_with(|| a.label.cmp(&b.label))
+        });
         items.truncate(8);
         items
     }

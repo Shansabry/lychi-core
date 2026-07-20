@@ -11,7 +11,7 @@ const OBJECT_PATH: &str = "/org/mpris/MediaPlayer2";
 const PLAYER_IFACE: &str = "org.mpris.MediaPlayer2.Player";
 
 /// Current playback state from a media player via MPRIS.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct TrackInfo {
     pub title: String,
     pub artist: String,
@@ -30,7 +30,7 @@ pub struct TrackInfo {
     pub player_name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum PlaybackStatus {
     Playing,

@@ -3,7 +3,9 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType, RiskLevel};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType, RiskLevel,
+};
 use crate::error::LychiError;
 
 #[cfg(target_os = "linux")]
@@ -29,13 +31,17 @@ impl AppControlHandler {
 #[derive(Debug, Clone)]
 pub(crate) struct RunningWindow {
     /// X11 window ID (only set on X11 sessions)
-    window_id: Option<u32>,
+    pub(crate) window_id: Option<u32>,
+    /// KWin internalId UUID (only set on Wayland/KDE)
+    pub(crate) kwin_id: Option<String>,
     /// Window title
-    title: String,
+    pub(crate) title: String,
     /// WM class or app name (lowercase)
     pub(crate) wm_class: String,
     /// Process ID
-    pid: u32,
+    pub(crate) pid: u32,
+    /// Virtual desktop number (KWin: 1-indexed, X11: 0-indexed), None if on all desktops
+    pub(crate) desktop: Option<u32>,
 }
 
 /// Cached window list with TTL.
@@ -69,32 +75,39 @@ pub(crate) fn get_windows() -> Vec<RunningWindow> {
 }
 
 /// Enumerate windows using the appropriate backend for the session type.
-/// Wayland (KDE) → KWin D-Bus scripting (sees all windows).
+/// KDE Wayland → KWin D-Bus scripting (sees all windows).
 /// X11 → native EWMH protocol via x11rb.
+/// Other Wayland (GNOME/wlroots) → no backend, empty list.
 #[cfg(target_os = "linux")]
 fn enumerate_windows() -> Vec<RunningWindow> {
-    let wayland = crate::context::is_wayland();
-    tracing::info!("appctl: enumerate_windows (wayland={wayland})");
-    if wayland {
+    let compositor = crate::context::compositor();
+    tracing::info!("appctl: enumerate_windows ({compositor:?})");
+    if compositor == crate::context::Compositor::KdeWayland {
         kwin_windows::enumerate_windows()
             .into_iter()
             .map(|w| RunningWindow {
                 window_id: None,
+                kwin_id: w.internal_id,
                 title: w.caption,
                 wm_class: w.resource_class,
                 pid: w.pid,
+                desktop: w.desktop,
             })
             .collect()
-    } else {
+    } else if compositor == crate::context::Compositor::X11 {
         x11_windows::enumerate_windows()
             .into_iter()
             .map(|w| RunningWindow {
                 window_id: Some(w.window_id),
+                kwin_id: None,
                 title: w.title,
                 wm_class: w.wm_class,
                 pid: w.pid,
+                desktop: w.desktop,
             })
             .collect()
+    } else {
+        Vec::new()
     }
 }
 
@@ -146,20 +159,30 @@ fn parse_verb_and_target(args: &str) -> (&str, &str) {
     }
 }
 
-/// Focus a window natively.
+/// Focus a window natively. Prefers per-window ID targeting when available.
 #[cfg(target_os = "linux")]
-fn do_focus(window: &RunningWindow) -> Result<(), String> {
-    if crate::context::is_wayland() {
-        kwin_windows::focus_window(&window.wm_class)
-    } else if let Some(wid) = window.window_id {
-        x11_windows::focus_window(wid)
-    } else {
-        Err("No window ID available".to_string())
+pub(crate) fn do_focus(window: &RunningWindow) -> Result<(), String> {
+    match crate::context::compositor() {
+        crate::context::Compositor::KdeWayland => {
+            if let Some(ref id) = window.kwin_id {
+                kwin_windows::focus_window_by_id(id)
+            } else {
+                kwin_windows::focus_window(&window.wm_class)
+            }
+        }
+        crate::context::Compositor::X11 => {
+            if let Some(wid) = window.window_id {
+                x11_windows::focus_window(wid)
+            } else {
+                Err("No window ID available".to_string())
+            }
+        }
+        _ => Err("Window control not available on this compositor".to_string()),
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn do_focus(_window: &RunningWindow) -> Result<(), String> {
+pub(crate) fn do_focus(_window: &RunningWindow) -> Result<(), String> {
     Err("Window focus not supported on this platform".to_string())
 }
 
@@ -172,25 +195,49 @@ pub fn focus_by_class(wm_class: &str) -> Result<(), String> {
     do_focus(window)
 }
 
-/// Gracefully close a window natively.
+/// Gracefully close a window natively. Prefers per-window ID targeting when available.
 #[cfg(target_os = "linux")]
-fn do_close(window: &RunningWindow) -> Result<(), String> {
-    if crate::context::is_wayland() {
-        kwin_windows::close_window(&window.wm_class)
-    } else if let Some(wid) = window.window_id {
-        x11_windows::close_window(wid)
-    } else {
-        Err("No window ID available".to_string())
+pub(crate) fn do_close(window: &RunningWindow) -> Result<(), String> {
+    match crate::context::compositor() {
+        crate::context::Compositor::KdeWayland => {
+            if let Some(ref id) = window.kwin_id {
+                kwin_windows::close_window_by_id(id)
+            } else {
+                kwin_windows::close_window(&window.wm_class)
+            }
+        }
+        crate::context::Compositor::X11 => {
+            if let Some(wid) = window.window_id {
+                x11_windows::close_window(wid)
+            } else {
+                Err("No window ID available".to_string())
+            }
+        }
+        _ => Err("Window control not available on this compositor".to_string()),
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn do_close(_window: &RunningWindow) -> Result<(), String> {
+pub(crate) fn do_close(_window: &RunningWindow) -> Result<(), String> {
     Err("Window close not supported on this platform".to_string())
 }
 
 #[async_trait]
 impl ActionHandler for AppControlHandler {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::{ArgTransform, Trigger};
+        static TRIGGERS: &[Trigger] = &[
+            // `appctl <verb> <target>` — internal run command, verbatim args.
+            Trigger::keywords(&["appctl"]),
+            // Bare verbs — prepend the verb so the handler sees "kill spotify".
+            Trigger::new(
+                &["focus", "quit", "close", "kill"],
+                ArgTransform::PrependKeyword,
+            ),
+        ];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "appctl"
     }
@@ -203,7 +250,7 @@ impl ActionHandler for AppControlHandler {
         RiskLevel::Low
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let (verb, target) = parse_verb_and_target(args);
 
         if target.is_empty() {
@@ -243,29 +290,67 @@ impl ActionHandler for AppControlHandler {
                     );
                 }
                 n if n > 1 => {
-                    // Prefer exact comm match to avoid ambiguity
+                    // Many matches usually means one app with several processes
+                    // (Spotify/Chrome spawn renderers/helpers). "kill spotify"
+                    // means kill the WHOLE app, so if all exact-name matches are
+                    // the SAME program, kill them all — never ask the user to
+                    // hand-pick a PID from a wall of identical names.
                     let target_lower = target.to_lowercase();
                     let exact: Vec<_> = system_matches
                         .iter()
                         .filter(|p| p.comm.to_lowercase() == target_lower)
                         .collect();
-                    if exact.len() == 1 {
-                        return Ok(
-                            match crate::process_tracker::kill_system_pid(exact[0].pid) {
-                                Ok(msg) => ActionResult::ok(msg, OutputType::Status)
-                                    .with_risk(RiskLevel::Medium),
-                                Err(e) => ActionResult::err(e),
-                            },
-                        );
-                    }
-                    let names: Vec<String> = system_matches
+
+                    // Decide the kill set: the exact-name group if any, else all
+                    // matches only when they're all the same program name.
+                    let distinct_comms: std::collections::HashSet<String> = system_matches
                         .iter()
-                        .map(|p| format!("  {} (pid={})", p.comm, p.pid))
+                        .map(|p| p.comm.to_lowercase())
                         .collect();
-                    return Ok(ActionResult::err(format!(
-                        "Multiple matches ({n}), specify PID:\n{}",
-                        names.join("\n")
-                    )));
+                    let kill_set: Vec<u32> = if !exact.is_empty() {
+                        exact.iter().map(|p| p.pid).collect()
+                    } else if distinct_comms.len() == 1 {
+                        system_matches.iter().map(|p| p.pid).collect()
+                    } else {
+                        // Genuinely different programs share the query → ambiguous;
+                        // only here do we ask the user to disambiguate.
+                        let names: Vec<String> = system_matches
+                            .iter()
+                            .map(|p| format!("  {} (pid={})", p.comm, p.pid))
+                            .collect();
+                        return Ok(ActionResult::err(format!(
+                            "Multiple different programs match '{target}', specify PID:\n{}",
+                            names.join("\n")
+                        )));
+                    };
+
+                    let mut killed = 0usize;
+                    let mut last_err = None;
+                    for pid in &kill_set {
+                        match crate::process_tracker::kill_system_pid(*pid) {
+                            Ok(_) => killed += 1,
+                            // A child dying when its parent is killed is expected —
+                            // "already exited" isn't a real failure.
+                            Err(e) if e.contains("already exited") => {}
+                            Err(e) => last_err = Some(e),
+                        }
+                    }
+                    let name = exact
+                        .first()
+                        .map(|p| p.comm.clone())
+                        .unwrap_or_else(|| target.to_string());
+                    return Ok(if killed > 0 {
+                        let msg = if killed == 1 {
+                            format!("Killed {name}")
+                        } else {
+                            format!("Killed {name} ({killed} processes)")
+                        };
+                        ActionResult::ok(msg, OutputType::Status).with_risk(RiskLevel::Medium)
+                    } else {
+                        ActionResult::err(
+                            last_err.unwrap_or_else(|| format!("Couldn't kill {name}")),
+                        )
+                    });
                 }
                 _ => {} // 0 matches — fall through to window kill
             }
@@ -337,6 +422,10 @@ impl ActionHandler for AppControlHandler {
                     score: 900,
                     description: Some("Bring window to front".to_string()),
                     reason: None,
+                    thumb_b64: None,
+                    // Needs an app name — fill the verb so the user types it.
+                    fill: Some("focus ".to_string()),
+                    ..Default::default()
                 },
                 CompletionItem {
                     label: "quit <app>".to_string(),
@@ -344,6 +433,9 @@ impl ActionHandler for AppControlHandler {
                     score: 800,
                     description: Some("Gracefully close".to_string()),
                     reason: None,
+                    thumb_b64: None,
+                    fill: Some("quit ".to_string()),
+                    ..Default::default()
                 },
                 CompletionItem {
                     label: "kill <app>".to_string(),
@@ -351,6 +443,9 @@ impl ActionHandler for AppControlHandler {
                     score: 700,
                     description: Some("Force-kill process".to_string()),
                     reason: None,
+                    thumb_b64: None,
+                    fill: Some("kill ".to_string()),
+                    ..Default::default()
                 },
             ];
         }
@@ -370,11 +465,14 @@ impl ActionHandler for AppControlHandler {
                         w.wm_class.clone()
                     };
                     CompletionItem {
-                        label: display_name,
+                        label: display_name.clone(),
                         icon_path: None,
                         score: (1000 - i as u16).max(1),
                         description: Some(truncate(&w.title, 50)),
                         reason: None,
+                        thumb_b64: None,
+                        run: Some(format!("appctl {verb} {display_name}")),
+                        ..Default::default()
                     }
                 })
                 .collect();
@@ -396,11 +494,14 @@ impl ActionHandler for AppControlHandler {
                     w.wm_class.clone()
                 };
                 CompletionItem {
-                    label: display_name,
+                    label: display_name.clone(),
                     icon_path: None,
                     score: (1000 - i as u16).max(1),
                     description: Some(truncate(&w.title, 50)),
                     reason: None,
+                    thumb_b64: None,
+                    run: Some(format!("appctl {verb} {display_name}")),
+                    ..Default::default()
                 }
             })
             .collect();
@@ -434,6 +535,10 @@ impl ActionHandler for AppControlHandler {
                         score: 950,
                         description: Some(format!("pid={} running {duration}", proc.pid)),
                         reason: None,
+                        thumb_b64: None,
+                        // Kill by PID — unambiguous even if the command string repeats.
+                        run: Some(format!("appctl kill {}", proc.pid)),
+                        ..Default::default()
                     });
                 }
             }
@@ -457,6 +562,9 @@ impl ActionHandler for AppControlHandler {
                             truncate(&proc.cmdline, 60)
                         )),
                         reason: None,
+                        thumb_b64: None,
+                        run: Some(format!("appctl kill {}", proc.pid)),
+                        ..Default::default()
                     });
                 }
             }

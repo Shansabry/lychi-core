@@ -2,7 +2,7 @@ pub mod store;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct NoteItem {
     pub id: String,
     pub text: String,
@@ -10,7 +10,7 @@ pub struct NoteItem {
     pub updated_at: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct TodoItem {
     pub id: String,
     pub text: String,

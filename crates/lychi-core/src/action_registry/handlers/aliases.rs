@@ -4,7 +4,9 @@ use std::time::Instant;
 use async_trait::async_trait;
 use redb::Database;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+};
 use crate::aliases::store::{AliasesStore, MAX_ALIASES};
 use crate::error::LychiError;
 
@@ -22,6 +24,12 @@ const ALIAS_SUBCOMMANDS: &[&str] = &["add", "list", "delete"];
 
 #[async_trait]
 impl ActionHandler for AliasHandler {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["alias", "aliases"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "alias"
     }
@@ -30,7 +38,7 @@ impl ActionHandler for AliasHandler {
         "Aliases — save command shortcuts. Usage: alias add <name> <command>, alias list, alias delete <name>"
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let start = Instant::now();
         let trimmed = args.trim();
         let store = AliasesStore::new();
@@ -42,44 +50,26 @@ impl ActionHandler for AliasHandler {
         {
             let aliases = store.get_aliases(&self.db)?;
             if aliases.is_empty() {
-                return Ok(ActionResult {
-                    success: true,
-                    output: Some("No aliases saved. Use: alias add <name> <command>".to_string()),
-                    error: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: Some(OutputType::Text),
-                    executed_args: None,
-                    launch_desktop: None,
-                    focus_app: None,
-                });
+                return Ok(ActionResult::ok(
+                    "No aliases saved. Use: alias add <name> <command>".to_string(),
+                    OutputType::Text,
+                )
+                .with_duration(start.elapsed().as_millis() as u64));
             }
             let lines: Vec<String> = aliases
                 .iter()
                 .map(|a| format!("  {} → {}", a.name, a.command))
                 .collect();
-            return Ok(ActionResult {
-                success: true,
-                output: Some(format!(
+            return Ok(ActionResult::ok(
+                format!(
                     "Aliases ({}/{}):\n{}",
                     aliases.len(),
                     MAX_ALIASES,
                     lines.join("\n")
-                )),
-                error: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: Some(OutputType::Text),
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+                ),
+                OutputType::Text,
+            )
+            .with_duration(start.elapsed().as_millis() as u64));
         }
 
         // "add <name> <command>" → add alias
@@ -89,20 +79,11 @@ impl ActionHandler for AliasHandler {
                 .split_once(' ')
                 .ok_or_else(|| LychiError::Alias("Usage: alias add <name> <command>".into()))?;
             let item = store.add_alias(&self.db, name, command)?;
-            return Ok(ActionResult {
-                success: true,
-                output: Some(format!("Alias saved: {} → {}", item.name, item.command)),
-                error: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(ActionResult::ok(
+                format!("Alias saved: {} → {}", item.name, item.command),
+                OutputType::Status,
+            )
+            .with_duration(start.elapsed().as_millis() as u64));
         }
 
         // "delete <name>" / "del <name>" / "rm <name>" → delete alias
@@ -113,20 +94,10 @@ impl ActionHandler for AliasHandler {
         {
             let name = rest.trim();
             store.delete_alias(&self.db, name)?;
-            return Ok(ActionResult {
-                success: true,
-                output: Some(format!("Alias deleted: {name}")),
-                error: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(
+                ActionResult::ok(format!("Alias deleted: {name}"), OutputType::Status)
+                    .with_duration(start.elapsed().as_millis() as u64),
+            );
         }
 
         // "update <name> <command>" → update alias command
@@ -136,39 +107,18 @@ impl ActionHandler for AliasHandler {
                 .split_once(' ')
                 .ok_or_else(|| LychiError::Alias("Usage: alias update <name> <command>".into()))?;
             store.update_alias(&self.db, name, command)?;
-            return Ok(ActionResult {
-                success: true,
-                output: Some(format!("Alias updated: {name} → {command}")),
-                error: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(ActionResult::ok(
+                format!("Alias updated: {name} → {command}"),
+                OutputType::Status,
+            )
+            .with_duration(start.elapsed().as_millis() as u64));
         }
 
         // Unknown subcommand
-        Ok(ActionResult {
-            success: false,
-            output: None,
-            error: Some(
-                "Usage: alias add <name> <command> | alias list | alias delete <name>".to_string(),
-            ),
-            duration_ms: start.elapsed().as_millis() as u64,
-            routed_by: None,
-            open_url: None,
-            needs_confirmation: None,
-            risk_level: None,
-            output_type: None,
-            executed_args: None,
-            launch_desktop: None,
-            focus_app: None,
-        })
+        Ok(ActionResult::err(
+            "Usage: alias add <name> <command> | alias list | alias delete <name>".to_string(),
+        )
+        .with_duration(start.elapsed().as_millis() as u64))
     }
 
     async fn completions(&self, partial: &str) -> Vec<CompletionItem> {
@@ -185,6 +135,9 @@ impl ActionHandler for AliasHandler {
                     score: 100,
                     description: None,
                     reason: None,
+                    thumb_b64: None,
+                    run: Some(format!("alias {s}")),
+                    ..Default::default()
                 })
                 .collect();
 
@@ -199,6 +152,11 @@ impl ActionHandler for AliasHandler {
                             score: 80,
                             description: Some(format!("→ {}", alias.command)),
                             reason: None,
+                            thumb_b64: None,
+                            // Selecting an alias runs it — the intent layer
+                            // expands the alias name (first word) to its command.
+                            run: Some(alias.name.clone()),
+                            ..Default::default()
                         });
                     }
                 }
@@ -225,6 +183,9 @@ impl ActionHandler for AliasHandler {
                         score: 90,
                         description: Some(format!("→ {}", a.command)),
                         reason: None,
+                        thumb_b64: None,
+                        run: Some(format!("alias delete {}", a.name)),
+                        ..Default::default()
                     })
                     .collect();
             }

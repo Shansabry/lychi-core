@@ -1,162 +1,57 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::RwLock;
 use std::time::Instant;
 
 use crate::action_registry::{ActionHandler, ActionResult, OutputType, RiskLevel};
 use crate::error::LychiError;
 
-/// Captured environment from the user's interactive login shell.
-/// Uses RwLock so it can be refreshed when the shell config changes.
+/// Captured environment from the user's interactive login shell. A pure lazy
+/// cache keyed by shell path — legitimately process-global (no per-run state,
+/// refreshed only when the shell config changes). Not part of `RunEnv`.
 static SHELL_ENV: RwLock<Option<(String, HashMap<String, String>)>> = RwLock::new(None);
 
-/// Context CWD — set by the executor before each shell command.
-/// When set, shell commands run in this directory instead of Lychi's process CWD.
-static CONTEXT_CWD: Mutex<Option<String>> = Mutex::new(None);
+pub use crate::action_registry::{ExecContext, OutputMode, TerminalTarget};
 
-/// Terminal emulator setting — set by the executor from config.
-static TERMINAL_SETTING: Mutex<Option<String>> = Mutex::new(None);
+// ── Command validation ──────────────────────────────────────────────────
 
-/// Terminal routing mode — "auto", "manual", or "off".
-static TERMINAL_ROUTING: Mutex<Option<String>> = Mutex::new(None);
-
-/// Target terminal for routing — resolved from the focus ring by the executor.
-static CONTEXT_TERMINAL: Mutex<Option<TerminalTarget>> = Mutex::new(None);
-
-#[derive(Clone)]
-struct TerminalTarget {
-    wm_class: String,
-    pid: u32,
-    window_id: Option<String>,
+/// The command's first word — the executable/builtin/alias being invoked.
+/// Skips leading env-var assignments (`FOO=bar cmd`) so those still resolve.
+fn command_head(cmd: &str) -> Option<&str> {
+    cmd.split_whitespace()
+        .find(|word| !word.contains('=') || word.starts_with('='))
 }
 
-/// Set the working directory for the next shell command.
-pub fn set_context_cwd(cwd: Option<String>) {
-    if let Ok(mut guard) = CONTEXT_CWD.lock() {
-        *guard = cwd;
-    }
-}
-
-/// Get the current context CWD.
-fn get_context_cwd() -> Option<String> {
-    CONTEXT_CWD.lock().ok().and_then(|g| g.clone())
-}
-
-/// Set the terminal emulator for the next command.
-pub fn set_terminal(terminal: Option<String>) {
-    if let Ok(mut guard) = TERMINAL_SETTING.lock() {
-        *guard = terminal;
-    }
-}
-
-/// Get the configured terminal emulator.
-fn get_terminal() -> Option<String> {
-    TERMINAL_SETTING.lock().ok().and_then(|g| g.clone())
-}
-
-/// Set the terminal routing mode for the next command.
-pub fn set_terminal_routing(mode: Option<String>) {
-    if let Ok(mut guard) = TERMINAL_ROUTING.lock() {
-        *guard = mode;
-    }
-}
-
-/// Get the current terminal routing mode.
-pub fn get_terminal_routing() -> String {
-    TERMINAL_ROUTING
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-        .unwrap_or_else(|| "off".to_string())
-}
-
-/// Set the target terminal for routing.
-pub fn set_context_terminal(wm_class: Option<String>, pid: u32, window_id: Option<String>) {
-    if let Ok(mut guard) = CONTEXT_TERMINAL.lock() {
-        *guard = wm_class.map(|wm| TerminalTarget {
-            wm_class: wm,
-            pid,
-            window_id,
-        });
-    }
-}
-
-/// Get the current routing target.
-fn get_context_terminal() -> Option<TerminalTarget> {
-    CONTEXT_TERMINAL.lock().ok().and_then(|g| g.clone())
-}
-
-// ── Inline-safe whitelist ───────────────────────────────────────────────
-
-/// Commands that produce short, read-only output and should stay inline.
-fn inline_safe_set() -> &'static HashSet<&'static str> {
-    static SET: OnceLock<HashSet<&str>> = OnceLock::new();
-    SET.get_or_init(|| {
-        [
-            "ls", "cat", "head", "tail", "wc", "file", "stat", "du", "df", "free", "uptime",
-            "uname", "hostname", "whoami", "id", "date", "cal", "echo", "printf", "pwd", "which",
-            "where", "whereis", "type", "env", "printenv", "locale", "lsblk", "lscpu", "lsusb",
-            "lspci", "ip", "ss", "dig", "nslookup", "ping", // single ping is quick
-        ]
-        .into_iter()
-        .collect()
-    })
-}
-
-/// Two-word commands that should stay inline (e.g. "git status", "docker ps").
-fn inline_safe_two_words() -> &'static HashSet<&'static str> {
-    static SET: OnceLock<HashSet<&str>> = OnceLock::new();
-    SET.get_or_init(|| {
-        [
-            "git status",
-            "git log",
-            "git diff",
-            "git branch",
-            "git remote",
-            "git show",
-            "git tag",
-            "git stash list",
-            "docker ps",
-            "docker images",
-            "docker inspect",
-            "cargo --version",
-            "node --version",
-            "python --version",
-            "go version",
-            "rustc --version",
-            "npm --version",
-        ]
-        .into_iter()
-        .collect()
-    })
-}
-
-/// Check if a command should run inline (captured output) vs in a terminal window.
-fn is_inline_safe(cmd: &str) -> bool {
-    let trimmed = cmd.trim();
-
-    // Check two-word match first (e.g. "git status")
-    let words: Vec<&str> = trimmed.splitn(3, char::is_whitespace).collect();
-    if words.len() >= 2 {
-        let two = format!("{} {}", words[0], words[1]);
-        if inline_safe_two_words().contains(two.as_str()) {
-            return true;
-        }
-    }
-
-    // Check single-word match
-    if let Some(first_word) = words.first()
-        && inline_safe_set().contains(first_word)
-    {
-        return true;
-    }
-
-    false
+/// How a `run` command's output is delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunMode {
+    /// Captured subprocess; output shown in Lychi's result panel. Opt-in
+    /// (Shift+Enter) — for quick read-only commands.
+    Inline,
+    /// Opens the user's terminal emulator (routed to an existing one, or a
+    /// fresh window). The default — handles interactive/long-running commands.
+    Terminal,
 }
 
 // ── Terminal launch ─────────────────────────────────────────────────────
+
+/// Open a command in the given terminal emulator (falls back to xterm).
+/// Public within the crate so other handlers (e.g. SSH) can launch terminal
+/// sessions — they pass the configured terminal from their own run env.
+pub(crate) fn open_in_terminal(
+    cmd: &str,
+    cwd: Option<&str>,
+    terminal: Option<&str>,
+) -> Result<u32, LychiError> {
+    let terminal = terminal.unwrap_or("xterm").to_string();
+    let shell = SHELL_ENV
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().map(|(s, _)| s.clone()))
+        .unwrap_or_else(|| "/bin/sh".to_string());
+    launch_in_terminal(&terminal, &shell, cmd, cwd)
+}
 
 /// Shell-escape a string for use in a shell command.
 fn shell_escape(s: &str) -> String {
@@ -167,6 +62,54 @@ fn shell_escape(s: &str) -> String {
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
     }
+}
+
+/// Terminals that CANNOT be launched with a command (no `-e`/URI/config that
+/// runs an arbitrary command — confirmed for Warp; Wave/Tabby share the trait).
+/// Matched on binary basename. We route around these to a working terminal.
+const NO_COMMAND_LAUNCH: &[&str] = &["warp-terminal", "warp", "waveterm", "tabby"];
+
+/// Preference order for a fallback terminal that DOES support command launch,
+/// when the resolved terminal can't run a command. First one on PATH wins.
+const FALLBACK_TERMINALS: &[&str] = &[
+    "konsole",
+    "gnome-terminal",
+    "kitty",
+    "alacritty",
+    "wezterm",
+    "foot",
+    "tilix",
+    "xfce4-terminal",
+    "kgx",
+    "ptyxis",
+    "xterm",
+];
+
+/// Whether a terminal binary can't be launched with a command.
+fn is_no_command_launch(term_basename: &str) -> bool {
+    let lower = term_basename.to_lowercase();
+    NO_COMMAND_LAUNCH.iter().any(|t| lower == *t)
+}
+
+/// Given a requested terminal that can't run a command, pick a command-capable
+/// one that's actually installed. Honors `$TERMINAL` first, then the preference
+/// order. Returns `None` if nothing suitable is found.
+fn pick_fallback_terminal() -> Option<String> {
+    if let Ok(t) = std::env::var("TERMINAL")
+        && !t.is_empty()
+    {
+        let base = std::path::Path::new(&t)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&t);
+        if !is_no_command_launch(base) && which::which(&t).is_ok() {
+            return Some(t);
+        }
+    }
+    FALLBACK_TERMINALS
+        .iter()
+        .find(|t| which::which(t).is_ok())
+        .map(|t| t.to_string())
 }
 
 /// Spawn the user's terminal emulator with a command.
@@ -188,29 +131,42 @@ fn launch_in_terminal(
         r#"{cwd_prefix}{cmd}; __ec=$?; echo ""; echo "[Process exited with code $__ec] Press Enter to close"; read"#
     );
 
+    let requested_basename = std::path::Path::new(terminal)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(terminal);
+
+    // If the resolved terminal can't run a command (e.g. Warp), route to a
+    // command-capable terminal that's installed instead — so `run top` opens a
+    // usable terminal rather than failing.
+    let terminal = if is_no_command_launch(requested_basename) {
+        match pick_fallback_terminal() {
+            Some(fallback) => {
+                tracing::info!(
+                    "[shell_exec] '{requested_basename}' can't run a command — falling back to '{fallback}'"
+                );
+                fallback
+            }
+            None => {
+                return Err(LychiError::ExecutionFailed(format!(
+                    "'{requested_basename}' can't run commands and no fallback terminal is installed"
+                )));
+            }
+        }
+    } else {
+        terminal.to_string()
+    };
+    let terminal = terminal.as_str();
+
     let term_basename = std::path::Path::new(terminal)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(terminal);
 
     let mut command = Command::new(terminal);
-
-    // Terminal-specific flags for "run this command"
-    match term_basename {
-        "kitty" => {
-            command.args(["--", shell, "-ic", &wrapped]);
-        }
-        "wezterm" => {
-            command.args(["start", "--", shell, "-ic", &wrapped]);
-        }
-        "gnome-terminal" | "gnome-terminal-server" => {
-            command.args(["--", shell, "-ic", &wrapped]);
-        }
-        _ => {
-            // Most terminals (alacritty, foot, konsole, xfce4-terminal,
-            // ghostty, xterm, etc.) use -e
-            command.args(["-e", shell, "-ic", &wrapped]);
-        }
+    // Build the terminal-specific argv to run `<shell> -ic "<wrapped>"`.
+    for arg in terminal_exec_args(term_basename, shell, &wrapped) {
+        command.arg(arg);
     }
 
     command
@@ -218,31 +174,139 @@ fn launch_in_terminal(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    // Detach from Lychi's process group
+    // Detach from Lychi's process group so it survives independently.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
 
-    let child = command.spawn().map_err(|e| {
-        LychiError::ExecutionFailed(format!("Failed to launch terminal '{}': {}", terminal, e))
+    let mut child = command.spawn().map_err(|e| {
+        LychiError::ExecutionFailed(format!("Failed to launch terminal '{terminal}': {e}"))
     })?;
 
     let pid = child.id();
 
-    // Don't drop the Child — that would wait for it or kill it.
-    // We want the terminal process to live independently.
-    std::mem::forget(child);
+    // Grace check: `spawn()` only fails if the binary can't be exec'd at all — a
+    // terminal launched with the wrong flags starts then dies in milliseconds,
+    // which would otherwise be reported as success (and leak a zombie). Wait
+    // briefly; if it already exited, that's a launch failure.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            // Died instantly — reaped here, so no zombie. Surface a real error.
+            return Err(LychiError::ExecutionFailed(format!(
+                "Terminal '{terminal}' exited immediately ({status}) — likely wrong launch flags"
+            )));
+        }
+        Ok(None) => {
+            // Still alive: reap it in a detached thread when it eventually
+            // exits (user closes the window), so it never becomes a zombie.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => {
+            // Couldn't poll — don't leak; best-effort reap in a thread.
+            tracing::debug!("[shell_exec] try_wait failed for {terminal}: {e}");
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
 
-    tracing::info!(
-        "[shell_exec] launched in terminal: {} (pid={}, cmd={})",
-        terminal,
-        pid,
-        cmd
-    );
+    tracing::info!("[shell_exec] launched in terminal: {terminal} (pid={pid}, cmd={cmd})");
 
     Ok(pid)
+}
+
+/// Resolve a window's WM class to a launchable terminal binary on PATH.
+///
+/// WM classes often differ from the binary name (`org.gnome.terminal` →
+/// `gnome-terminal`, `dev.warp.warp` → `warp`). We try known aliases and a few
+/// mechanical transforms, returning the first that exists on PATH — so "run in
+/// the terminal I'm already using" actually works instead of silently falling
+/// back to the configured default.
+pub fn terminal_binary_for_class(wm_class: &str) -> Option<String> {
+    let lower = wm_class.to_lowercase();
+
+    // Known WM-class → binary aliases (only where they genuinely differ).
+    let alias = match lower.as_str() {
+        "org.gnome.terminal" | "gnome-terminal-server" => Some("gnome-terminal"),
+        "org.gnome.console" => Some("kgx"),
+        "org.kde.konsole" | "konsole" => Some("konsole"),
+        "xfce4-terminal" | "xfce4-terminal.wrapper" => Some("xfce4-terminal"),
+        "org.wezfurlong.wezterm" => Some("wezterm"),
+        "dev.warp.warp" => Some("warp-terminal"),
+        _ => None,
+    };
+    if let Some(bin) = alias
+        && which::which(bin).is_ok()
+    {
+        return Some(bin.to_string());
+    }
+
+    // Mechanical fallbacks: the class as-is, and its last dotted segment
+    // (reverse-DNS classes like "com.foo.Bar" → "bar").
+    let candidates = [
+        lower.clone(),
+        lower.rsplit('.').next().unwrap_or(&lower).to_string(),
+    ];
+    for cand in candidates {
+        if which::which(&cand).is_ok() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// Argument style a terminal uses to run a command with arguments. The two
+/// conventions are genuinely incompatible (research-confirmed) — a table is
+/// required. `xterm -e prog arg1 arg2` (execvp remainder) is the golden
+/// standard; the GTK/VTE `-e "single string"` family is the exception.
+enum ArgStyle {
+    /// Flag (if any) then the command + args as SEPARATE argv (execvp-style).
+    Execvp(&'static [&'static str]),
+    /// Flag then ONE shell-quoted string the terminal re-parses itself.
+    SingleString(&'static str),
+}
+
+/// Map a terminal to how it wants a command passed, then build the argv to run
+/// `<shell> -ic "<wrapped>"`. Basename-keyed; unknown terminals default to the
+/// xterm golden standard (`-e` execvp).
+fn terminal_exec_args(term_basename: &str, shell: &str, wrapped: &str) -> Vec<String> {
+    let style = match term_basename {
+        // Positional command, no flag.
+        "kitty" | "foot" => ArgStyle::Execvp(&[]),
+        // execvp remainder after a prefix flag.
+        "wezterm" => ArgStyle::Execvp(&["start", "--"]),
+        "gnome-terminal" | "gnome-terminal-server" | "kgx" | "gnome-console" | "ptyxis" => {
+            ArgStyle::Execvp(&["--"])
+        }
+        "xfce4-terminal" | "terminator" => ArgStyle::Execvp(&["-x"]),
+        // execvp remainder after `-e` (xterm golden standard + compatibles).
+        "xterm" | "urxvt" | "rxvt" | "konsole" | "alacritty" | "ghostty" | "qterminal"
+        | "deepin-terminal" | "rio" | "contour" | "blackbox" => ArgStyle::Execvp(&["-e"]),
+        // GTK/VTE single-string `-e` (terminal re-splits the string itself).
+        "mate-terminal" | "tilix" => ArgStyle::SingleString("-e"),
+        // Unknown: xterm's `-e prog args` is the documented golden standard.
+        _ => ArgStyle::Execvp(&["-e"]),
+    };
+
+    match style {
+        ArgStyle::Execvp(flags) => {
+            let mut args: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
+            args.push(shell.to_string());
+            args.push("-ic".to_string());
+            args.push(wrapped.to_string());
+            args
+        }
+        ArgStyle::SingleString(flag) => {
+            // One argument the terminal shell-splits: `<shell> -ic '<wrapped>'`.
+            let single = format!("{} -ic {}", shell, shell_escape(wrapped));
+            vec![flag.to_string(), single]
+        }
+    }
 }
 
 /// Spawn an interactive login shell and capture its full environment.
@@ -328,6 +392,26 @@ impl ShellExec {
         env
     }
 
+    /// Whether the command's first word resolves in the user's login shell —
+    /// covers PATH binaries, shell builtins, aliases, and functions (exactly
+    /// what execution sees, since commands run via `sh -ic`). Lets us reject an
+    /// unknown command (e.g. `xyx`) *before* launching a terminal that would
+    /// just flash "command not found" and vanish.
+    fn command_exists(&self, head: &str) -> bool {
+        let env = self.get_env();
+        let probe = format!("command -v -- {} >/dev/null 2>&1", shell_escape(head));
+        Command::new(&self.shell)
+            .args(["-ic", &probe])
+            .env_clear()
+            .envs(&env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(true) // Probe failed to run → fail open, don't block.
+    }
+
     /// Run a command inline (captured output, displayed in Lychi's result panel).
     async fn execute_inline(
         &self,
@@ -382,28 +466,22 @@ impl ShellExec {
             )
         };
 
-        Ok(ActionResult {
-            success,
-            output: out,
-            error: err,
-            duration_ms,
-            routed_by: None,
-            open_url: None,
-            needs_confirmation: None,
-            risk_level: None,
-            output_type: Some(OutputType::Terminal),
-            executed_args: Some(cmd.to_string()),
-            launch_desktop: None,
-            focus_app: None,
-        })
+        let mut result = match out {
+            Some(body) => ActionResult::ok(body, OutputType::Terminal),
+            None => ActionResult::empty_ok(),
+        };
+        result.success = success;
+        result.error = err;
+        result.duration_ms = duration_ms;
+        Ok(result)
     }
 
     /// Try to route a command to an existing terminal via native protocol.
     ///
     /// Returns `Some(ActionResult)` on success, `None` if routing failed
     /// (caller should fall back to opening a new terminal).
-    fn try_route_command(&self, cmd: &str) -> Option<ActionResult> {
-        let target = match get_context_terminal() {
+    fn try_route_command(&self, ctx: &ExecContext, cmd: &str) -> Option<ActionResult> {
+        let target = match ctx.terminal_target.clone() {
             Some(t) => t,
             None => {
                 tracing::debug!(
@@ -451,23 +529,10 @@ impl ShellExec {
                     cmd
                 );
 
-                Some(ActionResult {
-                    success: true,
-                    output: Some(format!(
-                        "\u{2192} {} (pid={}): {cmd}",
-                        target.wm_class, target.pid
-                    )),
-                    error: None,
-                    duration_ms: 0,
-                    routed_by: Some("terminal_routing".to_string()),
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: Some(OutputType::Status),
-                    executed_args: Some(cmd.to_string()),
-                    launch_desktop: None,
-                    focus_app: None,
-                })
+                Some(ActionResult::ok(
+                    format!("\u{2192} {} (pid={}): {cmd}", target.wm_class, target.pid),
+                    OutputType::Status,
+                ))
             }
             Err(e) => {
                 if e.contains("no send protocol") {
@@ -499,35 +564,32 @@ impl ShellExec {
     /// Launch a command in the user's terminal emulator.
     fn execute_in_terminal(
         &self,
+        ctx: &ExecContext,
         cmd: &str,
         cwd: Option<&str>,
     ) -> Result<ActionResult, LychiError> {
-        let terminal = get_terminal().unwrap_or_else(|| "xterm".to_string());
+        let terminal = ctx.terminal.clone().unwrap_or_else(|| "xterm".to_string());
 
         let pid = launch_in_terminal(&terminal, &self.shell, cmd, cwd)?;
 
         // Track the spawned process so the user can list/kill it later
         crate::process_tracker::track(pid, cmd, cwd);
 
-        Ok(ActionResult {
-            success: true,
-            output: Some(format!("Running in {terminal}: {cmd}")),
-            error: None,
-            duration_ms: 0,
-            routed_by: None,
-            open_url: None,
-            needs_confirmation: None,
-            risk_level: None,
-            output_type: Some(OutputType::Status),
-            executed_args: Some(cmd.to_string()),
-            launch_desktop: None,
-            focus_app: None,
-        })
+        Ok(ActionResult::ok(
+            format!("Running in {terminal}: {cmd}"),
+            OutputType::Status,
+        ))
     }
 }
 
 #[async_trait]
 impl ActionHandler for ShellExec {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["run"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "run"
     }
@@ -540,44 +602,168 @@ impl ActionHandler for ShellExec {
         RiskLevel::Medium
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
+        // The `run` pipeline is three clear steps: validate → pick mode →
+        // dispatch. Everything it needs (cwd, terminal, output mode, routing
+        // target) comes from the immutable per-run `ctx`.
         let cmd = args.trim();
+
+        // 1. Validate. Empty or an unresolvable first word never launches
+        //    anything — we fail in Lychi with a clear message (and the caller
+        //    won't record a failed command in history).
         if cmd.is_empty() {
-            return Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some("Usage: run <shell command>".to_string()),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(error_result("Usage: run <shell command>"));
+        }
+        match command_head(cmd) {
+            Some(head) if self.command_exists(head) => {}
+            Some(head) => {
+                return Ok(error_result(&format!("{head}: command not found")));
+            }
+            None => return Ok(error_result("Usage: run <shell command>")),
         }
 
-        let cwd = get_context_cwd();
+        let cwd = ctx.cwd.as_deref();
 
-        // Smart split: inline-safe commands run in subprocess, everything else
-        // opens in the user's terminal emulator (or routes to an existing one).
-        if is_inline_safe(cmd) {
-            self.execute_inline(cmd, cwd.as_deref()).await
-        } else {
-            // Try terminal routing before opening a new terminal
-            let routing_mode = get_terminal_routing();
-            tracing::debug!("shell_exec: routing_mode={routing_mode} for cmd={cmd}");
-            if routing_mode != "off" {
-                tracing::debug!("shell_exec: attempting try_route_command");
-                if let Some(result) = self.try_route_command(cmd) {
-                    tracing::info!("shell_exec: routed successfully");
+        // 2. Pick mode from the context: inline (Shift+Enter) vs terminal (default).
+        let mode = match ctx.output_mode {
+            OutputMode::Inline => RunMode::Inline,
+            OutputMode::Terminal => RunMode::Terminal,
+        };
+        tracing::debug!("shell_exec: mode={mode:?} for cmd={cmd}");
+
+        // 3. Dispatch.
+        match mode {
+            RunMode::Inline => self.execute_inline(cmd, cwd).await,
+            RunMode::Terminal => {
+                // Prefer routing into an already-open terminal; else a fresh one.
+                if ctx.routing_mode() != "off"
+                    && let Some(result) = self.try_route_command(ctx, cmd)
+                {
                     return Ok(result);
                 }
-                tracing::debug!("shell_exec: routing failed, falling back to new terminal");
+                self.execute_in_terminal(ctx, cmd, cwd)
             }
-            self.execute_in_terminal(cmd, cwd.as_deref())
         }
+    }
+}
+
+/// A failed `ActionResult` carrying a user-facing error message. Keeps the
+/// `run` failure paths to one line instead of a full struct literal.
+fn error_result(message: &str) -> ActionResult {
+    ActionResult::err(message.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_head_skips_env_assignments() {
+        assert_eq!(command_head("ls -la"), Some("ls"));
+        assert_eq!(command_head("FOO=bar mycmd arg"), Some("mycmd"));
+        assert_eq!(command_head("A=1 B=2 git status"), Some("git"));
+        assert_eq!(command_head("   "), None);
+    }
+
+    #[test]
+    fn no_command_launch_detection() {
+        // Warp (both binary and short form) cannot run a command.
+        assert!(is_no_command_launch("warp-terminal"));
+        assert!(is_no_command_launch("warp"));
+        assert!(is_no_command_launch("Warp")); // case-insensitive
+        assert!(is_no_command_launch("waveterm"));
+        assert!(is_no_command_launch("tabby"));
+        // Normal terminals are fine.
+        assert!(!is_no_command_launch("konsole"));
+        assert!(!is_no_command_launch("gnome-terminal"));
+        assert!(!is_no_command_launch("kitty"));
+        assert!(!is_no_command_launch("xterm"));
+    }
+
+    #[test]
+    fn fallback_terminal_is_command_capable() {
+        // Whatever we pick as a fallback must NOT itself be a no-command-launch
+        // terminal (never fall back Warp→Warp). On CI/dev at least xterm exists.
+        if let Some(fallback) = pick_fallback_terminal() {
+            let base = std::path::Path::new(&fallback)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&fallback);
+            assert!(!is_no_command_launch(base), "fallback must be launchable");
+        }
+    }
+
+    #[test]
+    fn terminal_exec_args_per_terminal() {
+        let sh = "/bin/zsh";
+        let w = "echo hi; read";
+
+        // xfce4-terminal: -x (execvp remainder), NOT -e — the reported bug.
+        assert_eq!(
+            terminal_exec_args("xfce4-terminal", sh, w),
+            vec!["-x", sh, "-ic", w]
+        );
+        // terminator also uses -x.
+        assert_eq!(terminal_exec_args("terminator", sh, w)[0], "-x");
+        // gnome-terminal / kgx: -- (execvp), never deprecated -e.
+        assert_eq!(
+            terminal_exec_args("gnome-terminal", sh, w),
+            vec!["--", sh, "-ic", w]
+        );
+        assert_eq!(terminal_exec_args("kgx", sh, w)[0], "--");
+        // wezterm: start -- prefix.
+        assert_eq!(
+            terminal_exec_args("wezterm", sh, w),
+            vec!["start", "--", sh, "-ic", w]
+        );
+        // kitty / foot: positional, no flag.
+        assert_eq!(terminal_exec_args("kitty", sh, w), vec![sh, "-ic", w]);
+        assert_eq!(terminal_exec_args("foot", sh, w), vec![sh, "-ic", w]);
+        // xterm golden standard + compatibles: -e execvp.
+        assert_eq!(
+            terminal_exec_args("konsole", sh, w),
+            vec!["-e", sh, "-ic", w]
+        );
+        assert_eq!(terminal_exec_args("alacritty", sh, w)[0], "-e");
+        assert_eq!(terminal_exec_args("ghostty", sh, w)[0], "-e");
+        // Unknown terminal: default to the xterm golden standard (-e execvp).
+        assert_eq!(
+            terminal_exec_args("some-new-term", sh, w),
+            vec!["-e", sh, "-ic", w]
+        );
+    }
+
+    #[test]
+    fn terminal_exec_args_single_string_family() {
+        let sh = "/bin/zsh";
+        let w = "echo hi; read";
+        // mate-terminal / tilix: ONE shell-quoted string after -e.
+        let args = terminal_exec_args("mate-terminal", sh, w);
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "-e");
+        // The single string embeds the shell invocation, quoting the wrapped cmd.
+        assert!(args[1].starts_with("/bin/zsh -ic "));
+        assert!(args[1].contains("echo hi"));
+    }
+
+    #[test]
+    fn exec_context_output_mode_and_routing() {
+        // Output mode + routing come from the immutable per-call context — no
+        // global flag, so no cross-test interference (this used to need a lock).
+        let inline = ExecContext {
+            output_mode: OutputMode::Inline,
+            ..Default::default()
+        };
+        assert_eq!(inline.output_mode, OutputMode::Inline);
+
+        let default = ExecContext::default();
+        assert_eq!(default.output_mode, OutputMode::Terminal);
+        assert_eq!(default.routing_mode(), "off"); // empty → off
+
+        let routed = ExecContext {
+            terminal_routing: "auto".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(routed.routing_mode(), "auto");
     }
 }

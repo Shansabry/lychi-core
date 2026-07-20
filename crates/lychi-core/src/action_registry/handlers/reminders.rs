@@ -4,7 +4,9 @@ use std::time::Instant;
 use async_trait::async_trait;
 use redb::Database;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+};
 use crate::error::LychiError;
 use crate::reminders::store::RemindersStore;
 use crate::reminders::time_parse;
@@ -26,54 +28,15 @@ const REMINDER_SUBCOMMANDS: &[(&str, &str)] = &[
 ];
 
 fn ok_result(start: Instant, output: String) -> ActionResult {
-    ActionResult {
-        success: true,
-        output: Some(output),
-        error: None,
-        duration_ms: start.elapsed().as_millis() as u64,
-        routed_by: None,
-        open_url: None,
-        needs_confirmation: None,
-        risk_level: None,
-        output_type: Some(OutputType::Status),
-        executed_args: None,
-        launch_desktop: None,
-        focus_app: None,
-    }
+    ActionResult::ok(output, OutputType::Status).with_duration(start.elapsed().as_millis() as u64)
 }
 
 fn ok_text(start: Instant, output: String) -> ActionResult {
-    ActionResult {
-        success: true,
-        output: Some(output),
-        error: None,
-        duration_ms: start.elapsed().as_millis() as u64,
-        routed_by: None,
-        open_url: None,
-        needs_confirmation: None,
-        risk_level: None,
-        output_type: Some(OutputType::Text),
-        executed_args: None,
-        launch_desktop: None,
-        focus_app: None,
-    }
+    ActionResult::ok(output, OutputType::Text).with_duration(start.elapsed().as_millis() as u64)
 }
 
 fn err_result(start: Instant, error: String) -> ActionResult {
-    ActionResult {
-        success: false,
-        output: None,
-        error: Some(error),
-        duration_ms: start.elapsed().as_millis() as u64,
-        routed_by: None,
-        open_url: None,
-        needs_confirmation: None,
-        risk_level: None,
-        output_type: None,
-        executed_args: None,
-        launch_desktop: None,
-        focus_app: None,
-    }
+    ActionResult::err(error).with_duration(start.elapsed().as_millis() as u64)
 }
 
 /// Try to split "buy milk in 30 minutes" into ("buy milk", "in 30 minutes").
@@ -113,6 +76,12 @@ fn split_text_and_time(input: &str) -> Option<(String, u64)> {
 
 #[async_trait]
 impl ActionHandler for RemindersHandler {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["reminder"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "reminder"
     }
@@ -121,7 +90,7 @@ impl ActionHandler for RemindersHandler {
         "Reminders — timed desktop notifications. Usage: reminder add <text> in/at <time>, reminder list, reminder delete <id>"
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let start = Instant::now();
         let trimmed = args.trim();
         let store = RemindersStore::new();
@@ -251,6 +220,9 @@ impl ActionHandler for RemindersHandler {
                 score: if cmd.starts_with(&lower) { 100 } else { 50 },
                 description: Some(desc.to_string()),
                 reason: None,
+                thumb_b64: None,
+                run: Some(format!("reminder {cmd}")),
+                ..Default::default()
             })
             .collect()
     }
@@ -259,6 +231,15 @@ impl ActionHandler for RemindersHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action_registry::Output;
+
+    /// Extract the text body from a result's output, for assertions.
+    fn body(r: &ActionResult) -> Option<&str> {
+        match &r.output {
+            Output::Text { body, .. } => Some(body.as_str()),
+            _ => None,
+        }
+    }
 
     #[test]
     fn split_text_and_time_in() {
@@ -289,13 +270,22 @@ mod tests {
         let db = crate::db::open_test_database();
         let handler = RemindersHandler::new(db);
 
-        let result = handler.execute("add buy milk in 30 minutes").await.unwrap();
+        let result = handler
+            .execute(
+                &crate::action_registry::ExecContext::default(),
+                "add buy milk in 30 minutes",
+            )
+            .await
+            .unwrap();
         assert!(result.success);
-        assert!(result.output.unwrap().contains("Reminder set"));
+        assert!(body(&result).unwrap().contains("Reminder set"));
 
-        let result = handler.execute("list").await.unwrap();
+        let result = handler
+            .execute(&crate::action_registry::ExecContext::default(), "list")
+            .await
+            .unwrap();
         assert!(result.success);
-        assert!(result.output.unwrap().contains("buy milk"));
+        assert!(body(&result).unwrap().contains("buy milk"));
     }
 
     #[tokio::test]
@@ -303,9 +293,12 @@ mod tests {
         let db = crate::db::open_test_database();
         let handler = RemindersHandler::new(db);
 
-        let result = handler.execute("").await.unwrap();
+        let result = handler
+            .execute(&crate::action_registry::ExecContext::default(), "")
+            .await
+            .unwrap();
         assert!(result.success);
-        assert_eq!(result.output.as_deref(), Some("__reminders_panel__"));
+        assert_eq!(body(&result), Some("__reminders_panel__"));
     }
 
     #[tokio::test]
@@ -314,8 +307,14 @@ mod tests {
         let handler = RemindersHandler::new(db);
 
         // Without "add" subcommand — should still work
-        let result = handler.execute("standup at 5pm").await.unwrap();
+        let result = handler
+            .execute(
+                &crate::action_registry::ExecContext::default(),
+                "standup at 5pm",
+            )
+            .await
+            .unwrap();
         assert!(result.success);
-        assert!(result.output.unwrap().contains("Reminder set"));
+        assert!(body(&result).unwrap().contains("Reminder set"));
     }
 }

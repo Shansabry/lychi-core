@@ -6,7 +6,7 @@ const MAX_TEXT_BYTES: u64 = 100_000; // 100KB
 const MAX_TEXT_LINES: usize = 500;
 const MAX_IMAGE_BYTES: u64 = 10_000_000; // 10MB
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, specta::Type)]
 pub struct FilePreviewData {
     #[serde(flatten)]
     pub detail: FilePreviewDetail,
@@ -18,7 +18,7 @@ pub struct FilePreviewData {
     pub full_path: String,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, specta::Type)]
 #[serde(tag = "kind")]
 pub enum FilePreviewDetail {
     Text {
@@ -39,7 +39,7 @@ pub enum FilePreviewDetail {
     },
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize, specta::Type)]
 pub struct DirChild {
     pub name: String,
     pub is_dir: bool,
@@ -117,6 +117,7 @@ fn modified_epoch(metadata: &std::fs::Metadata) -> u64 {
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_file_preview(
     path: String,
     state: tauri::State<'_, crate::state::AppState>,

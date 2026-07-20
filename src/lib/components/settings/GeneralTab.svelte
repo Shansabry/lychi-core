@@ -1,13 +1,16 @@
 <script lang="ts">
 import { Moon, Sun, X } from "lucide-svelte";
-import type { CommandsConfig, GeneralConfig, PrivacyConfig } from "$lib/ipc";
+import type { CommandsConfig, GeneralConfig, HotkeyStatus, PrivacyConfig } from "$lib/ipc";
 import {
+	getAutostartEnabled,
+	getHotkeyStatus,
 	getInstalledTerminals,
 	recordHotkey,
 	restartApp,
 	saveCommandsConfig,
 	saveGeneralConfig,
 	savePrivacyConfig,
+	setAutostartEnabled,
 	setHotkey,
 } from "$lib/ipc";
 import Select from "../Select.svelte";
@@ -18,6 +21,7 @@ let {
 	privacyConfig = $bindable(),
 	layerShellSupported,
 	activeWindowStrategy,
+	screenComposited = true,
 	onsaveerror,
 }: {
 	generalConfig: GeneralConfig;
@@ -25,6 +29,7 @@ let {
 	privacyConfig: PrivacyConfig;
 	layerShellSupported: boolean;
 	activeWindowStrategy: string;
+	screenComposited?: boolean;
 	onsaveerror: (msg: string) => void;
 } = $props();
 
@@ -32,6 +37,32 @@ let recordingHotkey = $state(false);
 let hotkeyError = $state("");
 let customShell = $state(false);
 let terminalOptions: { value: string; label: string }[] = $state([]);
+let hotkeyStatus = $state<HotkeyStatus | null>(null);
+let autostartEnabled = $state(false);
+
+// Fetch hotkey/session status and autostart state on mount (non-blocking)
+getHotkeyStatus().then((s) => {
+	hotkeyStatus = s;
+});
+getAutostartEnabled()
+	.then((v) => {
+		autostartEnabled = v;
+	})
+	.catch(() => {});
+
+async function handleAutostartToggle() {
+	const next = !autostartEnabled;
+	autostartEnabled = next;
+	try {
+		await setAutostartEnabled(next);
+	} catch (err) {
+		autostartEnabled = !next;
+		console.error("[settings] Failed to toggle autostart:", err);
+		onsaveerror(`Failed to update autostart: ${err}`);
+	}
+}
+
+let isWayland = $derived(hotkeyStatus?.session_type === "wayland");
 
 // Fetch installed terminals on mount (non-blocking)
 getInstalledTerminals().then((terminals) => {
@@ -61,12 +92,17 @@ let shellOptions = $derived([
 	{ value: "__custom__", label: "Custom..." },
 ]);
 
+// Mirrors resolve_strategy() in platform/linux.rs
 function resolveStrategy(strategy: string): string {
-	if (strategy === "layer-shell") return layerShellSupported ? "layer-shell" : "x11";
-	if (strategy === "toplevel") return "toplevel";
+	if (strategy === "layer-shell")
+		return layerShellSupported ? "layer-shell" : isWayland ? "toplevel" : "x11";
+	if (strategy === "toplevel" || strategy === "toplevel-window") return "toplevel";
 	if (strategy === "x11") return "x11";
-	if (activeWindowStrategy === "toplevel") return "toplevel";
-	return layerShellSupported ? "layer-shell" : "x11";
+	// auto
+	if (!hotkeyStatus) return activeWindowStrategy; // status not loaded yet
+	if (isWayland && hotkeyStatus.desktop.toUpperCase().includes("KDE")) return "toplevel";
+	if (layerShellSupported) return "layer-shell";
+	return isWayland ? "toplevel" : "x11";
 }
 
 let strategyNeedsRestart = $derived(
@@ -186,6 +222,17 @@ async function handleTerminalChange(val: string) {
 {#if hotkeyError}
 	<div class="field-error">{hotkeyError}</div>
 {/if}
+{#if hotkeyStatus && !hotkeyStatus.reliable}
+	<div class="field-hint">
+		{#if isWayland}
+			On Wayland this hotkey only works while X11 apps are focused. For a reliable
+			shortcut, bind <code>lychi --toggle</code> to a key in your desktop's shortcut settings.
+		{:else}
+			The hotkey could not be registered (possibly taken by another app) — try a
+			different combo, or bind <code>lychi --toggle</code> in your desktop's shortcut settings.
+		{/if}
+	</div>
+{/if}
 <div class="field">
 	<span class="field-label">Theme</span>
 	<div class="theme-toggle">
@@ -207,6 +254,24 @@ async function handleTerminalChange(val: string) {
 		</button>
 	</div>
 </div>
+<div class="field">
+	<label for="autostart">Start at login</label>
+	<button
+		id="autostart"
+		class="checkbox"
+		class:checked={autostartEnabled}
+		onclick={handleAutostartToggle}
+		role="checkbox"
+		aria-checked={autostartEnabled}
+	>
+		{#if autostartEnabled}
+			<svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+				<path d="M2 6L5 9L10 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+			</svg>
+		{/if}
+	</button>
+</div>
+<div class="field-hint">Launches hidden in the background — summon with the hotkey or <code>lychi --toggle</code></div>
 <div class="field">
 	<label for="hide-blur">Hide on blur</label>
 	<button
@@ -246,8 +311,11 @@ async function handleTerminalChange(val: string) {
 			...(layerShellSupported
 				? [{ value: "layer-shell", label: "Layer shell (Wayland)" }]
 				: []),
-			...(activeWindowStrategy === "toplevel" || layerShellSupported
-				? [{ value: "toplevel", label: "Toplevel (KDE Wayland)" }]
+			...(isWayland || activeWindowStrategy === "toplevel" || layerShellSupported
+				? [{ value: "toplevel", label: "Toplevel window (Wayland)" }]
+				: []),
+			...(isWayland && !layerShellSupported
+				? [{ value: "toplevel-window", label: "Toplevel, no fullscreen (troubleshooting)" }]
 				: []),
 			{ value: "x11", label: "X11 fullscreen overlay" },
 		]}
@@ -259,6 +327,13 @@ async function handleTerminalChange(val: string) {
 		</button>
 	{/if}
 </div>
+{#if !screenComposited}
+	<div class="field-error">
+		Your window manager has compositing disabled — the launcher background will
+		render opaque. Enable compositing (XFCE: Window Manager Tweaks → Compositor;
+		MATE: marco compositing) for transparency.
+	</div>
+{/if}
 <div class="field">
 	<label for="shell-select">Shell</label>
 	{#if customShell}
@@ -379,6 +454,14 @@ async function handleTerminalChange(val: string) {
 		color: var(--fg-muted);
 		opacity: 0.7;
 		padding: 0 0 2px;
+	}
+
+	.field-hint code {
+		font-family: var(--font-mono);
+		background: var(--bg-secondary);
+		padding: 1px 4px;
+		border-radius: 3px;
+		user-select: all;
 	}
 
 	.field-error {

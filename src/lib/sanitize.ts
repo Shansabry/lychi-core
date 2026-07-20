@@ -56,3 +56,14 @@ export function sanitizeMarkdown(html: string): string {
 export function sanitizeTerminal(html: string): string {
 	return DOMPurify.sanitize(html, TERMINAL_CONFIG);
 }
+
+// Inline SVG (e.g. a generated QR code). Enables the SVG profile so vector
+// shapes survive, while DOMPurify still strips scripts and event handlers.
+const SVG_CONFIG: Config = {
+	USE_PROFILES: { svg: true, svgFilters: false },
+	ADD_ATTR: ["viewBox", "preserveAspectRatio"],
+};
+
+export function sanitizeSvg(svg: string): string {
+	return DOMPurify.sanitize(svg, SVG_CONFIG);
+}

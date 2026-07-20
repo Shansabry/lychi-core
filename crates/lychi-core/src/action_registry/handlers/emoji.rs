@@ -4,7 +4,9 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 use std::sync::Mutex;
 
 use crate::action_registry::handlers::clipboard::write_to_clipboard;
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+};
 use crate::error::LychiError;
 
 /// Cached nucleo matcher — reused across calls to avoid ~192ms cold-start.
@@ -56,6 +58,12 @@ impl EmojiHandler {
 
 #[async_trait]
 impl ActionHandler for EmojiHandler {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["emoji"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "emoji"
     }
@@ -64,23 +72,12 @@ impl ActionHandler for EmojiHandler {
         "Search and copy emoji by name (e:fire or emoji fire)"
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let trimmed = args.trim();
         if trimmed.is_empty() {
-            return Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some("Usage: e:<name> or emoji <name>".to_string()),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(ActionResult::err(
+                "Usage: e:<name> or emoji <name>".to_string(),
+            ));
         }
 
         // If args looks like a completion label ("🔥 fire"), extract the emoji
@@ -99,53 +96,17 @@ impl ActionHandler for EmojiHandler {
             match found {
                 Some(e) => e.as_str(),
                 None => {
-                    return Ok(ActionResult {
-                        success: false,
-                        output: None,
-                        error: Some(format!("No emoji found for: {trimmed}")),
-                        duration_ms: 0,
-                        routed_by: None,
-                        open_url: None,
-                        needs_confirmation: None,
-                        risk_level: None,
-                        output_type: None,
-                        executed_args: None,
-                        launch_desktop: None,
-                        focus_app: None,
-                    });
+                    return Ok(ActionResult::err(format!("No emoji found for: {trimmed}")));
                 }
             }
         };
 
         match write_to_clipboard(emoji_char) {
-            Ok(()) => Ok(ActionResult {
-                success: true,
-                output: Some(format!("Copied {emoji_char} to clipboard")),
-                error: None,
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: Some(OutputType::Status),
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            }),
-            Err(e) => Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some(format!("Clipboard error: {e}")),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            }),
+            Ok(()) => Ok(ActionResult::ok(
+                format!("Copied {emoji_char} to clipboard"),
+                OutputType::Status,
+            )),
+            Err(e) => Ok(ActionResult::err(format!("Clipboard error: {e}"))),
         }
     }
 
@@ -157,12 +118,14 @@ impl ActionHandler for EmojiHandler {
             return POPULAR
                 .iter()
                 .enumerate()
-                .map(|(i, (ch, name))| CompletionItem {
-                    label: format!("{ch} {name}"),
-                    icon_path: Some("__none__".to_string()),
-                    score: (POPULAR.len() - i) as u16,
-                    description: Some("Popular".to_string()),
-                    reason: None,
+                .map(|(i, (ch, name))| {
+                    CompletionItem::new(
+                        format!("{ch} {name}"),
+                        Some("__none__".into()),
+                        (POPULAR.len() - i) as u16,
+                    )
+                    .with_run(format!("emoji {ch}"))
+                    .with_description("Popular")
                 })
                 .collect();
         }
@@ -216,12 +179,10 @@ impl ActionHandler for EmojiHandler {
 
         results
             .into_iter()
-            .map(|(ch, name, group, score)| CompletionItem {
-                label: format!("{ch} {name}"),
-                icon_path: Some("__none__".to_string()),
-                score,
-                description: Some(group),
-                reason: None,
+            .map(|(ch, name, group, score)| {
+                CompletionItem::new(format!("{ch} {name}"), Some("__none__".into()), score)
+                    .with_run(format!("emoji {ch}"))
+                    .with_description(group)
             })
             .collect()
     }

@@ -6,7 +6,10 @@ pub mod context;
 pub mod db;
 pub mod desktop_apps;
 pub mod error;
+pub mod events;
 pub mod executor;
+pub mod file_search;
+pub mod file_search_score;
 pub mod history;
 pub mod intent;
 #[cfg(feature = "mpris")]

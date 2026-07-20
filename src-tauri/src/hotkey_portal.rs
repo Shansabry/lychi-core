@@ -1,0 +1,145 @@
+//! Global hotkey via the XDG GlobalShortcuts portal (Wayland).
+//!
+//! Wayland forbids client-side key grabs; the sanctioned mechanism is
+//! `org.freedesktop.portal.GlobalShortcuts`: the app asks the compositor to
+//! bind a trigger, the user confirms once in a DE dialog (KDE Plasma ≥5.27,
+//! GNOME ≥48, Hyprland), and the binding persists per app-id across
+//! restarts — later launches find it via ListShortcuts and never re-prompt.
+//!
+//! Compositors without the portal backend (Sway/wlroots, COSMic, GNOME ≤47)
+//! fail at `GlobalShortcuts::new()` / bind — we log and leave the existing
+//! fallback UX in place (first-run banner + Settings hint pointing at a
+//! DE-bound `lychi --toggle`).
+
+use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
+use futures_util::StreamExt;
+use tauri::Manager;
+
+use crate::state::AppState;
+
+const SHORTCUT_ID: &str = "toggle-launcher";
+
+/// Bind the toggle hotkey through the portal and service its activations.
+/// Runs for the app's lifetime; all failures are non-fatal (fallback UX).
+pub async fn setup(app: tauri::AppHandle, configured_hotkey: String) {
+    if let Err(e) = run(&app, &configured_hotkey).await {
+        tracing::warn!(
+            "[portal] GlobalShortcuts unavailable ({e}) — bind `lychi --toggle` in your desktop's shortcut settings"
+        );
+    }
+}
+
+async fn run(app: &tauri::AppHandle, configured_hotkey: &str) -> ashpd::Result<()> {
+    let shortcuts = GlobalShortcuts::new().await?;
+    let session = shortcuts.create_session(Default::default()).await?;
+
+    // Bindings persist per app-id. Bind only if absent: BindShortcuts may
+    // only be attempted once per session, and skipping it avoids any dialog
+    // on subsequent launches.
+    let existing = shortcuts
+        .list_shortcuts(&session, Default::default())
+        .await?
+        .response()
+        .map(|r| r.shortcuts().to_vec())
+        .unwrap_or_default();
+
+    let trigger = if let Some(known) = existing.iter().find(|s| s.id() == SHORTCUT_ID) {
+        known.trigger_description().to_string()
+    } else {
+        let preferred = to_portal_trigger(configured_hotkey);
+        tracing::info!(
+            "[portal] binding '{SHORTCUT_ID}' (preferred trigger: {preferred}) — the desktop may show a confirmation dialog"
+        );
+        let new_shortcut = NewShortcut::new(SHORTCUT_ID, "Show or hide the Lychi launcher")
+            .preferred_trigger(preferred.as_str());
+        let bound = shortcuts
+            .bind_shortcuts(&session, &[new_shortcut], None, Default::default())
+            .await?
+            .response()?;
+        bound
+            .shortcuts()
+            .iter()
+            .find(|s| s.id() == SHORTCUT_ID)
+            .map(|s| s.trigger_description().to_string())
+            .unwrap_or_default()
+    };
+
+    if trigger.is_empty() {
+        tracing::warn!("[portal] shortcut not bound (user declined or compositor refused)");
+        return Ok(());
+    }
+
+    {
+        let state = app.state::<AppState>();
+        state
+            .hotkey_registered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state
+            .portal_bound
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    tracing::info!("[portal] global shortcut active: {trigger}");
+
+    // Service activations for the app's lifetime. The session must stay
+    // alive — dropping it unbinds the shortcut for this run.
+    let mut activated = shortcuts.receive_activated().await?;
+    let _session = session;
+    while let Some(activation) = activated.next().await {
+        if activation.shortcut_id() == SHORTCUT_ID
+            && let Some(win) = app.get_webview_window("main")
+        {
+            tracing::debug!("[portal] activation → toggle");
+            // toggle_window is thread-safe: it debounces and posts the
+            // decision to the GTK main thread.
+            crate::window::toggle_window(&win);
+        }
+    }
+    tracing::warn!("[portal] activation stream ended");
+    Ok(())
+}
+
+/// Map Lychi's hotkey config format ("Super+Space", "Ctrl+Alt+K") to the
+/// portal trigger format from the freedesktop shortcuts spec
+/// ("LOGO+space", "CTRL+ALT+k"): modifiers uppercase (Super→LOGO), key as an
+/// xkbcommon keysym name.
+fn to_portal_trigger(hotkey: &str) -> String {
+    hotkey
+        .split('+')
+        .map(|part| match part.trim() {
+            "Super" | "Meta" | "Cmd" => "LOGO".to_string(),
+            "Ctrl" | "Control" => "CTRL".to_string(),
+            "Alt" => "ALT".to_string(),
+            "Shift" => "SHIFT".to_string(),
+            "Space" => "space".to_string(),
+            "Enter" | "Return" => "Return".to_string(),
+            "Tab" => "Tab".to_string(),
+            "Backspace" => "BackSpace".to_string(),
+            "Delete" => "Delete".to_string(),
+            "Home" => "Home".to_string(),
+            "End" => "End".to_string(),
+            "PageUp" => "Prior".to_string(),
+            "PageDown" => "Next".to_string(),
+            "Up" => "Up".to_string(),
+            "Down" => "Down".to_string(),
+            "Left" => "Left".to_string(),
+            "Right" => "Right".to_string(),
+            key if key.len() == 1 => key.to_lowercase(),
+            // F1-F12 and other keysym-named keys pass through unchanged
+            key => key.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_portal_trigger;
+
+    #[test]
+    fn maps_common_hotkeys() {
+        assert_eq!(to_portal_trigger("Super+Space"), "LOGO+space");
+        assert_eq!(to_portal_trigger("Ctrl+Alt+K"), "CTRL+ALT+k");
+        assert_eq!(to_portal_trigger("Ctrl+Shift+F5"), "CTRL+SHIFT+F5");
+        assert_eq!(to_portal_trigger("Super+Enter"), "LOGO+Return");
+    }
+}

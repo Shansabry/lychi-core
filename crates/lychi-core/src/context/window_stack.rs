@@ -79,11 +79,11 @@ fn same_window(a: &WindowContext, b: &WindowContext) -> bool {
 /// `spawn_blocking` during app setup. Safe to call on X11 too.
 pub fn warmup() {
     let t0 = Instant::now();
-    let wayland = super::is_wayland();
-    let stack = if wayland {
-        detect_stack_kwin()
-    } else {
-        detect_stack_x11()
+    let stack = match super::compositor() {
+        super::Compositor::KdeWayland => detect_stack_kwin(),
+        super::Compositor::X11 => detect_stack_x11(),
+        // No stack backend on GNOME/wlroots Wayland — nothing to seed
+        _ => Vec::new(),
     };
 
     let mut seeded = 0u32;
@@ -151,16 +151,16 @@ pub fn find_recent_terminal(
     }
 
     // Fall back to Z-order stack scan
-    let wayland = super::is_wayland();
+    let compositor = super::compositor();
     tracing::debug!(
-        "window_stack: focus ring empty/exhausted, falling back to stack scan (session={})",
-        if wayland { "wayland" } else { "x11" }
+        "window_stack: focus ring empty/exhausted, falling back to stack scan ({compositor:?})"
     );
 
-    let stack = if wayland {
-        detect_stack_kwin()
-    } else {
-        detect_stack_x11()
+    let stack = match compositor {
+        super::Compositor::KdeWayland => detect_stack_kwin(),
+        super::Compositor::X11 => detect_stack_x11(),
+        // No stack backend on GNOME/wlroots Wayland
+        _ => Vec::new(),
     };
 
     tracing::debug!(

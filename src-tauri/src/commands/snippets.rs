@@ -7,12 +7,14 @@ use lychi_core::snippets::store::SnippetsStore;
 use crate::state::AppState;
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_snippets(state: State<'_, AppState>) -> Result<Vec<SnippetItem>, LychiError> {
     let store = SnippetsStore::new();
     store.get_snippets(&state.db)
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn add_snippet(
     name: String,
     body: String,
@@ -23,6 +25,7 @@ pub async fn add_snippet(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn update_snippet(
     id: String,
     name: String,
@@ -34,6 +37,7 @@ pub async fn update_snippet(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn delete_snippet(id: String, state: State<'_, AppState>) -> Result<(), LychiError> {
     let store = SnippetsStore::new();
     store.delete_snippet(&state.db, &id)

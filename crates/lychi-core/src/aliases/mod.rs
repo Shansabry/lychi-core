@@ -2,7 +2,7 @@ pub mod store;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct AliasItem {
     pub name: String,
     pub command: String,

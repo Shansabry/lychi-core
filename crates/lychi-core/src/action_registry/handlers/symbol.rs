@@ -4,7 +4,9 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 use std::sync::Mutex;
 
 use crate::action_registry::handlers::clipboard::write_to_clipboard;
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+};
 use crate::error::LychiError;
 
 /// Cached nucleo matcher.
@@ -1291,6 +1293,12 @@ impl SymbolHandler {
 
 #[async_trait]
 impl ActionHandler for SymbolHandler {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["sym"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "sym"
     }
@@ -1299,23 +1307,12 @@ impl ActionHandler for SymbolHandler {
         "Search and copy symbols by name (sym:arrow or sym arrow)"
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let trimmed = args.trim();
         if trimmed.is_empty() {
-            return Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some("Usage: sym:<name> or sym <name>".to_string()),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(ActionResult::err(
+                "Usage: sym:<name> or sym <name>".to_string(),
+            ));
         }
 
         // If args starts with a non-ASCII char, it's a completion label
@@ -1330,53 +1327,17 @@ impl ActionHandler for SymbolHandler {
             {
                 Some(s) => s.ch,
                 None => {
-                    return Ok(ActionResult {
-                        success: false,
-                        output: None,
-                        error: Some(format!("No symbol found for: {trimmed}")),
-                        duration_ms: 0,
-                        routed_by: None,
-                        open_url: None,
-                        needs_confirmation: None,
-                        risk_level: None,
-                        output_type: None,
-                        executed_args: None,
-                        launch_desktop: None,
-                        focus_app: None,
-                    });
+                    return Ok(ActionResult::err(format!("No symbol found for: {trimmed}")));
                 }
             }
         };
 
         match write_to_clipboard(ch) {
-            Ok(()) => Ok(ActionResult {
-                success: true,
-                output: Some(format!("Copied {ch} to clipboard")),
-                error: None,
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: Some(OutputType::Status),
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            }),
-            Err(e) => Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some(format!("Clipboard error: {e}")),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            }),
+            Ok(()) => Ok(ActionResult::ok(
+                format!("Copied {ch} to clipboard"),
+                OutputType::Status,
+            )),
+            Err(e) => Ok(ActionResult::err(format!("Clipboard error: {e}"))),
         }
     }
 
@@ -1389,12 +1350,14 @@ impl ActionHandler for SymbolHandler {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, &idx)| {
-                    SYMBOLS.get(idx).map(|s| CompletionItem {
-                        label: format!("{} {}", s.ch, s.name),
-                        icon_path: Some("__none__".to_string()),
-                        score: (POPULAR_INDICES.len() - i) as u16,
-                        description: Some(s.category.to_string()),
-                        reason: None,
+                    SYMBOLS.get(idx).map(|s| {
+                        CompletionItem::new(
+                            format!("{} {}", s.ch, s.name),
+                            Some("__none__".into()),
+                            (POPULAR_INDICES.len() - i) as u16,
+                        )
+                        .with_run(format!("sym {}", s.ch))
+                        .with_description(s.category.to_string())
                     })
                 })
                 .collect();
@@ -1430,12 +1393,14 @@ impl ActionHandler for SymbolHandler {
 
         results
             .into_iter()
-            .map(|(sym, score)| CompletionItem {
-                label: format!("{} {}", sym.ch, sym.name),
-                icon_path: Some("__none__".to_string()),
-                score,
-                description: Some(sym.category.to_string()),
-                reason: None,
+            .map(|(sym, score)| {
+                CompletionItem::new(
+                    format!("{} {}", sym.ch, sym.name),
+                    Some("__none__".into()),
+                    score,
+                )
+                .with_run(format!("sym {}", sym.ch))
+                .with_description(sym.category.to_string())
             })
             .collect()
     }

@@ -52,6 +52,8 @@ pub fn parse_desktop_file(path: &PathBuf) -> Option<DesktopEntry> {
     let mut generic_name = None;
     let mut keywords_raw: Option<String> = None;
     let mut wm_class = None;
+    let mut categories_raw: Option<String> = None;
+    let mut is_terminal_app = false;
     let mut no_display = false;
     let mut hidden = false;
     let mut in_desktop_entry = false;
@@ -88,6 +90,12 @@ pub fn parse_desktop_file(path: &PathBuf) -> Option<DesktopEntry> {
             icon = Some(val.to_string());
         } else if let Some(val) = line.strip_prefix("StartupWMClass=") {
             wm_class = Some(val.to_string());
+        } else if let Some(val) = line.strip_prefix("Categories=") {
+            if categories_raw.is_none() {
+                categories_raw = Some(val.to_string());
+            }
+        } else if line == "Terminal=true" {
+            is_terminal_app = true;
         } else if line == "NoDisplay=true" {
             no_display = true;
         } else if line == "Hidden=true" {
@@ -105,6 +113,7 @@ pub fn parse_desktop_file(path: &PathBuf) -> Option<DesktopEntry> {
     let keywords = parse_keywords(keywords_raw.as_deref());
     let name_tokens = tokenize(&name);
     let acronym = make_acronym(&name);
+    let categories = parse_categories(categories_raw.as_deref());
 
     Some(DesktopEntry {
         name,
@@ -116,9 +125,22 @@ pub fn parse_desktop_file(path: &PathBuf) -> Option<DesktopEntry> {
         name_tokens,
         acronym,
         icon,
+        categories,
+        is_terminal_app,
         desktop_path: path.to_string_lossy().into_owned(),
         icon_path: OnceLock::new(),
     })
+}
+
+/// Parse the Categories= field into lowercased tokens.
+/// Input: "Network;WebBrowser;" → ["network", "webbrowser"]
+fn parse_categories(raw: Option<&str>) -> Vec<String> {
+    let Some(raw) = raw else { return Vec::new() };
+    raw.split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase)
+        .collect()
 }
 
 /// Parse and normalize the Keywords= field.

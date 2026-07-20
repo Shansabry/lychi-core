@@ -7,7 +7,9 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+};
 use crate::context::EnvironmentContext;
 use crate::error::LychiError;
 
@@ -37,6 +39,12 @@ impl ContextDebugHandler {
 
 #[async_trait]
 impl ActionHandler for ContextDebugHandler {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["ctx"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "ctx"
     }
@@ -45,7 +53,7 @@ impl ActionHandler for ContextDebugHandler {
         "Show current environment context (debug)"
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let args_trimmed = args.trim();
 
         // `ctx metrics` — process-lifetime totals
@@ -118,6 +126,9 @@ impl ActionHandler for ContextDebugHandler {
             score: 100,
             description: Some("Show environment context signals".to_string()),
             reason: None,
+            thumb_b64: None,
+            run: Some("ctx".to_string()),
+            ..Default::default()
         }];
         let p = partial.trim();
         if "metrics".starts_with(p) || p.starts_with("metrics") {
@@ -129,6 +140,9 @@ impl ActionHandler for ContextDebugHandler {
                     "Show context system counters (staleness, coherence, clipboard)".to_string(),
                 ),
                 reason: None,
+                thumb_b64: None,
+                run: Some("ctx metrics".to_string()),
+                ..Default::default()
             });
             items.push(CompletionItem {
                 label: "ctx metrics --reset".to_string(),
@@ -136,6 +150,9 @@ impl ActionHandler for ContextDebugHandler {
                 score: 85,
                 description: Some("Set baseline for delta/rate reporting".to_string()),
                 reason: None,
+                thumb_b64: None,
+                run: Some("ctx metrics --reset".to_string()),
+                ..Default::default()
             });
             items.push(CompletionItem {
                 label: "ctx metrics --rate".to_string(),
@@ -143,6 +160,9 @@ impl ActionHandler for ContextDebugHandler {
                 score: 84,
                 description: Some("Show counter deltas since last reset".to_string()),
                 reason: None,
+                thumb_b64: None,
+                run: Some("ctx metrics --rate".to_string()),
+                ..Default::default()
             });
         }
         items
@@ -466,25 +486,12 @@ fn format_context(ctx: &EnvironmentContext) -> String {
                 ClipboardContentType::Json => "JSON".into(),
                 ClipboardContentType::GitHash(h) => format!("Git hash: {h}"),
                 ClipboardContentType::Uuid(u) => format!("UUID: {u}"),
-                ClipboardContentType::ErrorTrace => "Error/stack trace".into(),
+                ClipboardContentType::ErrorTrace(msg) => format!("Error/stack trace: {msg}"),
                 ClipboardContentType::Plain => "Plain text".into(),
             };
             lines.push(format!("Clipboard: {desc}"));
         }
         None => lines.push("Clipboard: empty".to_string()),
-    }
-
-    // Browser context
-    if let Some(ref browser) = ctx.browser {
-        use crate::context::browser_context::BrowserContext;
-        let desc = match browser {
-            BrowserContext::GitHub { owner, repo } => format!("GitHub: {owner}/{repo}"),
-            BrowserContext::Localhost { port } => format!("Localhost: :{port}"),
-            BrowserContext::StackOverflow => "Stack Overflow".into(),
-            BrowserContext::Documentation => "Documentation".into(),
-            BrowserContext::Unknown => "Unknown".into(),
-        };
-        lines.push(format!("Browser: {desc}"));
     }
 
     // Network
@@ -499,12 +506,6 @@ fn format_context(ctx: &EnvironmentContext) -> String {
             lines.push(format!("Network: {ssid}{vpn}"));
         }
         None => lines.push("Network: none".to_string()),
-    }
-
-    // App class
-    if let Some(ref w) = ctx.active_window {
-        let app_class = crate::context::app_class::classify(&w.wm_class);
-        lines.push(format!("App class: {app_class:?}"));
     }
 
     // Cache

@@ -5,7 +5,9 @@ use std::time::Instant;
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+};
 use crate::error::LychiError;
 
 /// In-memory timer state, shared between handler + background tick loop.
@@ -64,7 +66,7 @@ impl Timer {
 }
 
 /// Serializable timer status sent to the frontend.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, specta::Type)]
 pub struct TimerStatus {
     pub id: String,
     pub name: String,
@@ -150,37 +152,11 @@ fn format_duration(secs: f64) -> String {
 }
 
 fn ok_result(start: Instant, output: String) -> ActionResult {
-    ActionResult {
-        success: true,
-        output: Some(output),
-        error: None,
-        duration_ms: start.elapsed().as_millis() as u64,
-        routed_by: None,
-        open_url: None,
-        needs_confirmation: None,
-        risk_level: None,
-        output_type: Some(OutputType::Status),
-        executed_args: None,
-        launch_desktop: None,
-        focus_app: None,
-    }
+    ActionResult::ok(output, OutputType::Status).with_duration(start.elapsed().as_millis() as u64)
 }
 
 fn err_result(start: Instant, error: String) -> ActionResult {
-    ActionResult {
-        success: false,
-        output: None,
-        error: Some(error),
-        duration_ms: start.elapsed().as_millis() as u64,
-        routed_by: None,
-        open_url: None,
-        needs_confirmation: None,
-        risk_level: None,
-        output_type: None,
-        executed_args: None,
-        launch_desktop: None,
-        focus_app: None,
-    }
+    ActionResult::err(error).with_duration(start.elapsed().as_millis() as u64)
 }
 
 pub struct TimerHandler {
@@ -205,6 +181,15 @@ const TIMER_SUBCOMMANDS: &[(&str, &str)] = &[
 
 #[async_trait]
 impl ActionHandler for TimerHandler {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::{ArgTransform, Trigger};
+        static TRIGGERS: &[Trigger] = &[
+            Trigger::keywords(&["timer"]),
+            Trigger::new(&["stopwatch"], ArgTransform::Prepend("stopwatch")),
+        ];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "timer"
     }
@@ -213,7 +198,7 @@ impl ActionHandler for TimerHandler {
         "Timer — countdown timers with desktop notification. Usage: timer 25m, timer start workout 5m, timer stop, timer status"
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let start = Instant::now();
         let trimmed = args.trim();
 
@@ -421,7 +406,7 @@ impl ActionHandler for TimerHandler {
                         }
                         "pause" | "resume" => {
                             // Delegate to existing pause/resume with stopwatch name filter
-                            return self.execute(&format!("{sub} {sub_rest}")).await;
+                            return self.execute(ctx, &format!("{sub} {sub_rest}")).await;
                         }
                         _ => rest.to_string(),
                     }
@@ -563,6 +548,11 @@ impl ActionHandler for TimerHandler {
                     score: 200,
                     description: Some(desc),
                     reason: None,
+                    thumb_b64: None,
+                    // A timer name isn't a runnable command on its own —
+                    // selecting it shows timer status.
+                    run: Some("timer status".to_string()),
+                    ..Default::default()
                 });
             }
         }
@@ -576,6 +566,9 @@ impl ActionHandler for TimerHandler {
                     score: if cmd.starts_with(&lower) { 100 } else { 50 },
                     description: Some(desc.to_string()),
                     reason: None,
+                    thumb_b64: None,
+                    run: Some(format!("timer {cmd}")),
+                    ..Default::default()
                 });
             }
         }
@@ -676,6 +669,15 @@ fn timer_monitor_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action_registry::Output;
+
+    /// Extract the text body from a result's output, for assertions.
+    fn body(r: &ActionResult) -> Option<&str> {
+        match &r.output {
+            Output::Text { body, .. } => Some(body.as_str()),
+            _ => None,
+        }
+    }
 
     #[test]
     fn test_parse_duration_minutes() {
@@ -739,9 +741,15 @@ mod tests {
         let state = new_timer_state();
         let handler = TimerHandler::new(state.clone());
 
-        let result = handler.execute("start test 1m").await.unwrap();
+        let result = handler
+            .execute(
+                &crate::action_registry::ExecContext::default(),
+                "start test 1m",
+            )
+            .await
+            .unwrap();
         assert!(result.success);
-        assert_eq!(result.output.as_deref(), Some("__timer_panel__"));
+        assert_eq!(body(&result), Some("__timer_panel__"));
 
         // Verify timer was actually created
         let timers = get_all_timers(&state);
@@ -749,9 +757,12 @@ mod tests {
         assert_eq!(timers[0].name, "test");
         assert_eq!(timers[0].duration_secs, 60);
 
-        let result = handler.execute("status").await.unwrap();
+        let result = handler
+            .execute(&crate::action_registry::ExecContext::default(), "status")
+            .await
+            .unwrap();
         assert!(result.success);
-        assert_eq!(result.output.as_deref(), Some("__timer_panel__"));
+        assert_eq!(body(&result), Some("__timer_panel__"));
     }
 
     #[tokio::test]
@@ -759,16 +770,34 @@ mod tests {
         let state = new_timer_state();
         let handler = TimerHandler::new(state.clone());
 
-        handler.execute("start workout 5m").await.unwrap();
+        handler
+            .execute(
+                &crate::action_registry::ExecContext::default(),
+                "start workout 5m",
+            )
+            .await
+            .unwrap();
 
-        let result = handler.execute("pause workout").await.unwrap();
+        let result = handler
+            .execute(
+                &crate::action_registry::ExecContext::default(),
+                "pause workout",
+            )
+            .await
+            .unwrap();
         assert!(result.success);
-        assert_eq!(result.output.as_deref(), Some("__timer_panel__"));
+        assert_eq!(body(&result), Some("__timer_panel__"));
         assert!(get_all_timers(&state)[0].paused);
 
-        let result = handler.execute("resume workout").await.unwrap();
+        let result = handler
+            .execute(
+                &crate::action_registry::ExecContext::default(),
+                "resume workout",
+            )
+            .await
+            .unwrap();
         assert!(result.success);
-        assert_eq!(result.output.as_deref(), Some("__timer_panel__"));
+        assert_eq!(body(&result), Some("__timer_panel__"));
         assert!(!get_all_timers(&state)[0].paused);
     }
 
@@ -777,12 +806,24 @@ mod tests {
         let state = new_timer_state();
         let handler = TimerHandler::new(state.clone());
 
-        handler.execute("start cooking 30s").await.unwrap();
+        handler
+            .execute(
+                &crate::action_registry::ExecContext::default(),
+                "start cooking 30s",
+            )
+            .await
+            .unwrap();
 
-        let result = handler.execute("stop cooking").await.unwrap();
+        let result = handler
+            .execute(
+                &crate::action_registry::ExecContext::default(),
+                "stop cooking",
+            )
+            .await
+            .unwrap();
         assert!(result.success);
         // Last timer removed — returns status message, not panel sentinel
-        assert!(result.output.unwrap().contains("stopped"));
+        assert!(body(&result).unwrap().contains("stopped"));
 
         let timers = get_all_timers(&state);
         assert!(timers.is_empty());
@@ -794,9 +835,12 @@ mod tests {
         let handler = TimerHandler::new(state.clone());
 
         // "timer 25m" → starts a timer and opens panel
-        let result = handler.execute("25m").await.unwrap();
+        let result = handler
+            .execute(&crate::action_registry::ExecContext::default(), "25m")
+            .await
+            .unwrap();
         assert!(result.success);
-        assert_eq!(result.output.as_deref(), Some("__timer_panel__"));
+        assert_eq!(body(&result), Some("__timer_panel__"));
         assert_eq!(get_all_timers(&state).len(), 1);
     }
 
@@ -805,12 +849,27 @@ mod tests {
         let state = new_timer_state();
         let handler = TimerHandler::new(state.clone());
 
-        handler.execute("start a 5m").await.unwrap();
-        handler.execute("start b 10m").await.unwrap();
+        handler
+            .execute(
+                &crate::action_registry::ExecContext::default(),
+                "start a 5m",
+            )
+            .await
+            .unwrap();
+        handler
+            .execute(
+                &crate::action_registry::ExecContext::default(),
+                "start b 10m",
+            )
+            .await
+            .unwrap();
 
-        let result = handler.execute("clear").await.unwrap();
+        let result = handler
+            .execute(&crate::action_registry::ExecContext::default(), "clear")
+            .await
+            .unwrap();
         assert!(result.success);
-        assert!(result.output.unwrap().contains("Cleared 2"));
+        assert!(body(&result).unwrap().contains("Cleared 2"));
 
         let timers = get_all_timers(&state);
         assert!(timers.is_empty());
@@ -821,9 +880,12 @@ mod tests {
         let state = new_timer_state();
         let handler = TimerHandler::new(state.clone());
 
-        let result = handler.execute("stopwatch").await.unwrap();
+        let result = handler
+            .execute(&crate::action_registry::ExecContext::default(), "stopwatch")
+            .await
+            .unwrap();
         assert!(result.success);
-        assert_eq!(result.output.as_deref(), Some("__timer_panel__"));
+        assert_eq!(body(&result), Some("__timer_panel__"));
 
         let timers = get_all_timers(&state);
         assert_eq!(timers.len(), 1);
@@ -838,7 +900,13 @@ mod tests {
         let state = new_timer_state();
         let handler = TimerHandler::new(state.clone());
 
-        let result = handler.execute("stopwatch workout").await.unwrap();
+        let result = handler
+            .execute(
+                &crate::action_registry::ExecContext::default(),
+                "stopwatch workout",
+            )
+            .await
+            .unwrap();
         assert!(result.success);
 
         let timers = get_all_timers(&state);
@@ -852,9 +920,21 @@ mod tests {
         let state = new_timer_state();
         let handler = TimerHandler::new(state.clone());
 
-        handler.execute("stopwatch run").await.unwrap();
+        handler
+            .execute(
+                &crate::action_registry::ExecContext::default(),
+                "stopwatch run",
+            )
+            .await
+            .unwrap();
 
-        let result = handler.execute("stopwatch stop run").await.unwrap();
+        let result = handler
+            .execute(
+                &crate::action_registry::ExecContext::default(),
+                "stopwatch stop run",
+            )
+            .await
+            .unwrap();
         assert!(result.success);
         assert!(get_all_timers(&state).is_empty());
     }
@@ -864,7 +944,10 @@ mod tests {
         let state = new_timer_state();
         let handler = TimerHandler::new(state.clone());
 
-        let result = handler.execute("sw").await.unwrap();
+        let result = handler
+            .execute(&crate::action_registry::ExecContext::default(), "sw")
+            .await
+            .unwrap();
         assert!(result.success);
 
         let timers = get_all_timers(&state);

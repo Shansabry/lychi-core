@@ -8,7 +8,9 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType, RiskLevel};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType, RiskLevel,
+};
 use crate::context::pin;
 use crate::error::LychiError;
 
@@ -16,6 +18,15 @@ pub struct PinWorkspaceHandler;
 
 #[async_trait]
 impl ActionHandler for PinWorkspaceHandler {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::{ArgTransform, Trigger};
+        static TRIGGERS: &[Trigger] = &[
+            Trigger::new(&["pin"], ArgTransform::StripLeading("workspace ")),
+            Trigger::new(&["unpin"], ArgTransform::Fixed("clear")),
+        ];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "pin_workspace"
     }
@@ -28,7 +39,7 @@ impl ActionHandler for PinWorkspaceHandler {
         RiskLevel::Low
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let args = args.trim();
 
         // Show current pin status
@@ -82,6 +93,9 @@ impl ActionHandler for PinWorkspaceHandler {
                 score: 100,
                 description: Some("Unpin workspace".to_string()),
                 reason: None,
+                thumb_b64: None,
+                run: Some("pin_workspace clear".to_string()),
+                ..Default::default()
             });
         }
 

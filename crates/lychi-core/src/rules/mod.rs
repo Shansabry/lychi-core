@@ -1,6 +1,6 @@
 pub mod shell;
 
-use crate::action_registry::RiskLevel;
+use crate::action_registry::{RiskAssessment, RiskLevel};
 use crate::config::schema::PrivacyConfig;
 use shell::ShellRules;
 
@@ -9,7 +9,11 @@ pub struct ValidationRequest<'a> {
     pub action_id: &'a str,
     pub args: &'a str,
     pub routed_by: &'a str,
-    pub default_risk: RiskLevel,
+    /// The handler's own risk verdict for this invocation (level + optional
+    /// custom message). Produced by `ActionHandler::assess_risk`. The Rules
+    /// Engine layers only cross-cutting policy (shell denylist, privacy consent)
+    /// on top of this — it no longer reaches into handler internals.
+    pub risk: &'a RiskAssessment,
 }
 
 /// The outcome of pre-execution validation.
@@ -40,29 +44,36 @@ impl RulesEngine {
     /// Validate whether an action should execute, require confirmation, or be denied.
     /// Privacy config gates network calls that send user data to third parties (C6).
     pub fn validate(&self, req: &ValidationRequest, privacy: &PrivacyConfig) -> ValidationDecision {
+        let decision = self.decide(req, privacy);
+        // Log every gate decision — this is the security-critical brick, and a
+        // beta report of "it blocked my command" / "asked to confirm" needs a
+        // trail. Deny/Confirm are notable (warn); Execute is routine (debug).
+        match &decision {
+            ValidationDecision::Deny { reason } => {
+                tracing::warn!(action = %req.action_id, %reason, "[rules] DENY")
+            }
+            ValidationDecision::Confirm { reason } => {
+                tracing::info!(action = %req.action_id, %reason, "[rules] CONFIRM")
+            }
+            ValidationDecision::Execute => {
+                tracing::debug!(action = %req.action_id, "[rules] execute")
+            }
+        }
+        decision
+    }
+
+    /// The pure decision logic (logged by `validate`).
+    fn decide(&self, req: &ValidationRequest, privacy: &PrivacyConfig) -> ValidationDecision {
         // C6: Check privacy consent for network-sensitive commands first
         if let Some(decision) = self.check_privacy(req, privacy) {
             return decision;
         }
 
+        // Cross-cutting policy the Rules Engine genuinely owns (not handler-local):
+        // the shell denylist, force-kill safety, and C6 network-consent for
+        // speedtest. Everything else defers to the handler's own risk assessment.
         match req.action_id {
-            "run" => self.shell_rules.validate(req.args),
-            "system" => {
-                use crate::action_registry::handlers::system::DESTRUCTIVE_ACTIONS;
-                let action = req.args.trim().to_lowercase();
-                // Only destructive actions (shutdown, reboot, etc.) require confirmation.
-                // Reversible toggles (mute, volume, brightness, wifi, bluetooth) auto-execute.
-                if DESTRUCTIVE_ACTIONS.iter().any(|d| action.starts_with(d)) {
-                    ValidationDecision::Confirm {
-                        reason: format!(
-                            "System action '{}' requires confirmation",
-                            req.args.trim()
-                        ),
-                    }
-                } else {
-                    ValidationDecision::Execute
-                }
-            }
+            "run" => return self.shell_rules.validate(req.args),
             "appctl" if req.args.trim_start().starts_with("kill ") => {
                 let target = req
                     .args
@@ -70,27 +81,30 @@ impl RulesEngine {
                     .strip_prefix("kill ")
                     .unwrap_or("")
                     .trim();
-                ValidationDecision::Confirm {
+                return ValidationDecision::Confirm {
                     reason: format!("Force-kill '{target}'? This may cause data loss."),
-                }
+                };
             }
-            // C6: speedtest uploads data to Cloudflare — require consent
+            // C6: speedtest uploads data to Cloudflare — require consent.
             "sysinfo" if req.args.trim().eq_ignore_ascii_case("speedtest") => {
-                ValidationDecision::Confirm {
+                return ValidationDecision::Confirm {
                     reason: "Speed test will download 10 MB and upload 1 MB to Cloudflare"
                         .to_string(),
-                }
+                };
             }
-            _ => {
-                // All other handlers: use their default risk
-                match req.default_risk {
-                    RiskLevel::Low => ValidationDecision::Execute,
-                    RiskLevel::Medium => ValidationDecision::Confirm {
-                        reason: format!("Action '{}' has medium risk", req.action_id),
-                    },
-                    RiskLevel::High => ValidationDecision::Confirm {
-                        reason: format!("Action '{}' has high risk", req.action_id),
-                    },
+            _ => {}
+        }
+
+        // Handler-declared risk. The handler owns "which of my invocations is
+        // risky?" via `assess_risk`; the engine just turns the verdict into a
+        // decision, using the handler's custom message when one was supplied.
+        match req.risk.level {
+            RiskLevel::Low => ValidationDecision::Execute,
+            RiskLevel::Medium | RiskLevel::High => {
+                ValidationDecision::Confirm {
+                    reason: req.risk.reason.clone().unwrap_or_else(|| {
+                        format!("Action '{}' requires confirmation", req.action_id)
+                    }),
                 }
             }
         }
@@ -150,12 +164,23 @@ mod tests {
         }
     }
 
+    // Low-risk assessment (what most handlers return) — a shared constant so the
+    // request helper can borrow it.
+    const LOW: RiskAssessment = RiskAssessment {
+        level: RiskLevel::Low,
+        reason: None,
+    };
+
     fn req<'a>(action_id: &'a str, args: &'a str) -> ValidationRequest<'a> {
+        // These tests exercise the engine's *cross-cutting* policy (shell rules,
+        // force-kill, speedtest consent), which is independent of the handler's
+        // risk. Handler-declared risk (system destructive, service/package
+        // mutation) is now tested in those handlers' own modules.
         ValidationRequest {
             action_id,
             args,
             routed_by: "explicit",
-            default_risk: RiskLevel::Low,
+            risk: &LOW,
         }
     }
 
@@ -190,64 +215,33 @@ mod tests {
     }
 
     #[test]
-    fn system_destructive_confirms() {
+    fn handler_declared_risk_drives_confirmation() {
+        // The engine turns a handler's risk verdict into a decision, using the
+        // handler's custom message when supplied. (The per-handler logic for WHICH
+        // invocations are risky lives in the handlers' own tests now.)
         let engine = RulesEngine::new();
         let p = privacy();
-        // Destructive actions require confirmation
-        assert!(matches!(
-            engine.validate(&req("system", "shutdown"), &p),
-            ValidationDecision::Confirm { .. }
-        ));
-        assert!(matches!(
-            engine.validate(&req("system", "reboot"), &p),
-            ValidationDecision::Confirm { .. }
-        ));
-        assert!(matches!(
-            engine.validate(&req("system", "hibernate"), &p),
-            ValidationDecision::Confirm { .. }
-        ));
-        assert!(matches!(
-            engine.validate(&req("system", "logout"), &p),
-            ValidationDecision::Confirm { .. }
-        ));
-    }
 
-    #[test]
-    fn system_reversible_auto_executes() {
-        let engine = RulesEngine::new();
-        let p = privacy();
-        // Non-destructive toggles auto-execute
-        assert_eq!(
-            engine.validate(&req("system", "mute"), &p),
-            ValidationDecision::Execute
+        let confirm = RiskAssessment::confirm("Are you sure?");
+        let decision = engine.validate(
+            &ValidationRequest {
+                action_id: "anything",
+                args: "",
+                routed_by: "explicit",
+                risk: &confirm,
+            },
+            &p,
         );
         assert_eq!(
-            engine.validate(&req("system", "unmute"), &p),
-            ValidationDecision::Execute
+            decision,
+            ValidationDecision::Confirm {
+                reason: "Are you sure?".to_string()
+            }
         );
+
+        // A Low verdict auto-executes.
         assert_eq!(
-            engine.validate(&req("system", "volume up"), &p),
-            ValidationDecision::Execute
-        );
-        assert_eq!(
-            engine.validate(&req("system", "brightness 50"), &p),
-            ValidationDecision::Execute
-        );
-        assert_eq!(
-            engine.validate(&req("system", "wifi on"), &p),
-            ValidationDecision::Execute
-        );
-        assert_eq!(
-            engine.validate(&req("system", "bluetooth off"), &p),
-            ValidationDecision::Execute
-        );
-        // Lock and suspend are non-destructive too
-        assert_eq!(
-            engine.validate(&req("system", "lock"), &p),
-            ValidationDecision::Execute
-        );
-        assert_eq!(
-            engine.validate(&req("system", "suspend"), &p),
+            engine.validate(&req("anything", ""), &p),
             ValidationDecision::Execute
         );
     }

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 
-use crate::action_registry::{ActionHandler, ActionResult};
+use crate::action_registry::{ActionHandler, ActionResult, ExecContext, OutputType};
 use crate::error::LychiError;
 
 #[derive(Default)]
@@ -28,6 +28,12 @@ impl BrowseHandler {
 
 #[async_trait]
 impl ActionHandler for BrowseHandler {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["browse"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "browse"
     }
@@ -36,27 +42,14 @@ impl ActionHandler for BrowseHandler {
         "Browse files in a directory interactively"
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let path_str = args.trim();
         let dir = if path_str.is_empty() { "~/" } else { path_str };
 
         let expanded = Self::expand_path(dir);
 
         if !expanded.exists() || !expanded.is_dir() {
-            return Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some(format!("Directory not found: {dir}")),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(ActionResult::err(format!("Directory not found: {dir}")));
         }
 
         // Ensure the path ends with / for the frontend @ mode
@@ -66,19 +59,9 @@ impl ActionHandler for BrowseHandler {
             format!("{dir}/")
         };
 
-        Ok(ActionResult {
-            success: true,
-            output: Some(format!("__browse_panel__:{browse_path}")),
-            error: None,
-            duration_ms: 0,
-            routed_by: None,
-            open_url: None,
-            needs_confirmation: None,
-            risk_level: None,
-            output_type: None,
-            executed_args: None,
-            launch_desktop: None,
-            focus_app: None,
-        })
+        Ok(ActionResult::ok(
+            format!("__browse_panel__:{browse_path}"),
+            OutputType::Status,
+        ))
     }
 }

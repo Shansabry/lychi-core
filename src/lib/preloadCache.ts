@@ -29,6 +29,7 @@ export interface SettingsCache {
 	appVersion: string;
 	layerShellSupported: boolean;
 	activeWindowStrategy: string;
+	screenComposited: boolean;
 }
 
 let settingsPromise: Promise<SettingsCache> | null = null;
@@ -45,6 +46,7 @@ export function preloadSettings(): Promise<SettingsCache> {
 			appVersion: s.app_version,
 			layerShellSupported: s.layer_shell_supported,
 			activeWindowStrategy: s.active_window_strategy,
+			screenComposited: s.screen_composited,
 		}));
 	}
 	return settingsPromise;

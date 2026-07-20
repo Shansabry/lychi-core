@@ -80,3 +80,16 @@ impl serde::Serialize for LychiError {
         serializer.serialize_str(&self.to_string())
     }
 }
+
+// For generated TypeScript bindings (tauri-specta): every command returns
+// `Result<T, LychiError>`, so `LychiError` must be `specta::Type`. It serializes
+// to a plain string (above), so we present it to specta as a `String` rather than
+// deriving a variant-per-error type the frontend would never introspect.
+impl specta::Type for LychiError {
+    fn inline(
+        type_map: &mut specta::TypeCollection,
+        generics: specta::Generics,
+    ) -> specta::datatype::DataType {
+        String::inline(type_map, generics)
+    }
+}

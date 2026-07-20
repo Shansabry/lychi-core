@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem};
+use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, ExecContext};
 use crate::error::LychiError;
 
 const YOUTUBE_SEARCH_URL: &str = "https://www.youtube.com/results?search_query=";
@@ -21,6 +21,12 @@ impl YouTube {
 
 #[async_trait]
 impl ActionHandler for YouTube {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["yt"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "yt"
     }
@@ -34,49 +40,42 @@ impl ActionHandler for YouTube {
         if query.is_empty() {
             return Vec::new();
         }
-        vec![CompletionItem {
-            label: format!("Search YouTube: {query}"),
-            icon_path: Some("__none__".to_string()),
-            score: 100,
-            description: Some("Enter to search".to_string()),
-            reason: None,
-        }]
+        vec![
+            CompletionItem::new(
+                format!("Search YouTube: {query}"),
+                Some("__none__".into()),
+                100,
+            )
+            .with_run(format!("yt {query}"))
+            .with_description("Enter to search"),
+        ]
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let query = args.trim();
         if query.is_empty() {
-            return Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some("Usage: yt <search query>".to_string()),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(ActionResult::err("Usage: yt <search query>".to_string()));
         }
 
         let url = format!("{}{}", YOUTUBE_SEARCH_URL, urlencoding::encode(query));
 
-        Ok(ActionResult {
-            success: true,
-            output: Some(format!("YouTube: {query}")),
-            error: None,
-            duration_ms: 0,
-            routed_by: None,
-            open_url: Some(url),
-            needs_confirmation: None,
-            risk_level: None,
-            output_type: None,
-            executed_args: None,
-            launch_desktop: None,
-            focus_app: None,
-        })
+        // Pure navigation: opening the browser IS the result — no card, no
+        // secondary keystroke. `auto_open` makes that intent explicit.
+        Ok(ActionResult::navigate(url, true))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn completion_carries_clean_run_command() {
+        let items = YouTube::new().completions("lofi hip hop").await;
+        assert_eq!(items.len(), 1);
+        // Label is the human display text…
+        assert_eq!(items[0].label, "Search YouTube: lofi hip hop");
+        // …but `run` is the exact command — no label leaks into the query.
+        assert_eq!(items[0].run.as_deref(), Some("yt lofi hip hop"));
     }
 }

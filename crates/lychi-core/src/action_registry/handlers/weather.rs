@@ -8,7 +8,9 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType, RiskLevel};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType, RiskLevel,
+};
 use crate::error::LychiError;
 
 const USER_AGENT: &str = "Lychi/1.0 (https://lychi.app)";
@@ -379,6 +381,15 @@ impl WeatherHandler {
 
 #[async_trait]
 impl ActionHandler for WeatherHandler {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::{ArgTransform, Trigger};
+        static TRIGGERS: &[Trigger] = &[Trigger::new(
+            &["weather"],
+            ArgTransform::StripLeading("in "),
+        )];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "weather"
     }
@@ -391,7 +402,7 @@ impl ActionHandler for WeatherHandler {
         RiskLevel::Low
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         // "here" = auto-detect location (same as empty args)
         let input = args.trim();
         let input = if input.eq_ignore_ascii_case("here") {
@@ -410,20 +421,7 @@ impl ActionHandler for WeatherHandler {
         if let Some(cached) = self.weather_cache.read().await.get(&cache_key)
             && cached.fetched_at.elapsed().as_secs() < WEATHER_CACHE_SECS
         {
-            return Ok(ActionResult {
-                success: true,
-                output: Some(cached.output.clone()),
-                error: None,
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: Some(OutputType::Weather),
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(ActionResult::ok(cached.output.clone(), OutputType::Weather));
         }
 
         let start = Instant::now();
@@ -440,20 +438,7 @@ impl ActionHandler for WeatherHandler {
             },
         );
 
-        Ok(ActionResult {
-            success: true,
-            output: Some(output),
-            error: None,
-            duration_ms,
-            routed_by: None,
-            open_url: None,
-            needs_confirmation: None,
-            risk_level: None,
-            output_type: Some(OutputType::Weather),
-            executed_args: None,
-            launch_desktop: None,
-            focus_app: None,
-        })
+        Ok(ActionResult::ok(output, OutputType::Weather).with_duration(duration_ms))
     }
 
     async fn completions(&self, partial: &str) -> Vec<CompletionItem> {
@@ -466,6 +451,9 @@ impl ActionHandler for WeatherHandler {
                 score: 100,
                 description: Some("Detect current location".to_string()),
                 reason: None,
+                thumb_b64: None,
+                run: Some("weather here".to_string()),
+                ..Default::default()
             });
         }
         items
@@ -476,6 +464,9 @@ impl ActionHandler for WeatherHandler {
 /// while sharing the same instance with WeatherAskHandler.
 #[async_trait]
 impl ActionHandler for Arc<WeatherHandler> {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        self.as_ref().triggers()
+    }
     fn id(&self) -> &str {
         self.as_ref().id()
     }
@@ -485,8 +476,8 @@ impl ActionHandler for Arc<WeatherHandler> {
     fn default_risk(&self) -> RiskLevel {
         self.as_ref().default_risk()
     }
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
-        self.as_ref().execute(args).await
+    async fn execute(&self, ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
+        self.as_ref().execute(ctx, args).await
     }
     async fn completions(&self, partial: &str) -> Vec<CompletionItem> {
         self.as_ref().completions(partial).await

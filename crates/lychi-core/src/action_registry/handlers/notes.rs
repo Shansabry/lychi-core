@@ -4,7 +4,9 @@ use std::time::Instant;
 use async_trait::async_trait;
 use redb::Database;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+};
 use crate::error::LychiError;
 use crate::notes::store::{MAX_NOTES, NotesStore};
 
@@ -37,6 +39,12 @@ impl NotesHandler {
 
 #[async_trait]
 impl ActionHandler for NotesHandler {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["note", "notes"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "note"
     }
@@ -45,72 +53,43 @@ impl ActionHandler for NotesHandler {
         "Notes — add, list, or delete notes (max 5). Usage: note <text> to add, note read to list, note delete <id> to remove"
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let start = Instant::now();
         let text = args.trim();
         let store = NotesStore::new();
 
         // No args → open notes panel
         if text.is_empty() {
-            return Ok(ActionResult {
-                success: true,
-                output: Some("__notes_panel__".to_string()),
-                error: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(
+                ActionResult::ok("__notes_panel__".to_string(), OutputType::Status)
+                    .with_duration(start.elapsed().as_millis() as u64),
+            );
         }
 
         // "read" / "list" → list all notes
         if text.eq_ignore_ascii_case("read") || text.eq_ignore_ascii_case("list") {
             let notes = store.get_notes(&self.db)?;
             if notes.is_empty() {
-                return Ok(ActionResult {
-                    success: true,
-                    output: Some("No notes saved".to_string()),
-                    error: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: Some(OutputType::Text),
-                    executed_args: None,
-                    launch_desktop: None,
-                    focus_app: None,
-                });
+                return Ok(
+                    ActionResult::ok("No notes saved".to_string(), OutputType::Text)
+                        .with_duration(start.elapsed().as_millis() as u64),
+                );
             }
             let lines: Vec<String> = notes
                 .iter()
                 .enumerate()
                 .map(|(i, n)| format!("{}. {} ({})", i + 1, Self::note_title(&n.text), n.id))
                 .collect();
-            return Ok(ActionResult {
-                success: true,
-                output: Some(format!(
+            return Ok(ActionResult::ok(
+                format!(
                     "Notes ({}/{}):\n{}",
                     notes.len(),
                     MAX_NOTES,
                     lines.join("\n")
-                )),
-                error: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: Some(OutputType::Text),
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+                ),
+                OutputType::Text,
+            )
+            .with_duration(start.elapsed().as_millis() as u64));
         }
 
         // "delete <id>" → delete a note
@@ -121,59 +100,30 @@ impl ActionHandler for NotesHandler {
         {
             let id = rest.trim();
             store.delete_note(&self.db, id)?;
-            return Ok(ActionResult {
-                success: true,
-                output: Some(format!("Note deleted: {id}")),
-                error: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(
+                ActionResult::ok(format!("Note deleted: {id}"), OutputType::Status)
+                    .with_duration(start.elapsed().as_millis() as u64),
+            );
         }
 
         // Add a new note
         match store.add_note(&self.db, text) {
-            Ok(item) => Ok(ActionResult {
-                success: true,
-                output: Some(format!(
+            Ok(item) => Ok(ActionResult::ok(
+                format!(
                     "Note saved ({} chars, {}/{})",
                     item.text.len(),
                     store.notes_count(&self.db)?,
                     MAX_NOTES
-                )),
-                error: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            }),
+                ),
+                OutputType::Status,
+            )
+            .with_duration(start.elapsed().as_millis() as u64)),
             Err(e) if e.to_string().contains("limit reached") => {
                 // Return sentinel so frontend opens NotesPanel with pending note
-                Ok(ActionResult {
-                    success: true,
-                    output: Some(format!("__notes_limit__:{text}")),
-                    error: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: None,
-                    executed_args: None,
-                    launch_desktop: None,
-                    focus_app: None,
-                })
+                Ok(
+                    ActionResult::ok(format!("__notes_limit__:{text}"), OutputType::Status)
+                        .with_duration(start.elapsed().as_millis() as u64),
+                )
             }
             Err(e) => Err(e),
         }
@@ -190,6 +140,9 @@ impl ActionHandler for NotesHandler {
                 score: if cmd.starts_with(&lower) { 100 } else { 50 },
                 description: Some(desc.to_string()),
                 reason: None,
+                thumb_b64: None,
+                run: Some(format!("note {cmd}")),
+                ..Default::default()
             })
             .collect()
     }
@@ -217,6 +170,12 @@ const TODO_SUBCOMMANDS: &[(&str, &str)] = &[
 
 #[async_trait]
 impl ActionHandler for TodoHandler {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["todo", "todos"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "todo"
     }
@@ -225,27 +184,17 @@ impl ActionHandler for TodoHandler {
         "Todo list — add, list, check off, or delete items. Usage: todo add <text>, todo list, todo done <id>, todo delete <id>"
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let start = Instant::now();
         let trimmed = args.trim();
         let store = NotesStore::new();
 
         // No args → open notes panel
         if trimmed.is_empty() {
-            return Ok(ActionResult {
-                success: true,
-                output: Some("__notes_panel__".to_string()),
-                error: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(
+                ActionResult::ok("__notes_panel__".to_string(), OutputType::Status)
+                    .with_duration(start.elapsed().as_millis() as u64),
+            );
         }
 
         let (cmd, rest) = trimmed.split_once(' ').unwrap_or((trimmed, ""));
@@ -254,54 +203,21 @@ impl ActionHandler for TodoHandler {
         match cmd.to_lowercase().as_str() {
             "add" => {
                 if rest.is_empty() {
-                    return Ok(ActionResult {
-                        success: false,
-                        output: None,
-                        error: Some("Usage: todo add <text>".to_string()),
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        routed_by: None,
-                        open_url: None,
-                        needs_confirmation: None,
-                        risk_level: None,
-                        output_type: None,
-                        executed_args: None,
-                        launch_desktop: None,
-                        focus_app: None,
-                    });
+                    return Ok(ActionResult::err("Usage: todo add <text>".to_string())
+                        .with_duration(start.elapsed().as_millis() as u64));
                 }
                 let item = store.add_todo(&self.db, rest)?;
-                Ok(ActionResult {
-                    success: true,
-                    output: Some(format!("Added: {} ({})", item.text, item.id)),
-                    error: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: None,
-                    executed_args: None,
-                    launch_desktop: None,
-                    focus_app: None,
-                })
+                Ok(ActionResult::ok(
+                    format!("Added: {} ({})", item.text, item.id),
+                    OutputType::Status,
+                )
+                .with_duration(start.elapsed().as_millis() as u64))
             }
             "list" | "ls" => {
                 let todos = store.get_todos(&self.db)?;
                 if todos.is_empty() {
-                    return Ok(ActionResult {
-                        success: true,
-                        output: Some("No todos".to_string()),
-                        error: None,
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        routed_by: None,
-                        open_url: None,
-                        needs_confirmation: None,
-                        risk_level: None,
-                        output_type: None,
-                        executed_args: None,
-                        launch_desktop: None,
-                        focus_app: None,
-                    });
+                    return Ok(ActionResult::ok("No todos".to_string(), OutputType::Status)
+                        .with_duration(start.elapsed().as_millis() as u64));
                 }
                 let lines: Vec<String> = todos
                     .iter()
@@ -310,20 +226,8 @@ impl ActionHandler for TodoHandler {
                         format!("[{check}] {} ({})", t.text, t.id)
                     })
                     .collect();
-                Ok(ActionResult {
-                    success: true,
-                    output: Some(lines.join("\n")),
-                    error: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: Some(OutputType::Text),
-                    executed_args: None,
-                    launch_desktop: None,
-                    focus_app: None,
-                })
+                Ok(ActionResult::ok(lines.join("\n"), OutputType::Text)
+                    .with_duration(start.elapsed().as_millis() as u64))
             }
             "summary" => {
                 let notes = store.get_notes(&self.db)?;
@@ -366,104 +270,39 @@ impl ActionHandler for TodoHandler {
                     lines.push("Nothing here — no notes and no todos.".to_string());
                 }
 
-                Ok(ActionResult {
-                    success: true,
-                    output: Some(lines.join("\n")),
-                    error: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: Some(OutputType::Text),
-                    executed_args: None,
-                    launch_desktop: None,
-                    focus_app: None,
-                })
+                Ok(ActionResult::ok(lines.join("\n"), OutputType::Text)
+                    .with_duration(start.elapsed().as_millis() as u64))
             }
             "done" | "check" | "toggle" => {
                 if rest.is_empty() {
-                    return Ok(ActionResult {
-                        success: false,
-                        output: None,
-                        error: Some("Usage: todo done <id>".to_string()),
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        routed_by: None,
-                        open_url: None,
-                        needs_confirmation: None,
-                        risk_level: None,
-                        output_type: None,
-                        executed_args: None,
-                        launch_desktop: None,
-                        focus_app: None,
-                    });
+                    return Ok(ActionResult::err("Usage: todo done <id>".to_string())
+                        .with_duration(start.elapsed().as_millis() as u64));
                 }
                 store.toggle_todo(&self.db, rest)?;
-                Ok(ActionResult {
-                    success: true,
-                    output: Some(format!("Toggled: {rest}")),
-                    error: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: None,
-                    executed_args: None,
-                    launch_desktop: None,
-                    focus_app: None,
-                })
+                Ok(
+                    ActionResult::ok(format!("Toggled: {rest}"), OutputType::Status)
+                        .with_duration(start.elapsed().as_millis() as u64),
+                )
             }
             "delete" | "del" | "rm" | "remove" => {
                 if rest.is_empty() {
-                    return Ok(ActionResult {
-                        success: false,
-                        output: None,
-                        error: Some("Usage: todo delete <id>".to_string()),
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        routed_by: None,
-                        open_url: None,
-                        needs_confirmation: None,
-                        risk_level: None,
-                        output_type: None,
-                        executed_args: None,
-                        launch_desktop: None,
-                        focus_app: None,
-                    });
+                    return Ok(ActionResult::err("Usage: todo delete <id>".to_string())
+                        .with_duration(start.elapsed().as_millis() as u64));
                 }
                 store.delete_todo(&self.db, rest)?;
-                Ok(ActionResult {
-                    success: true,
-                    output: Some(format!("Deleted: {rest}")),
-                    error: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: None,
-                    executed_args: None,
-                    launch_desktop: None,
-                    focus_app: None,
-                })
+                Ok(
+                    ActionResult::ok(format!("Deleted: {rest}"), OutputType::Status)
+                        .with_duration(start.elapsed().as_millis() as u64),
+                )
             }
             // If the first word isn't a subcommand, treat the entire args as "add"
             _ => {
                 let item = store.add_todo(&self.db, trimmed)?;
-                Ok(ActionResult {
-                    success: true,
-                    output: Some(format!("Added: {} ({})", item.text, item.id)),
-                    error: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: None,
-                    executed_args: None,
-                    launch_desktop: None,
-                    focus_app: None,
-                })
+                Ok(ActionResult::ok(
+                    format!("Added: {} ({})", item.text, item.id),
+                    OutputType::Status,
+                )
+                .with_duration(start.elapsed().as_millis() as u64))
             }
         }
     }
@@ -479,6 +318,9 @@ impl ActionHandler for TodoHandler {
                 score: if cmd.starts_with(&lower) { 100 } else { 50 },
                 description: Some(desc.to_string()),
                 reason: None,
+                thumb_b64: None,
+                run: Some(format!("todo {cmd}")),
+                ..Default::default()
             })
             .collect()
     }

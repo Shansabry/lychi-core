@@ -26,6 +26,7 @@ const SYNCABLE_KEYS: &[&str] = &[
     "ai.provider",
     "ai.model",
     "ai.ollama_url",
+    "ai.ollama_model",
     "weather.unit",
     "weather.default_location",
 ];
@@ -132,6 +133,7 @@ pub fn apply_to_config(settings: &HashMap<String, String>, config: &mut Config) 
             "ai.provider" => config.ai.provider = value.clone(),
             "ai.model" => config.ai.model = value.clone(),
             "ai.ollama_url" => config.ai.ollama_url = value.clone(),
+            "ai.ollama_model" => config.ai.ollama_model = value.clone(),
             "weather.unit" => config.weather.unit = value.clone(),
             "weather.default_location" => config.weather.default_location = value.clone(),
             _ => {}
@@ -209,6 +211,7 @@ fn extract_syncable_from_config(config: &Config) -> Vec<(String, String)> {
         ("ai.provider".into(), config.ai.provider.clone()),
         ("ai.model".into(), config.ai.model.clone()),
         ("ai.ollama_url".into(), config.ai.ollama_url.clone()),
+        ("ai.ollama_model".into(), config.ai.ollama_model.clone()),
         ("weather.unit".into(), config.weather.unit.clone()),
         (
             "weather.default_location".into(),

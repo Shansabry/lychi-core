@@ -15,14 +15,122 @@ pub fn init_app() {
 /// Uses `XDG_SESSION_DESKTOP` first (single-valued, more reliable), falls back
 /// to `XDG_CURRENT_DESKTOP`. Only triggers on Wayland sessions.
 pub fn is_kde_wayland() -> bool {
-    let is_wayland = std::env::var("XDG_SESSION_TYPE")
+    is_wayland_session() && desktop_contains("KDE")
+}
+
+fn is_wayland_session() -> bool {
+    std::env::var("XDG_SESSION_TYPE")
         .map(|v| v == "wayland")
-        .unwrap_or(false);
-    let is_kde = std::env::var("XDG_SESSION_DESKTOP")
+        .unwrap_or(false)
+}
+
+fn desktop_contains(name: &str) -> bool {
+    std::env::var("XDG_SESSION_DESKTOP")
         .or_else(|_| std::env::var("XDG_CURRENT_DESKTOP"))
-        .map(|v| v.to_uppercase().contains("KDE"))
-        .unwrap_or(false);
-    is_wayland && is_kde
+        .map(|v| v.to_uppercase().contains(name))
+        .unwrap_or(false)
+}
+
+/// The window strategy init_window() resolved for this session.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WindowStrategy {
+    /// wlr-layer-shell surface (wlroots compositors)
+    LayerShell,
+    /// Monitor-covering transparent xdg_toplevel, launcher centered by CSS
+    /// (KDE Wayland, GNOME Wayland, any Wayland without usable layer-shell)
+    Toplevel,
+    /// Fullscreen override window with X11 hints
+    X11,
+}
+
+impl WindowStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WindowStrategy::LayerShell => "layer-shell",
+            WindowStrategy::Toplevel => "toplevel",
+            WindowStrategy::X11 => "x11",
+        }
+    }
+}
+
+static ACTIVE_STRATEGY: std::sync::OnceLock<WindowStrategy> = std::sync::OnceLock::new();
+
+/// True when the user forced `window_strategy = "toplevel-window"` — the
+/// escape hatch that skips fullscreen_on_monitor() on non-KDE Wayland.
+static TOPLEVEL_PLAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn toplevel_plain() -> bool {
+    TOPLEVEL_PLAIN.get().copied().unwrap_or(false)
+}
+
+/// Whether the X11 screen has a compositor. Without one (xfwm4/Marco with
+/// compositing off) the transparent fullscreen overlay renders opaque black.
+/// Set by init_window(); true on Wayland (always composited).
+static SCREEN_COMPOSITED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub fn screen_composited() -> bool {
+    SCREEN_COMPOSITED.get().copied().unwrap_or(true)
+}
+
+/// Compact opaque window used on non-composited X11 (rofi-style fallback).
+/// Width matches the launcher bar; height starts at the input-bar height and
+/// is resized to content by the frontend (window.setSize via ResizeObserver).
+const COMPACT_W: i32 = 680;
+const COMPACT_INITIAL_H: i32 = 64;
+
+fn compact_x(geom: &gdk::Rectangle) -> i32 {
+    geom.x() + (geom.width() - COMPACT_W) / 2
+}
+
+fn compact_y(geom: &gdk::Rectangle) -> i32 {
+    geom.y() + (geom.height() as f64 * 0.18) as i32
+}
+
+/// The strategy resolved by init_window(). Every consumer (dismiss handlers,
+/// reposition, settings IPC) reads this instead of re-deriving from env vars.
+/// Defaults to X11 if queried before init_window() ran.
+pub fn active_strategy() -> WindowStrategy {
+    ACTIVE_STRATEGY
+        .get()
+        .copied()
+        .unwrap_or(WindowStrategy::X11)
+}
+
+/// Resolve the configured strategy string to a concrete strategy for this session.
+fn resolve_strategy(strategy: &str) -> WindowStrategy {
+    match strategy {
+        "layer-shell" => {
+            if gtk_layer_shell::is_supported() {
+                WindowStrategy::LayerShell
+            } else if is_wayland_session() {
+                tracing::warn!(
+                    "layer-shell strategy requested but not supported — falling back to toplevel"
+                );
+                WindowStrategy::Toplevel
+            } else {
+                tracing::warn!(
+                    "layer-shell strategy requested but not supported — falling back to x11"
+                );
+                WindowStrategy::X11
+            }
+        }
+        "toplevel" | "toplevel-window" => WindowStrategy::Toplevel,
+        "x11" => WindowStrategy::X11,
+        _ => {
+            // "auto"
+            if is_kde_wayland() {
+                // layer-shell focus is unreliable on KWin (I-008)
+                WindowStrategy::Toplevel
+            } else if gtk_layer_shell::is_supported() {
+                WindowStrategy::LayerShell
+            } else if is_wayland_session() {
+                // GNOME (Mutter has no layer-shell) and unknown Wayland compositors
+                WindowStrategy::Toplevel
+            } else {
+                WindowStrategy::X11
+            }
+        }
+    }
 }
 
 /// Strip ANSI escape codes from kscreen-doctor output.
@@ -233,6 +341,28 @@ fn find_cursor_monitor_kde(display: &gdk::Display) -> Option<gdk::Monitor> {
     None
 }
 
+/// Index of a monitor within the display, matched by geometry origin.
+/// Needed for fullscreen_on_monitor(), which takes an index rather than a
+/// GdkMonitor. Falls back to 0 if not matched.
+fn monitor_index(display: &gdk::Display, monitor: &gdk::Monitor) -> i32 {
+    use gtk::prelude::MonitorExt;
+    let target = monitor.geometry();
+    for i in 0..display.n_monitors() {
+        if let Some(m) = display.monitor(i) {
+            let g = m.geometry();
+            if g.x() == target.x() && g.y() == target.y() {
+                return i;
+            }
+        }
+    }
+    tracing::warn!(
+        "monitor_index: monitor at {},{} not found — defaulting to 0",
+        target.x(),
+        target.y()
+    );
+    0
+}
+
 /// Resolve the target monitor based on the monitor_mode config value.
 /// "cursor" → monitor under the pointer; "primary" → primary monitor.
 pub fn get_monitor_for_mode(mode: &str) -> Option<gdk::Monitor> {
@@ -300,18 +430,29 @@ pub fn reposition_to_monitor(window: &WebviewWindow, monitor: &gdk::Monitor) {
             geom.width(),
             geom.height()
         );
-    } else if is_kde_wayland() {
-        // KDE toplevel: fullscreen container, CSS handles centering
-        gtk_win.move_(geom.x(), geom.y());
+    } else if active_strategy() == WindowStrategy::Toplevel {
+        // Wayland toplevel: monitor-covering container, CSS handles centering
         gtk_win.set_size_request(geom.width(), geom.height());
+        if is_kde_wayland() {
+            gtk_win.move_(geom.x(), geom.y());
+        } else if !toplevel_plain() {
+            // Mutter ignores move_() — retarget via fullscreen-on-output
+            if let Some(display) = gdk::Display::default() {
+                gtk_win.fullscreen_on_monitor(
+                    &gtk::prelude::WidgetExt::screen(&gtk_win)
+                        .unwrap_or_else(|| gdk::Screen::default().expect("no GDK screen")),
+                    monitor_index(&display, monitor),
+                );
+            }
+        }
         tracing::debug!(
-            "Repositioned KDE toplevel fullscreen to {},{} ({}x{})",
+            "Repositioned Wayland toplevel to {},{} ({}x{})",
             geom.x(),
             geom.y(),
             geom.width(),
             geom.height()
         );
-    } else {
+    } else if screen_composited() {
         // X11 fullscreen overlay
         gtk_win.move_(geom.x(), geom.y());
         gtk_win.set_size_request(geom.width(), geom.height());
@@ -321,6 +462,15 @@ pub fn reposition_to_monitor(window: &WebviewWindow, monitor: &gdk::Monitor) {
             geom.y(),
             geom.width(),
             geom.height()
+        );
+    } else {
+        // X11 compact opaque window (no compositor) — keep width, retarget
+        // position; frontend owns the height.
+        gtk_win.move_(compact_x(&geom), compact_y(&geom));
+        tracing::debug!(
+            "Repositioned X11 compact window to monitor at {},{}",
+            geom.x(),
+            geom.y()
         );
     }
 }
@@ -336,32 +486,15 @@ pub fn init_window(window: &WebviewWindow, strategy: &str) {
         }
     };
 
-    use gtk::prelude::{GtkWindowExt, MonitorExt, WidgetExt};
+    use gtk::prelude::{GtkWindowExt, MonitorExt, WidgetExt, WidgetExtManual};
 
-    let use_layer_shell = match strategy {
-        "layer-shell" => {
-            if gtk_layer_shell::is_supported() {
-                true
-            } else {
-                tracing::warn!(
-                    "layer-shell strategy requested but not supported, falling back to x11"
-                );
-                false
-            }
-        }
-        "x11" | "toplevel" => false,
-        _ => {
-            // "auto": use layer-shell UNLESS on KDE Wayland (focus bugs)
-            if is_kde_wayland() {
-                tracing::info!(
-                    "KDE Wayland detected — using toplevel window (layer-shell focus unreliable on KWin)"
-                );
-                false
-            } else {
-                gtk_layer_shell::is_supported()
-            }
-        }
-    };
+    let resolved = resolve_strategy(strategy);
+    let _ = ACTIVE_STRATEGY.set(resolved);
+    let _ = TOPLEVEL_PLAIN.set(strategy == "toplevel-window");
+    tracing::info!(
+        "Window strategy resolved: {} (configured: {strategy})",
+        resolved.as_str()
+    );
 
     // Gracefully handle missing screen/monitor instead of panicking
     let setup_ok = (|| -> Option<()> {
@@ -376,7 +509,7 @@ pub fn init_window(window: &WebviewWindow, strategy: &str) {
         }
         gtk_win.set_app_paintable(true);
 
-        if use_layer_shell {
+        if resolved == WindowStrategy::LayerShell {
             use gtk_layer_shell::LayerShell;
             gtk_win.hide(); // Must unmap before init_layer_shell
             gtk_win.init_layer_shell();
@@ -416,37 +549,83 @@ pub fn init_window(window: &WebviewWindow, strategy: &str) {
             tracing::debug!(
                 "Layer shell initialized (strategy: {strategy}, top_margin: {top_margin}, max_h: {max_height})"
             );
-        } else if strategy == "toplevel" || (strategy == "auto" && is_kde_wayland()) {
-            // KDE toplevel: fullscreen transparent container — CSS handles centering.
-            // Wayland xdg_toplevel ignores move_(), so we can't position a sized window.
-            // Instead, cover the monitor and let the frontend center the launcher UI.
-            // Normal GTK window — KWin's focus model works correctly here.
+        } else if resolved == WindowStrategy::Toplevel {
+            // Wayland toplevel: monitor-covering transparent container — CSS
+            // handles centering. Wayland xdg_toplevel ignores move_(), so we
+            // can't position a sized window; cover the monitor instead.
             // NOTE: set_skip_taskbar_hint doesn't work on Wayland — it only sets
             // X11 atoms. This is a known Tauri limitation (tauri#9829). The window
-            // will appear in KDE's taskbar. We set Utility hint so it at least
+            // will appear in the taskbar. We set Utility hint so it at least
             // behaves as a tool window (no alt-tab, stays above, etc).
             gtk_win.set_type_hint(gdk::WindowTypeHint::Utility);
             gtk_win.set_skip_taskbar_hint(true);
             gtk_win.set_skip_pager_hint(true);
             gtk_win.set_decorated(false);
             gtk_win.set_keep_above(true);
-
-            gtk_win.move_(geom.x(), geom.y());
             gtk_win.set_size_request(geom.width(), geom.height());
+
+            if is_kde_wayland() {
+                // KWin honours move_() here, and true fullscreen would
+                // re-trigger compositor blur/dim effects (I-001).
+                gtk_win.move_(geom.x(), geom.y());
+                // Hide from taskbar/Alt-Tab via KWin's plasma-shell protocol
+                // (I-009: the X11 skip hints above are no-ops on Wayland).
+                // Re-applied on every map — GTK recreates the wl_surface each
+                // time the window is re-shown.
+                gtk_win.connect_map_event(|win, _| {
+                    if let Err(e) = crate::platform::kde_taskbar::hide_from_taskbar(win) {
+                        tracing::warn!("[plasma-shell] skip-taskbar failed: {e}");
+                    } else {
+                        tracing::debug!("[plasma-shell] skip-taskbar applied");
+                    }
+                    glib::Propagation::Proceed
+                });
+                gtk_win.connect_unmap_event(|_, _| {
+                    crate::platform::kde_taskbar::mark_unmapped();
+                    glib::Propagation::Proceed
+                });
+            } else if strategy != "toplevel-window" {
+                // GNOME/unknown Wayland: move_() is a no-op on Mutter. The only
+                // sanctioned positioning primitive is xdg_toplevel.set_fullscreen
+                // on a specific output, which fullscreen_on_monitor() maps to.
+                // "toplevel-window" is the escape hatch: plain monitor-sized
+                // window, compositor decides placement.
+                gtk_win.fullscreen_on_monitor(&screen, monitor_index(&display, &monitor));
+            }
             tracing::debug!(
-                "KDE toplevel window: fullscreen {}x{} at {},{} (strategy: {strategy})",
+                "Toplevel window: {}x{} at {},{} (strategy: {strategy}, kde: {})",
                 geom.width(),
                 geom.height(),
                 geom.x(),
-                geom.y()
+                geom.y(),
+                is_kde_wayland()
             );
         } else {
-            // X11 path — fullscreen overlay on primary monitor
-            gtk_win.move_(geom.x(), geom.y());
-            gtk_win.set_size_request(geom.width(), geom.height());
+            // X11 path
+            let composited = screen.is_composited();
+            let _ = SCREEN_COMPOSITED.set(composited);
+            if composited {
+                // Fullscreen transparent overlay on primary monitor
+                gtk_win.move_(geom.x(), geom.y());
+                gtk_win.set_size_request(geom.width(), geom.height());
+            } else {
+                // No compositor (xfwm4/Marco with compositing off): ARGB
+                // transparency renders black, so a fullscreen overlay would
+                // blank the desktop. Fall back to a rofi-style compact
+                // opaque window; the frontend resizes it to content height.
+                tracing::warn!(
+                    "X11: no compositor detected — using compact opaque window (rofi-style fallback)"
+                );
+                gtk_win.set_type_hint(gdk::WindowTypeHint::Utility);
+                gtk_win.set_keep_above(true);
+                gtk_win.resize(COMPACT_W, COMPACT_INITIAL_H);
+                gtk_win.move_(compact_x(&geom), compact_y(&geom));
+            }
             gtk_win.set_skip_taskbar_hint(true);
             gtk_win.set_skip_pager_hint(true);
-            tracing::debug!("X11 window hints applied (strategy: {strategy})");
+            tracing::debug!(
+                "X11 window hints applied (strategy: {strategy}, composited: {composited})"
+            );
         }
         Some(())
     })();
@@ -472,7 +651,7 @@ pub fn focus_window(window: &WebviewWindow) {
 
 /// Set up interaction-gated dismiss-on-blur.
 ///
-/// Works on both layer-shell (wlroots) and KDE toplevel windows.
+/// Works on both layer-shell (wlroots) and Wayland toplevel windows (KDE/GNOME).
 /// On layer-shell: also switches keyboard mode to OnDemand on first interaction.
 /// On X11 fullscreen: returns early (frontend handles dismiss via click-on-backdrop).
 ///
@@ -484,81 +663,90 @@ pub fn setup_dismiss_on_blur(
     window: &WebviewWindow,
     dismiss_armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     summon_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    armed_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     let gtk_win = match window.gtk_window() {
         Ok(w) => w,
         Err(_) => return,
     };
 
+    // Installed on every strategy. Layer-shell/toplevel need it because the
+    // frontend can't see compositor focus; X11 needs it so Alt-Tab away
+    // dismisses (backdrop clicks land inside our fullscreen overlay, but
+    // focus loss to another window is only visible at the GTK level).
     use gtk_layer_shell::LayerShell;
     let is_layer = gtk_win.is_layer_window();
-    let is_toplevel_kde = !is_layer && is_kde_wayland();
-
-    if !is_layer && !is_toplevel_kde {
-        return; // X11 fullscreen — frontend handles dismiss
-    }
+    let is_toplevel = !is_layer && active_strategy() == WindowStrategy::Toplevel;
 
     use gtk::prelude::WidgetExt;
     use std::sync::atomic::Ordering;
 
-    // key-press: user typed → arm dismiss (Escape handled separately)
+    // key-press: user typed → arm dismiss, stamped with the current summon
+    // cycle (Escape handled separately)
     {
         let armed = dismiss_armed.clone();
         let seq = summon_seq.clone();
+        let stamp = armed_seq.clone();
         gtk_win.connect_key_press_event(move |_, event| {
             use gdk::keys::constants as key;
             let keyval = event.keyval();
             // Don't arm on Escape (handled by setup_escape_handler)
             if keyval != key::Escape && !armed.load(Ordering::SeqCst) {
+                let current = seq.load(Ordering::SeqCst);
+                stamp.store(current, Ordering::SeqCst);
                 armed.store(true, Ordering::SeqCst);
-                tracing::info!(
-                    "[dismiss] seq={} key-press → armed=true",
-                    seq.load(Ordering::SeqCst)
-                );
+                tracing::info!("[dismiss] seq={current} key-press → armed=true");
             }
             glib::Propagation::Proceed // let key propagate to WebView
         });
     }
 
-    // button-press: user clicked inside → arm dismiss
+    // button-press: user clicked inside → arm dismiss, stamped with the cycle
     {
         let armed = dismiss_armed.clone();
         let seq = summon_seq.clone();
+        let stamp = armed_seq.clone();
         gtk_win.connect_button_press_event(move |_, _| {
             if !armed.load(Ordering::SeqCst) {
+                let current = seq.load(Ordering::SeqCst);
+                stamp.store(current, Ordering::SeqCst);
                 armed.store(true, Ordering::SeqCst);
-                tracing::info!(
-                    "[dismiss] seq={} button-press → armed=true",
-                    seq.load(Ordering::SeqCst)
-                );
+                tracing::info!("[dismiss] seq={current} button-press → armed=true");
             }
             glib::Propagation::Proceed
         });
     }
 
-    // focus-out: only dismiss if user interacted (armed)
+    // focus-out: only dismiss if the user interacted (armed) IN THIS summon
+    // cycle — a stale focus-out arriving after a re-summon must not close
+    // the fresh window.
     let handle = window.app_handle().clone();
     gtk_win.connect_focus_out_event(move |_, _| {
         let seq = summon_seq.load(Ordering::SeqCst);
         let armed = dismiss_armed.load(Ordering::SeqCst);
-        if armed {
-            tracing::info!("[dismiss] seq={seq} focus-out (armed) → DISMISS");
+        let stamped = armed_seq.load(Ordering::SeqCst);
+        if armed && stamped == seq {
+            tracing::info!("[dismiss] seq={seq} focus-out (armed, current cycle) → DISMISS");
             dismiss_armed.store(false, Ordering::SeqCst);
             use tauri::Emitter;
             let _ = handle.emit("lychi://dismiss", ());
+        } else if armed {
+            tracing::info!(
+                "[dismiss] focus-out from stale cycle (armed_seq={stamped}, seq={seq}) → ignored"
+            );
         } else {
             tracing::info!("[dismiss] seq={seq} focus-out (not armed) → ignored");
         }
         glib::Propagation::Proceed
     });
     tracing::info!(
-        "[dismiss] interaction-gated dismiss handler installed (layer={is_layer}, kde_toplevel={is_toplevel_kde})"
+        "[dismiss] interaction-gated dismiss handler installed (layer={is_layer}, toplevel={is_toplevel})"
     );
 }
 
 /// GTK-level Escape key handler — catches Escape even when the WebView
 /// input doesn't have DOM focus. Emits `lychi://gtk-escape` for the frontend.
-/// Active on layer-shell and KDE toplevel (X11 handles Escape via fullscreen overlay click).
+/// Active on layer-shell and Wayland toplevel (X11 handles Escape via fullscreen overlay click).
 pub fn setup_escape_handler(window: &WebviewWindow) {
     let gtk_win = match window.gtk_window() {
         Ok(w) => w,
@@ -567,7 +755,7 @@ pub fn setup_escape_handler(window: &WebviewWindow) {
 
     use gtk_layer_shell::LayerShell;
     let is_layer = gtk_win.is_layer_window();
-    if !is_layer && !is_kde_wayland() {
+    if !is_layer && active_strategy() != WindowStrategy::Toplevel {
         return; // X11 fullscreen — frontend DOM handles Escape
     }
 

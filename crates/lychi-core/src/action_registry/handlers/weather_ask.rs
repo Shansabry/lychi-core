@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
-use crate::action_registry::{ActionHandler, ActionResult, OutputType, RiskLevel};
+use crate::action_registry::{ActionHandler, ActionResult, ExecContext, OutputType, RiskLevel};
 use crate::error::LychiError;
 use crate::providers::AiProvider;
 
@@ -103,23 +103,10 @@ impl ActionHandler for WeatherAskHandler {
         RiskLevel::Low
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let question = args.trim();
         if question.is_empty() {
-            return Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some("No question provided".to_string()),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: Some(OutputType::Text),
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(ActionResult::err("No question provided".to_string()));
         }
 
         let start = Instant::now();
@@ -157,19 +144,8 @@ impl ActionHandler for WeatherAskHandler {
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        Ok(ActionResult {
-            success: true,
-            output: Some(answer),
-            error: None,
-            duration_ms,
-            routed_by: None,
-            open_url: Some(report_url),
-            needs_confirmation: None,
-            risk_level: None,
-            output_type: Some(OutputType::Text),
-            executed_args: None,
-            launch_desktop: None,
-            focus_app: None,
-        })
+        Ok(ActionResult::ok(answer, OutputType::Text)
+            .with_link(report_url)
+            .with_duration(duration_ms))
     }
 }

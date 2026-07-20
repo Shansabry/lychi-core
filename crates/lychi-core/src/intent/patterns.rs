@@ -6,90 +6,7 @@
 //! 3. Pattern detection (file paths, URLs, math/conversion expressions)
 //! 4. No match: `PatternResult::NoMatch` — IntentResolver uses AI, falls back to open→web
 
-/// Known handler prefixes — single source of truth for all keyword recognition.
-/// Used by: pattern routing, typo correction, frontend completion handling.
-pub const KNOWN_PREFIXES: &[&str] = &[
-    // Explicit handler prefixes
-    "ask",
-    "bm",
-    "bookmark",
-    "browse",
-    "clip",
-    "clipboard",
-    "ctx",
-    "close",
-    "emoji",
-    "focus",
-    "kill",
-    "open",
-    "pin",
-    "unpin",
-    "sym",
-    "unicode",
-    "web",
-    "yt",
-    "run",
-    "calc",
-    "calculator",
-    "file",
-    "url",
-    "media",
-    "project",
-    "quit",
-    "system",
-    "note",
-    "notes",
-    "todo",
-    "todos",
-    "snip",
-    "snippet",
-    "snippets",
-    "weather",
-    "sysinfo",
-    "ip",
-    "cpu",
-    "mem",
-    "disk",
-    "temp",
-    "gpu",
-    "battery",
-    "net",
-    "audio",
-    "display",
-    "os",
-    "speedtest",
-    "time",
-    "tz",
-    "clock",
-    "alias",
-    "aliases",
-    "timer",
-    "stopwatch",
-    "reminder",
-    "remind",
-    // System power commands — explicit single-word triggers
-    "shutdown",
-    "poweroff",
-    "reboot",
-    "restart",
-    "hibernate",
-    "lock",
-    "suspend",
-    "sleep",
-    "logout",
-    "signout",
-    "mute",
-    "unmute",
-    "volume",
-    "brightness",
-    "bluetooth",
-    "spotify",
-    "pomodoro",
-    "recent",
-    // Sysinfo keywords
-    "memory",
-    "temperature",
-];
+use crate::action_registry::registry::ActionRegistry;
 
 /// Common TLDs for URL detection.
 const TLDS: &[&str] = &[
@@ -114,7 +31,7 @@ pub enum Confidence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
     /// Handler to dispatch to (e.g. "web", "calc", "run", "file", "url")
-    pub handler: &'static str,
+    pub handler: String,
     /// Arguments to pass to the handler
     pub args: String,
     /// Whether this route was explicitly triggered (prefix or trigger char).
@@ -153,17 +70,12 @@ impl PatternResult {
     }
 }
 
-/// Check if a word is a known handler prefix (used by typo_suggest to skip exact matches).
-pub fn is_known_prefix(word: &str) -> bool {
-    KNOWN_PREFIXES.iter().any(|p| p.eq_ignore_ascii_case(word))
-}
-
 /// Route raw user input to the appropriate handler.
-pub fn route(raw: &str) -> PatternResult {
-    route_inner(raw, true)
+pub fn route(raw: &str, registry: &ActionRegistry) -> PatternResult {
+    route_inner(raw, true, registry)
 }
 
-fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
+fn route_inner(raw: &str, check_aliases: bool, registry: &ActionRegistry) -> PatternResult {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return PatternResult::NoMatch {
@@ -172,7 +84,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
     }
 
     // 1. Explicit prefix — first word matches a known handler
-    if let Some(r) = try_explicit_prefix(trimmed) {
+    if let Some(r) = try_explicit_prefix(trimmed, registry) {
         return PatternResult::Match(r);
     }
 
@@ -206,7 +118,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
     for &(prefix, handler) in COLON_TRIGGERS {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
             return PatternResult::Match(Route {
-                handler,
+                handler: handler.to_string(),
                 args: rest.trim().to_string(),
                 explicit: true,
                 confidence: Confidence::Explicit,
@@ -215,7 +127,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
     }
     if let Some(query) = trimmed.strip_prefix('?') {
         return PatternResult::Match(Route {
-            handler: "web",
+            handler: "web".to_string(),
             args: query.trim().to_string(),
             explicit: true,
             confidence: Confidence::Explicit,
@@ -223,7 +135,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
     }
     if let Some(expr) = trimmed.strip_prefix('=') {
         return PatternResult::Match(Route {
-            handler: "calc",
+            handler: "calc".to_string(),
             args: expr.trim().to_string(),
             explicit: true,
             confidence: Confidence::Explicit,
@@ -231,7 +143,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
     }
     if let Some(cmd) = trimmed.strip_prefix('>') {
         return PatternResult::Match(Route {
-            handler: "run",
+            handler: "run".to_string(),
             args: cmd.trim().to_string(),
             explicit: true,
             confidence: Confidence::Explicit,
@@ -241,7 +153,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
     // 3. File path
     if trimmed.starts_with('/') || trimmed.starts_with("~/") || trimmed.starts_with("./") {
         return PatternResult::Match(Route {
-            handler: "file",
+            handler: "file".to_string(),
             args: trimmed.to_string(),
             explicit: false,
             confidence: Confidence::Strong,
@@ -251,7 +163,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
     // 4. URL
     if looks_like_url(trimmed) {
         return PatternResult::Match(Route {
-            handler: "url",
+            handler: "url".to_string(),
             args: trimmed.to_string(),
             explicit: false,
             confidence: Confidence::Strong,
@@ -261,7 +173,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
     // 5. Math expression (digits + operators only, no letters)
     if is_math_expression(trimmed) {
         return PatternResult::Match(Route {
-            handler: "calc",
+            handler: "calc".to_string(),
             args: trimmed.to_string(),
             explicit: false,
             confidence: Confidence::Strong,
@@ -271,18 +183,31 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
     // 5b. Unit/currency conversion (e.g. "5 kg to lb", "100 usd to eur")
     if crate::action_registry::handlers::calc::is_conversion_expression(trimmed) {
         return PatternResult::Match(Route {
-            handler: "calc",
+            handler: "calc".to_string(),
             args: trimmed.to_string(),
             explicit: false,
             confidence: Confidence::Strong,
         });
     }
 
-    // 5c. Structured power phrases — unambiguous, handle before AI fallback
+    // 5c. Bare hex color (e.g. "#FF5733", "#F53") — route to color handler
+    if trimmed.starts_with('#') {
+        let hex = &trimmed[1..];
+        if matches!(hex.len(), 3 | 6 | 8) && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return PatternResult::Match(Route {
+                handler: "color".to_string(),
+                args: trimmed.to_string(),
+                explicit: false,
+                confidence: Confidence::Strong,
+            });
+        }
+    }
+
+    // 5d. Structured power phrases — unambiguous, handle before AI fallback
     let lower = trimmed.to_lowercase();
     if lower.starts_with("shutdown in ") || lower.starts_with("shut down in ") {
         return PatternResult::Match(Route {
-            handler: "system",
+            handler: "system".to_string(),
             args: lower,
             explicit: false,
             confidence: Confidence::Strong,
@@ -290,7 +215,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
     }
     if lower == "cancel shutdown" || lower == "shutdown cancel" {
         return PatternResult::Match(Route {
-            handler: "system",
+            handler: "system".to_string(),
             args: "cancel shutdown".to_string(),
             explicit: false,
             confidence: Confidence::Strong,
@@ -309,7 +234,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
             } else {
                 format!("{expanded} {extra}")
             };
-            return route_inner(&full, false);
+            return route_inner(&full, false, registry);
         }
     }
 
@@ -320,7 +245,7 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
         let candidate = home.join(trimmed);
         if candidate.exists() {
             return PatternResult::Match(Route {
-                handler: "file",
+                handler: "file".to_string(),
                 args: format!("~/{trimmed}"),
                 explicit: false,
                 confidence: Confidence::Weak,
@@ -335,112 +260,71 @@ fn route_inner(raw: &str, check_aliases: bool) -> PatternResult {
     }
 }
 
-fn try_explicit_prefix(input: &str) -> Option<Route> {
+fn try_explicit_prefix(input: &str, registry: &ActionRegistry) -> Option<Route> {
     let first_word = input.split_whitespace().next()?;
     let lower = first_word.to_lowercase();
+    let args = input[first_word.len()..].trim_start().to_string();
 
-    if KNOWN_PREFIXES.contains(&lower.as_str()) {
-        let args = input[first_word.len()..].trim_start().to_string();
+    // Conditional / two-step cases that a single handler `triggers()` declaration
+    // can't express — they must run BEFORE the registry's data-driven routing and
+    // return early. Everything else is resolved by `registry.route_prefix` below.
+    let conditional: Option<(&'static str, String)> = match lower.as_str() {
+        "open" => {
+            // "open https://github.com" → redirect to url handler; else open.
+            if looks_like_url(&args) {
+                Some(("url", args.clone()))
+            } else {
+                Some(("open", args.clone()))
+            }
+        }
+        // Unit conversion alias — routes to calc handler, unless clipboard transform.
+        "convert" => {
+            if args.starts_with("clipboard") {
+                Some(("clipboard_transform", format!("convert {args}")))
+            } else {
+                Some(("calc", args.clone()))
+            }
+        }
+        // Power commands with trailing args ("shutdown in N") fall through to the
+        // structured-phrase step; a bare word routes via the registry (system).
+        "shutdown" | "poweroff" => {
+            if args.is_empty() {
+                None // bare word — let registry.route_prefix handle it below
+            } else {
+                return None; // "shutdown in 10m" — handled by structured phrase step
+            }
+        }
+        // "remind me to X in 30m" — strip "me to "/"me " then prepend "add ".
+        // Two-step transform, kept structural.
+        "remind" => {
+            let reminder_args = args
+                .strip_prefix("me to ")
+                .or_else(|| args.strip_prefix("me "))
+                .unwrap_or(&args)
+                .to_string();
+            Some(("reminder", format!("add {reminder_args}")))
+        }
+        _ => None,
+    };
+    if let Some((handler, args)) = conditional {
+        return Some(Route {
+            handler: handler.to_string(),
+            args,
+            explicit: true,
+            confidence: Confidence::Explicit,
+        });
+    }
 
-        // Map the prefix string to a static str
-        let (handler, args) = match lower.as_str() {
-            "ask" => ("ask", args),
-            "bm" | "bookmark" => ("bm", args),
-            "browse" => ("browse", args),
-            "clip" | "clipboard" => ("clip", args),
-            "emoji" => ("emoji", args),
-            // App control verbs — pass verb + target as args to appctl handler
-            "focus" | "quit" | "close" | "kill" => ("appctl", format!("{} {}", lower, args)),
-            "open" => {
-                // "open https://github.com" → redirect to url handler
-                if looks_like_url(&args) {
-                    ("url", args)
-                } else {
-                    ("open", args)
-                }
-            }
-            "web" => ("web", args),
-            "yt" => ("yt", args),
-            "run" => ("run", args),
-            "calc" => ("calc", args),
-            "file" => ("file", args),
-            "url" => ("url", args),
-            "media" => ("media", args),
-            "pin" => {
-                // "pin workspace /path" → strip "workspace " prefix
-                let pin_args = args.strip_prefix("workspace ").unwrap_or(&args).to_string();
-                ("pin_workspace", pin_args)
-            }
-            "unpin" => ("pin_workspace", "clear".to_string()),
-            "project" => ("project", args),
-            "system" => ("system", args),
-            "note" | "notes" => ("note", args),
-            "todo" | "todos" => ("todo", args),
-            "snip" | "snippet" | "snippets" => ("snip", args),
-            "weather" => {
-                // Strip leading "in " — "weather in tokyo" → args "tokyo"
-                let weather_args = args.strip_prefix("in ").unwrap_or(&args).to_string();
-                ("weather", weather_args)
-            }
-            "sym" => ("sym", args),
-            "sysinfo" => ("sysinfo", args),
-            "unicode" => ("unicode", args),
-            "time" | "tz" | "clock" => {
-                let time_args = args.strip_prefix("in ").unwrap_or(&args).to_string();
-                ("time", time_args)
-            }
-            "alias" | "aliases" => ("alias", args),
-            "reminder" => ("reminder", args),
-            "remind" => {
-                // "remind me to X in 30m" → strip "me to " prefix
-                let reminder_args = args
-                    .strip_prefix("me to ")
-                    .or_else(|| args.strip_prefix("me "))
-                    .unwrap_or(&args)
-                    .to_string();
-                ("reminder", format!("add {reminder_args}"))
-            }
-            "timer" => ("timer", args),
-            "stopwatch" => {
-                // Route "stopwatch [args]" → timer handler with "stopwatch [args]"
-                if args.is_empty() {
-                    ("timer", "stopwatch".to_string())
-                } else {
-                    ("timer", format!("stopwatch {args}"))
-                }
-            }
-            // Bare shortcuts — pass the keyword itself as args
-            "ip" | "cpu" | "mem" | "disk" | "temp" | "gpu" | "battery" | "net" | "audio"
-            | "display" | "os" | "speedtest" => ("sysinfo", lower.clone()),
-            "ctx" => ("ctx", args),
-            // Power commands — single-word, unambiguous, no AI needed.
-            // "shutdown in N" has trailing args — let it fall through to structured phrase handler.
-            "shutdown" | "poweroff" => {
-                if args.is_empty() {
-                    ("system", "shutdown".to_string())
-                } else {
-                    return None; // "shutdown in 10m" — handled by structured phrase step
-                }
-            }
-            "reboot" | "restart" => ("system", "reboot".to_string()),
-            "lock" => ("system", "lock".to_string()),
-            "suspend" | "sleep" => ("system", "suspend".to_string()),
-            "hibernate" => ("system", "hibernate".to_string()),
-            "logout" | "signout" => ("system", "logout".to_string()),
-            // Common bare-word controls
-            "mute" => ("system", "mute".to_string()),
-            "unmute" => ("system", "unmute".to_string()),
-            _ => return None,
-        };
-        Some(Route {
+    // Data-driven routing: every remaining keyword prefix comes from a handler's
+    // declared `triggers()`, indexed by the registry.
+    registry
+        .route_prefix(&lower, &args)
+        .map(|(handler, args)| Route {
             handler,
             args,
             explicit: true,
             confidence: Confidence::Explicit,
         })
-    } else {
-        None
-    }
 }
 
 fn looks_like_url(input: &str) -> bool {
@@ -495,6 +379,229 @@ fn is_math_expression(input: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action_registry::registry::ActionRegistry;
+    use crate::action_registry::{ActionHandler, ActionResult, Trigger};
+    use crate::error::LychiError;
+    use async_trait::async_trait;
+
+    /// Minimal handler that only carries an id + trigger declaration — enough to
+    /// drive the router's prefix index in unit tests without pulling in every real
+    /// handler's constructor dependencies (db, AI provider, timer state, …).
+    struct TestHandler {
+        id: &'static str,
+        triggers: &'static [Trigger],
+    }
+
+    #[async_trait]
+    impl ActionHandler for TestHandler {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn description(&self) -> &str {
+            "test"
+        }
+        fn triggers(&self) -> &'static [Trigger] {
+            self.triggers
+        }
+        async fn execute(
+            &self,
+            _ctx: &crate::action_registry::ExecContext,
+            _args: &str,
+        ) -> Result<ActionResult, LychiError> {
+            Ok(ActionResult::default())
+        }
+    }
+
+    /// A registry populated with the real handlers' trigger declarations, so the
+    /// router's keyword routing is exercised end-to-end. Kept in sync with the
+    /// `triggers()` each handler declares.
+    fn test_registry() -> ActionRegistry {
+        use crate::action_registry::{ArgTransform, Trigger};
+        macro_rules! h {
+            ($id:expr, $triggers:expr) => {
+                Box::new(TestHandler {
+                    id: $id,
+                    // Test-only: leak the trigger table to get a 'static slice
+                    // without hand-declaring a named static per handler.
+                    triggers: Box::leak($triggers.to_vec().into_boxed_slice()),
+                })
+            };
+        }
+        let mut r = ActionRegistry::new();
+        r.register(h!("web", &[Trigger::keywords(&["web"])]));
+        r.register(h!("yt", &[Trigger::keywords(&["yt"])]));
+        r.register(h!("run", &[Trigger::keywords(&["run"])]));
+        r.register(h!("calc", &[Trigger::keywords(&["calc"])]));
+        r.register(h!("define", &[Trigger::keywords(&["define"])]));
+        r.register(h!("file", &[Trigger::keywords(&["file"])]));
+        r.register(h!("url", &[Trigger::keywords(&["url"])]));
+        r.register(h!("media", &[Trigger::keywords(&["media"])]));
+        r.register(h!("project", &[Trigger::keywords(&["project"])]));
+        r.register(h!("ask", &[Trigger::keywords(&["ask"])]));
+        r.register(h!("bm", &[Trigger::keywords(&["bm", "bookmark"])]));
+        r.register(h!("browse", &[Trigger::keywords(&["browse"])]));
+        r.register(h!("clip", &[Trigger::keywords(&["clip", "clipboard"])]));
+        r.register(h!("clear", &[Trigger::keywords(&["clear"])]));
+        r.register(h!("emoji", &[Trigger::keywords(&["emoji"])]));
+        r.register(h!("sym", &[Trigger::keywords(&["sym"])]));
+        r.register(h!("unicode", &[Trigger::keywords(&["unicode"])]));
+        r.register(h!("ctx", &[Trigger::keywords(&["ctx"])]));
+        r.register(h!("ssh", &[Trigger::keywords(&["ssh"])]));
+        r.register(h!("color", &[Trigger::keywords(&["color", "colour"])]));
+        r.register(h!(
+            "win",
+            &[Trigger::keywords(&["win", "window", "windows"])]
+        ));
+        r.register(h!("resize", &[Trigger::keywords(&["resize"])]));
+        r.register(h!("translate", &[Trigger::keywords(&["translate"])]));
+        r.register(h!("qr", &[Trigger::keywords(&["qr"])]));
+        r.register(h!("reminder", &[Trigger::keywords(&["reminder"])]));
+        r.register(h!("alias", &[Trigger::keywords(&["alias", "aliases"])]));
+        r.register(h!("note", &[Trigger::keywords(&["note", "notes"])]));
+        r.register(h!("todo", &[Trigger::keywords(&["todo", "todos"])]));
+        r.register(h!(
+            "snip",
+            &[Trigger::keywords(&["snip", "snippet", "snippets"])]
+        ));
+        r.register(h!(
+            "screenshot",
+            &[Trigger::keywords(&[
+                "screenshot",
+                "screencap",
+                "screengrab"
+            ])]
+        ));
+        r.register(h!("services", &[Trigger::keywords(&["services"])]));
+        r.register(h!(
+            "service",
+            &[Trigger::keywords(&["service", "systemctl"])]
+        ));
+        r.register(h!(
+            "time",
+            &[Trigger::new(
+                &["time", "tz", "clock"],
+                ArgTransform::StripLeading("in ")
+            )]
+        ));
+        r.register(h!(
+            "weather",
+            &[Trigger::new(
+                &["weather"],
+                ArgTransform::StripLeading("in ")
+            )]
+        ));
+        r.register(h!(
+            "appctl",
+            &[
+                Trigger::keywords(&["appctl"]),
+                Trigger::new(
+                    &["focus", "quit", "close", "kill"],
+                    ArgTransform::PrependKeyword
+                ),
+            ]
+        ));
+        r.register(h!(
+            "pin_workspace",
+            &[
+                Trigger::new(&["pin"], ArgTransform::StripLeading("workspace ")),
+                Trigger::new(&["unpin"], ArgTransform::Fixed("clear")),
+            ]
+        ));
+        r.register(h!(
+            "timer",
+            &[
+                Trigger::keywords(&["timer"]),
+                Trigger::new(&["stopwatch"], ArgTransform::Prepend("stopwatch")),
+            ]
+        ));
+        r.register(h!(
+            "generate",
+            &[
+                Trigger::keywords(&["generate", "gen"]),
+                Trigger::new(&["password"], ArgTransform::Prepend("password")),
+                Trigger::new(&["uuid"], ArgTransform::Fixed("uuid")),
+                Trigger::new(&["token"], ArgTransform::Prepend("token")),
+                Trigger::new(&["random", "rand"], ArgTransform::Prepend("random")),
+            ]
+        ));
+        r.register(h!(
+            "devutil",
+            &[Trigger::new(
+                &[
+                    "base64",
+                    "hash",
+                    "urlencode",
+                    "urldecode",
+                    "epoch",
+                    "json",
+                    "upper",
+                    "lower",
+                    "title",
+                    "slug",
+                    "reverse",
+                    "count",
+                ],
+                ArgTransform::PrependKeyword
+            )]
+        ));
+        r.register(h!(
+            "sysinfo",
+            &[
+                Trigger::keywords(&["sysinfo"]),
+                Trigger::new(
+                    &[
+                        "ip",
+                        "cpu",
+                        "mem",
+                        "disk",
+                        "temp",
+                        "gpu",
+                        "battery",
+                        "net",
+                        "audio",
+                        "display",
+                        "os",
+                        "speedtest",
+                    ],
+                    ArgTransform::KeywordOnly
+                ),
+            ]
+        ));
+        r.register(h!(
+            "system",
+            &[
+                Trigger::keywords(&["system"]),
+                Trigger::new(&["shutdown", "poweroff"], ArgTransform::Fixed("shutdown")),
+                Trigger::new(&["reboot", "restart"], ArgTransform::Fixed("reboot")),
+                Trigger::new(&["lock"], ArgTransform::Fixed("lock")),
+                Trigger::new(&["suspend", "sleep"], ArgTransform::Fixed("suspend")),
+                Trigger::new(&["hibernate"], ArgTransform::Fixed("hibernate")),
+                Trigger::new(&["logout", "signout"], ArgTransform::Fixed("logout")),
+                Trigger::new(&["mute"], ArgTransform::Fixed("mute")),
+                Trigger::new(&["unmute"], ArgTransform::Fixed("unmute")),
+            ]
+        ));
+        r.register(h!(
+            "clipboard_transform",
+            &[
+                Trigger::new(&["summarize"], ArgTransform::Prepend("summarize")),
+                Trigger::new(&["rewrite"], ArgTransform::Prepend("rewrite")),
+            ]
+        ));
+        r.register(h!(
+            "packages",
+            &[
+                Trigger::new(&["install"], ArgTransform::Prepend("install")),
+                Trigger::keywords(&["pkg", "package"]),
+            ]
+        ));
+        r
+    }
+
+    /// Test-only wrapper so existing tests can call `route(input)` unchanged.
+    fn route(raw: &str) -> PatternResult {
+        super::route(raw, &test_registry())
+    }
 
     #[test]
     fn explicit_prefixes() {
@@ -670,6 +777,26 @@ mod tests {
                 "expected NoMatch for: {input}"
             );
         }
+    }
+
+    #[test]
+    fn kill_and_appctl_route_to_appctl_not_open() {
+        // "kill spotify" → appctl with the verb+target.
+        let r = route("kill spotify").unwrap();
+        assert_eq!(r.handler, "appctl");
+        assert_eq!(r.args, "kill spotify");
+
+        // The picker's internal run command must route back to appctl verbatim —
+        // NOT fall through to a NoMatch that the app index would turn into "open
+        // spotify" (the bug: `kill spotify` focused Spotify instead of killing it).
+        let r = route("appctl kill spotify").unwrap();
+        assert_eq!(r.handler, "appctl");
+        assert_eq!(r.args, "kill spotify");
+        assert!(r.explicit);
+
+        let r = route("appctl kill 12345").unwrap();
+        assert_eq!(r.handler, "appctl");
+        assert_eq!(r.args, "kill 12345");
     }
 
     #[test]
@@ -855,5 +982,73 @@ mod tests {
     fn empty_input_is_no_match() {
         assert!(matches!(route(""), PatternResult::NoMatch { .. }));
         assert!(matches!(route("   "), PatternResult::NoMatch { .. }));
+    }
+
+    #[test]
+    fn text_verbs_route_to_devutil() {
+        for (input, expected_args) in [
+            ("upper hello", "upper hello"),
+            ("slug My Post", "slug My Post"),
+            ("json {\"a\":1}", "json {\"a\":1}"),
+            ("reverse abc", "reverse abc"),
+            ("count one two", "count one two"),
+        ] {
+            let r = route(input).unwrap();
+            assert_eq!(r.handler, "devutil", "input: {input}");
+            assert_eq!(r.args, expected_args, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn random_routes_to_generate() {
+        let r = route("random 1 100").unwrap();
+        assert_eq!(r.handler, "generate");
+        assert_eq!(r.args, "random 1 100");
+        // bare `random` still routes (defaults applied in the handler)
+        let r = route("random").unwrap();
+        assert_eq!(r.handler, "generate");
+        assert_eq!(r.args, "random");
+    }
+
+    #[test]
+    fn screenshot_routes_with_mode() {
+        let r = route("screenshot").unwrap();
+        assert_eq!(r.handler, "screenshot");
+        assert_eq!(r.args, "");
+        let r = route("screenshot area").unwrap();
+        assert_eq!(r.handler, "screenshot");
+        assert_eq!(r.args, "area");
+        // aliases route too
+        assert_eq!(route("screencap window").unwrap().handler, "screenshot");
+        assert_eq!(route("screengrab").unwrap().handler, "screenshot");
+    }
+
+    #[test]
+    fn services_and_service_route_correctly() {
+        // Plural word lists; singular controls.
+        assert_eq!(route("services").unwrap().handler, "services");
+        let r = route("service nginx restart").unwrap();
+        assert_eq!(r.handler, "service");
+        assert_eq!(r.args, "nginx restart");
+        // systemctl is an alias for the control handler.
+        assert_eq!(route("systemctl docker status").unwrap().handler, "service");
+    }
+
+    #[test]
+    fn package_commands_route() {
+        // `install <pkg>` → packages with the verb prepended.
+        let r = route("install neovim").unwrap();
+        assert_eq!(r.handler, "packages");
+        assert_eq!(r.args, "install neovim");
+        // `pkg` namespace passes the verb through in args.
+        let r = route("pkg search ripgrep").unwrap();
+        assert_eq!(r.handler, "packages");
+        assert_eq!(r.args, "search ripgrep");
+        assert_eq!(route("package install fd").unwrap().handler, "packages");
+        // Bare `search` is NOT a package command (avoids shadowing web search).
+        assert!(!matches!(
+            route("search cat videos"),
+            PatternResult::Match(ref r) if r.handler == "packages"
+        ));
     }
 }

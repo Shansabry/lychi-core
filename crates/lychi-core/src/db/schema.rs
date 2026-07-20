@@ -47,6 +47,18 @@ pub struct TodoEntry {
 pub struct ClipboardEntry {
     pub text: String,
     pub created_at: u64,
+    #[serde(default)]
+    pub image: Option<ClipboardImageMeta>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ClipboardImageMeta {
+    /// Absolute path to PNG file on disk.
+    pub path: String,
+    pub width: u32,
+    pub height: u32,
+    /// Base64-encoded PNG thumbnail (max 48x48) for inline display.
+    pub thumb_b64: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

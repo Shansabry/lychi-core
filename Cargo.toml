@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "UNLICENSED"
+license = "GPL-3.0-only"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -13,12 +13,18 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 thiserror = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Non-blocking file logging (dedicated worker thread) + daily rotation. First-
+# party companion to `tracing`, same maintainers — the standard production setup.
+tracing-appender = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 directories = "6"
 toml = "1"
-redb = "3"
-uuid = { version = "1", features = ["v7"] }
+redb = "4"
+uuid = { version = "1", features = ["v7", "v4"] }
 postcard = { version = "1", features = ["alloc"] }
 chrono-tz = "0.10"
+# Type-introspection for generated TypeScript IPC bindings (tauri-specta).
+# Pinned to the exact RC the tauri-specta RC requires — they move in lockstep.
+specta = { version = "=2.0.0-rc.22", features = ["derive"] }

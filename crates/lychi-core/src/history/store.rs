@@ -198,6 +198,13 @@ impl HistoryStore {
                     score: blended,
                     description: None,
                     reason: None,
+                    thumb_b64: None,
+                    // A history entry's label IS the exact command already run —
+                    // dispatch it verbatim so the frontend never re-prefixes it
+                    // (input "run htop" + label "run htop" must not become
+                    // "run run htop").
+                    run: Some(cmd.to_string()),
+                    ..Default::default()
                 }
             })
             .collect();
@@ -260,6 +267,19 @@ mod tests {
         store.push(&db, "open firefox").unwrap();
         let entries = store.entries(&db).unwrap();
         assert_eq!(entries, vec!["web rust", "open firefox"]);
+    }
+
+    #[test]
+    fn fuzzy_search_sets_run_to_full_command() {
+        let db = open_test_database();
+        let store = HistoryStore::new(500, true);
+        store.push(&db, "run htop").unwrap();
+        let items = store.fuzzy_search(&db, "run htop");
+        assert!(!items.is_empty());
+        // The label is the past command, and `run` carries it verbatim so the
+        // frontend dispatches it as-is (never re-prefixed into "run run htop").
+        assert_eq!(items[0].label, "run htop");
+        assert_eq!(items[0].run.as_deref(), Some("run htop"));
     }
 
     #[test]

@@ -4,7 +4,9 @@ use std::time::Instant;
 use async_trait::async_trait;
 use redb::Database;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+};
 use crate::error::LychiError;
 use crate::snippets::store::SnippetsStore;
 
@@ -41,6 +43,12 @@ impl SnippetsHandler {
 
 #[async_trait]
 impl ActionHandler for SnippetsHandler {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["snip", "snippet", "snippets"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "snip"
     }
@@ -49,27 +57,17 @@ impl ActionHandler for SnippetsHandler {
         "Snippets — save and paste text blocks. Usage: snip <name> to paste, snip add <name> <body>, snip list, snip delete <name>, snip edit <name> <body>"
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let start = Instant::now();
         let text = args.trim();
         let store = SnippetsStore::new();
 
         // No args → open snippets panel
         if text.is_empty() {
-            return Ok(ActionResult {
-                success: true,
-                output: Some("__snippets_panel__".to_string()),
-                error: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            });
+            return Ok(
+                ActionResult::ok("__snippets_panel__".to_string(), OutputType::Status)
+                    .with_duration(start.elapsed().as_millis() as u64),
+            );
         }
 
         let (cmd, rest) = text.split_once(' ').unwrap_or((text, ""));
@@ -83,136 +81,61 @@ impl ActionHandler for SnippetsHandler {
                 let body = body.trim();
 
                 if name.is_empty() || body.is_empty() {
-                    return Ok(ActionResult {
-                        success: false,
-                        output: None,
-                        error: Some("Usage: snip add <name> <body>".to_string()),
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        routed_by: None,
-                        open_url: None,
-                        needs_confirmation: None,
-                        risk_level: None,
-                        output_type: None,
-                        executed_args: None,
-                        launch_desktop: None,
-                        focus_app: None,
-                    });
+                    return Ok(
+                        ActionResult::err("Usage: snip add <name> <body>".to_string())
+                            .with_duration(start.elapsed().as_millis() as u64),
+                    );
                 }
 
                 let item = store.add_snippet(&self.db, name, body)?;
-                Ok(ActionResult {
-                    success: true,
-                    output: Some(format!(
-                        "Snippet saved: {} ({} chars)",
-                        item.name,
-                        item.body.len()
-                    )),
-                    error: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: None,
-                    executed_args: None,
-                    launch_desktop: None,
-                    focus_app: None,
-                })
+                Ok(ActionResult::ok(
+                    format!("Snippet saved: {} ({} chars)", item.name, item.body.len()),
+                    OutputType::Status,
+                )
+                .with_duration(start.elapsed().as_millis() as u64))
             }
             "list" | "ls" => {
                 let snippets = store.get_snippets(&self.db)?;
                 if snippets.is_empty() {
-                    return Ok(ActionResult {
-                        success: true,
-                        output: Some("No snippets saved".to_string()),
-                        error: None,
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        routed_by: None,
-                        open_url: None,
-                        needs_confirmation: None,
-                        risk_level: None,
-                        output_type: Some(OutputType::Text),
-                        executed_args: None,
-                        launch_desktop: None,
-                        focus_app: None,
-                    });
+                    return Ok(
+                        ActionResult::ok("No snippets saved".to_string(), OutputType::Text)
+                            .with_duration(start.elapsed().as_millis() as u64),
+                    );
                 }
                 let lines: Vec<String> = snippets
                     .iter()
                     .map(|s| format!("  {} — {}", s.name, Self::truncate_body(&s.body, 50)))
                     .collect();
-                Ok(ActionResult {
-                    success: true,
-                    output: Some(format!(
-                        "Snippets ({}):\n{}",
-                        snippets.len(),
-                        lines.join("\n")
-                    )),
-                    error: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: Some(OutputType::Text),
-                    executed_args: None,
-                    launch_desktop: None,
-                    focus_app: None,
-                })
+                Ok(ActionResult::ok(
+                    format!("Snippets ({}):\n{}", snippets.len(), lines.join("\n")),
+                    OutputType::Text,
+                )
+                .with_duration(start.elapsed().as_millis() as u64))
             }
             "delete" | "del" | "rm" | "remove" => {
                 if rest.is_empty() {
-                    return Ok(ActionResult {
-                        success: false,
-                        output: None,
-                        error: Some("Usage: snip delete <name or id>".to_string()),
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        routed_by: None,
-                        open_url: None,
-                        needs_confirmation: None,
-                        risk_level: None,
-                        output_type: None,
-                        executed_args: None,
-                        launch_desktop: None,
-                        focus_app: None,
-                    });
+                    return Ok(
+                        ActionResult::err("Usage: snip delete <name or id>".to_string())
+                            .with_duration(start.elapsed().as_millis() as u64),
+                    );
                 }
 
                 // Try by name first, then by ID
                 if let Some(item) = store.get_snippet_by_name(&self.db, rest)? {
                     store.delete_snippet(&self.db, &item.id)?;
-                    return Ok(ActionResult {
-                        success: true,
-                        output: Some(format!("Snippet deleted: {}", item.name)),
-                        error: None,
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        routed_by: None,
-                        open_url: None,
-                        needs_confirmation: None,
-                        risk_level: None,
-                        output_type: None,
-                        executed_args: None,
-                        launch_desktop: None,
-                        focus_app: None,
-                    });
+                    return Ok(ActionResult::ok(
+                        format!("Snippet deleted: {}", item.name),
+                        OutputType::Status,
+                    )
+                    .with_duration(start.elapsed().as_millis() as u64));
                 }
 
                 // Try as ID directly
                 store.delete_snippet(&self.db, rest)?;
-                Ok(ActionResult {
-                    success: true,
-                    output: Some(format!("Snippet deleted: {rest}")),
-                    error: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: None,
-                    executed_args: None,
-                    launch_desktop: None,
-                    focus_app: None,
-                })
+                Ok(
+                    ActionResult::ok(format!("Snippet deleted: {rest}"), OutputType::Status)
+                        .with_duration(start.elapsed().as_millis() as u64),
+                )
             }
             "edit" | "update" => {
                 // snip edit <name> <new-body>
@@ -221,20 +144,10 @@ impl ActionHandler for SnippetsHandler {
                 let body = body.trim();
 
                 if name.is_empty() || body.is_empty() {
-                    return Ok(ActionResult {
-                        success: false,
-                        output: None,
-                        error: Some("Usage: snip edit <name> <new body>".to_string()),
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        routed_by: None,
-                        open_url: None,
-                        needs_confirmation: None,
-                        risk_level: None,
-                        output_type: None,
-                        executed_args: None,
-                        launch_desktop: None,
-                        focus_app: None,
-                    });
+                    return Ok(
+                        ActionResult::err("Usage: snip edit <name> <new body>".to_string())
+                            .with_duration(start.elapsed().as_millis() as u64),
+                    );
                 }
 
                 let item = store
@@ -242,78 +155,28 @@ impl ActionHandler for SnippetsHandler {
                     .ok_or_else(|| LychiError::Snippet(format!("Snippet not found: {name}")))?;
 
                 store.update_snippet(&self.db, &item.id, &item.name, body)?;
-                Ok(ActionResult {
-                    success: true,
-                    output: Some(format!(
-                        "Snippet updated: {} ({} chars)",
-                        item.name,
-                        body.len()
-                    )),
-                    error: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: None,
-                    executed_args: None,
-                    launch_desktop: None,
-                    focus_app: None,
-                })
+                Ok(ActionResult::ok(
+                    format!("Snippet updated: {} ({} chars)", item.name, body.len()),
+                    OutputType::Status,
+                )
+                .with_duration(start.elapsed().as_millis() as u64))
             }
             // Default: search by name and copy to clipboard
             _ => {
                 // Treat the entire args as a snippet name query
                 if let Some(item) = store.get_snippet_by_name(&self.db, text)? {
                     match write_to_clipboard(&item.body) {
-                        Ok(()) => Ok(ActionResult {
-                            success: true,
-                            output: Some(format!(
-                                "Copied: {} ({} chars)",
-                                item.name,
-                                item.body.len()
-                            )),
-                            error: None,
-                            duration_ms: start.elapsed().as_millis() as u64,
-                            routed_by: None,
-                            open_url: None,
-                            needs_confirmation: None,
-                            risk_level: None,
-                            output_type: None,
-                            executed_args: None,
-                            launch_desktop: None,
-                            focus_app: None,
-                        }),
-                        Err(e) => Ok(ActionResult {
-                            success: false,
-                            output: None,
-                            error: Some(format!("Clipboard error: {e}")),
-                            duration_ms: start.elapsed().as_millis() as u64,
-                            routed_by: None,
-                            open_url: None,
-                            needs_confirmation: None,
-                            risk_level: None,
-                            output_type: None,
-                            executed_args: None,
-                            launch_desktop: None,
-                            focus_app: None,
-                        }),
+                        Ok(()) => Ok(ActionResult::ok(
+                            format!("Copied: {} ({} chars)", item.name, item.body.len()),
+                            OutputType::Status,
+                        )
+                        .with_duration(start.elapsed().as_millis() as u64)),
+                        Err(e) => Ok(ActionResult::err(format!("Clipboard error: {e}"))
+                            .with_duration(start.elapsed().as_millis() as u64)),
                     }
                 } else {
-                    Ok(ActionResult {
-                        success: false,
-                        output: None,
-                        error: Some(format!("Snippet not found: {text}")),
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        routed_by: None,
-                        open_url: None,
-                        needs_confirmation: None,
-                        risk_level: None,
-                        output_type: None,
-                        executed_args: None,
-                        launch_desktop: None,
-                        focus_app: None,
-                    })
+                    Ok(ActionResult::err(format!("Snippet not found: {text}"))
+                        .with_duration(start.elapsed().as_millis() as u64))
                 }
             }
         }
@@ -332,6 +195,9 @@ impl ActionHandler for SnippetsHandler {
                 score: if cmd.starts_with(&lower) { 100 } else { 50 },
                 description: Some(desc.to_string()),
                 reason: None,
+                thumb_b64: None,
+                run: Some(format!("snip {cmd}")),
+                ..Default::default()
             })
             .collect();
 
@@ -352,6 +218,9 @@ impl ActionHandler for SnippetsHandler {
                             },
                             description: Some(Self::truncate_body(&s.body, 40).to_string()),
                             reason: None,
+                            thumb_b64: None,
+                            run: Some(format!("snip {}", s.name)),
+                            ..Default::default()
                         });
                     }
                 }

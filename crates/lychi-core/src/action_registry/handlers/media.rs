@@ -4,7 +4,9 @@ use std::time::Instant;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+};
 use crate::error::LychiError;
 use crate::mpris::{MprisManager, PlaybackStatus, TrackInfo};
 
@@ -26,20 +28,15 @@ fn media_result(
     output: Option<String>,
     error: Option<String>,
 ) -> ActionResult {
-    ActionResult {
-        success,
-        output,
-        error,
-        duration_ms: start.elapsed().as_millis() as u64,
-        routed_by: None,
-        open_url: None,
-        needs_confirmation: None,
-        risk_level: None,
-        output_type: None,
-        executed_args: None,
-        launch_desktop: None,
-        focus_app: None,
-    }
+    let duration = start.elapsed().as_millis() as u64;
+    let mut result = match (success, output, error) {
+        (true, Some(body), _) => ActionResult::ok(body, OutputType::Status),
+        (true, None, _) => ActionResult::empty_ok(),
+        (false, _, Some(e)) => ActionResult::err(e),
+        (false, _, None) => ActionResult::err("media command failed"),
+    };
+    result.duration_ms = duration;
+    result
 }
 
 /// Check if a bus name matches the given target strategy.
@@ -185,6 +182,9 @@ fn media_completions(partial: &str) -> Vec<CompletionItem> {
             score: if s.starts_with(&lower) { 100 } else { 50 },
             description: None,
             reason: None,
+            thumb_b64: None,
+            run: Some(format!("media {s}")),
+            ..Default::default()
         })
         .collect()
 }
@@ -247,6 +247,9 @@ fn state_aware_actions(players: &[TrackInfo], partial: &str) -> Vec<CompletionIt
                 score: 70,
                 description: Some(format!("{}: {}", p.player_name, p.title)),
                 reason: None,
+                thumb_b64: None,
+                run: Some(format!("media {a}")),
+                ..Default::default()
             })
         })
         .collect()
@@ -294,6 +297,9 @@ impl MediaHandler {
                 score: 100,
                 description: Some("Player not running".to_string()),
                 reason: None,
+                thumb_b64: None,
+                run: Some("media play".to_string()),
+                ..Default::default()
             }],
             Some(p) => {
                 let lower = partial.to_lowercase();
@@ -309,6 +315,13 @@ impl MediaHandler {
                     PlaybackStatus::Stopped => &["play"],
                 };
 
+                // These actions were computed for a *specific* provider (the
+                // partial began with "spotify"/"yt"). Carry that provider into
+                // `run` so the right player is controlled — a bare "media pause"
+                // would target Target::Any instead. Derive the provider key from
+                // the matched player's bus name.
+                let provider = player_to_provider_key(&p.bus_name);
+
                 actions
                     .iter()
                     .filter(|a| lower.is_empty() || a.contains(&lower))
@@ -318,6 +331,9 @@ impl MediaHandler {
                         score: 100,
                         description: Some(desc.clone()),
                         reason: None,
+                        thumb_b64: None,
+                        run: Some(format!("media {provider} {a}")),
+                        ..Default::default()
                     })
                     .collect()
             }
@@ -327,6 +343,12 @@ impl MediaHandler {
 
 #[async_trait]
 impl ActionHandler for MediaHandler {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["media"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "media"
     }
@@ -335,7 +357,7 @@ impl ActionHandler for MediaHandler {
         "Media controls — play, pause, next, prev. Prefix with provider (spotify, yt) to target a specific player."
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let (target, action) = parse_provider_and_args(args);
         execute_media(&self.mpris, target, action).await
     }
@@ -383,7 +405,7 @@ impl ActionHandler for MediaHandler {
             }
 
             items.push(CompletionItem {
-                label: provider_key,
+                label: provider_key.clone(),
                 icon_path: None,
                 score: if player.status == PlaybackStatus::Playing {
                     100
@@ -392,6 +414,9 @@ impl ActionHandler for MediaHandler {
                 },
                 description: Some(description),
                 reason: None,
+                thumb_b64: None,
+                run: Some(format!("media {provider_key}")),
+                ..Default::default()
             });
         }
 
@@ -403,6 +428,9 @@ impl ActionHandler for MediaHandler {
                 score: 60,
                 description: Some(format!("{} players active", players.len())),
                 reason: None,
+                thumb_b64: None,
+                run: Some("media pause all".to_string()),
+                ..Default::default()
             });
         }
 

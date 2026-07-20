@@ -8,7 +8,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 /// Detected content type of clipboard text.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(tag = "type", content = "value")]
 pub enum ClipboardContentType {
     /// A URL (http/https).
@@ -23,8 +23,9 @@ pub enum ClipboardContentType {
     GitHash(String),
     /// Valid JSON.
     Json,
-    /// A stack trace or error message.
-    ErrorTrace,
+    /// A stack trace or error message. Carries the key error line
+    /// (truncated) so suggestions can offer a meaningful search query.
+    ErrorTrace(String),
     /// Plain text with no special classification.
     Plain,
 }
@@ -90,8 +91,8 @@ fn classify(text: &str) -> ClipboardContentType {
     }
 
     // 7. Error / stack trace
-    if looks_like_error(text) {
-        return ClipboardContentType::ErrorTrace;
+    if let Some(key_line) = extract_error_line(text) {
+        return ClipboardContentType::ErrorTrace(key_line);
     }
 
     ClipboardContentType::Plain
@@ -102,7 +103,7 @@ fn classify(text: &str) -> ClipboardContentType {
 /// Tries arboard first. On Wayland, if arboard fails (which can happen when
 /// called from a non-main thread without a display context), falls back to
 /// `wl-paste --no-newline`.
-fn read_clipboard() -> Option<String> {
+pub fn read_clipboard() -> Option<String> {
     // Try arboard first (works on X11, sometimes on Wayland)
     match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
         Ok(text) if !text.trim().is_empty() => {
@@ -219,28 +220,64 @@ fn looks_like_json(s: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
 }
 
-fn looks_like_error(s: &str) -> bool {
-    // Common error/trace patterns across languages
-    let patterns = [
-        "Traceback (most recent",
-        "at line",
-        "panic!",
-        "thread '",
+/// Detect an error/stack trace and extract its key message line.
+///
+/// Deliberately strict: matching is case-sensitive and message tokens must
+/// anchor a line start. The old substring/lowercase matching classified any
+/// prose that merely *mentioned* "error:" (chat logs, docs) as a stack
+/// trace, producing junk "search this error" suggestions.
+fn extract_error_line(s: &str) -> Option<String> {
+    // A line starting with one of these IS the error message.
+    const LINE_START_TOKENS: [&str; 10] = [
         "Error:",
-        "error[E",
-        "Exception in thread",
-        "FATAL:",
-        "stack trace:",
-        "Caused by:",
-        "SyntaxError:",
         "TypeError:",
+        "SyntaxError:",
         "ReferenceError:",
         "RuntimeError:",
         "ValueError:",
-        "    at ",
+        "FATAL:",
+        "panic!",
+        "thread '",
+        "error[E",
     ];
-    let lower = s.to_lowercase();
-    patterns.iter().any(|p| lower.contains(&p.to_lowercase()))
+    // Multi-line trace shapes; the message line is found separately.
+    const TRACE_SIGNALS: [&str; 5] = [
+        "Traceback (most recent",
+        "Exception in thread",
+        "panicked at",
+        "Caused by:",
+        "stack trace:",
+    ];
+
+    if let Some(line) = s
+        .lines()
+        .map(str::trim)
+        .find(|l| LINE_START_TOKENS.iter().any(|t| l.starts_with(t)))
+    {
+        return Some(truncate_line(line));
+    }
+
+    if TRACE_SIGNALS.iter().any(|t| s.contains(t)) {
+        let msg = s
+            .lines()
+            .map(str::trim)
+            .find(|l| l.contains("Error:") || l.contains("Exception") || l.contains("panicked at"))
+            .or_else(|| s.lines().map(str::trim).find(|l| !l.is_empty()))?;
+        return Some(truncate_line(msg));
+    }
+
+    None
+}
+
+/// Cap the extracted line for use as a completion label / search query.
+fn truncate_line(line: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    if line.chars().count() <= MAX_CHARS {
+        line.to_string()
+    } else {
+        let cut: String = line.chars().take(MAX_CHARS).collect();
+        format!("{}…", cut.trim_end())
+    }
 }
 
 #[cfg(test)]
@@ -338,15 +375,53 @@ mod tests {
     fn test_error_detection() {
         assert!(matches!(
             classify("Traceback (most recent call last):\n  File \"main.py\", line 5"),
-            ClipboardContentType::ErrorTrace
+            ClipboardContentType::ErrorTrace(_)
         ));
         assert!(matches!(
             classify("thread 'main' panicked at 'index out of bounds'"),
-            ClipboardContentType::ErrorTrace
+            ClipboardContentType::ErrorTrace(_)
         ));
         assert!(matches!(
             classify("TypeError: Cannot read properties of undefined"),
-            ClipboardContentType::ErrorTrace
+            ClipboardContentType::ErrorTrace(_)
+        ));
+    }
+
+    #[test]
+    fn test_error_key_line_extraction() {
+        // The payload is the message line, even when preceded by trace noise
+        let trace =
+            "Traceback (most recent call last):\n  File \"main.py\", line 5\nValueError: bad input";
+        match classify(trace) {
+            ClipboardContentType::ErrorTrace(msg) => assert_eq!(msg, "ValueError: bad input"),
+            other => panic!("expected ErrorTrace, got {other:?}"),
+        }
+        // Long message lines are truncated with an ellipsis
+        let long = format!("TypeError: {}", "x".repeat(200));
+        match classify(&long) {
+            ClipboardContentType::ErrorTrace(msg) => {
+                assert!(msg.chars().count() <= 81);
+                assert!(msg.ends_with('…'));
+            }
+            other => panic!("expected ErrorTrace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_prose_mentioning_errors_is_plain() {
+        // Regression: the old lowercase/substring matcher classified any prose
+        // that mentioned "error:" or "at line" as a stack trace.
+        assert!(matches!(
+            classify("we saw an error: the thing failed at line 3 of the doc"),
+            ClipboardContentType::Plain
+        ));
+        assert!(matches!(
+            classify("Error 71 (Protocol error) dispatching to Wayland display."),
+            ClipboardContentType::Plain
+        ));
+        assert!(matches!(
+            classify("The error: handling section explains retries."),
+            ClipboardContentType::Plain
         ));
     }
 

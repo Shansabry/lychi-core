@@ -5,12 +5,14 @@ use lychi_core::paths;
 use tauri::State;
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_ai_config(state: State<'_, AppState>) -> Result<AiConfig, LychiError> {
     let config = state.config.read().await;
     Ok(config.ai.clone())
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn save_ai_config(
     state: State<'_, AppState>,
     ai_config: AiConfig,
@@ -21,6 +23,7 @@ pub async fn save_ai_config(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn set_api_key(provider: String, key: String) -> Result<(), LychiError> {
     // keyring calls are blocking D-Bus round-trips on Linux — run on a blocking thread
     // with a 5s timeout to guard against a hung secret-service daemon.
@@ -49,6 +52,7 @@ fn set_api_key_sync(provider: &str, key: &str) -> Result<(), LychiError> {
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_ai_status(state: State<'_, AppState>) -> Result<AiStatus, LychiError> {
     let config = state.config.read().await;
     let executor = state.executor.read().await;
@@ -61,6 +65,7 @@ pub async fn get_ai_status(state: State<'_, AppState>) -> Result<AiStatus, Lychi
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn check_ai_health(state: State<'_, AppState>) -> Result<bool, LychiError> {
     let config = state.config.read().await;
     tracing::debug!(
@@ -92,10 +97,30 @@ pub async fn check_ai_health(state: State<'_, AppState>) -> Result<bool, LychiEr
         }
     }
 
+    if config.ai.mode == "ollama" {
+        let client = lychi_core::providers::ollama::OllamaClient::new(
+            config.ai.ollama_url.clone(),
+            config.ai.ollama_model.clone(),
+            config.ai.max_tokens,
+        );
+        use lychi_core::providers::AiProvider;
+        return Ok(client.health_check().await);
+    }
+
     Ok(false)
 }
 
 #[tauri::command]
+#[specta::specta]
+pub async fn list_ollama_models(
+    state: State<'_, AppState>,
+) -> Result<Vec<lychi_core::providers::ollama::OllamaModelInfo>, LychiError> {
+    let config = state.config.read().await;
+    lychi_core::providers::ollama::OllamaClient::list_models(&config.ai.ollama_url).await
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn get_masked_api_key(provider: String) -> Result<Option<String>, LychiError> {
     // keyring calls are blocking D-Bus round-trips on Linux — run on a blocking thread
     // with a 5s timeout to guard against a hung secret-service daemon.
@@ -135,7 +160,7 @@ fn get_stored_key(provider: &str) -> Result<String, LychiError> {
         .map_err(|e| LychiError::Config(format!("No API key found for {provider}: {e}")))
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, specta::Type)]
 pub struct AiStatus {
     pub mode: String,
     pub provider: String,

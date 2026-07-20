@@ -21,6 +21,12 @@ pub struct DesktopEntry {
     pub acronym: String,
     /// Icon name or path
     pub icon: Option<String>,
+    /// Categories= lowercased (e.g. ["network", "webbrowser"]). Used as a
+    /// name-agnostic app-nature signal to break ranking ties (a GUI app vs a
+    /// Settings/System config tool) without referencing any app name.
+    pub categories: Vec<String>,
+    /// Terminal=true — a CLI tool launched in a terminal, not a GUI app.
+    pub is_terminal_app: bool,
     /// Absolute path to the .desktop file — used as stable canonical ID
     pub desktop_path: String,
     /// Resolved icon filesystem path — populated at warmup

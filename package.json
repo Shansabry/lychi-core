@@ -2,10 +2,11 @@
   "name": "lychi",
   "private": true,
   "version": "0.1.0",
+  "license": "GPL-3.0-only",
   "type": "module",
   "scripts": {
     "dev": "RUST_LOG=debug tauri dev",
-    "build": "NO_STRIP=1 tauri build --bundles appimage",
+    "build": "pnpm build:cli && NO_STRIP=1 tauri build --bundles appimage",
     "build:debug": "RUST_LOG=debug tauri build --debug --no-bundle",
     "vite:dev": "vite dev",
     "vite:build": "vite build",
@@ -19,24 +20,26 @@
     "test": "cargo test --workspace",
     "test:core": "cargo test -p lychi-core",
     "clean": "rm -rf .svelte-kit node_modules/.vite",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "build:cli": "cargo build --release -p lychi-cli && mkdir -p src-tauri/binaries && cp target/release/lychi src-tauri/binaries/lychi-x86_64-unknown-linux-gnu",
+    "build:all": "pnpm build:cli && NO_STRIP=1 tauri build"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.2",
     "@sveltejs/adapter-static": "^3",
     "@sveltejs/kit": "^2",
-    "@sveltejs/vite-plugin-svelte": "^6",
-    "@tauri-apps/api": "^2",
-    "@tauri-apps/cli": "^2",
+    "@sveltejs/vite-plugin-svelte": "^7",
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/cli": "^2.11.4",
     "svelte": "^5",
     "svelte-check": "^4",
     "typescript": "^5",
-    "vite": "^7"
+    "vite": "^8"
   },
   "dependencies": {
     "ansi-to-html": "^0.7.2",
     "dompurify": "^3.3.1",
-    "lucide-svelte": "^0.574.0",
-    "marked": "^17.0.3"
+    "lucide-svelte": "^1",
+    "marked": "^18"
   }
 }

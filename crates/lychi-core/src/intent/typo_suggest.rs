@@ -4,6 +4,7 @@
 //! this module checks for close matches against known keywords using Levenshtein distance.
 
 use crate::action_registry::CompletionItem;
+use crate::action_registry::registry::ActionRegistry;
 
 /// Minimum Levenshtein distance to accept as a suggestion.
 /// Distance 1 = single typo (e.g., "tmie" → "time").
@@ -69,7 +70,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// Try to find a "Did you mean: X?" suggestion for a near-miss input.
 ///
 /// Returns a `CompletionItem` if a close match is found, or `None`.
-pub fn suggest(raw: &str) -> Option<CompletionItem> {
+pub fn suggest(raw: &str, registry: &ActionRegistry) -> Option<CompletionItem> {
     let lower = raw.trim().to_lowercase();
     let words: Vec<&str> = lower.split_whitespace().collect();
 
@@ -85,13 +86,16 @@ pub fn suggest(raw: &str) -> Option<CompletionItem> {
     // 2. Check first word against single keywords (e.g., "weathr" → "weather")
     //    Skip if the first word is already a known command/keyword (no typo to fix).
     let first = words[0];
-    let is_known = super::patterns::is_known_prefix(first);
+    let is_known = registry.is_known_prefix(first);
     if first.len() >= MIN_WORD_LEN && !is_known {
-        let mut best: Option<(&str, usize)> = None;
-        for &kw in super::patterns::KNOWN_PREFIXES {
+        let mut best: Option<(String, usize)> = None;
+        for kw in registry.known_prefixes() {
             let dist = levenshtein(first, kw);
-            if dist > 0 && dist <= MAX_DISTANCE && (best.is_none() || dist < best.unwrap().1) {
-                best = Some((kw, dist));
+            if dist > 0
+                && dist <= MAX_DISTANCE
+                && (best.is_none() || dist < best.as_ref().unwrap().1)
+            {
+                best = Some((kw.to_string(), dist));
             }
         }
         if let Some((kw, _)) = best {
@@ -108,6 +112,8 @@ pub fn suggest(raw: &str) -> Option<CompletionItem> {
                 score: 90,
                 description: Some(suggestion),
                 reason: None,
+                thumb_b64: None,
+                ..Default::default()
             });
         }
     }
@@ -150,6 +156,8 @@ fn suggest_phrase(words: &[&str]) -> Option<CompletionItem> {
                 score: 90,
                 description: Some(suggestion),
                 reason: None,
+                thumb_b64: None,
+                ..Default::default()
             });
         }
     }
@@ -160,6 +168,57 @@ fn suggest_phrase(words: &[&str]) -> Option<CompletionItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action_registry::{ActionHandler, ActionResult, Trigger};
+    use crate::error::LychiError;
+    use async_trait::async_trait;
+
+    struct TestHandler {
+        id: &'static str,
+        triggers: &'static [Trigger],
+    }
+
+    #[async_trait]
+    impl ActionHandler for TestHandler {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn description(&self) -> &str {
+            "test"
+        }
+        fn triggers(&self) -> &'static [Trigger] {
+            self.triggers
+        }
+        async fn execute(
+            &self,
+            _ctx: &crate::action_registry::ExecContext,
+            _args: &str,
+        ) -> Result<ActionResult, LychiError> {
+            Ok(ActionResult::default())
+        }
+    }
+
+    /// Registry carrying the keyword prefixes the typo tests exercise.
+    fn test_registry() -> ActionRegistry {
+        let mut r = ActionRegistry::new();
+        r.register(Box::new(TestHandler {
+            id: "weather",
+            triggers: Box::leak(vec![Trigger::keywords(&["weather"])].into_boxed_slice()),
+        }));
+        r.register(Box::new(TestHandler {
+            id: "time",
+            triggers: Box::leak(vec![Trigger::keywords(&["time"])].into_boxed_slice()),
+        }));
+        r.register(Box::new(TestHandler {
+            id: "web",
+            triggers: Box::leak(vec![Trigger::keywords(&["web"])].into_boxed_slice()),
+        }));
+        r
+    }
+
+    /// Test wrapper so existing tests can call `suggest(input)` unchanged.
+    fn suggest(raw: &str) -> Option<CompletionItem> {
+        super::suggest(raw, &test_registry())
+    }
 
     #[test]
     fn levenshtein_basic() {

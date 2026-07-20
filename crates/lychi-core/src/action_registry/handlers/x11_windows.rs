@@ -14,6 +14,8 @@ pub struct WindowInfo {
     pub title: String,
     pub wm_class: String,
     pub pid: u32,
+    /// Virtual desktop number (0-indexed), None if on all desktops (-1).
+    pub desktop: Option<u32>,
 }
 
 /// Interned EWMH atoms needed for window enumeration.
@@ -22,6 +24,7 @@ struct Atoms {
     net_wm_name: Atom,
     utf8_string: Atom,
     net_wm_pid: Atom,
+    net_wm_desktop: Atom,
 }
 
 fn intern_atoms(conn: &RustConnection) -> Option<Atoms> {
@@ -29,12 +32,14 @@ fn intern_atoms(conn: &RustConnection) -> Option<Atoms> {
     let net_wm_name = conn.intern_atom(false, b"_NET_WM_NAME").ok()?;
     let utf8_string = conn.intern_atom(false, b"UTF8_STRING").ok()?;
     let net_wm_pid = conn.intern_atom(false, b"_NET_WM_PID").ok()?;
+    let net_wm_desktop = conn.intern_atom(false, b"_NET_WM_DESKTOP").ok()?;
 
     Some(Atoms {
         net_client_list: net_client_list.reply().ok()?.atom,
         net_wm_name: net_wm_name.reply().ok()?.atom,
         utf8_string: utf8_string.reply().ok()?.atom,
         net_wm_pid: net_wm_pid.reply().ok()?.atom,
+        net_wm_desktop: net_wm_desktop.reply().ok()?.atom,
     })
 }
 
@@ -102,12 +107,20 @@ pub fn enumerate_windows() -> Vec<WindowInfo> {
             0,
             1,
         );
-        requests.push((wid, name, name_fallback, class, pid));
+        let desktop = conn.get_property::<u32, Atom>(
+            false,
+            wid,
+            atoms.net_wm_desktop,
+            AtomEnum::CARDINAL.into(),
+            0,
+            1,
+        );
+        requests.push((wid, name, name_fallback, class, pid, desktop));
     }
 
     // Collect replies
     let mut windows = Vec::new();
-    for (wid, name_cookie, fallback_cookie, class_cookie, pid_cookie) in requests {
+    for (wid, name_cookie, fallback_cookie, class_cookie, pid_cookie, desktop_cookie) in requests {
         let title = name_cookie
             .ok()
             .and_then(|c| c.reply().ok())
@@ -134,6 +147,13 @@ pub fn enumerate_windows() -> Vec<WindowInfo> {
             .and_then(|r| r.value32().and_then(|mut i| i.next()))
             .unwrap_or(0);
 
+        // _NET_WM_DESKTOP: 0-indexed, 0xFFFFFFFF means "on all desktops"
+        let desktop = desktop_cookie
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().and_then(|mut i| i.next()))
+            .filter(|&d| d != 0xFFFFFFFF);
+
         if title.is_empty() || pid == 0 {
             continue;
         }
@@ -146,6 +166,7 @@ pub fn enumerate_windows() -> Vec<WindowInfo> {
             title,
             wm_class,
             pid,
+            desktop,
         });
     }
 

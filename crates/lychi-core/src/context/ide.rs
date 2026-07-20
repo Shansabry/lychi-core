@@ -32,38 +32,78 @@ pub fn register_extra_markers(strong: &[String], soft: &[String]) {
 /// When `window_id` is provided, checks the per-window workspace cache first.
 /// A cache hit with matching token is returned as `Cached` without disk resolution.
 pub fn detect_workspace(
+    pid: u32,
     title: &str,
-    _wm_class: &str,
+    wm_class: &str,
     window_id: Option<&str>,
 ) -> (Option<String>, IdeWorkspaceSource) {
-    let Some(token) = extract_folder_from_title(title).map(normalize_title_token) else {
-        tracing::debug!("ide::detect: no title token from '{}'", title);
-        return (None, IdeWorkspaceSource::None);
-    };
+    // ── Design invariant ────────────────────────────────────────────────
+    // The window TITLE is the source of truth for *which* project is
+    // focused: it is per-window and always reflects the current project
+    // (switching projects in a window changes the title immediately). The
+    // `/proc` and config-state signals only *resolve a path* — they must
+    // never *override which project* the title names, because they lag:
+    // config `storage.json` is written lazily/globally and can point at a
+    // different or stale project. So:
+    //   1. Title token → disk search — PRIMARY, token-consistent by design.
+    //   2. proc / config — FALLBACK only when the title gives no usable
+    //      token, or its disk search fails. Their result is accepted only if
+    //      it stays consistent with the title token (never contradicts it).
+    let token = extract_folder_from_title(title).map(normalize_title_token);
 
-    // Fast path: check per-window workspace cache. If the cached token matches
-    // the current title token, trust the cache (already revalidated by get()).
-    // Token changed (different project in same window) falls through to disk resolution.
-    if let Some(wid) = window_id
+    // Fast path: per-window cache, valid only when the token still matches
+    // AND the cached path is still consistent with that token — so a path
+    // resolved from a lagging source can never stay pinned to a token it
+    // doesn't belong to.
+    if let (Some(tok), Some(wid)) = (token, window_id)
         && let Some(cached) = super::workspace_cache::get(wid)
-        && cached.token == token
+        && cached.token == tok
+        && path_matches_token(&cached.path, tok)
     {
-        tracing::debug!(
-            "ide::detect: '{}' → {} (cached, marker={})",
-            token,
-            cached.path,
-            cached.marker
-        );
+        tracing::debug!("ide::detect: '{tok}' → {} (cached)", cached.path);
         return (Some(cached.path), IdeWorkspaceSource::Cached);
     }
 
-    if let Some((path, marker)) = workspace_from_title(token) {
-        tracing::debug!("ide::detect: '{}' → {} (marker={})", token, path, marker);
+    // 1. PRIMARY — resolve the title's token on disk. The search finds a
+    //    folder named like the token, so the result always matches the
+    //    focused project (incl. the exact subfolder, not a parent).
+    if let Some(tok) = token
+        && let Some((path, marker)) = workspace_from_title(tok)
+    {
+        tracing::debug!("ide::detect: '{tok}' → {path} (title, marker={marker})");
         return (Some(path), IdeWorkspaceSource::Title);
     }
 
-    tracing::debug!("ide::detect: '{}' not resolved on disk", token);
+    // 2. FALLBACK — only reached when the title gave no token or didn't
+    //    resolve on disk. Ground-truth `/proc` first (accurate when the
+    //    editor was launched from the project), then config state. If a
+    //    token exists, the candidate must be consistent with it.
+    if let Some(path) = super::ide_proc::detect(pid)
+        && token.is_none_or(|t| path_matches_token(&path, t))
+    {
+        tracing::debug!("ide::detect: pid={pid} → {path} (proc)");
+        return (Some(path), IdeWorkspaceSource::Proc);
+    }
+    if let Some(path) = super::ide_config::detect(wm_class)
+        && token.is_none_or(|t| path_matches_token(&path, t))
+    {
+        tracing::debug!("ide::detect: {wm_class} → {path} (config)");
+        return (Some(path), IdeWorkspaceSource::Config);
+    }
+
+    tracing::debug!("ide::detect: unresolved (title='{title}')");
     (None, IdeWorkspaceSource::None)
+}
+
+/// Whether a resolved path belongs to the project the title token names —
+/// i.e. its final path segment equals the token (case-insensitively). Guards
+/// against a lagging proc/config source pinning a stale/parent path (`amt`)
+/// onto a different focused project (`amt-course-registration`).
+pub(crate) fn path_matches_token(path: &str, token: &str) -> bool {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(token))
 }
 
 /// Return the extracted folder token from a title (for caching).
@@ -470,14 +510,91 @@ fn is_code_root_candidate(path: &Path) -> bool {
     path.join(".git").exists() && BUILD_MARKERS.iter().any(|m| path.join(m).exists())
 }
 
+/// Whether `path` is itself a single project/repo (`.git` + build marker) —
+/// vs a container that merely holds repos. The run-target resolver uses this to
+/// tell "single-repo workspace" from "multi-repo container".
+pub fn is_project_dir(path: &Path) -> bool {
+    is_code_root_candidate(path)
+}
+
+/// Signals for picking the ACTIVE sub-repo when a workspace root is a container
+/// of several repos (e.g. `amt/` holding three sibling repos). Mirrors how
+/// VS Code scopes SCM to the repo containing the active file: we proxy "active
+/// file" with the window title's subfolder token and the focused terminal's
+/// cwd. Both optional; `None`/empty means "no disambiguation signal".
+#[derive(Debug, Default, Clone)]
+pub struct ActiveHint<'a> {
+    /// Subfolder token from the IDE window title (names the focused sub-repo).
+    pub title_token: Option<&'a str>,
+    /// Focused terminal's cwd — only pass when coherent with the workspace
+    /// (same repo/project), so a terminal in a DIFFERENT project can't hijack.
+    pub terminal_cwd: Option<&'a str>,
+}
+
+/// Enumerate code-root candidates directly under a container (children and
+/// grandchildren with `.git` + a build marker). Skips VCS/build noise dirs.
+/// This is the set of repos a multi-repo workspace like `amt/` holds.
+pub fn enumerate_child_repos(container: &Path) -> Vec<String> {
+    const SKIP: &[&str] = &[
+        "node_modules",
+        "target",
+        ".cache",
+        "dist",
+        "build",
+        "__pycache__",
+        ".venv",
+        ".tox",
+        ".mypy_cache",
+        ".next",
+        ".nuxt",
+        "vendor",
+        ".cargo",
+        ".rustup",
+    ];
+    let mut candidates = Vec::new();
+    let Ok(entries) = std::fs::read_dir(container) else {
+        return candidates;
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() || !ft.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with('.') || SKIP.contains(&name_str.as_ref()) {
+            continue;
+        }
+        let child = entry.path();
+        if is_code_root_candidate(&child) {
+            candidates.push(child.to_string_lossy().into_owned());
+        }
+        if let Ok(sub_entries) = std::fs::read_dir(&child) {
+            for sub in sub_entries.flatten() {
+                if !sub.file_type().map(|f| f.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let grandchild = sub.path();
+                if is_code_root_candidate(&grandchild) {
+                    candidates.push(grandchild.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    candidates
+}
+
 /// Resolve the actual code root for an IDE workspace.
 ///
-/// When the workspace root is a meta-project container (e.g. Lychi with code in `core/`),
-/// this finds the unique child/grandchild that qualifies as a code root.
-///
-/// Uses the same candidate definition everywhere: `.git` + build marker.
-/// Returns `None` if 0 or >1 candidates (C16: ambiguity → None).
-pub fn resolve_code_root(workspace_root: &Path) -> Option<(String, CodeRootSource)> {
+/// When the workspace root is a meta-project container (e.g. `amt/` with three
+/// repos, or Lychi with code in `core/`), this finds the code root. A UNIQUE
+/// child/grandchild is used directly; when SEVERAL qualify, `hint` disambiguates
+/// to the one the user is actually in (title token, then coherent terminal cwd).
+/// Returns `None` only on genuine ambiguity (0 candidates, or >1 with no hint).
+pub fn resolve_code_root(
+    workspace_root: &Path,
+    hint: &ActiveHint,
+) -> Option<(String, CodeRootSource)> {
     let ws_str = workspace_root.to_string_lossy();
 
     // Check cache first
@@ -508,70 +625,10 @@ pub fn resolve_code_root(workspace_root: &Path) -> Option<(String, CodeRootSourc
 
     // Two-level explicit scan (no queue, no recursion)
     let t0 = std::time::Instant::now();
-    let mut candidates: Vec<String> = Vec::new();
-
-    let entries = match std::fs::read_dir(workspace_root) {
-        Ok(e) => e,
-        Err(_) => {
-            super::workspace_cache::set_code_root(&ws_str, None);
-            return None;
-        }
-    };
-
-    for entry in entries.flatten() {
-        let ft = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if ft.is_symlink() || !ft.is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        // Skip known non-project dirs + hidden dirs
-        if name_str.starts_with('.') {
-            continue;
-        }
-        const SKIP: &[&str] = &[
-            "node_modules",
-            "target",
-            ".cache",
-            "dist",
-            "build",
-            "__pycache__",
-            ".venv",
-            ".tox",
-            ".mypy_cache",
-            ".next",
-            ".nuxt",
-            "vendor",
-            ".cargo",
-            ".rustup",
-        ];
-        if SKIP.contains(&name_str.as_ref()) {
-            continue;
-        }
-
-        let child = entry.path();
-
-        // Check child
-        if is_code_root_candidate(&child) {
-            candidates.push(child.to_string_lossy().into_owned());
-        }
-
-        // Check grandchildren
-        if let Ok(sub_entries) = std::fs::read_dir(&child) {
-            for sub in sub_entries.flatten() {
-                if !sub.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                    continue;
-                }
-                let grandchild = sub.path();
-                if is_code_root_candidate(&grandchild) {
-                    candidates.push(grandchild.to_string_lossy().into_owned());
-                }
-            }
-        }
+    let mut candidates: Vec<String> = enumerate_child_repos(workspace_root);
+    if candidates.is_empty() && !workspace_root.is_dir() {
+        super::workspace_cache::set_code_root(&ws_str, None);
+        return None;
     }
 
     let result = match candidates.len() {
@@ -594,19 +651,72 @@ pub fn resolve_code_root(workspace_root: &Path) -> Option<(String, CodeRootSourc
             None
         }
         n => {
-            let preview: Vec<_> = candidates.iter().take(3).cloned().collect();
-            tracing::debug!(
-                "code_root: {} → none (ambiguous: {n} candidates: {preview:?}, {}ms)",
-                ws_str,
-                t0.elapsed().as_millis()
-            );
-            None
+            // Multiple sibling repos — pick the ACTIVE one using the hint,
+            // like VS Code scoping to the active file's repo. Signal order:
+            // 1) title token names a candidate; 2) coherent terminal cwd walks
+            // up to a candidate. Only give up when neither disambiguates.
+            match disambiguate(&candidates, hint) {
+                Some(path) => {
+                    tracing::debug!(
+                        "code_root: {} → {} (StrongChild, disambiguated from {n}, {}ms)",
+                        ws_str,
+                        path,
+                        t0.elapsed().as_millis()
+                    );
+                    Some((path, CodeRootSource::StrongChild))
+                }
+                None => {
+                    let preview: Vec<_> = candidates.iter().take(3).cloned().collect();
+                    tracing::debug!(
+                        "code_root: {} → none (ambiguous: {n} candidates: {preview:?}, no hint, {}ms)",
+                        ws_str,
+                        t0.elapsed().as_millis()
+                    );
+                    None
+                }
+            }
         }
     };
 
-    // Cache result (even None) to avoid re-scanning
+    // Cache result (even None) to avoid re-scanning. Note: a hint-disambiguated
+    // result IS cached under the workspace root — acceptable because the title
+    // token drives the per-window `detect_workspace` cache upstream, and this
+    // code-root cache is revalidated on read.
     super::workspace_cache::set_code_root(&ws_str, result.as_ref().map(|(p, _)| p.clone()));
     result
+}
+
+/// Pick the active repo from several sibling candidates using the active-file
+/// proxy signals. Returns the chosen candidate path, or `None` if neither
+/// signal points at exactly one candidate (true ambiguity → caller yields None).
+fn disambiguate(candidates: &[String], hint: &ActiveHint) -> Option<String> {
+    // 1. Title token: the candidate whose final path segment equals the token.
+    if let Some(token) = hint.title_token.filter(|t| !t.is_empty()) {
+        let mut matches = candidates
+            .iter()
+            .filter(|c| path_matches_token(c, token))
+            .cloned();
+        if let Some(first) = matches.next()
+            && matches.next().is_none()
+        {
+            return Some(first); // exactly one candidate matches the token
+        }
+    }
+
+    // 2. Coherent terminal cwd: walk it up to its repo root; if that root is
+    //    one of the candidates, that's where the user is working.
+    if let Some(cwd) = hint.terminal_cwd.filter(|c| !c.is_empty())
+        && let Some(repo_root) = super::git::find_git_root(cwd)
+    {
+        if let Some(hit) = candidates.iter().find(|c| {
+            // Same repo root, or same trailing dir name.
+            **c == repo_root || path_matches_token(c, repo_root.rsplit('/').next().unwrap_or(""))
+        }) {
+            return Some(hit.clone());
+        }
+    }
+
+    None
 }
 
 /// Check if a directory contains any project marker file.
@@ -642,6 +752,74 @@ fn read_project_dirs() -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_repo_disambiguation_by_title_token() {
+        // Container `amt/` with three sibling repos → the title token picks the
+        // focused one instead of the old "ambiguous → None".
+        let base = std::env::temp_dir().join(format!("lychi-multirepo-{}", std::process::id()));
+        for repo in ["amt-course-registration", "other-repo", "third"] {
+            std::fs::create_dir_all(base.join(repo).join(".git")).unwrap();
+            std::fs::write(base.join(repo).join("package.json"), "{}").unwrap();
+        }
+        let cands: Vec<String> = ["amt-course-registration", "other-repo", "third"]
+            .iter()
+            .map(|r| base.join(r).to_string_lossy().into_owned())
+            .collect();
+
+        // Title token names exactly one → chosen.
+        let hint = ActiveHint {
+            title_token: Some("amt-course-registration"),
+            terminal_cwd: None,
+        };
+        assert_eq!(
+            disambiguate(&cands, &hint),
+            Some(
+                base.join("amt-course-registration")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+
+        // No hint → genuinely ambiguous, None (C16: none over wrong).
+        assert_eq!(disambiguate(&cands, &ActiveHint::default()), None);
+
+        // Terminal cwd inside one repo → walks up to it.
+        let deep = base.join("other-repo").join("src");
+        std::fs::create_dir_all(&deep).unwrap();
+        let hint_term = ActiveHint {
+            title_token: None,
+            terminal_cwd: Some(deep.to_str().unwrap()),
+        };
+        assert_eq!(
+            disambiguate(&cands, &hint_term),
+            Some(base.join("other-repo").to_string_lossy().into_owned())
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn path_matches_token_guards_identity() {
+        // Exact focused subfolder matches its token.
+        assert!(path_matches_token(
+            "/mnt/DevSSD/workspace/amt/amt-course-registration",
+            "amt-course-registration"
+        ));
+        // Case-insensitive.
+        assert!(path_matches_token("/home/u/Lychi", "lychi"));
+        // A stale/parent path must NOT match a different focused token —
+        // this is the guard that stops config's `amt` (or a stale `rturn-api`)
+        // from being pinned onto the `amt-course-registration` window.
+        assert!(!path_matches_token(
+            "/mnt/DevSSD/workspace/amt",
+            "amt-course-registration"
+        ));
+        assert!(!path_matches_token(
+            "/mnt/DevSSD/workspace/rturn/rturn-api",
+            "amt-course-registration"
+        ));
+    }
 
     #[test]
     fn test_extract_folder_3_segments() {

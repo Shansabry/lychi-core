@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use std::process::Command;
 use std::time::Instant;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, OutputType, RiskLevel};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType, RiskAssessment, RiskLevel,
+};
 use crate::error::LychiError;
 
 pub struct SystemCommand;
@@ -444,6 +446,24 @@ const ALL_ACTION_NAMES: &[(&str, &str)] = &[
 
 #[async_trait]
 impl ActionHandler for SystemCommand {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::{ArgTransform, Trigger};
+        static TRIGGERS: &[Trigger] = &[
+            Trigger::keywords(&["system"]),
+            // Bare power words. `shutdown`/`poweroff` with trailing args are
+            // intercepted structurally in patterns.rs; a bare word routes here.
+            Trigger::new(&["shutdown", "poweroff"], ArgTransform::Fixed("shutdown")),
+            Trigger::new(&["reboot", "restart"], ArgTransform::Fixed("reboot")),
+            Trigger::new(&["lock"], ArgTransform::Fixed("lock")),
+            Trigger::new(&["suspend", "sleep"], ArgTransform::Fixed("suspend")),
+            Trigger::new(&["hibernate"], ArgTransform::Fixed("hibernate")),
+            Trigger::new(&["logout", "signout"], ArgTransform::Fixed("logout")),
+            Trigger::new(&["mute"], ArgTransform::Fixed("mute")),
+            Trigger::new(&["unmute"], ArgTransform::Fixed("unmute")),
+        ];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "system"
     }
@@ -452,66 +472,39 @@ impl ActionHandler for SystemCommand {
         "System controls (power, audio, brightness, wifi, bluetooth)"
     }
 
-    fn default_risk(&self) -> RiskLevel {
-        RiskLevel::Medium
+    fn assess_risk(&self, args: &str) -> RiskAssessment {
+        // Only destructive actions (shutdown, reboot, hibernate, logout) need
+        // confirmation. Reversible toggles (mute, volume, brightness, wifi,
+        // bluetooth) auto-execute. This ownership lives here, not in the Rules
+        // Engine.
+        let action = args.trim().to_lowercase();
+        if DESTRUCTIVE_ACTIONS.iter().any(|d| action.starts_with(d)) {
+            RiskAssessment::confirm(format!(
+                "System action '{}' requires confirmation",
+                args.trim()
+            ))
+        } else {
+            RiskAssessment::level(RiskLevel::Low)
+        }
     }
 
-    async fn execute(&self, args: &str) -> Result<ActionResult, LychiError> {
+    async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let input = args.trim();
         let start = Instant::now();
 
         if input.is_empty() {
-            return Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some(
-                    "Usage: system <action>. Try: shutdown, mute, volume 50, brightness up, wifi off"
-                        .to_string(),
-                ),
-                duration_ms: 0,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-            focus_app: None,
-            });
+            return Ok(ActionResult::err(
+                "Usage: system <action>. Try: shutdown, mute, volume 50, brightness up, wifi off"
+                    .to_string(),
+            ));
         }
 
         // Try bluetooth connect/disconnect
         if let Some(result) = try_bluetooth_connect(input) {
             let duration_ms = start.elapsed().as_millis() as u64;
             return match result {
-                Ok(msg) => Ok(ActionResult {
-                    success: true,
-                    output: Some(msg),
-                    error: None,
-                    duration_ms,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: Some(OutputType::Status),
-                    executed_args: None,
-                    launch_desktop: None,
-                    focus_app: None,
-                }),
-                Err(e) => Ok(ActionResult {
-                    success: false,
-                    output: None,
-                    error: Some(e),
-                    duration_ms,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: None,
-                    executed_args: None,
-                    launch_desktop: None,
-                    focus_app: None,
-                }),
+                Ok(msg) => Ok(ActionResult::ok(msg, OutputType::Status).with_duration(duration_ms)),
+                Err(e) => Ok(ActionResult::err(e).with_duration(duration_ms)),
             };
         }
 
@@ -519,34 +512,8 @@ impl ActionHandler for SystemCommand {
         if let Some(result) = try_parameterized(input) {
             let duration_ms = start.elapsed().as_millis() as u64;
             return match result {
-                Ok(msg) => Ok(ActionResult {
-                    success: true,
-                    output: Some(msg),
-                    error: None,
-                    duration_ms,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: Some(OutputType::Status),
-                    executed_args: None,
-                    launch_desktop: None,
-                    focus_app: None,
-                }),
-                Err(e) => Ok(ActionResult {
-                    success: false,
-                    output: None,
-                    error: Some(e),
-                    duration_ms,
-                    routed_by: None,
-                    open_url: None,
-                    needs_confirmation: None,
-                    risk_level: None,
-                    output_type: None,
-                    executed_args: None,
-                    launch_desktop: None,
-                    focus_app: None,
-                }),
+                Ok(msg) => Ok(ActionResult::ok(msg, OutputType::Status).with_duration(duration_ms)),
+                Err(e) => Ok(ActionResult::err(e).with_duration(duration_ms)),
             };
         }
 
@@ -559,52 +526,18 @@ impl ActionHandler for SystemCommand {
                 let result = (a.run)();
                 let duration_ms = start.elapsed().as_millis() as u64;
                 match result {
-                    Ok(()) => Ok(ActionResult {
-                        success: true,
-                        output: Some(format!("{} initiated", a.description)),
-                        error: None,
-                        duration_ms,
-                        routed_by: None,
-                        open_url: None,
-                        needs_confirmation: None,
-                        risk_level: None,
-                        output_type: Some(OutputType::Status),
-                        executed_args: None,
-                        launch_desktop: None,
-                        focus_app: None,
-                    }),
-                    Err(e) => Ok(ActionResult {
-                        success: false,
-                        output: None,
-                        error: Some(e),
-                        duration_ms,
-                        routed_by: None,
-                        open_url: None,
-                        needs_confirmation: None,
-                        risk_level: None,
-                        output_type: None,
-                        executed_args: None,
-                        launch_desktop: None,
-                        focus_app: None,
-                    }),
+                    Ok(()) => Ok(ActionResult::ok(
+                        format!("{} initiated", a.description),
+                        OutputType::Status,
+                    )
+                    .with_duration(duration_ms)),
+                    Err(e) => Ok(ActionResult::err(e).with_duration(duration_ms)),
                 }
             }
-            None => Ok(ActionResult {
-                success: false,
-                output: None,
-                error: Some(format!(
-                    "Unknown action '{input}'. Try: shutdown, mute, volume 50, brightness up, wifi off"
-                )),
-                duration_ms: start.elapsed().as_millis() as u64,
-                routed_by: None,
-                open_url: None,
-                needs_confirmation: None,
-                risk_level: None,
-                output_type: None,
-                executed_args: None,
-                launch_desktop: None,
-                focus_app: None,
-            }),
+            None => Ok(ActionResult::err(format!(
+                "Unknown action '{input}'. Try: shutdown, mute, volume 50, brightness up, wifi off"
+            ))
+            .with_duration(start.elapsed().as_millis() as u64)),
         }
     }
 
@@ -619,6 +552,18 @@ impl ActionHandler for SystemCommand {
                 score: if name.starts_with(&lower) { 100 } else { 50 },
                 description: Some(desc.to_string()),
                 reason: None,
+                thumb_b64: None,
+                // Names with a "<…>" placeholder (e.g. "volume <n>") need a
+                // value: selecting them fills the input up to the placeholder
+                // so the user types the value, then Enter runs it
+                // (tab-to-complete). Concrete actions run immediately.
+                run: if name.contains('<') {
+                    None
+                } else {
+                    Some(format!("system {name}"))
+                },
+                fill: name.find('<').map(|i| format!("system {}", &name[..i])),
+                ..Default::default()
             })
             .collect();
 
@@ -648,6 +593,9 @@ impl ActionHandler for SystemCommand {
                     score: 90,
                     description: Some(format!("{} ({})", dev.name, status)),
                     reason: None,
+                    thumb_b64: None,
+                    run: Some(format!("system {action} {}", dev.name)),
+                    ..Default::default()
                 });
             }
         }
@@ -659,6 +607,65 @@ impl ActionHandler for SystemCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assess_risk_confirms_destructive_auto_executes_reversible() {
+        let h = SystemCommand::new();
+        // Destructive → confirm (Medium + custom message).
+        for a in ["shutdown", "reboot", "hibernate", "logout"] {
+            assert_eq!(
+                h.assess_risk(a).level,
+                RiskLevel::Medium,
+                "{a} should confirm"
+            );
+        }
+        // Reversible toggles → auto-execute (Low).
+        for a in [
+            "mute",
+            "unmute",
+            "volume up",
+            "brightness 50",
+            "wifi on",
+            "bluetooth off",
+            "lock",
+            "suspend",
+        ] {
+            assert_eq!(
+                h.assess_risk(a).level,
+                RiskLevel::Low,
+                "{a} should auto-execute"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn placeholder_actions_fill_input_concrete_actions_run() {
+        let items = SystemCommand::new().completions("").await;
+        assert!(!items.is_empty());
+        for item in &items {
+            if item.label.contains('<') {
+                // Argument-needing hints like "volume <n>" fill the input up to
+                // the placeholder (tab-to-complete), not run.
+                assert!(
+                    item.run.is_none(),
+                    "placeholder action must not run directly: {}",
+                    item.label
+                );
+                let fill = item.fill.as_deref().expect("placeholder has a fill");
+                assert!(
+                    fill.starts_with("system ") && !fill.contains('<'),
+                    "fill must be a clean runnable prefix: {fill}"
+                );
+            } else {
+                // Concrete actions run as `system <name>`.
+                assert_eq!(
+                    item.run.as_deref(),
+                    Some(format!("system {}", item.label).as_str())
+                );
+                assert!(item.fill.is_none());
+            }
+        }
+    }
 
     #[test]
     fn test_parse_percent() {

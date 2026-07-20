@@ -1,14 +1,11 @@
 # Rust
 **/target
 **/*.rs.bk
-Cargo.lock
 
 # Frontend
 **/node_modules
 **/build
 **/.svelte-kit
-**/pnpm-lock.yaml
-**/pnpm-workspace.yaml
 
 # Environment
 .env
@@ -49,3 +46,7 @@ core/app-icon.png
 # Logs
 *.log
 npm-debug.log*
+
+# Generated CLI sidecar artifacts (built by pnpm build:cli)
+**/src-tauri/binaries/
+src/lib/bindings.ts

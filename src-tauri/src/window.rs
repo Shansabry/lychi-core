@@ -9,16 +9,62 @@ fn tid() -> String {
     std::thread::current().name().unwrap_or("?").to_string()
 }
 
-/// Toggle the launcher window visibility.
+/// Minimum gap between accepted toggle requests. Absorbs double-delivery of
+/// one physical keypress (DE-bound `lychi --toggle` + the X11 shortcut plugin
+/// both firing over XWayland windows, duplicate IPC lines, key autorepeat).
+const TOGGLE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Toggle the launcher window — the single toggle authority.
+///
+/// All entry points (hotkey, IPC socket, tray, single-instance) route here.
+/// Two correctness properties:
+/// - **Debounce**: duplicate deliveries of one keypress are dropped.
+/// - **Atomic decide+act**: the visible/hidden decision runs ON the GTK main
+///   thread against the live widget state, and a hide executes inline there.
+///   The old pattern (`is_visible()` round-trip from an arbitrary thread,
+///   then a separately queued hide/show) interleaved under concurrency and
+///   caused the "press the hotkey twice" bug.
 pub fn toggle_window(window: &WebviewWindow) {
-    if window.is_visible().unwrap_or(false) {
-        // Disarm dismiss so focus-out during hide doesn't re-trigger
-        let state = window.app_handle().state::<AppState>();
-        state.dismiss_armed.store(false, Ordering::SeqCst);
-        let _ = window.hide();
-    } else {
-        show_window(window);
+    static LAST_TOGGLE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    {
+        let mut last = match LAST_TOGGLE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let now = std::time::Instant::now();
+        if let Some(prev) = *last
+            && now.duration_since(prev) < TOGGLE_DEBOUNCE
+        {
+            tracing::debug!("[toggle] debounced duplicate request");
+            return;
+        }
+        *last = Some(now);
     }
+
+    let win = window.clone();
+    glib::MainContext::default().invoke(move || {
+        let visible = win
+            .gtk_window()
+            .map(|g| {
+                use gtk::prelude::WidgetExt;
+                g.is_visible()
+            })
+            .unwrap_or(false);
+        tracing::info!("[toggle] decision on GTK thread: visible={visible}");
+        if visible {
+            // Disarm dismiss so focus-out during hide doesn't re-trigger.
+            let state = win.app_handle().state::<AppState>();
+            state.dismiss_armed.store(false, Ordering::SeqCst);
+            // On the GTK thread this executes inline — the widget flag is
+            // updated synchronously, so a follow-up toggle decides correctly.
+            let _ = win.hide();
+        } else {
+            // show_window does blocking context work (KWin D-Bus snapshot) —
+            // it must not run on the GTK thread. Hand it to a worker; its own
+            // GTK closure does the actual map.
+            std::thread::spawn(move || show_window(&win));
+        }
+    });
 }
 
 /// Show the window, reposition to the correct monitor, focus it, and notify
@@ -92,6 +138,18 @@ pub fn show_window(window: &WebviewWindow) {
             if let Err(e) = window_clone.set_focus() {
                 tracing::error!("Failed to focus window: {e}");
             }
+
+            // Ready signal: the surface is mapped — tell the frontend to drop
+            // `.not-ready` (opacity 0 + pointer-events none). Without this, a
+            // lost pre-show summon leaves an INVISIBLE monitor-covering
+            // surface that eats every desktop click. Re-emit once as a
+            // watchdog: `lychi://shown` is idempotent (only sets ready=true),
+            // unlike summon which clears input state.
+            let _ = window_clone.emit("lychi://shown", ());
+            let watchdog = window_clone.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                let _ = watchdog.emit("lychi://shown", ());
+            });
 
             let _ = tx.send(true);
         });

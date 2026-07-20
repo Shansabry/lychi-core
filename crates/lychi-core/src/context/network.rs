@@ -8,7 +8,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 
 /// Network context snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct NetworkContext {
     /// Active WiFi SSID, if connected.
     pub ssid: Option<String>,

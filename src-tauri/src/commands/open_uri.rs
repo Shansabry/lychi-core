@@ -13,6 +13,7 @@ fn expand_file_uri(uri: &str) -> String {
 /// Open a URI using the platform's native mechanism with proper
 /// desktop activation (e.g. Wayland activation tokens on Linux).
 #[tauri::command]
+#[specta::specta]
 pub async fn open_uri(uri: String) -> Result<(), LychiError> {
     let uri = expand_file_uri(&uri);
     crate::platform::open_uri(&uri)

@@ -5,7 +5,7 @@ use crate::rules::shell::ShellRules;
 
 /// Bump this when the system prompt changes in a semantically meaningful way.
 /// Included in debug logs so bad routes can be tied to the prompt that produced them.
-pub const PROMPT_VERSION: &str = "v2";
+pub const PROMPT_VERSION: &str = "v5";
 
 /// Build the system prompt for intent routing.
 ///
@@ -41,6 +41,17 @@ Examples (non-obvious argument transformations only):
 - "how much is 15% of 200" → {{"action_id": "calc", "args": "200 * 0.15"}}
 - "open readyroos in vscode" → {{"action_id": "project", "args": "readyroos"}}
 - "open github.com" → {{"action_id": "url", "args": "https://github.com"}}
+- "make hello world uppercase" → {{"action_id": "devutil", "args": "upper hello world"}}
+- "format this json {{\"a\":1}}" → {{"action_id": "devutil", "args": "json {{\"a\":1}}"}}
+- "slugify My Blog Post" → {{"action_id": "devutil", "args": "slug My Blog Post"}}
+- "random number between 1 and 100" → {{"action_id": "generate", "args": "random 1 100"}}
+- "roll a dice" → {{"action_id": "generate", "args": "random 1 6"}}
+- "take a screenshot of a region" → {{"action_id": "screenshot", "args": "area"}}
+- "capture the active window" → {{"action_id": "screenshot", "args": "window"}}
+- "restart nginx" → {{"action_id": "service", "args": "nginx restart"}}
+- "is docker running" → {{"action_id": "service", "args": "docker status"}}
+- "install neovim" → {{"action_id": "packages", "args": "install neovim"}}
+- "search for a markdown editor package" → {{"action_id": "packages", "args": "search markdown editor"}}
 
 Rules:
 - "open" = GUI apps by name. "project" = open a project folder in editor. "browse" = browse a directory. "run" = shell commands.
@@ -108,6 +119,23 @@ fn action_description(id: &str) -> &'static str {
         "snip" => "Snippets — save and paste reusable text blocks",
         "sym" => "Search and copy a symbol or special character by name",
         "unicode" => "Search Unicode characters by name or codepoint",
+        "devutil" => {
+            "Developer text utilities. Prepend the verb to the text. Verbs: 'base64 <text>' / 'base64 -d <b64>', 'hash [md5|sha256] <text>', 'urlencode <text>' / 'urldecode <text>', 'epoch [<unix-seconds>]', 'json <text>' (pretty-print) / 'json -m <text>' (minify), 'upper <text>' / 'lower <text>' / 'title <text>' (change case), 'slug <text>' (url-safe slug), 'reverse <text>', 'count <text>' (chars/words/lines). Use for 'encode/decode', 'make uppercase', 'format this json', 'slugify', etc."
+        }
+        "generate" => {
+            "Generate random values. Args: 'password [length]', 'uuid', 'token [length]', 'random [min] <max>' (random integer, default 0–100). Use for 'generate a password', 'give me a uuid', 'random number between 1 and 100', 'roll a dice'"
+        }
+        "color" => "Convert or inspect a color between HEX, RGB, and HSL (e.g. '#ff5733')",
+        "screenshot" => {
+            "Take a screenshot. Args: empty or 'full' for the whole screen, 'area' (aliases: region, select) to select a region, 'window' for the active window. Use for 'take a screenshot', 'capture this region', 'grab a screenshot of the window'"
+        }
+        "services" => "List currently running systemd services",
+        "service" => {
+            "Control a systemd service. Args: '<name>' or '<name> status' to check it; '<name> start|stop|restart|reload|enable|disable' to control it. Use for 'restart nginx', 'is docker running', 'stop the bluetooth service'"
+        }
+        "packages" => {
+            "Search or install SYSTEM packages via the OS package manager (dnf/apt/pacman/flatpak). Args: 'search <query>' or 'install <package>'. Use for 'install neovim', 'search for a markdown editor', 'is ripgrep available to install'. NOT for web searches"
+        }
         _ => "Unknown command",
     }
 }

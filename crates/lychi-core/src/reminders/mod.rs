@@ -4,7 +4,7 @@ pub mod time_parse;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct ReminderItem {
     pub id: String,
     pub text: String,
