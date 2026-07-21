@@ -150,6 +150,46 @@ fn strip_code_fences(response: &str) -> &str {
     stripped.strip_suffix("```").unwrap_or(stripped).trim()
 }
 
+/// Extract the first balanced top-level JSON object from a string, tolerating
+/// leading/trailing prose. Small local models frequently append a stray token or
+/// a sentence after the JSON (`{...} </s>`, `{...} Let me know...`), which a
+/// strict whole-string parse rejects. We scan for the first `{`, then track brace
+/// depth (ignoring braces inside strings / escapes) to find its matching `}`.
+/// Returns the object slice, or the input unchanged if no object is found (so the
+/// caller's parse produces the original, meaningful error).
+fn extract_json_object(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let Some(start) = bytes.iter().position(|&b| b == b'{') else {
+        return s;
+    };
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            match b {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &s[start..=i];
+                }
+            }
+            _ => {}
+        }
+    }
+    s
+}
+
 /// Validate and potentially upgrade the risk level of a shell step.
 fn validate_step_risk(step: &AgentStep) -> RiskLevel {
     if step.action_id == "run" {
@@ -188,7 +228,9 @@ pub fn parse_ai_response(
     known_actions: &[&str],
     original_input: &str,
 ) -> Result<AiResponse, LychiError> {
-    let cleaned = strip_code_fences(response);
+    // Strip markdown fences, then isolate the first balanced JSON object so a
+    // trailing token/sentence from a small local model doesn't fail the parse.
+    let cleaned = extract_json_object(strip_code_fences(response));
 
     let json: serde_json::Value = serde_json::from_str(cleaned)
         .map_err(|e| LychiError::Ai(format!("Failed to parse AI response as JSON: {e}")))?;
@@ -434,6 +476,40 @@ mod tests {
     fn adversarial_truncated_json() {
         let known = &["web"];
         assert!(parse_ai_response(r#"{"action_id": "web", "args":"#, known, "test").is_err());
+    }
+
+    #[test]
+    fn tolerates_trailing_text_after_json() {
+        // Small local models often append a stray token/sentence after the JSON.
+        // The first balanced object must still parse (extract_json_object).
+        let known = &["web"];
+        let r = parse_ai_response(
+            r#"{"action_id": "web", "args": "rust"} </s> hope that helps!"#,
+            known,
+            "test",
+        );
+        assert!(r.is_ok(), "trailing text after the JSON object must be tolerated");
+    }
+
+    #[test]
+    fn tolerates_leading_prose_before_json() {
+        let known = &["web"];
+        let r = parse_ai_response(
+            r#"Sure! Here is the route: {"action_id": "web", "args": "rust"}"#,
+            known,
+            "test",
+        );
+        assert!(r.is_ok(), "leading prose before the JSON object must be tolerated");
+    }
+
+    #[test]
+    fn extract_json_object_handles_nested_and_strings() {
+        // Braces inside strings must not confuse the balance scan.
+        let s = r#"junk {"a": {"b": "text with } brace"}, "c": 1} tail"#;
+        assert_eq!(
+            extract_json_object(s),
+            r#"{"a": {"b": "text with } brace"}, "c": 1}"#
+        );
     }
 
     #[test]

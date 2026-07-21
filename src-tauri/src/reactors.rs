@@ -156,9 +156,10 @@ impl EventHandler for AiReactor {
         // Re-register the AI-dependent handlers with the new provider (or None,
         // which makes them emit a "set up AI" message). `register` overwrites by
         // id, so this replaces the previously-registered instances in place.
-        executor.registry.register(Box::new(AskHandler::new(
+        executor.registry.register(Box::new(AskHandler::with_timeout(
             provider.clone(),
             search_engine,
+            crate::state::AppState::ask_timeout(&ai),
         )));
         let weather_handler = Arc::new(WeatherHandler::new(
             weather.unit.clone(),
@@ -178,10 +179,8 @@ impl EventHandler for AiReactor {
         // Swap (or clear) the intent router.
         match provider {
             Some(p) => {
-                let router = AiRouter::new_shared(
-                    p,
-                    std::time::Duration::from_secs(ai.timeout_secs),
-                );
+                let router =
+                    AiRouter::new_shared(p, crate::state::AppState::ask_timeout(&ai));
                 executor.resolver.set_ai_router(router);
                 tracing::info!("[reactor] ai config applied (provider: {}/{})", ai.mode, ai.provider);
             }

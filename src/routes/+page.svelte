@@ -59,6 +59,9 @@ let isExecuting = $state(false);
 // clobbering fresh state.
 let executeGeneration = 0;
 let isRouting = $state(false);
+// Local-AI model warmup indicator (only fires for mode=local — BYOK/Ollama/Cloud
+// have no local model to load).
+let aiLoading = $state(false);
 let backendReady = $state(false);
 let lastResult: CommandResult | null = $state(null);
 let lastCommand = $state("");
@@ -659,6 +662,12 @@ onMount(() => {
 			}
 		});
 		unlisteners.push(unlistenMedia);
+
+		// Local-AI model load state → status-bar "Loading AI model…" indicator.
+		const unlistenAiLoad = await win.listen<string>("lychi://ai-load-state", (e) => {
+			aiLoading = e.payload === "loading";
+		});
+		unlisteners.push(unlistenAiLoad);
 
 		// Listen for streaming file search results
 		const unlistenFileSearch = await win.listen<FileSearchBatch>(
@@ -1893,6 +1902,7 @@ async function handleDismiss() {
 		{contextStale}
 		{contextStaleHint}
 		{contextRefreshing}
+		{aiLoading}
 		actionsAvailable={!settingsOpen && !notesOpen && !mediaOpen && !historyOpen && panelActions.length > 0}
 		onactionpanel={openActionPanel}
 		/>

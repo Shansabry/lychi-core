@@ -1,0 +1,11 @@
+# Enable AVX2 + FMA SIMD for x86-64 release builds. Lights up vectorized code
+# paths in our Rust hot loops. (The bundled llama.cpp inference engine is compiled
+# separately by cmake with its own optimization flags, so this flag is for our
+# crates, not the engine.)
+#
+# AVX2+FMA is present on essentially every x86-64 CPU since ~2013 (Intel Haswell,
+# AMD Excavator), so this stays portable for a distributed AppImage across both
+# Intel and AMD. We deliberately do NOT use `target-cpu=native` — that would pin
+# the binary to the build machine's exact CPU and break distribution.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-feature=+avx2,+fma"]

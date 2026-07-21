@@ -28,3 +28,21 @@ chrono-tz = "0.10"
 # Type-introspection for generated TypeScript IPC bindings (tauri-specta).
 # Pinned to the exact RC the tauri-specta RC requires — they move in lockstep.
 specta = { version = "=2.0.0-rc.22", features = ["derive"] }
+# Local AI (feature = "local-ai"): CPU inference via llama.cpp Rust bindings.
+# default-features off = CPU-only, statically-linked llama.cpp (no CUDA/Vulkan/
+# BLAS/OpenMP), giving a single self-contained binary that's portable across
+# x86-64 (AVX2 baseline via .cargo/config.toml). ~3-6x faster on CPU than the
+# pure-Rust path. Weights are downloaded at runtime, so this adds only the engine.
+# `common` is llama.cpp's non-GPU helper layer — it provides grammar-constrained
+# sampling (our JSON output mode) + the sampler chain; CPU-only, no extra runtime
+# deps, so it keeps the single-static-binary property.
+llama-cpp-2 = { version = "0.1.151", default-features = false, features = ["common"] }
+
+# --- Build profiles ---
+#
+# Fat LTO + single codegen unit for the shipped build. Our Rust hot paths (fuzzy
+# matching, etc.) benefit; the llama.cpp engine itself is compiled by cmake with
+# its own optimization flags, independent of these. Cheap, safe, no dep cost.
+[profile.release]
+lto = "fat"
+codegen-units = 1

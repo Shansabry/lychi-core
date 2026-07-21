@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "dev": "RUST_LOG=debug tauri dev",
-    "build": "pnpm build:cli && NO_STRIP=1 tauri build --bundles appimage",
+    "dev:local-ai": "RUST_LOG=debug tauri dev -- --features local-ai",
+    "build": "pnpm build:cli && NO_STRIP=1 tauri build --bundles appimage --features local-ai && bash scripts/fix-appimage-codecs.sh",
     "build:debug": "RUST_LOG=debug tauri build --debug --no-bundle",
     "vite:dev": "vite dev",
     "vite:build": "vite build",

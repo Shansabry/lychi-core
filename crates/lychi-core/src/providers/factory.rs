@@ -22,6 +22,12 @@ pub enum ProviderError {
     MissingBaseUrl,
     /// Ollama mode but no model was selected.
     OllamaNoModel,
+    /// Local mode but no model was selected.
+    LocalNoModel,
+    /// Local mode but the selected model file isn't downloaded yet.
+    LocalModelMissing(String),
+    /// Local mode requested but this build lacks the `local-ai` feature.
+    LocalUnavailable,
     /// Cloud mode selected but no signed-in cloud client is available yet
     /// (user not signed in, or Lychi Cloud not enabled in this build).
     CloudUnavailable,
@@ -36,6 +42,13 @@ impl std::fmt::Display for ProviderError {
                 write!(f, "No endpoint URL set for the custom provider")
             }
             Self::OllamaNoModel => write!(f, "No Ollama model selected"),
+            Self::LocalNoModel => write!(f, "No local model selected"),
+            Self::LocalModelMissing(m) => {
+                write!(f, "Local model '{m}' is not downloaded yet")
+            }
+            Self::LocalUnavailable => {
+                write!(f, "Local AI is not available in this build")
+            }
             Self::CloudUnavailable => write!(f, "Lychi Cloud is not available yet"),
         }
     }
@@ -68,10 +81,33 @@ pub fn build_provider_with_cloud(
     match cfg.mode.as_str() {
         "byo" => build_byo(cfg, key_lookup),
         "ollama" => build_ollama(cfg),
+        "local" => build_local(cfg),
         "cloud" => cloud_provider().ok_or(ProviderError::CloudUnavailable),
         // "disabled" and any unknown/legacy mode → off.
         _ => Err(ProviderError::Disabled),
     }
+}
+
+/// Build the bundled local-AI provider. Feature-gated: when `local-ai` is off,
+/// a `mode = "local"` config degrades to `LocalUnavailable` rather than failing
+/// the build (the arm still exists so old/foreign configs don't panic).
+#[cfg(feature = "local-ai")]
+fn build_local(cfg: &AiConfig) -> Result<Arc<dyn AiProvider>, ProviderError> {
+    if cfg.local_model.trim().is_empty() {
+        return Err(ProviderError::LocalNoModel);
+    }
+    let path = crate::paths::models_dir().join(&cfg.local_model);
+    if !path.exists() {
+        return Err(ProviderError::LocalModelMissing(cfg.local_model.clone()));
+    }
+    let client = crate::providers::local::LocalClient::load(path, cfg.max_tokens)
+        .map_err(|e| ProviderError::LocalModelMissing(e.to_string()))?;
+    Ok(Arc::new(client))
+}
+
+#[cfg(not(feature = "local-ai"))]
+fn build_local(_cfg: &AiConfig) -> Result<Arc<dyn AiProvider>, ProviderError> {
+    Err(ProviderError::LocalUnavailable)
 }
 
 fn build_byo(

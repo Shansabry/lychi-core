@@ -1,6 +1,14 @@
 pub mod byo;
 pub mod cloud;
 pub mod factory;
+#[cfg(feature = "local-ai")]
+pub mod local;
+/// The curated local-model registry (plain metadata — NOT feature-gated, so the
+/// download command + settings UI work without the `local-ai` engine feature).
+pub mod local_models;
+/// Streamed model downloader (NOT feature-gated — a user can download a model
+/// independent of whether this build has the inference engine).
+pub mod local_download;
 pub mod ollama;
 
 use async_trait::async_trait;

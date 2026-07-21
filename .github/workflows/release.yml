@@ -59,7 +59,21 @@ jobs:
           cp target/release/lychi src-tauri/binaries/lychi-x86_64-unknown-linux-gnu
 
       - name: Build bundles (AppImage, deb, rpm)
-        run: pnpm exec tauri build --verbose
+        # --features local-ai bakes the bundled llama.cpp CPU-inference engine
+        # into the release (statically linked; runtime AI-mode switching is pure
+        # config). The AVX2 baseline (crates/lychi-core/.cargo/config.toml) keeps
+        # it portable across x86-64.
+        run: pnpm exec tauri build --verbose --features local-ai
+
+      # linuxdeploy recursively bundles WebKitGTK's GStreamer codec/crypto stack
+      # (mp3lame, mpg123, gsm, nettle/hogweed, pulse, ...). Those bundled copies'
+      # ELF constructors segfault at _dl_init on newer-glibc HOSTS (the AppImage
+      # crashes on launch before main()). They must come from the host instead.
+      # Build on the glibc-2.35 baseline above AND strip these from the AppImage
+      # so the loader falls through to the host's working copies. See docs/issues
+      # (AppImage codec _dl_init crash) for the full diagnosis.
+      - name: Strip over-bundled codec libs from the AppImage
+        run: bash scripts/fix-appimage-codecs.sh
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

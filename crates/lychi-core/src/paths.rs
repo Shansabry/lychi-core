@@ -36,3 +36,9 @@ pub fn db_file() -> PathBuf {
 pub fn clipboard_images_dir() -> PathBuf {
     data_dir().join("clipboard-images")
 }
+
+/// Directory where downloaded local-AI model weights (GGUF) are stored. Weights
+/// are fetched on first use (not bundled), so this lives in the data dir.
+pub fn models_dir() -> PathBuf {
+    data_dir().join("models")
+}

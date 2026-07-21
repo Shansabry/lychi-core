@@ -318,9 +318,10 @@ function selectPlayer(busName: string) {
 		height: 3px;
 		background: var(--bg-secondary);
 		border-radius: 2px;
-		overflow: hidden;
 		cursor: pointer;
-		/* Enlarge click target without affecting layout */
+		/* Enlarge click target without affecting layout. No `overflow: hidden` —
+		   it would clip the fill's soft accent glow; the fill has its own
+		   border-radius, and background-clip keeps the track itself tidy. */
 		margin: -6px 0;
 		padding: 6px 0;
 		box-sizing: content-box;
@@ -329,8 +330,15 @@ function selectPlayer(busName: string) {
 
 	.progress-fill {
 		height: 100%;
-		background: var(--fg);
 		border-radius: 2px;
+		/* Gradient played portion: a dim accent at the start brightening to full
+		   accent at the leading edge (the playhead), so it reads as filling toward
+		   "now". color-mix keeps both stops tied to the theme accent. No glow. */
+		background: linear-gradient(
+			90deg,
+			color-mix(in srgb, var(--accent) 45%, transparent) 0%,
+			var(--accent) 100%
+		);
 	}
 
 	/* Only animate the fill while the panel is visible. When hidden the width is
@@ -347,25 +355,39 @@ function selectPlayer(busName: string) {
 		gap: 20px;
 	}
 
+	/* Fixed-size flex boxes that center their glyph, so prev/play/next line up on
+	   a shared centerline regardless of each media glyph's own baseline/metrics
+	   (unicode ⏮ ▶ ⏭ sit differently on the text baseline). */
 	.ctrl-btn {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 34px;
+		height: 34px;
 		background: none;
 		border: none;
 		color: var(--fg-muted);
 		font-size: 18px;
-		cursor: pointer;
-		padding: 4px;
-		border-radius: 4px;
-		transition: color 80ms ease;
 		line-height: 1;
+		cursor: pointer;
+		border-radius: 50%;
+		transition: color 80ms ease, background 80ms ease;
 	}
 
 	.ctrl-btn:hover {
 		color: var(--fg);
+		background: var(--bg-secondary);
 	}
 
 	.ctrl-btn.play {
 		font-size: 22px;
-		color: var(--fg);
+		color: var(--accent);
+	}
+
+	.ctrl-btn.play:hover {
+		color: var(--accent);
+		background: var(--bg-secondary);
+		filter: brightness(1.15);
 	}
 
 	.loading {

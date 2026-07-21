@@ -33,6 +33,7 @@ let aiConfig: AiConfig = $state({
 	wire_format: "",
 	ollama_url: "",
 	ollama_model: "",
+	local_model: "",
 	timeout_secs: 8,
 	max_tokens: 300,
 });

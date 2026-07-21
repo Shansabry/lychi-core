@@ -28,6 +28,7 @@ import type {
 	MountPoint,
 	NoteItem,
 	OllamaModelInfo,
+	LocalModelInfo,
 	PrivacyConfig,
 	ProjectsConfig,
 	ReminderItem,
@@ -69,6 +70,7 @@ export type {
 	NetworkContext,
 	NoteItem,
 	OllamaModelInfo,
+	LocalModelInfo,
 	OutputType,
 	PlaybackStatus,
 	PrivacyConfig,
@@ -276,6 +278,7 @@ export async function getAllSettings(): Promise<AllSettings> {
 				wire_format: "",
 				ollama_url: "",
 				ollama_model: "",
+				local_model: "",
 				timeout_secs: 8,
 				max_tokens: 300,
 			},
@@ -507,6 +510,7 @@ export async function getAiConfig(): Promise<AiConfig> {
 			wire_format: "",
 			ollama_url: "",
 			ollama_model: "",
+			local_model: "",
 			timeout_secs: 8,
 			max_tokens: 300,
 		};
@@ -546,6 +550,24 @@ export async function testAiConnection(): Promise<AiTestResult> {
 export async function listOllamaModels(): Promise<OllamaModelInfo[]> {
 	if (!isTauri()) return [];
 	return unwrap(await commands.listOllamaModels());
+}
+
+// --- Local AI (bundled CPU inference) ---
+
+export async function getLocalModels(): Promise<LocalModelInfo[]> {
+	if (!isTauri()) return [];
+	return unwrap(await commands.getLocalModels());
+}
+
+/** Starts a background download; progress arrives via onModelDownloadProgress. */
+export async function downloadLocalModel(modelId: string): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.downloadLocalModel(modelId));
+}
+
+export async function deleteLocalModel(modelId: string): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.deleteLocalModel(modelId));
 }
 
 // --- Firebase / Cloud ---

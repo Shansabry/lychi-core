@@ -72,6 +72,9 @@ pub fn run() {
             commands::ai::check_ai_health,
             commands::ai::test_ai_connection,
             commands::ai::list_ollama_models,
+            commands::ai::get_local_models,
+            commands::ai::download_local_model,
+            commands::ai::delete_local_model,
             commands::config::get_general_config,
             commands::config::save_general_config,
             commands::config::get_commands_config,
@@ -324,6 +327,13 @@ pub fn run() {
                     lychi_core::clipboard::store::run_clipboard_monitor(clip_db, clipboard_running);
                 })
                 .expect("failed to spawn clipboard monitor thread");
+
+            // Warm up local AI (if it's the active mode) so the first query isn't
+            // slow — loads the multi-GB model in the background, status via event.
+            {
+                let ai = app.state::<AppState>().config.blocking_read().ai.clone();
+                AppState::warmup_local_ai(app.handle(), &ai);
+            }
 
             // App-index filesystem watcher — rebuilds AppIndex when .desktop files change
             let watcher_running = app.state::<AppState>().app_index_watcher_running.clone();

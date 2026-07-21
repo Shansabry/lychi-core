@@ -308,9 +308,10 @@ impl AppState {
         // handler). Single source of truth for mode dispatch is the core factory.
         let ai_provider: Option<Arc<dyn AiProvider>> = Self::build_ai_provider(&config.ai);
 
-        registry.register(Box::new(AskHandler::new(
+        registry.register(Box::new(AskHandler::with_timeout(
             ai_provider.clone(),
             config.commands.default_search_engine.clone(),
+            Self::ask_timeout(&config.ai),
         )));
         registry.register(Box::new(WeatherAskHandler::new(
             weather_handler,
@@ -340,7 +341,7 @@ impl AppState {
         ));
 
         let ai_router = ai_provider.map(|p| {
-            AiRouter::new_shared(p, std::time::Duration::from_secs(config.ai.timeout_secs))
+            AiRouter::new_shared(p, Self::ask_timeout(&config.ai))
         });
 
         let history = HistoryStore::new(config.history.max_entries, config.history.deduplicate);
@@ -420,6 +421,66 @@ impl AppState {
             }
         }
     }
+
+    /// The timeout the `ask`/transform handlers should use, derived from the AI
+    /// config. Cloud/BYO want to fail fast (short) to fall back to web; LOCAL CPU
+    /// inference is slow and runs on the user's own machine, so give it a
+    /// generous floor rather than bailing to web after a few seconds.
+    pub fn ask_timeout(ai: &lychi_core::config::AiConfig) -> std::time::Duration {
+        use std::time::Duration;
+        if ai.mode == "local" {
+            // Config timeout, but never less than 60s — a 1B model on CPU can take
+            // 15-40s for a full answer, and the user chose local deliberately.
+            Duration::from_secs(ai.timeout_secs.max(60))
+        } else {
+            Duration::from_secs(ai.timeout_secs.max(1))
+        }
+    }
+
+    /// Warm up the local model in the background when local AI is the active
+    /// mode + a model is selected, so the FIRST query isn't slow (the multi-GB
+    /// load happens up front). Emits `lychi://ai-load-state` as it progresses so
+    /// the status bar can show a "loading" indicator. No-op unless mode=local.
+    #[cfg(feature = "local-ai")]
+    pub fn warmup_local_ai(app: &tauri::AppHandle, ai: &lychi_core::config::AiConfig) {
+        use lychi_core::providers::{local, local_models};
+        use tauri::Emitter;
+
+        if ai.mode != "local" || ai.local_model.trim().is_empty() {
+            return;
+        }
+        let id = ai.local_model.trim_end_matches(".gguf");
+        let Some(spec) = local_models::find(id) else {
+            return;
+        };
+        let path = lychi_core::paths::models_dir().join(&ai.local_model);
+        if !path.exists() {
+            return;
+        }
+
+        let app = app.clone();
+        let spec_id = spec.id;
+        std::thread::Builder::new()
+            .name("local-ai-warmup".into())
+            .spawn(move || {
+                let Some(spec) = local_models::find(spec_id) else {
+                    return;
+                };
+                let _ = app.emit("lychi://ai-load-state", "loading");
+                // warmup returns its terminal state — no reaching back into a
+                // global to find out how it went.
+                let state = match local::warmup(spec, &path) {
+                    local::LoadState::Ready => "ready",
+                    local::LoadState::Failed => "failed",
+                    _ => "idle",
+                };
+                let _ = app.emit("lychi://ai-load-state", state);
+            })
+            .ok();
+    }
+
+    #[cfg(not(feature = "local-ai"))]
+    pub fn warmup_local_ai(_app: &tauri::AppHandle, _ai: &lychi_core::config::AiConfig) {}
 
     /// Async-safe wrapper: builds the provider on a blocking thread so the
     /// keyring's internal `block_on` never runs on a tokio worker. Use this from

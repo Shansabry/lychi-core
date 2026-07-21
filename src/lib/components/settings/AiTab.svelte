@@ -1,13 +1,22 @@
 <script lang="ts">
 import { listen } from "@tauri-apps/api/event";
 import { onMount } from "svelte";
-import type { AiConfig, CreditBalance, FirebaseUser, OllamaModelInfo } from "$lib/ipc";
+import type {
+	AiConfig,
+	CreditBalance,
+	FirebaseUser,
+	LocalModelInfo,
+	OllamaModelInfo,
+} from "$lib/ipc";
 import {
 	checkAiHealth,
 	cloudGetCredits,
+	deleteLocalModel,
+	downloadLocalModel,
 	firebaseGetUser,
 	firebaseSignIn,
 	firebaseSignOut,
+	getLocalModels,
 	getMaskedApiKey,
 	listOllamaModels,
 	saveAiConfig,
@@ -39,6 +48,64 @@ let testResult: { ok: boolean; error: string | null } | null = $state(null);
 // Ollama state
 let ollamaModels: OllamaModelInfo[] = $state([]);
 let ollamaFetchError: string | null = $state(null);
+
+// --- Local AI (bundled CPU inference) state ---
+let localModels: LocalModelInfo[] = $state([]);
+// The model the user is being warned about before download (warning gate).
+let pendingDownload: LocalModelInfo | null = $state(null);
+// model_id → { downloaded, total, error } while a download is in flight.
+let downloadProgress: Record<string, { downloaded: number; total: number | null; error: string | null }> =
+	$state({});
+
+async function refreshLocalModels() {
+	try {
+		localModels = await getLocalModels();
+	} catch {
+		localModels = [];
+	}
+}
+
+// Show the warning gate; download only starts after explicit confirm.
+function askDownload(m: LocalModelInfo) {
+	pendingDownload = m;
+}
+
+async function confirmDownload() {
+	const m = pendingDownload;
+	pendingDownload = null;
+	if (!m) return;
+	downloadProgress[m.id] = { downloaded: 0, total: null, error: null };
+	try {
+		await downloadLocalModel(m.id); // returns immediately; progress via event
+	} catch (err) {
+		downloadProgress[m.id] = { downloaded: 0, total: null, error: `${err}` };
+	}
+}
+
+async function handleSelectLocalModel(m: LocalModelInfo) {
+	if (!m.downloaded) return;
+	aiConfig.local_model = `${m.id}.gguf`;
+	await saveAi();
+}
+
+async function handleDeleteLocalModel(m: LocalModelInfo) {
+	try {
+		await deleteLocalModel(m.id);
+		if (aiConfig.local_model === `${m.id}.gguf`) {
+			aiConfig.local_model = "";
+			await saveAi();
+		}
+		await refreshLocalModels();
+	} catch (err) {
+		onsaveerror(`Failed to delete: ${err}`);
+	}
+}
+
+function fmtBytes(n: number): string {
+	if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
+	if (n >= 1e6) return `${(n / 1e6).toFixed(0)} MB`;
+	return `${(n / 1e3).toFixed(0)} KB`;
+}
 
 // Lychi Cloud is disabled for launch (BYOK + Ollama only) — flip this when
 // lychi-cloud ships (Phase 2.3). Typed as boolean so TS doesn't narrow the
@@ -143,9 +210,40 @@ onMount(() => {
 		cloudCredits = null;
 	});
 
+	// Local-model download progress (a download runs in the background).
+	const unlistenDownload = listen<{
+		model_id: string;
+		file_label: string;
+		downloaded: number;
+		total: number | null;
+		done: boolean;
+		error: string | null;
+	}>("lychi://model-download-progress", (e) => {
+		const p = e.payload;
+		if (p.error) {
+			downloadProgress[p.model_id] = { downloaded: 0, total: null, error: p.error };
+			return;
+		}
+		// "weights" is the last (big) file; its `done` means the model is ready.
+		if (p.done && p.file_label === "weights") {
+			delete downloadProgress[p.model_id];
+			downloadProgress = { ...downloadProgress };
+			refreshLocalModels();
+			return;
+		}
+		if (!p.done) {
+			downloadProgress[p.model_id] = {
+				downloaded: p.downloaded,
+				total: p.total,
+				error: null,
+			};
+		}
+	});
+
 	return () => {
 		unlistenSignIn.then((u) => u());
 		unlistenSignOut.then((u) => u());
+		unlistenDownload.then((u) => u());
 	};
 });
 
@@ -156,6 +254,8 @@ export async function initModels(aiMode: string) {
 		if (CLOUD_ENABLED) refreshCloudUser();
 	} else if (aiMode === "byo") {
 		refreshMaskedKey(aiConfig.provider);
+	} else if (aiMode === "local") {
+		refreshLocalModels();
 	}
 	refreshHealth();
 }
@@ -289,6 +389,8 @@ async function handleModeChange(val: string) {
 		if (CLOUD_ENABLED) refreshCloudUser();
 	} else if (val === "byo") {
 		refreshMaskedKey(aiConfig.provider);
+	} else if (val === "local") {
+		refreshLocalModels();
 	}
 }
 
@@ -420,6 +522,7 @@ export function dismissConfirm() {
 			...(aiConfig.mode === "cloud"
 				? [{ value: "cloud", label: "Lychi Cloud (coming soon)" }]
 				: []),
+			{ value: "local", label: "Local AI (bundled)" },
 			{ value: "ollama", label: "Ollama (Local)" },
 			{ value: "byo", label: "BYO API Key" },
 		]}
@@ -474,6 +577,75 @@ export function dismissConfirm() {
 			Opens your browser to sign in. You'll be redirected back to Lychi automatically.
 		</div>
 	{/if}
+{:else if aiConfig.mode === "local"}
+	<div class="local-intro">
+		Private, offline AI that runs on your CPU — nothing leaves your machine.
+		Pick a model to download.
+	</div>
+	<div class="local-models">
+		{#each localModels as m (m.id)}
+			{@const prog = downloadProgress[m.id]}
+			{@const selected = aiConfig.local_model === `${m.id}.gguf`}
+			<div class="local-model" class:selected>
+				<div class="local-model-head">
+					<span class="local-model-label">{m.label}</span>
+					<span class="local-model-size">{m.size_label} · {m.ram_label}</span>
+				</div>
+				<div class="local-model-desc">{m.description}</div>
+
+				{#if prog?.error}
+					<div class="local-error">✗ {prog.error}</div>
+					<button class="set-btn" onclick={() => askDownload(m)}>Retry</button>
+				{:else if prog}
+					<div class="local-progress">
+						Downloading… {fmtBytes(prog.downloaded)}{prog.total ? ` / ${fmtBytes(prog.total)}` : ""}
+					</div>
+				{:else if m.downloaded}
+					<div class="local-actions">
+						{#if selected}
+							<span class="local-active">✓ Selected</span>
+						{:else}
+							<button class="set-btn" onclick={() => handleSelectLocalModel(m)}>Use this</button>
+						{/if}
+						<button class="set-btn clear-btn" onclick={() => handleDeleteLocalModel(m)}>Delete</button>
+					</div>
+				{:else}
+					<button class="set-btn" onclick={() => askDownload(m)}>Download</button>
+				{/if}
+			</div>
+		{/each}
+	</div>
+
+	{#if pendingDownload}
+		<div class="warn-gate">
+			<div class="warn-title">Download {pendingDownload.label}?</div>
+			<ul class="warn-list">
+				<li>Downloads <strong>{pendingDownload.size_label}</strong> (one-time).</li>
+				<li>Runs on your <strong>CPU</strong> — uses ~{pendingDownload.ram_label} while active, best on a modern machine with 8&nbsp;GB+ RAM. May be slow on older hardware and uses battery.</li>
+				<li><strong>Fully private &amp; offline</strong> — nothing is sent anywhere.</li>
+			</ul>
+			<div class="warn-actions">
+				<button class="set-btn accent-btn" onclick={confirmDownload}>Download</button>
+				<button class="set-btn" onclick={() => (pendingDownload = null)}>Cancel</button>
+			</div>
+		</div>
+	{/if}
+
+	<div class="field">
+		<label for="local-timeout">Timeout</label>
+		<div class="number-row">
+			<input
+				id="local-timeout"
+				type="number"
+				min="5"
+				max="120"
+				bind:value={aiConfig.timeout_secs}
+				onchange={saveAi}
+			/>
+			<span class="unit-label">s</span>
+		</div>
+	</div>
+	{@render statusBlock()}
 {:else if aiConfig.mode === "ollama"}
 	<div class="field">
 		<label for="ollama-url">URL</label>
@@ -820,6 +992,96 @@ export function dismissConfirm() {
 		color: var(--fg-muted);
 		padding: 0 0 6px 132px;
 		line-height: 1.4;
+	}
+
+	/* --- Local AI --- */
+	.local-intro {
+		font-size: 12px;
+		color: var(--fg-muted);
+		line-height: 1.5;
+		padding: 4px 0 10px;
+	}
+	.local-models {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+	.local-model {
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		padding: 10px 12px;
+	}
+	.local-model.selected {
+		border-color: var(--accent);
+	}
+	.local-model-head {
+		display: flex;
+		justify-content: space-between;
+		align-items: baseline;
+		gap: 8px;
+	}
+	.local-model-label {
+		font-size: 13px;
+		color: var(--fg);
+	}
+	.local-model-size {
+		font-size: 11px;
+		color: var(--fg-muted);
+	}
+	.local-model-desc {
+		font-size: 11px;
+		color: var(--fg-muted);
+		margin: 3px 0 8px;
+		line-height: 1.4;
+	}
+	.local-actions {
+		display: flex;
+		gap: 6px;
+		align-items: center;
+	}
+	.local-active {
+		font-size: 12px;
+		color: var(--accent);
+	}
+	.local-progress {
+		font-size: 12px;
+		color: var(--fg-muted);
+		font-family: var(--font-mono);
+	}
+	.local-error {
+		font-size: 12px;
+		color: var(--error);
+		margin-bottom: 6px;
+	}
+	.warn-gate {
+		border: 1px solid var(--accent);
+		border-radius: 6px;
+		padding: 12px;
+		margin-top: 10px;
+		background: var(--bg-secondary);
+	}
+	.warn-title {
+		font-size: 13px;
+		color: var(--fg);
+		margin-bottom: 8px;
+	}
+	.warn-list {
+		margin: 0 0 10px;
+		padding-left: 18px;
+		font-size: 12px;
+		color: var(--fg-muted);
+		line-height: 1.6;
+	}
+	.warn-list strong {
+		color: var(--fg);
+	}
+	.warn-actions {
+		display: flex;
+		gap: 8px;
+	}
+	.accent-btn {
+		color: var(--accent);
+		border-color: var(--accent);
 	}
 
 	.test-btn {

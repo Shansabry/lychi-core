@@ -15,6 +15,7 @@ pub async fn get_ai_config(state: State<'_, AppState>) -> Result<AiConfig, Lychi
 #[specta::specta]
 pub async fn save_ai_config(
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
     ai_config: AiConfig,
 ) -> Result<(), LychiError> {
     use lychi_core::config::db as config_db;
@@ -23,12 +24,18 @@ pub async fn save_ai_config(
     // Persist, then release the write lock BEFORE emitting — the AiReactor
     // acquires the config/executor locks with blocking_*, so this command must
     // not still hold them when the event fans out.
+    let ai_snapshot;
     {
         let mut config = state.config.write().await;
         config.ai = ai_config;
         config.save(&paths::config_file())?;
         config_db::save_config_to_db(&state.db, &config)?;
+        ai_snapshot = config.ai.clone();
     }
+
+    // If the user switched to (or picked a model for) local AI, warm it up now so
+    // the first query isn't slow. No-op for other modes.
+    AppState::warmup_local_ai(&app, &ai_snapshot);
 
     // The AiReactor rebuilds the provider, hot-swaps the router, and
     // re-registers the AI-dependent handlers — no restart needed to switch.
@@ -216,4 +223,121 @@ pub struct AiStatus {
     pub provider: String,
     pub model: String,
     pub has_ai_router: bool,
+}
+
+// --- Local AI: curated model list, download, delete ---
+
+/// One offered local model, for the settings picker. Carries the warning-gate
+/// info (size/RAM) so the UI can inform the user BEFORE download.
+#[derive(serde::Serialize, specta::Type)]
+pub struct LocalModelInfo {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub size_label: String,
+    pub ram_label: String,
+    /// Whether the model's files are already on disk.
+    pub downloaded: bool,
+}
+
+/// The curated local-model list + which are downloaded. Available even in builds
+/// without the `local-ai` engine feature (download is independent of inference).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_local_models() -> Result<Vec<LocalModelInfo>, LychiError> {
+    use lychi_core::providers::{local_download, local_models};
+    Ok(local_models::MODELS
+        .iter()
+        .map(|m| LocalModelInfo {
+            id: m.id.to_string(),
+            label: m.label.to_string(),
+            description: m.description.to_string(),
+            size_label: m.size_label.to_string(),
+            ram_label: m.ram_label.to_string(),
+            downloaded: local_download::is_downloaded(m),
+        })
+        .collect())
+}
+
+/// Progress/terminal payload emitted on `lychi://model-download-progress`. A
+/// download runs as a BACKGROUND task; the command returns immediately, so ALL
+/// outcomes — progress, completion (`done`), and failure (`error`) — arrive here.
+#[derive(Clone, serde::Serialize, specta::Type)]
+pub struct ModelDownloadProgress {
+    pub model_id: String,
+    pub file_label: String,
+    pub downloaded: u64,
+    pub total: Option<u64>,
+    pub done: bool,
+    /// Set on a terminal failure; `None` during progress / on success.
+    pub error: Option<String>,
+}
+
+/// Start downloading a model's weights + tokenizer. Returns IMMEDIATELY; the
+/// download runs as a background task and reports via
+/// `lychi://model-download-progress` (progress, then a final `done` or `error`).
+/// Idempotent. The UI must show the CPU/RAM + size warning and get explicit
+/// confirmation BEFORE calling this.
+#[tauri::command]
+#[specta::specta]
+pub async fn download_local_model(
+    model_id: String,
+    app: tauri::AppHandle,
+) -> Result<(), LychiError> {
+    use lychi_core::providers::local_download;
+
+    // Validate up front so an unknown id fails fast (before spawning).
+    let spec = local_download::find(&model_id)
+        .ok_or_else(|| LychiError::Config(format!("Unknown model '{model_id}'")))?;
+
+    // Fire-and-forget: a multi-GB download must not hold the command invocation
+    // open for minutes. All outcomes flow through the event.
+    tauri::async_runtime::spawn(async move {
+        use tauri::Emitter;
+        let emit = |p: local_download::DownloadProgress| {
+            let _ = app.emit(
+                "lychi://model-download-progress",
+                ModelDownloadProgress {
+                    model_id: p.model_id,
+                    file_label: p.file_label,
+                    downloaded: p.downloaded,
+                    total: p.total,
+                    done: p.done,
+                    error: None,
+                },
+            );
+        };
+        if let Err(e) = local_download::download(spec, emit).await {
+            let _ = app.emit(
+                "lychi://model-download-progress",
+                ModelDownloadProgress {
+                    model_id: model_id.clone(),
+                    file_label: String::new(),
+                    downloaded: 0,
+                    total: None,
+                    done: false,
+                    error: Some(e.to_string()),
+                },
+            );
+        }
+    });
+
+    Ok(())
+}
+
+/// Delete a downloaded model's files to reclaim disk space.
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_local_model(model_id: String) -> Result<(), LychiError> {
+    use lychi_core::providers::local_models;
+    let spec = local_models::find(&model_id)
+        .ok_or_else(|| LychiError::Config(format!("Unknown model '{model_id}'")))?;
+    let dir = paths::models_dir();
+    let f = spec.gguf_filename();
+    let path = dir.join(&f);
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .map_err(|e| LychiError::Config(format!("delete {f}: {e}")))?;
+    }
+    Ok(())
 }

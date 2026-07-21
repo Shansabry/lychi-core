@@ -5,8 +5,6 @@ import {
 	Lightbulb,
 	LoaderCircle,
 	Music,
-	Pause,
-	Play,
 	Settings,
 	Sparkles,
 	SquareTerminal,
@@ -37,6 +35,7 @@ let {
 	contextRefreshing = false,
 	actionsAvailable = false,
 	onactionpanel = () => {},
+	aiLoading = false,
 }: {
 	result: CommandResult | null;
 	executing: boolean;
@@ -59,6 +58,7 @@ let {
 	contextRefreshing?: boolean;
 	actionsAvailable?: boolean;
 	onactionpanel?: () => void;
+	aiLoading?: boolean;
 } = $props();
 
 let resultVisible = $derived(
@@ -70,6 +70,19 @@ let resultVisible = $derived(
 		!notesOpen,
 );
 
+// The left status-info slot has transient content to show (routing / running /
+// AI loading / a result / a context hint). When it does, the now-playing media
+// pill yields its space so that content is unobstructed; once the slot clears,
+// the pill slides back in. This keeps the busy state legible without crowding.
+let statusBusy = $derived(
+	aiLoading ||
+		routing ||
+		executing ||
+		Boolean(result) ||
+		contextRefreshing ||
+		contextStale,
+);
+
 async function togglePlayPause() {
 	if (!nowPlaying) return;
 	await mediaControl(nowPlaying.bus_name, "play_pause");
@@ -78,7 +91,9 @@ async function togglePlayPause() {
 
 <div class="status-bar">
 	<div class="status-info">
-		{#if routing}
+		{#if aiLoading}
+			<span class="ai-loading"><Sparkles size={11} strokeWidth={2} /> Loading AI model…</span>
+		{:else if routing}
 			<span class="routing-text"><span class="traveler"><span class="dot"></span></span> Routing...</span>
 		{:else if executing}
 			<span class="executing-text"><span class="traveler"><span class="dot"></span></span> Running...</span>
@@ -114,19 +129,32 @@ async function togglePlayPause() {
 	{#if nowPlaying && !mediaOpen}
 		<!-- svelte-ignore a11y_click_events_have_key_events -->
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
-		<div class="now-playing" onclick={ontogglemedia}>
+		<div
+			class="now-playing"
+			class:yielded={statusBusy}
+			onclick={ontogglemedia}
+		>
+			<!-- Left slot: the animated equalizer IS the playing indicator + the
+			     pause control. While playing it shows the bouncing waveform; on
+			     hover / when paused it's the play/pause button. Clicking it toggles
+			     playback (stopPropagation so it doesn't open the panel). MPRIS gives
+			     no real audio stream, so the waveform is a synthetic bounce. -->
 			<button
-				class="mini-play"
+				class="viz-btn"
 				onmousedown={(e) => e.preventDefault()}
 				onclick={(e) => { e.stopPropagation(); togglePlayPause(); }}
 				tabindex={-1}
 				aria-label={nowPlaying.status === "playing" ? "Pause" : "Play"}
 			>
-				{#if nowPlaying.status === "playing"}
-					<Pause size={10} strokeWidth={2} />
-				{:else}
-					<Play size={10} strokeWidth={2} />
-				{/if}
+				<!-- Always the waveform: animated while playing, frozen + muted when
+				     paused (animation-play-state: paused + dimmed). -->
+				<span
+					class="viz"
+					class:playing={nowPlaying.status === "playing"}
+					aria-hidden="true"
+				>
+					<span></span><span></span><span></span><span></span>
+				</span>
 			</button>
 			<span class="now-playing-text">
 				{#if multiplePlayers}
@@ -227,7 +255,9 @@ async function togglePlayPause() {
 	.status-bar {
 		display: flex;
 		align-items: center;
-		justify-content: space-between;
+		/* Left group ([media][status-info]) packs against the left edge; the
+		   toolbar is pushed to the far right via margin-left:auto below. */
+		justify-content: flex-start;
 		padding: 4px 20px;
 		font-family: var(--font-mono);
 		font-size: 11px;
@@ -241,6 +271,8 @@ async function togglePlayPause() {
 		gap: 2px;
 		align-items: center;
 		flex-shrink: 0;
+		/* Pin to the far right regardless of how much the left group fills. */
+		margin-left: auto;
 	}
 
 	.toolbar-sep {
@@ -312,6 +344,11 @@ async function togglePlayPause() {
 	}
 
 	.now-playing {
+		/* Pinned to the far bottom-left: render before .status-info (order:-1) and
+		   sit hard against the bar's left padding, with status-info following it to
+		   the right. The auto right-margin that pushes the toolbar over lives on
+		   .status-info (see below), so this stays flush left. */
+		order: -1;
 		display: flex;
 		align-items: center;
 		gap: 6px;
@@ -319,29 +356,141 @@ async function togglePlayPause() {
 		cursor: pointer;
 		border-radius: 4px;
 		padding: 2px 6px;
-		transition: background 100ms ease;
+		/* Transition opacity + width so it collapses/returns smoothly when the
+		   status-info slot needs the space. will-change keeps it on the GPU layer
+		   (hot path — toggles often). */
+		transition:
+			background 100ms ease,
+			opacity 160ms ease,
+			max-width 200ms ease,
+			transform 200ms ease;
+		will-change: opacity, max-width, transform;
+		max-width: 300px;
+		overflow: hidden;
 	}
 
 	.now-playing:hover {
 		background: var(--bg-secondary);
 	}
 
-	.mini-play {
+	/* Yielded: the status-info slot has something to show → the media pill fades
+	   out, collapses its width, and nudges left, so the busy state is unobstructed.
+	   It's kept in the DOM (not removed) so it returns instantly and cheaply. */
+	.now-playing.yielded {
+		opacity: 0;
+		max-width: 0;
+		transform: translateX(-6px);
+		padding-left: 0;
+		padding-right: 0;
+		pointer-events: none;
+	}
+
+	/* Equalizer visualizer: 4 accent pill-bars that grow from the CENTER (not the
+	   floor) — transform-origin: center + scaleY. The organic/random look (vs. a
+	   marching left-to-right wave) comes from THREE distinct keyframe curves whose
+	   crests land at different heights + different times, plus a distinct duration
+	   per bar so they drift out of phase forever. Springy cubic-bezier (never
+	   linear). Floors never hit 0 so bars stay alive. Paused = frozen mid + dim via
+	   animation-play-state. GPU-friendly: only transform animates. */
+	.viz {
+		display: inline-flex;
+		align-items: center;
+		gap: 2.5px;
+		height: 12px;
+		flex-shrink: 0;
+		/* Paused (default): frozen mid-height, dimmed + desaturated so it clearly
+		   reads "stopped" — a quiet, muted version of the playing waveform. */
+		opacity: 0.4;
+		filter: saturate(0.6);
+		transition: opacity 150ms ease, filter 150ms ease;
+	}
+
+	.viz span {
+		width: 2px;
+		height: 100%;
+		border-radius: 2px;
+		transform: scaleY(0.35);
+		transform-origin: center;
+		will-change: transform;
+		animation-iteration-count: infinite;
+		/* Smooth, gentle easing (not springy) — each keyframe segment eases in and
+		   out so there are no abrupt direction snaps. */
+		animation-timing-function: ease-in-out;
+		animation-play-state: paused;
+	}
+
+	/* Playing: full color, and the bars animate. */
+	.viz.playing {
+		opacity: 1;
+		filter: none;
+	}
+
+	.viz.playing span {
+		animation-play-state: running;
+	}
+
+	/* Per-bar: a distinct color + keyframe curve + duration + non-round negative
+	   delay (starts mid-cycle, never syncs into a wave). Colors span an accent-
+	   anchored gradient (accent → a warmer/cooler sibling) so it's multicolor but
+	   still on-theme; --accent stays the dominant hue. */
+	.viz span:nth-child(1) { background: var(--accent); animation-name: eq-a; animation-duration: 1.9s; animation-delay: -0.8s; }
+	.viz span:nth-child(2) { background: color-mix(in srgb, var(--accent) 60%, #ff5ea8); animation-name: eq-c; animation-duration: 2.4s; animation-delay: -1.7s; }
+	.viz span:nth-child(3) { background: color-mix(in srgb, var(--accent) 55%, #6ea8ff); animation-name: eq-b; animation-duration: 2.1s; animation-delay: -2.3s; }
+	.viz span:nth-child(4) { background: color-mix(in srgb, var(--accent) 65%, #ffcf5e); animation-name: eq-a; animation-duration: 2.6s; animation-delay: -0.4s; }
+
+	/* Keyframes LOOP SEAMLESSLY (0% == 100%) so there's no jump at the wrap, with
+	   evenly-spaced stops and gentle swings so the motion flows continuously. */
+	@keyframes eq-a {
+		0%   { transform: scaleY(0.40); }
+		25%  { transform: scaleY(1.00); }
+		50%  { transform: scaleY(0.55); }
+		75%  { transform: scaleY(0.80); }
+		100% { transform: scaleY(0.40); }
+	}
+	@keyframes eq-b {
+		0%   { transform: scaleY(0.85); }
+		25%  { transform: scaleY(0.45); }
+		50%  { transform: scaleY(1.00); }
+		75%  { transform: scaleY(0.55); }
+		100% { transform: scaleY(0.85); }
+	}
+	@keyframes eq-c {
+		0%   { transform: scaleY(0.55); }
+		25%  { transform: scaleY(0.90); }
+		50%  { transform: scaleY(0.40); }
+		75%  { transform: scaleY(0.95); }
+		100% { transform: scaleY(0.55); }
+	}
+
+	/* Respect reduced-motion: no bounce, steady mid height. */
+	@media (prefers-reduced-motion: reduce) {
+		.viz span {
+			animation: none;
+			transform: scaleY(0.6);
+		}
+	}
+
+	/* Left slot: holds either the waveform (playing) or the play glyph (paused).
+	   Fixed width so the pill doesn't jump when swapping between them. */
+	.viz-btn {
 		display: flex;
 		align-items: center;
 		justify-content: center;
+		width: 18px;
+		height: 14px;
 		background: none;
 		border: none;
-		color: var(--fg-muted);
+		color: var(--accent);
 		cursor: pointer;
-		padding: 2px;
+		padding: 0;
 		border-radius: 3px;
 		flex-shrink: 0;
-		transition: color 100ms ease;
+		transition: opacity 100ms ease, color 100ms ease;
 	}
 
-	.mini-play:hover {
-		color: var(--fg);
+	/* Hover hint that the waveform is a pause control: dim it slightly. */
+	.viz-btn:hover {
+		opacity: 0.7;
 	}
 
 	.now-playing-text {
@@ -360,10 +509,21 @@ async function togglePlayPause() {
 	}
 
 	.routing-text,
-	.executing-text {
+	.executing-text,
+	.ai-loading {
 		display: flex;
 		align-items: center;
 		gap: 4px;
+	}
+
+	.ai-loading {
+		color: var(--ai);
+		animation: pulse 1.4s ease-in-out infinite;
+	}
+
+	@keyframes pulse {
+		0%, 100% { opacity: 1; }
+		50% { opacity: 0.5; }
 	}
 
 	.routing-text {

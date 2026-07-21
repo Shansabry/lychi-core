@@ -303,7 +303,8 @@ impl Default for ProjectsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct AiConfig {
-    /// AI mode: "disabled", "byo", "ollama" (cloud is deferred to Phase 2.3).
+    /// AI mode: "disabled", "byo", "ollama", "local" (cloud is deferred to
+    /// Phase 2.3). "local" runs bundled CPU inference via Candle (feature-gated).
     pub mode: String,
     /// BYO provider preset id: "openai", "anthropic", "groq", "grok",
     /// "gemini", "openrouter", or "custom". Selects the default base URL +
@@ -322,6 +323,9 @@ pub struct AiConfig {
     pub ollama_url: String,
     /// Ollama model name (e.g. "mistral:latest", "llama3:8b")
     pub ollama_model: String,
+    /// Local model file id — the GGUF filename under `paths::models_dir()`, e.g.
+    /// "llama-3.2-1b-instruct-q4_k_m.gguf". Empty = no local model selected.
+    pub local_model: String,
     /// AI request timeout in seconds (default 8).
     pub timeout_secs: u64,
     /// Max tokens for routing/intent calls (default 300).
@@ -430,6 +434,7 @@ impl Default for AiConfig {
             wire_format: String::new(),
             ollama_url: "http://localhost:11434".to_string(),
             ollama_model: String::new(),
+            local_model: String::new(),
             timeout_secs: default_ai_timeout(),
             max_tokens: default_max_tokens(),
         }

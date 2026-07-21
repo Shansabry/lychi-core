@@ -5,7 +5,13 @@ edition.workspace = true
 
 [features]
 default = ["mpris"]
-mpris = ["dep:zbus", "dep:futures-util", "dep:futures-core"]
+mpris = ["dep:zbus", "dep:futures-core"]
+# Bundled local AI (CPU inference via llama.cpp, statically linked). Optional +
+# OUT of default so normal builds don't pull the ML engine. Model weights are
+# downloaded on first use (not bundled), so this only adds the engine, not
+# gigabytes. llama-cpp-2 vendors + statically links llama.cpp (CPU-only, no
+# CUDA/BLAS/OpenMP runtime deps by default) — one self-contained binary.
+local-ai = ["dep:llama-cpp-2"]
 
 [dependencies]
 serde = { workspace = true }
@@ -44,10 +50,17 @@ getrandom = "0.4"
 notify-rust = "4"
 emojis = "0.9"
 unicode_names2 = "3"
-reqwest = { version = "0.13", features = ["json", "query"] }
+reqwest = { version = "0.13", features = ["json", "query", "stream"] }
 zbus = { version = "5", features = ["tokio"], optional = true }
-futures-util = { version = "0.3", optional = true }
+# Not optional: the model downloader (streamed) needs StreamExt independent of
+# the mpris/local-ai features. Tiny crate.
+futures-util = "0.3"
 futures-core = { version = "0.3", optional = true }
+# Local AI (feature = "local-ai"): CPU inference via statically-linked llama.cpp.
+# default-features off = CPU-only, static (no CUDA/Vulkan/BLAS/OpenMP), so the
+# AppImage stays a single self-contained binary. Built with an AVX2 baseline
+# (see .cargo/config.toml) for portability across x86-64.
+llama-cpp-2 = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", default-features = false }
