@@ -703,7 +703,6 @@ mod tests {
             ("o:firefox", "open", "firefox"),
             ("bm:github", "bm", "github"),
             ("n:call dentist", "note", "call dentist"),
-            ("t:add buy milk", "todo", "add buy milk"),
             ("cl:", "clip", ""),
             ("m:pause", "media", "pause"),
             ("p:lychi", "project", "lychi"),

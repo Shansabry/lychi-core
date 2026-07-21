@@ -95,6 +95,10 @@ impl ActionHandler for WeatherAskHandler {
         "weather-ask"
     }
 
+    fn execution_mode(&self) -> crate::action_registry::ExecutionMode {
+        crate::action_registry::ExecutionMode::ReplacePrevious
+    }
+
     fn description(&self) -> &str {
         "Answer conversational weather questions using real weather data"
     }

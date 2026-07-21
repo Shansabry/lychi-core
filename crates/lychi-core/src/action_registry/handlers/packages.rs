@@ -321,7 +321,11 @@ impl ActionHandler for PackagesHandler {
         "Search and install system packages (dnf/apt/pacman/zypper/flatpak)"
     }
 
-    fn assess_risk(&self, args: &str) -> RiskAssessment {
+    fn assess_risk(
+        &self,
+        args: &str,
+        _ctx: &crate::action_registry::RiskContext<'_>,
+    ) -> RiskAssessment {
         // Search is read-only (auto); install mutates the system (root via
         // pkexec) and needs confirmation.
         if is_mutating(args) {
@@ -389,8 +393,8 @@ mod tests {
     #[test]
     fn assess_risk_confirms_install_not_search() {
         let h = PackagesHandler::new();
-        assert_eq!(h.assess_risk("install neovim").level, RiskLevel::Medium);
-        assert_eq!(h.assess_risk("search ripgrep").level, RiskLevel::Low);
+        assert_eq!(h.assess_risk("install neovim", &Default::default()).level, RiskLevel::Medium);
+        assert_eq!(h.assess_risk("search ripgrep", &Default::default()).level, RiskLevel::Low);
     }
 
     #[test]

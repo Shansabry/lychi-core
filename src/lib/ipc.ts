@@ -154,6 +154,18 @@ export async function executeCommand(
 	return unwrap(await commands.executeCommand(input, confirmed ?? null, runInline ?? null));
 }
 
+export async function confirmExecution(): Promise<CommandResult> {
+	if (!isTauri()) {
+		return {
+			success: false,
+			output: null,
+			error: "Not running in Tauri",
+			duration_ms: 0,
+		} as CommandResult;
+	}
+	return unwrap(await commands.confirmExecution());
+}
+
 export async function getHistory(): Promise<string[]> {
 	if (!isTauri()) return [];
 	return unwrap(await commands.getHistory());

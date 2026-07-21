@@ -55,6 +55,7 @@ pub fn run() {
     let specta_builder =
         tauri_specta::Builder::<tauri::Wry>::new().commands(tauri_specta::collect_commands![
             commands::execute::execute_command,
+            commands::execute::confirm_execution,
             commands::execute::get_completions,
             commands::execute::get_command_catalog,
             commands::execute::get_trigger_catalog,

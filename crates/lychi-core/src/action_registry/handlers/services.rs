@@ -254,7 +254,11 @@ impl ActionHandler for ServicesHandler {
         "Control systemd services: list, status, start/stop/restart"
     }
 
-    fn assess_risk(&self, args: &str) -> RiskAssessment {
+    fn assess_risk(
+        &self,
+        args: &str,
+        _ctx: &crate::action_registry::RiskContext<'_>,
+    ) -> RiskAssessment {
         // Read-only verbs (status/list) auto-execute; mutating verbs
         // (start/stop/restart/…) need confirmation. This decision lives here,
         // where the handler already knows its verbs — not in the Rules Engine.
@@ -393,11 +397,11 @@ mod tests {
     #[test]
     fn assess_risk_confirms_mutating_verbs_only() {
         let h = ServicesHandler::new();
-        assert_eq!(h.assess_risk("nginx restart").level, RiskLevel::Medium);
-        assert_eq!(h.assess_risk("stop nginx").level, RiskLevel::Medium);
+        assert_eq!(h.assess_risk("nginx restart", &Default::default()).level, RiskLevel::Medium);
+        assert_eq!(h.assess_risk("stop nginx", &Default::default()).level, RiskLevel::Medium);
         // read-only → auto-execute
-        assert_eq!(h.assess_risk("nginx").level, RiskLevel::Low);
-        assert_eq!(h.assess_risk("nginx status").level, RiskLevel::Low);
+        assert_eq!(h.assess_risk("nginx", &Default::default()).level, RiskLevel::Low);
+        assert_eq!(h.assess_risk("nginx status", &Default::default()).level, RiskLevel::Low);
     }
 
     #[test]

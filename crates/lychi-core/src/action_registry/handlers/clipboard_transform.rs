@@ -36,6 +36,10 @@ impl ActionHandler for ClipboardTransformHandler {
         "clipboard_transform"
     }
 
+    fn execution_mode(&self) -> crate::action_registry::ExecutionMode {
+        crate::action_registry::ExecutionMode::ReplacePrevious
+    }
+
     fn description(&self) -> &str {
         "AI-powered clipboard transformations (summarize, rewrite, convert, translate)"
     }

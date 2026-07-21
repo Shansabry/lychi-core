@@ -84,6 +84,10 @@ impl ActionHandler for TranslateHandler {
         "translate"
     }
 
+    fn execution_mode(&self) -> crate::action_registry::ExecutionMode {
+        crate::action_registry::ExecutionMode::ReplacePrevious
+    }
+
     fn description(&self) -> &str {
         "Translate text to another language"
     }

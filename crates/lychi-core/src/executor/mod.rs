@@ -2,6 +2,13 @@ use std::sync::Arc;
 
 use redb::Database;
 
+/// Execution-concurrency policy (G4), extracted so the orchestrator stays lean.
+pub mod concurrency;
+use concurrency::ConcurrencyGate;
+/// Suggestion-learning latch/debounce state, extracted for the same reason.
+pub mod suggestion_tracker;
+use suggestion_tracker::SuggestionTracker;
+
 use crate::action_registry::registry::ActionRegistry;
 use crate::action_registry::{ActionResult, CompletionItem, RiskLevel};
 use crate::config::schema::PrivacyConfig;
@@ -44,13 +51,11 @@ fn expand_at_references(input: &str) -> String {
                 return tok.to_string();
             }
             // Tilde-expand: `~` or `~/...` → home.
-            if let Some(after) = rest.strip_prefix('~') {
-                if after.is_empty() || after.starts_with('/') {
-                    if let Some(h) = home.as_ref() {
-                        let joined = format!("{}{}", h.display(), after);
-                        return joined;
-                    }
-                }
+            if let Some(after) = rest.strip_prefix('~')
+                && (after.is_empty() || after.starts_with('/'))
+                && let Some(h) = home.as_ref()
+            {
+                return format!("{}{}", h.display(), after);
             }
             rest.to_string()
         })
@@ -66,6 +71,17 @@ pub struct ExecuteResult {
     pub result: ActionResult,
     pub action_id: String,
     pub envelope: crate::action_registry::ResultEnvelope,
+    /// When the result is a pending confirmation, this carries the exact resolved
+    /// intent that was assessed. The bridge stores it so the confirm step can
+    /// execute THIS action (via `run_confirmed`) instead of re-resolving the raw
+    /// input — closing the confirmation TOCTOU gap (G1). `None` otherwise.
+    pub pending_intent: Option<crate::intent::ResolvedIntent>,
+    /// True when an `Exclusive` action was rejected because another exclusive
+    /// action was already running (G4 fail-fast). The confirm path uses this to
+    /// REINSERT the pending confirmation instead of consuming it — so a "busy"
+    /// reject doesn't force the user to reconstruct a confirmed destructive action
+    /// (the reviewer's #1↔#10 interaction). No execution occurred.
+    pub busy: bool,
 }
 
 /// Per-run inputs the caller supplies to `run()` — the config/UI state that used
@@ -103,17 +119,18 @@ pub struct Executor {
     pub db: Arc<Database>,
     /// Current environment context, refreshed on each summon.
     pub context: Option<EnvironmentContext>,
-    /// Commands suggested in the most recent completions pass. Used by the
-    /// suggestion learning loop: executing one of these counts as acceptance.
-    last_suggestions: std::sync::Mutex<Vec<String>>,
-    /// Debounce guard for impression recording: (context_key, commands, ts_ms)
-    /// of the last zero-state panel we counted. `completions()` fires per
-    /// keystroke, so we only record an impression once the SAME panel settles
-    /// (same context + same commands within the debounce window).
-    last_impression: std::sync::Mutex<Option<(String, Vec<String>, u64)>>,
+    /// Suggestion-learning state (acceptance latch + impression debounce),
+    /// extracted into its own collaborator so the Executor doesn't carry the
+    /// ad-hoc mutexes inline. The Executor still owns the policy (what to record).
+    suggestions: SuggestionTracker,
     /// Lowercased custom search-engine ("bang") keywords, so the router can send
     /// `gh tokio` to the `bang` handler. Set from config after construction.
     bang_keywords: Vec<String>,
+    /// Execution-concurrency policy (G4): enforces each handler's `ExecutionMode`
+    /// (immediate / exclusive-fail-fast / replace-previous-with-cancellation).
+    /// Extracted into its own collaborator so the Executor stays an orchestrator
+    /// rather than accumulating specialized concurrency mechanics.
+    gate: ConcurrencyGate,
 }
 
 impl Executor {
@@ -131,9 +148,9 @@ impl Executor {
             history,
             db,
             context: None,
-            last_suggestions: std::sync::Mutex::new(Vec::new()),
-            last_impression: std::sync::Mutex::new(None),
+            suggestions: SuggestionTracker::new(),
             bang_keywords: Vec::new(),
+            gate: ConcurrencyGate::new(),
         }
     }
 
@@ -164,13 +181,7 @@ impl Executor {
     /// `frecency::record_suggestion`.
     pub fn suggestion_acceptance(&self, input: &str) -> Option<String> {
         let trimmed = input.trim();
-        let accepted = self
-            .last_suggestions
-            .lock()
-            .ok()?
-            .iter()
-            .any(|s| s == trimmed);
-        if !accepted {
+        if !self.suggestions.was_shown(trimmed) {
             return None;
         }
         self.context
@@ -179,13 +190,12 @@ impl Executor {
     }
 
     fn note_suggestions(&self, items: &[CompletionItem]) {
-        if let Ok(mut guard) = self.last_suggestions.lock() {
-            *guard = items
-                .iter()
-                .filter(|i| i.icon_path.as_deref() == Some("__context__"))
-                .map(|i| i.label.clone())
-                .collect();
-        }
+        let shown: Vec<String> = items
+            .iter()
+            .filter(|i| i.icon_path.as_deref() == Some("__context__"))
+            .map(|i| i.label.clone())
+            .collect();
+        self.suggestions.set_shown(shown);
     }
 
     /// Debounce window (ms) for impression recording — one settle of the same
@@ -213,15 +223,13 @@ impl Executor {
         let context_key = crate::context::suggestions::context_key(ctx);
         let now = crate::db::now_millis();
 
-        if let Ok(mut guard) = self.last_impression.lock() {
-            if let Some((prev_key, prev_cmds, prev_ts)) = guard.as_ref()
-                && *prev_key == context_key
-                && *prev_cmds == commands
-                && now.saturating_sub(*prev_ts) < Self::IMPRESSION_DEBOUNCE_MS
-            {
-                return; // same panel still settling — already counted
-            }
-            *guard = Some((context_key.clone(), commands.clone(), now));
+        if !self.suggestions.should_record_impression(
+            &context_key,
+            &commands,
+            now,
+            Self::IMPRESSION_DEBOUNCE_MS,
+        ) {
+            return; // same panel still settling — already counted
         }
         let _ = crate::db::frecency::record_impressions(&self.db, &context_key, &commands);
     }
@@ -508,8 +516,39 @@ impl Executor {
         privacy: &PrivacyConfig,
         inputs: &RunInputs,
     ) -> Result<ExecuteResult, LychiError> {
+        self.run_inner(input, None, confirmed, privacy, inputs).await
+    }
+
+    /// Execute a PRE-RESOLVED intent, re-checking policy but skipping resolution.
+    ///
+    /// This is the second half of the confirmation flow (G1): the first `run`
+    /// assessed and captured a `ResolvedIntent`; on confirm we execute THAT exact
+    /// action rather than re-resolving the raw string, closing the time-of-check /
+    /// time-of-use gap (routing/context/config can't shift the action between
+    /// assessment and execution). Policy (`rules.validate`) still runs, so a
+    /// deny/consent change since assessment is honored.
+    pub async fn run_confirmed(
+        &self,
+        intent: crate::intent::ResolvedIntent,
+        privacy: &PrivacyConfig,
+        inputs: &RunInputs,
+    ) -> Result<ExecuteResult, LychiError> {
+        // `input` is only used for logging here; the intent is authoritative.
+        self.run_inner("", Some(intent), true, privacy, inputs).await
+    }
+
+    async fn run_inner(
+        &self,
+        input: &str,
+        preresolved: Option<crate::intent::ResolvedIntent>,
+        confirmed: bool,
+        privacy: &PrivacyConfig,
+        inputs: &RunInputs,
+    ) -> Result<ExecuteResult, LychiError> {
         // Set context hint on AI router so it's included in the prompt
-        if let Some(ai) = self.resolver.ai_router() {
+        if preresolved.is_none()
+            && let Some(ai) = self.resolver.ai_router()
+        {
             let hint = self.context.as_ref().and_then(|ctx| ctx.ai_hint());
             ai.set_context_hint(hint);
         }
@@ -530,11 +569,12 @@ impl Executor {
             .and_then(|ctx| resolve_with_clipboard(input, ctx))
             .unwrap_or_else(|| input.to_string());
 
-        // Custom search-engine shortcut ("bang"): `gh tokio` → bang handler.
-        // Checked before general resolution so a configured keyword always wins
-        // over app/web fallbacks; a bare keyword (no query) is left to normal
-        // routing so it doesn't shadow a real command/app of the same name.
-        let mut intent = if let Some(full) = self.bang_route(&effective_input) {
+        // A pre-resolved intent (confirmation re-run) is used verbatim — no
+        // re-resolution, so the confirmed action is exactly what was assessed.
+        // Otherwise resolve fresh: bang shortcut first, then the resolver.
+        let mut intent = if let Some(intent) = preresolved {
+            intent
+        } else if let Some(full) = self.bang_route(&effective_input) {
             crate::intent::ResolvedIntent {
                 action_id: "bang".to_string(),
                 args: full,
@@ -565,6 +605,8 @@ impl Executor {
                 ),
                 action_id: intent.action_id.clone(),
                 envelope: Default::default(),
+                pending_intent: None,
+                busy: false,
             });
         }
         let run_repo_override = match run_repo {
@@ -593,9 +635,18 @@ impl Executor {
             RoutingMethod::Ai => "ai",
         };
 
-        // Ask the handler to assess this specific invocation's risk, then let the
-        // rules engine layer cross-cutting policy on top.
-        let risk = handler.assess_risk(&intent.args);
+        // Ask the handler to assess this specific invocation's risk — with a cheap
+        // context (cwd, workspace) so risk can depend on WHERE it runs (G2) — then
+        // let the rules engine layer cross-cutting policy on top.
+        let risk_ctx = crate::action_registry::RiskContext {
+            cwd: self.context.as_ref().and_then(|c| c.cwd.as_deref()),
+            workspace_root: self
+                .context
+                .as_ref()
+                .and_then(|c| c.project.as_ref())
+                .and_then(|p| p.workspace_root.as_deref()),
+        };
+        let risk = handler.assess_risk(&intent.args, &risk_ctx);
         let decision = self.rules.validate(
             &ValidationRequest {
                 action_id: &intent.action_id,
@@ -613,6 +664,12 @@ impl Executor {
             ..Default::default()
         };
 
+        // Set only when we return a pending confirmation — carries the exact
+        // assessed intent so confirm executes it verbatim (G1, no re-resolve).
+        let mut pending_intent: Option<crate::intent::ResolvedIntent> = None;
+        // Set true if an Exclusive action was rejected as busy (no execution).
+        let mut busy = false;
+
         let result = match decision {
             ValidationDecision::Deny { reason } => {
                 envelope.risk_level = Some(RiskLevel::High);
@@ -621,6 +678,7 @@ impl Executor {
             ValidationDecision::Confirm { reason } if !confirmed => {
                 envelope.needs_confirmation = Some(reason);
                 envelope.risk_level = Some(risk.level);
+                pending_intent = Some(intent.clone());
                 // A pending-confirmation result: not yet run, no error, no output.
                 ActionResult {
                     success: false,
@@ -649,7 +707,10 @@ impl Executor {
                         self.context.clone(),
                     );
                 }
-                let result = handler.execute(&exec_ctx, &intent.args).await?;
+                let (result, was_busy) = self
+                    .gate.run(handler, &exec_ctx, &intent.args)
+                    .await?;
+                busy = was_busy;
                 if intent.routing == RoutingMethod::Ai {
                     envelope.routed_by = Some("ai".to_string());
                 }
@@ -684,6 +745,8 @@ impl Executor {
                             routed_by: Some(routed_by.to_string()),
                             ..Default::default()
                         },
+                        pending_intent: None,
+                        busy: false,
                     });
                 }
 
@@ -695,6 +758,8 @@ impl Executor {
             result,
             action_id,
             envelope,
+            busy,
+            pending_intent,
         })
     }
 
@@ -1380,6 +1445,375 @@ mod tests {
                 Vec::new()
             }
         }
+    }
+
+    /// A `ReplacePrevious` handler that sleeps, so a superseding call can cancel
+    /// it mid-flight. Records whether its body ran to completion.
+    struct SlowReplaceHandler {
+        delay_ms: u64,
+        completed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ActionHandler for SlowReplaceHandler {
+        fn id(&self) -> &str {
+            "slow"
+        }
+        fn description(&self) -> &str {
+            "slow replace stub"
+        }
+        fn execution_mode(&self) -> crate::action_registry::ExecutionMode {
+            crate::action_registry::ExecutionMode::ReplacePrevious
+        }
+        async fn execute(
+            &self,
+            _ctx: &crate::action_registry::ExecContext,
+            _args: &str,
+        ) -> Result<ActionResult, crate::error::LychiError> {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            // Only reached if NOT cancelled — the cancel branch drops this future
+            // before this line runs.
+            self.completed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(ActionResult::ok(
+                "slow done",
+                crate::action_registry::OutputType::Status,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_previous_cancels_superseded_call() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let exec = make_executor(ActionRegistry::new());
+        let ctx = crate::action_registry::ExecContext::default();
+
+        let first_done = Arc::new(AtomicBool::new(false));
+        let second_done = Arc::new(AtomicBool::new(false));
+        let first = SlowReplaceHandler {
+            delay_ms: 500,
+            completed: first_done.clone(),
+        };
+        let second = SlowReplaceHandler {
+            delay_ms: 10,
+            completed: second_done.clone(),
+        };
+
+        // Start the slow first call, then supersede it with a fast second call.
+        // Both target the same handler id ("slow"), so the second cancels the first.
+        let (r1, r2) = tokio::join!(
+            async {
+                let f = exec.gate.run(&first, &ctx, "a");
+                f.await
+            },
+            async {
+                // Let the first register its cancel handle before we supersede it.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                exec.gate.run(&second, &ctx, "b").await
+            },
+        );
+
+        let (r1, _busy1) = r1.unwrap();
+        let (r2, _busy2) = r2.unwrap();
+
+        // The first was superseded: its body never completed (cancelled mid-sleep)
+        // and it returns an unsuccessful (discarded) result.
+        assert!(
+            !first_done.load(Ordering::SeqCst),
+            "first call should have been cancelled before completing"
+        );
+        assert!(!r1.success, "superseded call returns unsuccessful result");
+        // The second ran to completion.
+        assert!(second_done.load(Ordering::SeqCst), "second call completed");
+        assert!(r2.success, "second call succeeded");
+    }
+
+    /// A handler that always assesses High risk (→ RulesEngine returns Confirm),
+    /// records whether its body actually executed, and lets a test flip it to
+    /// Exclusive mode. Used to exercise the confirmation (G1) and busy (G4) paths.
+    struct RiskyHandler {
+        id: &'static str,
+        executed: Arc<std::sync::atomic::AtomicBool>,
+        mode: crate::action_registry::ExecutionMode,
+    }
+
+    #[async_trait]
+    impl ActionHandler for RiskyHandler {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn description(&self) -> &str {
+            "risky stub"
+        }
+        fn default_risk(&self) -> RiskLevel {
+            RiskLevel::High
+        }
+        fn execution_mode(&self) -> crate::action_registry::ExecutionMode {
+            self.mode
+        }
+        fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+            static T: &[crate::action_registry::Trigger] =
+                &[crate::action_registry::Trigger::keywords(&["danger"])];
+            T
+        }
+        async fn execute(
+            &self,
+            _ctx: &crate::action_registry::ExecContext,
+            _args: &str,
+        ) -> Result<ActionResult, crate::error::LychiError> {
+            self.executed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(ActionResult::ok(
+                "risky executed",
+                crate::action_registry::OutputType::Status,
+            ))
+        }
+    }
+
+    // --- G1: confirmation binds to the assessed intent (no re-resolve) ---
+
+    #[tokio::test]
+    async fn confirm_returns_pending_then_run_confirmed_executes_stored_intent() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let executed = Arc::new(AtomicBool::new(false));
+        let mut reg = ActionRegistry::new();
+        reg.register(Box::new(RiskyHandler {
+            id: "danger",
+            executed: executed.clone(),
+            mode: crate::action_registry::ExecutionMode::Immediate,
+        }));
+        let ex = make_executor(reg);
+        let privacy = PrivacyConfig::default();
+        let inputs = RunInputs::default();
+
+        // First pass: High risk → pending confirmation, NOT executed, and the exact
+        // resolved intent is captured for the confirm step.
+        let first = ex
+            .run("danger rm -rf /tmp/x", false, &privacy, &inputs)
+            .await
+            .unwrap();
+        assert!(
+            first.envelope.needs_confirmation.is_some(),
+            "should require confirmation"
+        );
+        assert!(!executed.load(Ordering::SeqCst), "must not run before confirm");
+        let pending = first.pending_intent.expect("captured pending intent");
+        assert_eq!(pending.action_id, "danger");
+
+        // Confirm: runs the STORED intent (no re-resolution) → now executes.
+        let confirmed = ex.run_confirmed(pending, &privacy, &inputs).await.unwrap();
+        assert!(confirmed.result.success, "confirmed run executes");
+        assert!(executed.load(Ordering::SeqCst), "body ran after confirm");
+    }
+
+    #[tokio::test]
+    async fn confirmed_run_still_blocked_by_deny() {
+        // Even on the confirmed path, a Deny decision must halt execution — the
+        // shell denylist is a hard Deny, so a pre-resolved `run rm -rf /` intent
+        // must never execute even when routed through run_confirmed.
+        let mut reg = ActionRegistry::new();
+        reg.register(Box::new(
+            crate::action_registry::handlers::shell_exec::ShellExec::new(),
+        ));
+        let ex = make_executor(reg);
+        let privacy = PrivacyConfig::default();
+        let inputs = RunInputs::default();
+
+        // A denied shell command, pre-resolved as if it had been confirmed.
+        let intent = crate::intent::ResolvedIntent {
+            action_id: "run".into(),
+            args: "rm -rf /".into(),
+            routing: crate::intent::RoutingMethod::Explicit,
+        };
+        let res = ex.run_confirmed(intent, &privacy, &inputs).await.unwrap();
+        assert!(!res.result.success, "denied command must not succeed");
+        assert!(
+            res.result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains("block"),
+            "should be blocked by the rules engine, got: {:?}",
+            res.result.error
+        );
+    }
+
+    // --- G2: risk assessment receives the request context (cwd/workspace) ---
+
+    #[tokio::test]
+    async fn assess_risk_sees_context_cwd() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // A handler that flips to High risk ONLY when the cwd is under /tmp — proving
+        // the RiskContext (cwd) actually reaches assess_risk. Records what it saw.
+        struct CtxRiskHandler {
+            saw_tmp: Arc<AtomicBool>,
+        }
+        #[async_trait]
+        impl ActionHandler for CtxRiskHandler {
+            fn id(&self) -> &str {
+                "ctxrisk"
+            }
+            fn description(&self) -> &str {
+                "context-risk stub"
+            }
+            fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+                static T: &[crate::action_registry::Trigger] =
+                    &[crate::action_registry::Trigger::keywords(&["ctxrisk"])];
+                T
+            }
+            fn assess_risk(
+                &self,
+                _args: &str,
+                ctx: &crate::action_registry::RiskContext<'_>,
+            ) -> crate::action_registry::RiskAssessment {
+                let in_tmp = ctx.cwd.is_some_and(|c| c.starts_with("/tmp"));
+                if in_tmp {
+                    self.saw_tmp.store(true, Ordering::SeqCst);
+                }
+                crate::action_registry::RiskAssessment::level(if in_tmp {
+                    RiskLevel::High
+                } else {
+                    RiskLevel::Low
+                })
+            }
+            async fn execute(
+                &self,
+                _ctx: &crate::action_registry::ExecContext,
+                _args: &str,
+            ) -> Result<ActionResult, crate::error::LychiError> {
+                Ok(ActionResult::ok(
+                    "ok",
+                    crate::action_registry::OutputType::Status,
+                ))
+            }
+        }
+
+        let saw_tmp = Arc::new(AtomicBool::new(false));
+        let mut reg = ActionRegistry::new();
+        reg.register(Box::new(CtxRiskHandler {
+            saw_tmp: saw_tmp.clone(),
+        }));
+        let mut ex = make_executor(reg);
+        // Inject a context whose cwd is under /tmp.
+        ex.context = Some(crate::context::EnvironmentContext {
+            cwd: Some("/tmp/work".to_string()),
+            ..Default::default()
+        });
+
+        let privacy = PrivacyConfig::default();
+        let inputs = RunInputs::default();
+        let res = ex.run("ctxrisk go", false, &privacy, &inputs).await.unwrap();
+
+        assert!(
+            saw_tmp.load(Ordering::SeqCst),
+            "assess_risk should have seen the /tmp cwd from RiskContext"
+        );
+        // High risk under /tmp → the run returns a confirmation prompt.
+        assert!(
+            res.envelope.needs_confirmation.is_some(),
+            "context-elevated risk should require confirmation"
+        );
+    }
+
+    // --- G4: Exclusive rejects with busy while one is running ---
+
+    #[tokio::test]
+    async fn exclusive_second_call_is_busy_while_first_runs() {
+        let ex = make_executor(ActionRegistry::new());
+        let ctx = crate::action_registry::ExecContext::default();
+
+        struct SlowExclusive;
+        #[async_trait]
+        impl ActionHandler for SlowExclusive {
+            fn id(&self) -> &str {
+                "excl"
+            }
+            fn description(&self) -> &str {
+                "slow exclusive"
+            }
+            fn execution_mode(&self) -> crate::action_registry::ExecutionMode {
+                crate::action_registry::ExecutionMode::Exclusive
+            }
+            async fn execute(
+                &self,
+                _ctx: &crate::action_registry::ExecContext,
+                _args: &str,
+            ) -> Result<ActionResult, crate::error::LychiError> {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                Ok(ActionResult::ok(
+                    "excl done",
+                    crate::action_registry::OutputType::Status,
+                ))
+            }
+        }
+
+        let h1 = SlowExclusive;
+        let h2 = SlowExclusive;
+        let (r1, r2) = tokio::join!(
+            async { ex.gate.run(&h1, &ctx, "a").await },
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                ex.gate.run(&h2, &ctx, "b").await
+            },
+        );
+        let (res1, busy1) = r1.unwrap();
+        let (res2, busy2) = r2.unwrap();
+        assert!(!busy1 && res1.success, "first exclusive runs");
+        assert!(busy2, "second exclusive is rejected as busy");
+        assert!(!res2.success, "busy reject is not a success");
+    }
+
+    #[tokio::test]
+    async fn busy_flag_propagates_through_run_to_execute_result() {
+        // The Tauri confirm path reinserts a pending confirmation when
+        // `ExecuteResult.busy` is true — so verify busy flows all the way through
+        // the PUBLIC `run()` pipeline, not just `execute_gated`. Two concurrent
+        // exclusive runs: the second must surface `busy` on its ExecuteResult.
+        struct SlowExcl;
+        #[async_trait]
+        impl ActionHandler for SlowExcl {
+            fn id(&self) -> &str {
+                "excl"
+            }
+            fn description(&self) -> &str {
+                "slow exclusive"
+            }
+            fn execution_mode(&self) -> crate::action_registry::ExecutionMode {
+                crate::action_registry::ExecutionMode::Exclusive
+            }
+            fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+                static T: &[crate::action_registry::Trigger] =
+                    &[crate::action_registry::Trigger::keywords(&["excl"])];
+                T
+            }
+            async fn execute(
+                &self,
+                _ctx: &crate::action_registry::ExecContext,
+                _args: &str,
+            ) -> Result<ActionResult, crate::error::LychiError> {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                Ok(ActionResult::ok(
+                    "done",
+                    crate::action_registry::OutputType::Status,
+                ))
+            }
+        }
+        let mut reg = ActionRegistry::new();
+        reg.register(Box::new(SlowExcl));
+        let ex = make_executor(reg);
+        let privacy = PrivacyConfig::default();
+        let inputs = RunInputs::default();
+
+        let (r1, r2) = tokio::join!(
+            async { ex.run("excl a", false, &privacy, &inputs).await },
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                ex.run("excl b", false, &privacy, &inputs).await
+            },
+        );
+        assert!(!r1.unwrap().busy, "first run not busy");
+        assert!(r2.unwrap().busy, "second run surfaces busy on ExecuteResult");
     }
 
     /// Always returns success: false — simulates app-not-found soft failure

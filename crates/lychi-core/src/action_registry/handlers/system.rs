@@ -644,7 +644,11 @@ impl ActionHandler for SystemCommand {
         "System controls (power, audio, brightness, wifi, bluetooth)"
     }
 
-    fn assess_risk(&self, args: &str) -> RiskAssessment {
+    fn assess_risk(
+        &self,
+        args: &str,
+        _ctx: &crate::action_registry::RiskContext<'_>,
+    ) -> RiskAssessment {
         // Only destructive actions (shutdown, reboot, hibernate, logout) need
         // confirmation. Reversible toggles (mute, volume, brightness, wifi,
         // bluetooth) auto-execute. This ownership lives here, not in the Rules
@@ -786,7 +790,7 @@ mod tests {
         // Destructive → confirm (Medium + custom message).
         for a in ["shutdown", "reboot", "hibernate", "logout"] {
             assert_eq!(
-                h.assess_risk(a).level,
+                h.assess_risk(a, &Default::default()).level,
                 RiskLevel::Medium,
                 "{a} should confirm"
             );
@@ -803,7 +807,7 @@ mod tests {
             "suspend",
         ] {
             assert_eq!(
-                h.assess_risk(a).level,
+                h.assess_risk(a, &Default::default()).level,
                 RiskLevel::Low,
                 "{a} should auto-execute"
             );

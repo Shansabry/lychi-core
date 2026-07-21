@@ -61,12 +61,57 @@ use lychi_core::paths;
 use lychi_core::providers::{AgentPlan, AiProvider};
 use lychi_core::rules::RulesEngine;
 
+/// An action assessed and awaiting user confirmation (G1). Stores the exact
+/// resolved intent so confirm executes THAT action, plus the risk it was assessed
+/// at (auditability) and an expiry so a stale confirmation (user walked away, then
+/// confirmed minutes later) is rejected.
+///
+/// This is a SINGLE slot (`Option<PendingExecution>` in `AppState`), which is the
+/// tightest possible bound — a launcher shows one confirm prompt at a time, and a
+/// new prompt replaces any unanswered one. So there's no store to cap or GC.
+#[derive(Clone)]
+pub struct PendingExecution {
+    pub intent: lychi_core::intent::ResolvedIntent,
+    /// Risk level the action was assessed at when the prompt was shown. Recorded
+    /// for auditability; execution re-assesses risk with fresh context, so this is
+    /// the "what the user saw," not the authority for the execute-time decision.
+    pub risk: lychi_core::action_registry::RiskLevel,
+    /// Monotonic instant after which this pending action is no longer valid.
+    pub expires_at: std::time::Instant,
+}
+
+impl PendingExecution {
+    /// How long a confirmation prompt stays valid before it must be re-issued.
+    const TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+    pub fn new(
+        intent: lychi_core::intent::ResolvedIntent,
+        risk: lychi_core::action_registry::RiskLevel,
+    ) -> Self {
+        Self {
+            intent,
+            risk,
+            expires_at: std::time::Instant::now() + Self::TTL,
+        }
+    }
+
+    pub fn is_expired(&self) -> bool {
+        std::time::Instant::now() >= self.expires_at
+    }
+}
+
 pub struct AppState {
     pub executor: Arc<RwLock<Executor>>,
     pub db: Arc<Database>,
     pub history: HistoryStore,
     pub config: Arc<RwLock<Config>>,
     pub pending_plan: Arc<RwLock<Option<AgentPlan>>>,
+    /// The action awaiting user confirmation (G1). Captured when the pipeline
+    /// returns `needs_confirmation`; the `confirm_execution` command executes
+    /// THIS exact resolved intent rather than re-resolving raw input, closing the
+    /// confirmation time-of-check/time-of-use gap. Single-slot: the UI only shows
+    /// one confirm prompt at a time.
+    pub pending_execution: Arc<RwLock<Option<PendingExecution>>>,
     pub active_file_search: Arc<AtomicU64>,
     /// Persistent per-scope fuzzy file indexes (nucleo engines). Built lazily on
     /// first search of a scope, reused across keystrokes for instant matching.
@@ -297,6 +342,7 @@ impl AppState {
             history,
             config: Arc::new(RwLock::new(config)),
             pending_plan: Arc::new(RwLock::new(None)),
+            pending_execution: Arc::new(RwLock::new(None)),
             active_file_search: Arc::new(AtomicU64::new(0)),
             file_index: Arc::new(lychi_core::file_search::FileIndexStore::default()),
             timer_state,
@@ -398,4 +444,41 @@ fn cloud_provider() -> Option<Arc<dyn AiProvider>> {
         CLOUD_BASE_URL.to_string(),
         token_provider,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lychi_core::action_registry::RiskLevel;
+    use lychi_core::intent::{ResolvedIntent, RoutingMethod};
+
+    fn intent() -> ResolvedIntent {
+        ResolvedIntent {
+            action_id: "run".into(),
+            args: "rm -rf /tmp/x".into(),
+            routing: RoutingMethod::Explicit,
+        }
+    }
+
+    #[test]
+    fn pending_execution_stores_intent_and_risk() {
+        let p = PendingExecution::new(intent(), RiskLevel::High);
+        assert_eq!(p.intent.action_id, "run");
+        assert_eq!(p.intent.args, "rm -rf /tmp/x");
+        assert_eq!(p.risk, RiskLevel::High);
+    }
+
+    #[test]
+    fn pending_execution_fresh_is_not_expired() {
+        let p = PendingExecution::new(intent(), RiskLevel::High);
+        assert!(!p.is_expired(), "a just-created pending must be valid");
+    }
+
+    #[test]
+    fn pending_execution_past_expiry_is_expired() {
+        let mut p = PendingExecution::new(intent(), RiskLevel::High);
+        // Force the deadline into the past.
+        p.expires_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        assert!(p.is_expired(), "a past-deadline pending must be rejected");
+    }
 }

@@ -48,6 +48,11 @@ impl ActionHandler for AskHandler {
         "ask"
     }
 
+    // A long AI call; if the user retypes and re-runs, the newer answer wins (G4).
+    fn execution_mode(&self) -> crate::action_registry::ExecutionMode {
+        crate::action_registry::ExecutionMode::ReplacePrevious
+    }
+
     fn description(&self) -> &str {
         "Ask a question and get an AI-powered answer inline"
     }

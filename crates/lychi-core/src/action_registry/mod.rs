@@ -21,6 +21,24 @@ pub enum RiskLevel {
     High,
 }
 
+/// How an action coordinates with concurrent executions (G4). Declared per
+/// handler via `ActionHandler::execution_mode`; enforced by the app's execution
+/// gate before `Executor::run`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionMode {
+    /// Runs immediately, any number in parallel. Fast, side-effect-light actions
+    /// (calc, open, url, media control). The default.
+    Immediate,
+    /// A new invocation supersedes a still-running previous one of the same
+    /// handler — the old work should be abandoned. For long, latest-wins actions
+    /// (an AI query the user retyped).
+    ReplacePrevious,
+    /// Runs to completion with nothing else running concurrently. For destructive
+    /// or global-state actions (index rebuild, bulk delete) where interleaving
+    /// would corrupt state or confuse the user.
+    Exclusive,
+}
+
 /// A handler's risk verdict for a specific invocation: the level, plus an
 /// optional custom confirmation message. Returned by `ActionHandler::assess_risk`
 /// so risk logic (and its user-facing wording) lives in the handler, not the
@@ -31,6 +49,18 @@ pub struct RiskAssessment {
     /// Custom confirmation message shown when this action needs confirming. When
     /// `None`, the Rules Engine uses a generic message for the level.
     pub reason: Option<String>,
+}
+
+/// Cheap, borrowed context passed to `assess_risk_ctx` (G2) so a handler can make
+/// risk depend on *where* the action runs. Built by the executor from the live
+/// `EnvironmentContext` — no I/O, just borrows of already-gathered fields.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RiskContext<'a> {
+    /// Effective working directory the action will run in (detected workspace or
+    /// terminal cwd), if known.
+    pub cwd: Option<&'a str>,
+    /// Root of the active code workspace, if a project is focused.
+    pub workspace_root: Option<&'a str>,
 }
 
 impl RiskAssessment {
@@ -434,15 +464,26 @@ pub trait ActionHandler: Send + Sync {
         RiskLevel::Low
     }
 
-    /// Assess the risk of a *specific* invocation, given its args. This is where
-    /// a handler owns the "which of my invocations is dangerous?" decision —
-    /// keeping that knowledge in the handler instead of the Rules Engine.
+    /// Assess the risk of a *specific* invocation, given its args and a cheap
+    /// `RiskContext` (cwd, active workspace). This is where a handler owns the
+    /// "which of my invocations is dangerous?" decision — keeping that knowledge
+    /// in the handler instead of the Rules Engine — and it can make risk depend on
+    /// *where* the action runs (G2): deleting inside `/tmp` vs `~/Documents`,
+    /// running a checked-in script vs a downloaded one.
     ///
     /// The default defers to `default_risk()` with no custom message, so handlers
     /// with uniform risk don't need to implement this. Handlers with mixed risk
-    /// (read-only vs mutating verbs) override it to inspect `args`.
-    fn assess_risk(&self, _args: &str) -> RiskAssessment {
+    /// override it to inspect `args` (and, when relevant, `ctx`).
+    fn assess_risk(&self, _args: &str, _ctx: &RiskContext<'_>) -> RiskAssessment {
         RiskAssessment::level(self.default_risk())
+    }
+
+    /// How this handler's executions coordinate with concurrent ones (G4). The
+    /// Executor uses this to serialize/cancel appropriately. Default `Immediate`
+    /// (unbounded parallelism) suits fast, side-effect-light actions (calc, open,
+    /// completions). Override for long/cancellable or destructive/exclusive work.
+    fn execution_mode(&self) -> ExecutionMode {
+        ExecutionMode::Immediate
     }
 
     /// Keyword triggers that route to this handler, with their arg transforms.

@@ -25,6 +25,7 @@ import type {
 } from "$lib/ipc";
 import {
 	cancelFileSearch,
+	confirmExecution,
 	executeCommand,
 	getActiveWindowStrategy,
 	getAgentPlan,
@@ -1232,7 +1233,9 @@ async function handleConfirm() {
 			await grantPrivacyConsent("public_ip");
 		}
 
-		lastResult = await executeCommand(lastCommand, true);
+		// G1: execute the EXACT action that was assessed (stored backend-side),
+		// not a re-resolve of the raw string — closes the confirmation TOCTOU gap.
+		lastResult = await confirmExecution();
 		historyEntries = [...historyEntries, lastCommand];
 		inputValue = "";
 		if (lastResult.open_url && (lastResult.auto_open || !lastResult.output)) {

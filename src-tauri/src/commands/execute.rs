@@ -116,6 +116,31 @@ pub async fn execute_command(
         .run(&input, confirmed.unwrap_or(false), &privacy, &inputs)
         .await?;
 
+    // G1: if this returned a pending confirmation, store the EXACT assessed intent
+    // so `confirm_execution` runs it verbatim (no re-resolve). Any prior pending is
+    // replaced (a new prompt supersedes an unanswered one).
+    if let Some(intent) = exec.pending_intent.clone() {
+        let risk = exec
+            .envelope
+            .risk_level
+            .unwrap_or(lychi_core::action_registry::RiskLevel::High);
+        *state.pending_execution.write().await =
+            Some(crate::state::PendingExecution::new(intent, risk));
+    }
+
+    finalize_exec(&app, state.inner(), &input, exec).await
+}
+
+/// Shared post-execution tail: notify panel mutations, flatten to the wire DTO,
+/// perform app-launch / window-focus platform side-effects, and record history.
+/// Used by both `execute_command` and `confirm_execution` so the confirm path
+/// gets identical launch/navigate/focus handling without duplicating it.
+async fn finalize_exec(
+    app: &AppHandle,
+    state: &AppState,
+    input: &str,
+    exec: lychi_core::executor::ExecuteResult,
+) -> Result<CommandResultDto, LychiError> {
     // Notify frontend when notes/todos/reminders are mutated by a handler
     if exec.result.success && PANEL_MUTATION_ACTIONS.contains(&exec.action_id.as_str()) {
         let _ = app.emit("lychi://notes-changed", ());
@@ -246,10 +271,82 @@ pub async fn execute_command(
     // the launch worked even if the program later exits non-zero.) Confirmation
     // prompts returned early above, so they're recorded on the confirmed re-run.
     if dto.success {
-        let _ = state.history.push(&state.db, &input);
+        let _ = state.history.push(&state.db, input);
     }
 
     Ok(dto)
+}
+
+/// Confirm and run the action currently awaiting confirmation (G1).
+///
+/// Executes the EXACT resolved intent captured when the pipeline first returned
+/// `needs_confirmation` — it does NOT re-resolve the raw input, so the action
+/// can't shift between assessment and execution (closes the confirmation TOCTOU
+/// gap). Policy is still re-checked inside `run_confirmed`, so a deny/consent
+/// change since the prompt is honored. A missing or expired pending is rejected.
+#[tauri::command]
+#[specta::specta]
+pub async fn confirm_execution(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CommandResultDto, LychiError> {
+    // Take (and clear) the pending action — a confirmation is single-use.
+    let pending = state.pending_execution.write().await.take();
+    let Some(pending) = pending else {
+        return Err(LychiError::ExecutionFailed(
+            "Nothing to confirm — the request expired or was already handled.".into(),
+        ));
+    };
+    if pending.is_expired() {
+        return Err(LychiError::ExecutionFailed(
+            "Confirmation expired — please run the command again.".into(),
+        ));
+    }
+
+    let inputs = {
+        let config = state.config.read().await;
+        lychi_core::executor::RunInputs {
+            terminal: Some(config.commands.terminal.clone()),
+            terminal_routing: config.commands.terminal_routing.clone(),
+            inline: false,
+        }
+    };
+
+    // Reconstruct the human-facing input string only for history/logging; the
+    // stored intent is what actually executes.
+    let input_for_history = if pending.intent.args.is_empty() {
+        pending.intent.action_id.clone()
+    } else {
+        format!("{} {}", pending.intent.action_id, pending.intent.args)
+    };
+
+    // Audit trail: record what the user reviewed vs what will run.
+    tracing::info!(
+        action = %pending.intent.action_id,
+        assessed_risk = ?pending.risk,
+        "[confirm] executing confirmed action (risk re-checked with fresh context before run)"
+    );
+
+    let executor = state.executor.read().await;
+    let privacy = state.config.read().await.privacy.clone();
+    let exec = executor
+        .run_confirmed(pending.intent.clone(), &privacy, &inputs)
+        .await?;
+    drop(executor);
+
+    // Busy-reinsert (#1↔#10): if execution was rejected because an exclusive
+    // action was already running, NO execution happened — so put the pending
+    // confirmation back (with its ORIGINAL expiry) instead of consuming it. The
+    // user can retry the confirm without reconstructing the destructive command.
+    // A newer prompt that arrived meanwhile is not clobbered.
+    if exec.busy {
+        let mut slot = state.pending_execution.write().await;
+        if slot.is_none() {
+            *slot = Some(pending);
+        }
+    }
+
+    finalize_exec(&app, state.inner(), &input_for_history, exec).await
 }
 
 #[tauri::command]
