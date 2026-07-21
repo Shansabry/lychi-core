@@ -20,4 +20,5 @@ pub mod process_tracker;
 pub mod providers;
 pub mod reminders;
 pub mod rules;
+pub mod script_commands;
 pub mod snippets;

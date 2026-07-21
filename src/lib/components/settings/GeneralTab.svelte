@@ -13,6 +13,7 @@ import {
 	setAutostartEnabled,
 	setHotkey,
 } from "$lib/ipc";
+import { ACCENTS, resolveAccent, type Theme, type ThemeMode } from "$lib/theme";
 import Select from "../Select.svelte";
 
 let {
@@ -143,16 +144,30 @@ async function handleWindowStrategyChange(val: string) {
 	}
 }
 
-async function handleThemeChange(val: string) {
-	generalConfig.theme = val;
-	document.documentElement.dataset.theme = generalConfig.theme;
-	window.dispatchEvent(new CustomEvent("lychi-theme-change", { detail: generalConfig.theme }));
+// Emit the full theme to the engine (in +layout.svelte) + persist. One helper
+// for both mode and accent so the applier stays centralized.
+async function applyAndSaveTheme() {
+	const theme: Theme = {
+		mode: (generalConfig.theme as ThemeMode) ?? "dark",
+		accent: generalConfig.accent ?? "",
+	};
+	window.dispatchEvent(new CustomEvent<Theme>("lychi-theme-change", { detail: theme }));
 	try {
 		await saveGeneralConfig(generalConfig);
 	} catch (err) {
 		console.error("[settings] Failed to save theme:", err);
 		onsaveerror(`Failed to save: ${err}`);
 	}
+}
+
+async function handleThemeChange(val: string) {
+	generalConfig.theme = val;
+	await applyAndSaveTheme();
+}
+
+async function handleAccentChange(val: string) {
+	generalConfig.accent = val;
+	await applyAndSaveTheme();
 }
 
 function handleShellSelect(val: string) {
@@ -252,6 +267,26 @@ async function handleTerminalChange(val: string) {
 		>
 			<Sun size={14} />
 		</button>
+	</div>
+</div>
+<div class="field">
+	<span class="field-label">Accent</span>
+	<div class="accent-swatches">
+		{#each ACCENTS as swatch (swatch.id)}
+			{@const isDefault = swatch.id === "default"}
+			{@const preview = resolveAccent(swatch.id, (generalConfig.theme as ThemeMode) ?? "dark")}
+			<button
+				class="accent-swatch"
+				class:active={(generalConfig.accent ?? "") === swatch.id
+					|| (isDefault && !generalConfig.accent)}
+				class:is-default={isDefault}
+				style={preview ? `--swatch: ${preview}` : ""}
+				onclick={() => handleAccentChange(swatch.id === "default" ? "" : swatch.id)}
+				title={swatch.label}
+				aria-label={swatch.label}
+				aria-pressed={(generalConfig.accent ?? "") === swatch.id}
+			></button>
+		{/each}
 	</div>
 </div>
 <div class="field">
@@ -605,6 +640,36 @@ async function handleTerminalChange(val: string) {
 	.theme-option.active {
 		background: var(--border);
 		color: var(--fg);
+	}
+
+	.accent-swatches {
+		display: flex;
+		gap: 6px;
+		align-items: center;
+	}
+
+	.accent-swatch {
+		width: 18px;
+		height: 18px;
+		border-radius: 50%;
+		border: 1px solid var(--border);
+		background: var(--swatch, transparent);
+		cursor: pointer;
+		padding: 0;
+		transition: transform 100ms ease, box-shadow 100ms ease;
+	}
+
+	/* The "Default" (monochrome) swatch shows the current --accent + fg split. */
+	.accent-swatch.is-default {
+		background: linear-gradient(135deg, var(--accent) 50%, var(--fg-muted) 50%);
+	}
+
+	.accent-swatch:hover {
+		transform: scale(1.15);
+	}
+
+	.accent-swatch.active {
+		box-shadow: 0 0 0 2px var(--bg-secondary), 0 0 0 3px var(--fg);
 	}
 
 	.checkbox {

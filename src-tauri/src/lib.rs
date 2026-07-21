@@ -329,6 +329,38 @@ pub fn run() {
             let watcher_running = app.state::<AppState>().app_index_watcher_running.clone();
             lychi_core::desktop_apps::watcher::start(watcher_running);
 
+            // Script Commands directory watcher — re-registers the `script` handler
+            // + keywords when files in ~/.config/lychi/scripts/ change. The rebuild
+            // action is injected (this keeps lychi-core Tauri-free): re-scan, then
+            // take the executor write lock and re-register (mirrors CommandsReactor).
+            {
+                let scripts_running = app.state::<AppState>().scripts_watcher_running.clone();
+                let executor = app.state::<AppState>().executor.clone();
+                let config = app.state::<AppState>().config.clone();
+                let on_change: std::sync::Arc<dyn Fn() + Send + Sync> =
+                    std::sync::Arc::new(move || {
+                        let scripts = lychi_core::script_commands::discover(
+                            &lychi_core::paths::scripts_dir(),
+                        );
+                        let keywords: Vec<String> =
+                            scripts.iter().map(|s| s.keyword.clone()).collect();
+                        let shell = config.blocking_read().commands.shell.clone();
+                        let mut ex = executor.blocking_write();
+                        ex.registry.register(Box::new(
+                            lychi_core::action_registry::handlers::script_commands::ScriptCommandsHandler::new(
+                                scripts, shell,
+                            ),
+                        ));
+                        ex.set_script_keywords(keywords);
+                        tracing::info!("[scripts] reloaded ({} commands)", ex.script_keyword_count());
+                    });
+                lychi_core::script_commands::watcher::start(
+                    lychi_core::paths::scripts_dir(),
+                    scripts_running,
+                    on_change,
+                );
+            }
+
             // Background timer + reminder monitor — owns its OS thread
             // (all notify-rust D-Bus calls serialized in this single thread)
             let timer_state = app.state::<AppState>().timer_state.clone();
@@ -519,6 +551,9 @@ pub fn run() {
                 state
                     .app_index_watcher_running
                     .store(false, std::sync::atomic::Ordering::SeqCst);
+                state
+                    .scripts_watcher_running
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
             }
             tauri::RunEvent::Exit => {
                 // Belt-and-suspenders: also set on Exit in case ExitRequested was skipped.
@@ -532,6 +567,9 @@ pub fn run() {
                         .store(false, std::sync::atomic::Ordering::SeqCst);
                     state
                         .app_index_watcher_running
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    state
+                        .scripts_watcher_running
                         .store(false, std::sync::atomic::Ordering::SeqCst);
                 }
 

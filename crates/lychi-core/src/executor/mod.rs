@@ -126,6 +126,11 @@ pub struct Executor {
     /// Lowercased custom search-engine ("bang") keywords, so the router can send
     /// `gh tokio` to the `bang` handler. Set from config after construction.
     bang_keywords: Vec<String>,
+    /// Lowercased Script Command keywords (from `~/.config/lychi/scripts/`), so
+    /// the router can send `deploy prod` to the `script` handler. Rebuilt by the
+    /// scripts fs-watcher. Same side-channel pattern as `bang_keywords` (can't use
+    /// `triggers()` — those are `'static`, these are runtime-discovered).
+    script_keywords: Vec<String>,
     /// Execution-concurrency policy (G4): enforces each handler's `ExecutionMode`
     /// (immediate / exclusive-fail-fast / replace-previous-with-cancellation).
     /// Extracted into its own collaborator so the Executor stays an orchestrator
@@ -150,6 +155,7 @@ impl Executor {
             context: None,
             suggestions: SuggestionTracker::new(),
             bang_keywords: Vec::new(),
+            script_keywords: Vec::new(),
             gate: ConcurrencyGate::new(),
         }
     }
@@ -170,6 +176,33 @@ impl Executor {
         }
         let first_l = first.to_lowercase();
         self.bang_keywords
+            .iter()
+            .any(|k| *k == first_l)
+            .then(|| trimmed.to_string())
+    }
+
+    /// Register the discovered Script Command keywords (lowercased) so the router
+    /// can recognise `deploy prod` and route it to the `script` handler.
+    pub fn set_script_keywords(&mut self, keywords: Vec<String>) {
+        self.script_keywords = keywords.into_iter().map(|k| k.to_lowercase()).collect();
+    }
+
+    /// Number of registered Script Command keywords (for logging).
+    pub fn script_keyword_count(&self) -> usize {
+        self.script_keywords.len()
+    }
+
+    /// If `input`'s first word is a discovered Script Command keyword, return the
+    /// full input for routing to the `script` handler. Unlike bangs, a BARE
+    /// keyword (no args) is valid — many scripts take no arguments.
+    fn script_route(&self, input: &str) -> Option<String> {
+        let trimmed = input.trim();
+        let first = trimmed
+            .split_once(char::is_whitespace)
+            .map(|(f, _)| f)
+            .unwrap_or(trimmed);
+        let first_l = first.to_lowercase();
+        self.script_keywords
             .iter()
             .any(|k| *k == first_l)
             .then(|| trimmed.to_string())
@@ -571,9 +604,17 @@ impl Executor {
 
         // A pre-resolved intent (confirmation re-run) is used verbatim — no
         // re-resolution, so the confirmed action is exactly what was assessed.
-        // Otherwise resolve fresh: bang shortcut first, then the resolver.
+        // Otherwise resolve fresh. Priority: user Script Commands, then bang
+        // shortcuts, then the general resolver. Scripts are the user's own named
+        // commands (highest intent), so they win over app/web fallbacks.
         let mut intent = if let Some(intent) = preresolved {
             intent
+        } else if let Some(full) = self.script_route(&effective_input) {
+            crate::intent::ResolvedIntent {
+                action_id: "script".to_string(),
+                args: full,
+                routing: crate::intent::RoutingMethod::Explicit,
+            }
         } else if let Some(full) = self.bang_route(&effective_input) {
             crate::intent::ResolvedIntent {
                 action_id: "bang".to_string(),

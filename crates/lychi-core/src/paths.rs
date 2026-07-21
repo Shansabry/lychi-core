@@ -23,6 +23,12 @@ pub fn config_file() -> PathBuf {
     config_dir().join("config.toml")
 }
 
+/// Directory of user Script Commands. A file dropped here becomes a named
+/// launcher command (keyword = filename stem). Lives alongside `config.toml`.
+pub fn scripts_dir() -> PathBuf {
+    config_dir().join("scripts")
+}
+
 pub fn db_file() -> PathBuf {
     data_dir().join("lychi.redb")
 }

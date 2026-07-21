@@ -144,6 +144,8 @@ pub struct AppState {
     pub timer_running: Arc<AtomicBool>,
     /// Shutdown signal for the app-index filesystem watcher OS thread.
     pub app_index_watcher_running: Arc<AtomicBool>,
+    /// Shutdown signal for the Script Commands directory watcher OS thread.
+    pub scripts_watcher_running: Arc<AtomicBool>,
     /// Limits concurrent heavy spawn_blocking tasks (file preview, future indexing)
     /// to prevent burst-load exhaustion of the blocking thread pool.
     pub heavy_sem: Arc<tokio::sync::Semaphore>,
@@ -325,6 +327,18 @@ impl AppState {
             config.commands.search_engines.clone(),
         )));
 
+        // Script Commands — files in ~/.config/lychi/scripts/ become named
+        // commands. Discovered at startup; hot-reloaded by the scripts watcher.
+        let scripts =
+            lychi_core::script_commands::discover(&lychi_core::paths::scripts_dir());
+        let script_keywords: Vec<String> = scripts.iter().map(|s| s.keyword.clone()).collect();
+        registry.register(Box::new(
+            lychi_core::action_registry::handlers::script_commands::ScriptCommandsHandler::new(
+                scripts,
+                config.commands.shell.clone(),
+            ),
+        ));
+
         let ai_router = ai_provider.map(|p| {
             AiRouter::new_shared(p, std::time::Duration::from_secs(config.ai.timeout_secs))
         });
@@ -335,6 +349,7 @@ impl AppState {
         let rules = RulesEngine::new();
         let mut executor = Executor::new(registry, rules, resolver, history.clone(), db.clone());
         executor.set_bang_keywords(bang_keywords);
+        executor.set_script_keywords(script_keywords);
 
         Self {
             executor: Arc::new(RwLock::new(executor)),
@@ -354,6 +369,7 @@ impl AppState {
             clipboard_running: Arc::new(AtomicBool::new(true)),
             timer_running: Arc::new(AtomicBool::new(true)),
             app_index_watcher_running: Arc::new(AtomicBool::new(true)),
+            scripts_watcher_running: Arc::new(AtomicBool::new(true)),
             heavy_sem: Arc::new(tokio::sync::Semaphore::new(3)),
             event_bus: Arc::new(lychi_core::events::EventBus::new()),
             #[cfg(feature = "mpris")]

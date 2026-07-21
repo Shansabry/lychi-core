@@ -53,6 +53,10 @@ pub struct GeneralConfig {
     pub hide_on_blur: bool,
     pub show_duration_ms: bool,
     pub theme: String,
+    /// Accent color (hex, e.g. "#7c8cff"). Empty = use the theme's default
+    /// monochrome accent. Drives the `--accent` CSS variable. Part of the small
+    /// theming engine — see `src/lib/theme.ts`.
+    pub accent: String,
     pub hotkey: String,
     pub window_x: Option<i32>,
     pub window_y: Option<i32>,
@@ -71,6 +75,7 @@ impl Default for GeneralConfig {
             hide_on_blur: true,
             show_duration_ms: true,
             theme: "dark".to_string(),
+            accent: String::new(),
             hotkey: "Super+Space".to_string(),
             window_x: None,
             window_y: None,

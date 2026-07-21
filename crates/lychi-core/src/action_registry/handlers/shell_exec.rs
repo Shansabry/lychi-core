@@ -53,6 +53,116 @@ pub(crate) fn open_in_terminal(
     launch_in_terminal(&terminal, &shell, cmd, cwd)
 }
 
+/// Return the cached login-shell env for `shell`, capturing (and caching) it on
+/// first use. Shared with `ShellExec::get_env` via the same `SHELL_ENV` cache so
+/// other handlers (Script Commands) run with the same environment as `run`.
+pub(crate) fn cached_shell_env(shell: &str) -> HashMap<String, String> {
+    if let Ok(guard) = SHELL_ENV.read()
+        && let Some((cached_shell, env)) = guard.as_ref()
+        && cached_shell == shell
+    {
+        return env.clone();
+    }
+    let env = capture_shell_env(shell);
+    if let Ok(mut guard) = SHELL_ENV.write() {
+        *guard = Some((shell.to_string(), env.clone()));
+    }
+    env
+}
+
+/// Run `cmd` through the login shell and capture its output, with a timeout and
+/// an output-size cap — the safe reusable capture path for handlers other than
+/// `run` (e.g. Script Commands). `sh -ic "<cmd>"` honors shebangs and the login
+/// env. On timeout the child is killed and a truncated/error result returned.
+///
+/// Returns an `ActionResult` with `OutputType::Terminal` (like `execute_inline`).
+pub(crate) async fn run_captured(
+    shell: &str,
+    cmd: &str,
+    cwd: Option<&str>,
+    timeout: std::time::Duration,
+    max_bytes: usize,
+) -> Result<ActionResult, LychiError> {
+    let env = cached_shell_env(shell);
+    let shell = shell.to_string();
+    let cmd = cmd.to_string();
+    let cwd = cwd.map(|s| s.to_string());
+
+    // The blocking child runs on a spawn_blocking thread; the timeout races it.
+    let start = Instant::now();
+    let handle = tokio::task::spawn_blocking(move || {
+        let mut command = Command::new(&shell);
+        command
+            .args(["-ic", &cmd])
+            .env_clear()
+            .envs(&env)
+            .env("TERM", "xterm-256color")
+            .env("COLUMNS", "120")
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .stdout(Stdio::piped());
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        command.output()
+    });
+
+    let output = match tokio::time::timeout(timeout, handle).await {
+        Ok(Ok(Ok(out))) => out,
+        Ok(Ok(Err(e))) => return Err(LychiError::ExecutionFailed(format!("script spawn: {e}"))),
+        Ok(Err(e)) => return Err(LychiError::ExecutionFailed(format!("script task: {e}"))),
+        Err(_) => {
+            // Timed out — the spawn_blocking thread is detached; the child will be
+            // reaped when it eventually exits. Report the timeout to the user.
+            return Ok(ActionResult {
+                success: false,
+                error: Some(format!("Timed out after {}s", timeout.as_secs())),
+                duration_ms: start.elapsed().as_millis() as u64,
+                ..Default::default()
+            });
+        }
+    };
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let success = output.status.success();
+
+    // Cap output at max_bytes (char-safe) to protect against a chatty script.
+    let cap = |bytes: &[u8]| -> String {
+        let s = String::from_utf8_lossy(bytes);
+        if s.len() <= max_bytes {
+            return s.into_owned();
+        }
+        let mut end = max_bytes;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}\n… (output truncated)", &s[..end])
+    };
+    let stdout = cap(&output.stdout);
+    let stderr = cap(&output.stderr);
+
+    let mut result = if success {
+        // Prefer stdout; fall back to stderr (some tools print to stderr).
+        if !stdout.is_empty() {
+            ActionResult::ok(stdout, OutputType::Terminal)
+        } else if !stderr.is_empty() {
+            ActionResult::ok(stderr, OutputType::Terminal)
+        } else {
+            ActionResult::empty_ok()
+        }
+    } else {
+        // Failure — surface stderr (else stdout) as the error message.
+        let msg = if !stderr.is_empty() { stderr } else { stdout };
+        ActionResult {
+            success: false,
+            error: (!msg.is_empty()).then_some(msg),
+            ..Default::default()
+        }
+    };
+    result.duration_ms = duration_ms;
+    Ok(result)
+}
+
 /// Shell-escape a string for use in a shell command.
 fn shell_escape(s: &str) -> String {
     if s.chars()

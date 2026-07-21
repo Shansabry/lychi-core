@@ -29,6 +29,7 @@ pub mod qr;
 pub mod reminders;
 pub mod resize_image;
 pub mod screenshot;
+pub mod script_commands;
 pub mod services;
 pub mod shell_exec;
 pub mod snippets;

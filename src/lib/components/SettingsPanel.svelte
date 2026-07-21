@@ -40,6 +40,7 @@ let generalConfig: GeneralConfig = $state({
 	hide_on_blur: true,
 	show_duration_ms: true,
 	theme: "dark",
+	accent: "",
 	hotkey: "Super+Space",
 	window_x: null,
 	window_y: null,
