@@ -29,6 +29,8 @@ let aiConfig: AiConfig = $state({
 	mode: "disabled",
 	provider: "anthropic",
 	model: "",
+	base_url: "",
+	wire_format: "",
 	ollama_url: "",
 	ollama_model: "",
 	timeout_secs: 8,
@@ -50,6 +52,8 @@ let commandsConfig: CommandsConfig = $state({
 	youtube_url: "https://www.youtube.com/results?search_query=",
 	shell: "/bin/bash",
 	terminal: "",
+	extra_terminals: [],
+	extra_ides: [],
 	terminal_routing: "manual",
 	search_engines: {},
 });

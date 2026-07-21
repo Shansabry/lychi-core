@@ -68,14 +68,20 @@ onMount(async () => {
 		display: flex;
 		flex-direction: column;
 		padding: 2px 0;
-		overflow-y: auto;
-		max-height: calc(65vh - 40px);
+		/* No inner scroll — the SettingsPanel `.content` wrapper already scrolls.
+		   A second overflow here produced a double scrollbar (only on this tab). */
 	}
 
 	.guide-tab-bar {
 		display: flex;
 		border-bottom: 1px solid var(--border);
 		margin-bottom: 8px;
+		/* Keep the Commands/Triggers switch visible while the list scrolls under
+		   the panel's single scrollbar. */
+		position: sticky;
+		top: 0;
+		background: var(--bg-secondary);
+		z-index: 1;
 	}
 
 	.guide-tab {

@@ -1,21 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-/// Current config schema version. Bump when a *breaking* change to the config
-/// shape needs a migration (see `Config::migrate`). A config written by an older
-/// Lychi loads with its stored version; migrations bring it up to `CONFIG_VERSION`.
-pub const CONFIG_VERSION: u32 = 1;
-
-fn default_config_version() -> u32 {
-    // A config file without a `version` field predates versioning → treat as v1.
-    1
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
-#[serde(default)]
 pub struct Config {
-    /// Schema version — enables safe migration across breaking config changes.
-    #[serde(default = "default_config_version")]
-    pub version: u32,
     pub general: GeneralConfig,
     pub commands: CommandsConfig,
     pub history: HistoryConfig,
@@ -30,8 +16,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            // A fresh config is written at the current version.
-            version: CONFIG_VERSION,
             general: GeneralConfig::default(),
             commands: CommandsConfig::default(),
             history: HistoryConfig::default(),
@@ -47,7 +31,6 @@ impl Default for Config {
 
 /// Controls the context-aware suggestion panel.
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
-#[serde(default)]
 pub struct SuggestionsConfig {
     /// Show frecency recents (past commands) on the empty prompt.
     pub zero_state_recents: bool,
@@ -66,7 +49,6 @@ impl Default for SuggestionsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
-#[serde(default)]
 pub struct GeneralConfig {
     pub hide_on_blur: bool,
     pub show_duration_ms: bool,
@@ -100,7 +82,6 @@ impl Default for GeneralConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
-#[serde(default)]
 pub struct CommandsConfig {
     pub default_search_engine: String,
     pub youtube_url: String,
@@ -110,11 +91,9 @@ pub struct CommandsConfig {
     /// Additional WM classes to recognise as terminal emulators.
     /// Matched exactly (case-insensitive) — no substring matching.
     /// Example: extra_terminals = ["com.my.custom.term"]
-    #[serde(default)]
     pub extra_terminals: Vec<String>,
     /// Additional WM classes to recognise as IDEs / code editors.
     /// Matched exactly (case-insensitive). Example: extra_ides = ["my-editor"]
-    #[serde(default)]
     pub extra_ides: Vec<String>,
     /// Terminal routing: "auto" | "manual" | "off"
     /// - auto: always try sending to existing terminal first
@@ -127,7 +106,6 @@ pub struct CommandsConfig {
     /// `gh tokio` open a GitHub search. Fully user-extensible — the core of a
     /// no-code "ecosystem". Ships with a few sensible defaults; user entries in
     /// config.toml override/extend them.
-    #[serde(default = "default_search_engines")]
     pub search_engines: std::collections::HashMap<String, String>,
 }
 
@@ -274,7 +252,6 @@ pub fn detect_installed_terminals() -> Vec<String> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
-#[serde(default)]
 pub struct HistoryConfig {
     pub max_entries: usize,
     pub deduplicate: bool,
@@ -290,20 +267,16 @@ impl Default for HistoryConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
-#[serde(default)]
 pub struct ProjectsConfig {
     pub directories: Vec<String>,
     /// Extra filenames treated as strong project markers (tier 1).
     /// Example: `["flake.nix", "WORKSPACE.bazel"]`
-    #[serde(default)]
     pub extra_strong_markers: Vec<String>,
     /// Extra filenames treated as soft project markers (tier 2).
     /// Soft markers only accepted when a strong marker exists in a child dir.
     /// Example: `[".devcontainer"]`
-    #[serde(default)]
     pub extra_soft_markers: Vec<String>,
     /// Pinned workspace path — overrides auto-detection when set.
-    #[serde(default)]
     pub pinned_workspace: Option<String>,
 }
 
@@ -324,7 +297,6 @@ impl Default for ProjectsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
-#[serde(default)]
 pub struct AiConfig {
     /// AI mode: "disabled", "byo", "ollama" (cloud is deferred to Phase 2.3).
     pub mode: String,
@@ -337,22 +309,17 @@ pub struct AiConfig {
     pub model: String,
     /// Override endpoint base URL for BYO. Empty = use the preset's default.
     /// Lets any OpenAI-compatible endpoint (OpenRouter, local proxies, …) work.
-    #[serde(default)]
     pub base_url: String,
     /// Request/response wire format for BYO: "openai", "anthropic", "gemini".
     /// Empty = infer from the preset. Grok/Groq/OpenRouter all speak "openai".
-    #[serde(default)]
     pub wire_format: String,
     /// Ollama server URL
     pub ollama_url: String,
     /// Ollama model name (e.g. "mistral:latest", "llama3:8b")
-    #[serde(default)]
     pub ollama_model: String,
     /// AI request timeout in seconds (default 8).
-    #[serde(default = "default_ai_timeout")]
     pub timeout_secs: u64,
     /// Max tokens for routing/intent calls (default 300).
-    #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
 }
 
@@ -465,7 +432,6 @@ impl Default for AiConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
-#[serde(default)]
 pub struct WeatherConfig {
     /// Temperature unit: "celsius" or "fahrenheit"
     pub unit: String,
@@ -485,7 +451,6 @@ impl Default for WeatherConfig {
 /// Privacy consent flags — all default to false (C6: Privacy First).
 /// Each flag records whether the user has consented to a specific network call.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, specta::Type)]
-#[serde(default)]
 pub struct PrivacyConfig {
     /// Allow IP geolocation (weather auto-detect via freeipapi.com)
     pub allow_ip_geolocation: bool,
@@ -496,7 +461,6 @@ pub struct PrivacyConfig {
 /// Configurable keyboard shortcuts for in-app actions.
 /// Uses "Modifier+Key" string format (e.g. "Ctrl+1", "Shift+Tab").
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
-#[serde(default)]
 pub struct KeybindingsConfig {
     pub toggle_history: String,
     pub toggle_notes: String,
@@ -515,12 +479,9 @@ pub struct KeybindingsConfig {
     /// Copy the selected search result's full path to the clipboard. Ctrl+Shift+C.
     pub copy_path: String,
     /// Quick screenshot: hide Lychi and capture a region. Ctrl+Shift+S.
-    #[serde(default = "default_screenshot_key")]
     pub screenshot: String,
-}
-
-fn default_screenshot_key() -> String {
-    "Ctrl+Shift+S".to_string()
+    /// Open the secondary-actions panel for the selected result. Ctrl+K.
+    pub action_panel: String,
 }
 
 impl Default for KeybindingsConfig {
@@ -540,6 +501,7 @@ impl Default for KeybindingsConfig {
             run_inline: "Shift+Enter".to_string(),
             copy_path: "Ctrl+Shift+C".to_string(),
             screenshot: "Ctrl+Shift+S".to_string(),
+            action_panel: "Ctrl+K".to_string(),
         }
     }
 }
@@ -602,4 +564,5 @@ mod tests {
         assert!(cfg.search_engines.contains_key("gh"));
         assert!(!cfg.search_engines.contains_key("open"));
     }
+
 }

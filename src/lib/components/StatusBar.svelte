@@ -35,6 +35,8 @@ let {
 	contextStale = false,
 	contextStaleHint = "",
 	contextRefreshing = false,
+	actionsAvailable = false,
+	onactionpanel = () => {},
 }: {
 	result: CommandResult | null;
 	executing: boolean;
@@ -55,6 +57,8 @@ let {
 	contextStale?: boolean;
 	contextStaleHint?: string;
 	contextRefreshing?: boolean;
+	actionsAvailable?: boolean;
+	onactionpanel?: () => void;
 } = $props();
 
 let resultVisible = $derived(
@@ -134,6 +138,21 @@ async function togglePlayPause() {
 	{/if}
 
 	<div class="toolbar">
+		{#if actionsAvailable}
+			<!-- Discoverable ⌘K affordance: teaches the shortcut and gives AT users a
+			     focusable trigger for the actions menu (aria-haspopup="menu"). -->
+			<button
+				class="actions-hint"
+				onmousedown={(e) => e.preventDefault()}
+				onclick={onactionpanel}
+				title="Show actions for the selected result"
+				aria-haspopup="menu"
+				tabindex={-1}
+			>
+				<span>Actions</span>
+				<kbd>{getComboString("action_panel")}</kbd>
+			</button>
+		{/if}
 		{#if result && (result.output || result.error)}
 			<button
 				class="bar-icon"
@@ -230,6 +249,38 @@ async function togglePlayPause() {
 		background: var(--border);
 		margin: 0 4px;
 		flex-shrink: 0;
+	}
+
+	.actions-hint {
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		background: none;
+		border: none;
+		color: var(--fg-muted);
+		font-family: var(--font-mono);
+		font-size: 11px;
+		padding: 2px 6px;
+		border-radius: 4px;
+		cursor: pointer;
+		margin-right: 2px;
+		transition: color 100ms ease, background 100ms ease;
+	}
+
+	.actions-hint:hover {
+		color: var(--fg);
+		background: var(--bg-secondary);
+	}
+
+	.actions-hint kbd {
+		font-family: var(--font-mono);
+		font-size: 10px;
+		color: var(--fg-muted);
+		background: var(--bg-secondary);
+		border: 1px solid var(--border);
+		border-radius: 3px;
+		padding: 0 4px;
+		line-height: 1.5;
 	}
 
 	.bar-icon {

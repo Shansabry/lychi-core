@@ -26,6 +26,7 @@ let {
 	onshifttabback = () => {},
 	ondrillinto = () => {},
 	oncopypath = () => {},
+	onactionpanel = () => {},
 	contextPill = "",
 	contextLoading = false,
 	searchGhost = "",
@@ -55,6 +56,7 @@ let {
 	onshifttabback?: () => void;
 	ondrillinto?: () => void;
 	oncopypath?: () => void;
+	onactionpanel?: () => void;
 	contextPill?: string;
 	contextLoading?: boolean;
 	searchGhost?: string;
@@ -300,6 +302,10 @@ function handleKeydown(e: KeyboardEvent) {
 	} else if (matchesAction(e, "copy_path") && searchMode) {
 		e.preventDefault();
 		oncopypath();
+	} else if (matchesAction(e, "action_panel")) {
+		// ⌘K / Ctrl+K — open the secondary-actions panel for the selected result.
+		e.preventDefault();
+		onactionpanel();
 	} else if (matchesAction(e, "web_search")) {
 		e.preventDefault();
 		onsubmit({ ctrlKey: true });

@@ -295,10 +295,17 @@ export async function getAllSettings(): Promise<AllSettings> {
 				youtube_url: "https://www.youtube.com/results?search_query=",
 				shell: "/bin/bash",
 				terminal: "",
+					extra_terminals: [],
+					extra_ides: [],
 				terminal_routing: "manual",
 				search_engines: {},
 			},
-			projects: { directories: [] },
+				projects: {
+					directories: [],
+					extra_strong_markers: [],
+					extra_soft_markers: [],
+					pinned_workspace: null,
+				},
 			privacy: { allow_ip_geolocation: false, allow_public_ip: false },
 			keybindings: {
 				toggle_history: "Ctrl+1",
@@ -315,6 +322,7 @@ export async function getAllSettings(): Promise<AllSettings> {
 				run_inline: "Shift+Enter",
 				copy_path: "Ctrl+Shift+C",
 				screenshot: "Ctrl+Shift+S",
+				action_panel: "Ctrl+K",
 			},
 			app_version: "0.0.0",
 			layer_shell_supported: false,
@@ -386,6 +394,8 @@ export async function getCommandsConfig(): Promise<CommandsConfig> {
 			youtube_url: "https://www.youtube.com/results?search_query=",
 			shell: "/bin/bash",
 			terminal: "",
+			extra_terminals: [],
+			extra_ides: [],
 			terminal_routing: "manual",
 			search_engines: {},
 		};
@@ -408,6 +418,9 @@ export async function getProjectsConfig(): Promise<ProjectsConfig> {
 	if (!isTauri())
 		return {
 			directories: ["~/Projects", "~/Dev", "~/Code", "~/repos"],
+			extra_strong_markers: [],
+			extra_soft_markers: [],
+			pinned_workspace: null,
 		};
 	return unwrap(await commands.getProjectsConfig());
 }
@@ -467,6 +480,7 @@ export const KEYBINDINGS_DEFAULTS: KeybindingsConfig = {
 	run_inline: "Shift+Enter",
 	copy_path: "Ctrl+Shift+C",
 	screenshot: "Ctrl+Shift+S",
+	action_panel: "Ctrl+K",
 };
 
 export async function getKeybindingsConfig(): Promise<KeybindingsConfig> {

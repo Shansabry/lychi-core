@@ -1,7 +1,7 @@
 <script lang="ts">
 import { Check, ChevronRight, FolderOpen, X } from "lucide-svelte";
 import type { DirEntry } from "$lib/ipc";
-import { listDirectories, saveProjectsConfig } from "$lib/ipc";
+import { getProjectsConfig, listDirectories, saveProjectsConfig } from "$lib/ipc";
 
 let {
 	projectDirs = $bindable(),
@@ -18,7 +18,10 @@ let browseInput = $state("");
 
 async function saveProjectDirs() {
 	try {
-		await saveProjectsConfig({ directories: projectDirs });
+		// Preserve the other projects fields (markers, pinned workspace); only the
+		// directories are edited here.
+		const current = await getProjectsConfig();
+		await saveProjectsConfig({ ...current, directories: projectDirs });
 	} catch (err) {
 		console.error("[settings] Failed to save projects config:", err);
 		onsaveerror(`Failed to save: ${err}`);

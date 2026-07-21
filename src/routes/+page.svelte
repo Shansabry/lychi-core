@@ -4,6 +4,7 @@ import { LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { onMount } from "svelte";
 import AgentPlanPanel from "$lib/components/AgentPlanPanel.svelte";
+import ActionPanel from "$lib/components/ActionPanel.svelte";
 import CommandInput from "$lib/components/CommandInput.svelte";
 import CompletionsList from "$lib/components/CompletionsList.svelte";
 import FilePreview from "$lib/components/FilePreview.svelte";
@@ -1313,6 +1314,127 @@ async function copySelectedPath() {
 	}
 }
 
+// --- ⌘K action panel ---
+// A secondary-actions menu for the selected result. The action IMPLEMENTATIONS
+// already exist above; this just enumerates which apply (frontend-only, keyed off
+// mode flags + icon_path sentinels + run/fill/label conventions) and dispatches.
+let actionPanelOpen = $state(false);
+
+type PanelAction = { id: string; label: string; hint?: string };
+
+/** The selected completion, or undefined (skips separators just in case). */
+let selectedCompletion = $derived.by(() => {
+	const item = completions[completionIndex];
+	if (!item || item.icon_path === "__separator__") return undefined;
+	return item;
+});
+
+/** Build the applicable actions for the currently-selected result. */
+let panelActions = $derived.by((): PanelAction[] => {
+	const item = selectedCompletion;
+	if (!item) return [];
+	const acts: PanelAction[] = [];
+	const isFolder = item.icon_path === "__folder__";
+	const hasPath = searchMode || atMode || filePathMap.has(item.label);
+	const isApp = item.run?.startsWith("appctl") || item.run?.startsWith("open ");
+	const isCalc = item.label.startsWith("= ");
+
+	if (hasPath) {
+		acts.push({ id: "open", label: isFolder ? "Open folder" : "Open", hint: "Enter" });
+		if (isFolder) acts.push({ id: "drill", label: "Browse inside", hint: "Tab" });
+		acts.push({ id: "reveal", label: "Reveal in file manager", hint: "Ctrl+Enter" });
+		acts.push({ id: "copy_path", label: "Copy path", hint: "Ctrl+Shift+C" });
+	} else if (isApp) {
+		acts.push({ id: "open", label: "Open / focus", hint: "Enter" });
+	} else if (isCalc) {
+		acts.push({ id: "copy_value", label: "Copy result", hint: "Enter" });
+	} else {
+		// Generic: runnable and/or fillable.
+		if (item.fill) {
+			acts.push({ id: "insert", label: "Insert into input", hint: "Tab" });
+		}
+		if (item.run || !item.fill) {
+			acts.push({ id: "open", label: "Run", hint: "Enter" });
+		}
+		if (item.run) {
+			acts.push({ id: "copy_command", label: "Copy command" });
+		}
+	}
+	return acts;
+});
+
+function openActionPanel() {
+	// Toggle: pressing Ctrl+K again (or the affordance) closes an open panel.
+	if (actionPanelOpen) {
+		closeActionPanel();
+		return;
+	}
+	if (!selectedCompletion || panelActions.length === 0) return;
+	actionPanelOpen = true;
+}
+
+function closeActionPanel() {
+	actionPanelOpen = false;
+	// Restore focus to the input (the panel had grabbed it).
+	requestAnimationFrame(() => {
+		document.querySelector<HTMLInputElement>(".input-container input")?.focus();
+	});
+}
+
+async function copyTextFlash(text: string, msg: string) {
+	try {
+		await navigator.clipboard.writeText(text);
+		flashHint(msg);
+	} catch (err) {
+		console.error("[action-panel] clipboard write failed:", err);
+	}
+}
+
+function runPanelAction(id: string) {
+	const item = selectedCompletion;
+	actionPanelOpen = false;
+	if (!item) {
+		closeActionPanel();
+		return;
+	}
+	switch (id) {
+		case "open":
+			handleCompletionSelect(item.label);
+			break;
+		case "drill":
+			drillIntoFolder(item);
+			closeActionPanel();
+			break;
+		case "reveal":
+			revealSelected();
+			break;
+		case "copy_path": {
+			const full = resolveFullPath(item.label);
+			if (full) copyTextFlash(full, "Path copied");
+			closeActionPanel();
+			break;
+		}
+		case "copy_value":
+			// "= 1024" → copy "1024"
+			copyTextFlash(item.label.replace(/^=\s*/, ""), "Result copied");
+			closeActionPanel();
+			break;
+		case "copy_command":
+			copyTextFlash(item.run ?? item.label, "Command copied");
+			closeActionPanel();
+			break;
+		case "insert":
+			if (item.fill) {
+				inputValue = item.fill;
+				handleInput(inputValue);
+			}
+			closeActionPanel();
+			break;
+		default:
+			closeActionPanel();
+	}
+}
+
 function handleCompletionSelect(label: string, forceOpen?: boolean) {
 	// / search mode — Enter opens the folder/file; Ctrl+Enter (forceOpen) reveals
 	// it in the file manager. Drilling into a folder is Tab / → (see drillIntoFolder).
@@ -1678,7 +1800,15 @@ async function handleDismiss() {
 			searchGhost={searchMode && completions.length > 0 && completionIndex >= 0 ? completions[completionIndex].label : ""}
 			browseGhost={atMode && completions.length > 0 && completionIndex >= 0 ? completions[completionIndex].label : ""}
 			history={historyEntries}
+			onactionpanel={openActionPanel}
 		/>
+		{#if actionPanelOpen}
+			<ActionPanel
+				actions={panelActions}
+				onrun={runPanelAction}
+				ondismiss={closeActionPanel}
+			/>
+		{/if}
 		<!-- Panels: always mounted, hidden via CSS (visibility:hidden) for instant toggle -->
 		<!-- Order matches shortcuts: Ctrl+1 History, Ctrl+2 Notes, Ctrl+3 Media, Ctrl+4 Settings -->
 		<div class:panel-hidden={!historyOpen}>
@@ -1763,6 +1893,8 @@ async function handleDismiss() {
 		{contextStale}
 		{contextStaleHint}
 		{contextRefreshing}
+		actionsAvailable={!settingsOpen && !notesOpen && !mediaOpen && !historyOpen && panelActions.length > 0}
+		onactionpanel={openActionPanel}
 		/>
 	</main>
 	{#if showPreview}
@@ -1895,6 +2027,9 @@ async function handleDismiss() {
 		max-height: 60vh;
 		display: flex;
 		flex-direction: column;
+		/* Positioning context for the ⌘K action panel, which anchors to the
+		   launcher's bottom-right rather than the viewport. */
+		position: relative;
 		background: var(--bg);
 		border: 1px solid var(--border);
 		border-radius: 12px;

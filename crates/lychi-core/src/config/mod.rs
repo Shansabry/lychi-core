@@ -10,50 +10,36 @@ use crate::error::LychiError;
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self, LychiError> {
-        if path.exists() {
-            let content = fs::read_to_string(path)?;
-            let mut config: Config = toml::from_str(&content)?;
-            config.migrate();
-            // Drop any search-engine keyword that collides with a reserved
-            // command (e.g. a hand-edited `open = "..."`) so it can't shadow a
-            // real command. Rejecting here would fail the whole config, so we
-            // degrade gracefully and warn instead.
-            // The load path has no action registry available. Reserved-command
-            // collisions are re-checked on the save path (which does have one);
-            // here we only drop structurally malformed keys (empty / multi-word).
-            let dropped = config.commands.sanitize_search_engines(&|_| false);
-            if !dropped.is_empty() {
-                tracing::warn!(
-                    "Ignoring reserved/invalid search-engine keywords: {}",
-                    dropped.join(", ")
-                );
-            }
-            Ok(config)
-        } else {
-            Ok(Config::default())
+        if !path.exists() {
+            return Ok(Config::default());
         }
-    }
+        let content = fs::read_to_string(path)?;
 
-    /// Migrate an older config in-place up to `CONFIG_VERSION`. Each step handles
-    /// one version bump; add a match arm per breaking change. Runs after load so
-    /// a config written by an older Lychi is brought current before use.
-    ///
-    /// (No migrations are needed for v1 — this is the framework so the *next*
-    /// breaking change has a home instead of silently corrupting configs.)
-    fn migrate(&mut self) {
-        while self.version < CONFIG_VERSION {
-            match self.version {
-                // Example for the future:
-                // 1 => { /* rename ai.mode values, etc. */ self.version = 2; }
-                _ => {
-                    // Unknown/newer-than-us version, or no migration defined:
-                    // stamp current and stop rather than loop forever.
-                    self.version = CONFIG_VERSION;
-                }
-            }
+        // Default-overlay load: defaults live in `Config::default()` (code, one
+        // source of truth), and the file only overrides what it sets. A partial
+        // or hand-edited config.toml that omits any field/section loads fine —
+        // the missing values come from the defaults, not from serde-default
+        // attributes on every field. So the structs stay clean.
+        let user: toml::Value = toml::from_str(&content)?;
+        let mut base = toml::Value::try_from(Config::default())
+            .map_err(|e| LychiError::Config(format!("serializing default config: {e}")))?;
+        merge_toml(&mut base, user);
+        let mut config: Config =
+            base.try_into().map_err(|e| LychiError::Config(e.to_string()))?;
+
+        // Drop any search-engine keyword that collides with a reserved command
+        // (e.g. a hand-edited `open = "..."`) so it can't shadow a real command.
+        // We degrade gracefully + warn rather than fail the whole config. The
+        // load path has no action registry; reserved-command collisions are
+        // re-checked on save. Here we only drop structurally malformed keys.
+        let dropped = config.commands.sanitize_search_engines(&|_| false);
+        if !dropped.is_empty() {
+            tracing::warn!(
+                "Ignoring reserved/invalid search-engine keywords: {}",
+                dropped.join(", ")
+            );
         }
-        // A config newer than this binary (downgrade) keeps its version; serde
-        // defaults fill any fields this older binary doesn't know about.
+        Ok(config)
     }
 
     pub fn save(&self, path: &Path) -> Result<(), LychiError> {
@@ -104,6 +90,26 @@ impl Config {
     }
 }
 
+/// Deep-merge `overlay` onto `base` in place: for tables, recurse key-by-key so
+/// a partial `[ai]` section overrides only the fields it sets; for any other
+/// value, `overlay` replaces `base`. This is what lets a partial config.toml
+/// override only what it specifies while the rest falls back to `Config::default`.
+fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base_map), toml::Value::Table(overlay_map)) => {
+            for (k, v) in overlay_map {
+                match base_map.get_mut(&k) {
+                    Some(base_v) => merge_toml(base_v, v),
+                    None => {
+                        base_map.insert(k, v);
+                    }
+                }
+            }
+        }
+        (base_slot, overlay_val) => *base_slot = overlay_val,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,18 +123,43 @@ mod tests {
     }
 
     #[test]
-    fn fresh_default_is_current_version() {
-        assert_eq!(Config::default().version, CONFIG_VERSION);
+    fn partial_config_overlays_onto_defaults() {
+        // Default-overlay load: a config.toml that sets only ONE field in ONE
+        // section must load fine — that field overrides, everything else falls
+        // back to Config::default(). No serde-default attributes needed.
+        let path = temp_path("partial");
+        std::fs::write(&path, "[general]\ntheme = \"light\"\n").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        // The set field overrides.
+        assert_eq!(cfg.general.theme, "light");
+        // Sibling fields in the same section keep their defaults.
+        assert_eq!(cfg.general.hide_on_blur, true);
+        // Untouched sections are fully defaulted (search engines present).
+        assert!(cfg.commands.search_engines.contains_key("gh"));
+        assert_eq!(cfg.ai.timeout_secs, AiConfig::default().timeout_secs);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn config_without_version_field_loads_as_v1() {
-        // A pre-versioning config (no `version =` line) must load as v1, not 0.
-        let path = temp_path("noversion");
-        std::fs::write(&path, "[general]\ntheme = \"dark\"\n").unwrap();
+    fn empty_config_file_yields_defaults() {
+        let path = temp_path("empty");
+        std::fs::write(&path, "").unwrap();
         let cfg = Config::load(&path).unwrap();
-        assert_eq!(cfg.version, 1);
-        assert_eq!(cfg.general.theme, "dark");
+        assert_eq!(cfg.general.theme, GeneralConfig::default().theme);
+        assert!(cfg.commands.search_engines.contains_key("npm"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn nested_partial_section_merges_field_by_field() {
+        // Setting one ai field must not wipe the others in [ai].
+        let path = temp_path("nested");
+        std::fs::write(&path, "[ai]\nmodel = \"custom-model\"\n").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.ai.model, "custom-model");
+        // timeout_secs untouched → default, not zero.
+        assert_eq!(cfg.ai.timeout_secs, AiConfig::default().timeout_secs);
+        assert_eq!(cfg.ai.max_tokens, AiConfig::default().max_tokens);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -140,22 +171,11 @@ mod tests {
         std::fs::write(&path, "this is not valid toml =[[[").unwrap();
         let cfg = Config::load_or_default(&path);
         // Falls back to defaults …
-        assert_eq!(cfg.version, CONFIG_VERSION);
+        assert_eq!(cfg.general.theme, GeneralConfig::default().theme);
         // … but the user's (broken) file was backed up, not lost.
         let backup = path.with_extension("toml.bak");
         assert!(backup.exists(), "broken config should be backed up");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&backup);
-    }
-
-    #[test]
-    fn migrate_stamps_current_version() {
-        // A config claiming an old version gets stamped current after migrate.
-        let mut cfg = Config {
-            version: 0,
-            ..Default::default()
-        };
-        cfg.migrate();
-        assert_eq!(cfg.version, CONFIG_VERSION);
     }
 }

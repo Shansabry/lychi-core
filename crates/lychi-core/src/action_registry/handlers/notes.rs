@@ -56,7 +56,7 @@ impl ActionHandler for NotesHandler {
     }
 
     fn description(&self) -> &str {
-        "Notes — add, list, or delete notes (max 5). Usage: note <text> to add, note read to list, note delete <id> to remove"
+        "Notes — add, list, or delete notes. Usage: note <text> to add, note read to list, note delete <id> to remove"
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
