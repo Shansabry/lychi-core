@@ -14,7 +14,7 @@ use crate::state::AppState;
 pub const FIREBASE_API_KEY: &str = "AIzaSyBPlaceholder_ReplaceWithRealKey";
 
 const FIREBASE_REFRESH_URL: &str = "https://securetoken.googleapis.com/v1/token";
-const CLOUD_BASE_URL: &str = "https://api.lychi.app";
+pub(crate) const CLOUD_BASE_URL: &str = "https://api.lychi.app";
 
 // Keyring entry names (service: "lychi")
 const KEY_ID_TOKEN: &str = "firebase-id_token";

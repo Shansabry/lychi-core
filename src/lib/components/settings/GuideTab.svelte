@@ -1,5 +1,23 @@
 <script lang="ts">
+import { onMount } from "svelte";
+import { type CommandInfo, getCommandCatalog, getTriggerCatalog } from "$lib/ipc";
+
 let guideTab: "commands" | "triggers" = $state("commands");
+
+// Both lists are generated from the LIVE action registry, so they never go
+// stale — registering a handler makes it appear automatically, and a trigger's
+// description comes from the same handler as its command (centralised).
+let commands: CommandInfo[] = $state([]);
+let triggers: CommandInfo[] = $state([]);
+
+onMount(async () => {
+	try {
+		[commands, triggers] = await Promise.all([getCommandCatalog(), getTriggerCatalog()]);
+	} catch {
+		commands = [];
+		triggers = [];
+	}
+});
 </script>
 
 <div class="guide" role="region" aria-label="Guide">
@@ -22,73 +40,25 @@ let guideTab: "commands" | "triggers" = $state("commands");
 
 	{#if guideTab === "commands"}
 		<div class="guide-table">
-			<div class="guide-row">
-				<code>open &lt;app&gt;</code>
-				<span>Launch an app</span>
-			</div>
-			<div class="guide-row">
-				<code>web &lt;query&gt;</code>
-				<span>Search the web</span>
-			</div>
-			<div class="guide-row">
-				<code>yt &lt;query&gt;</code>
-				<span>Search YouTube</span>
-			</div>
-			<div class="guide-row">
-				<code>run &lt;cmd&gt;</code>
-				<span>Run a shell command</span>
-			</div>
-			<div class="guide-row">
-				<code>calc &lt;expr&gt;</code>
-				<span>Evaluate math</span>
-			</div>
-			<div class="guide-row">
-				<code>file &lt;path&gt;</code>
-				<span>Open file or folder</span>
-			</div>
-			<div class="guide-row">
-				<code>project &lt;name&gt;</code>
-				<span>Open project in editor</span>
-			</div>
-			<div class="guide-row">
-				<code>spotify &lt;action&gt;</code>
-				<span>Control Spotify</span>
-			</div>
-			<div class="guide-row">
-				<code>media &lt;action&gt;</code>
-				<span>Control any media player</span>
-			</div>
-			<div class="guide-row">
-				<code>note &lt;text&gt;</code>
-				<span>Save a quick note</span>
-			</div>
-			<div class="guide-row">
-				<code>todo &lt;action&gt;</code>
-				<span>Manage todo list</span>
-			</div>
-			<div class="guide-row">
-				<code>system &lt;action&gt;</code>
-				<span>shutdown / reboot / lock / suspend</span>
-			</div>
+			{#each commands as cmd (cmd.id)}
+				<div class="guide-row">
+					<code>{cmd.keyword}</code>
+					<span>{cmd.description}</span>
+				</div>
+			{:else}
+				<div class="guide-empty">Loading commands…</div>
+			{/each}
 		</div>
 	{:else}
 		<div class="guide-table">
-			<div class="guide-row">
-				<code>=2+2</code>
-				<span>Calculator</span>
-			</div>
-			<div class="guide-row">
-				<code>&gt;ls -la</code>
-				<span>Shell command</span>
-			</div>
-			<div class="guide-row">
-				<code>~/Downloads</code>
-				<span>Open path</span>
-			</div>
-			<div class="guide-row">
-				<code>github.com</code>
-				<span>Open URL</span>
-			</div>
+			{#each triggers as trig (trig.keyword)}
+				<div class="guide-row">
+					<code>{trig.keyword}</code>
+					<span>{trig.description}</span>
+				</div>
+			{:else}
+				<div class="guide-empty">Loading triggers…</div>
+			{/each}
 		</div>
 	{/if}
 </div>
@@ -160,5 +130,11 @@ let guideTab: "commands" | "triggers" = $state("commands");
 	.guide-row span {
 		font-size: 11px;
 		color: var(--fg-muted);
+	}
+
+	.guide-empty {
+		font-size: 11px;
+		color: var(--fg-muted);
+		padding: 8px 0;
 	}
 </style>

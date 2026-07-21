@@ -2,47 +2,44 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{Value, json};
 
-use std::str::FromStr;
-
 use crate::error::LychiError;
 
 use super::{AiProvider, AiResponse, AiRoute};
 use crate::intent::prompt;
 
-/// Supported BYO API providers.
+/// Request/response wire format spoken to the endpoint.
+///
+/// This is intentionally decoupled from any specific vendor: OpenAI, Groq,
+/// Grok, Gemini (OpenAI-compat mode) and OpenRouter all speak `OpenAi`; only
+/// Anthropic's native Messages API differs. Adding a new OpenAI-compatible
+/// provider needs NO code change — just a base URL + this format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BYOProvider {
-    OpenAI,
+pub enum WireFormat {
+    OpenAi,
     Anthropic,
-    Groq,
 }
 
-impl FromStr for BYOProvider {
-    type Err = LychiError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+impl WireFormat {
+    /// Parse a wire-format string. Unknown values fall back to OpenAI, which is
+    /// the de-facto standard for third-party endpoints.
+    pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
-            "openai" => Ok(Self::OpenAI),
-            "anthropic" => Ok(Self::Anthropic),
-            "groq" => Ok(Self::Groq),
-            _ => Err(LychiError::Ai(format!("Unknown BYO provider: {s}"))),
+            "anthropic" => Self::Anthropic,
+            // "openai", "gemini" (openai-compat), "groq", "" and anything else
+            _ => Self::OpenAi,
         }
     }
 }
 
-impl BYOProvider {
-    fn endpoint(&self) -> &'static str {
-        match self {
-            Self::OpenAI => "https://api.openai.com/v1/chat/completions",
-            Self::Anthropic => "https://api.anthropic.com/v1/messages",
-            Self::Groq => "https://api.groq.com/openai/v1/chat/completions",
-        }
-    }
-}
-
-/// BYO API key provider — sends requests directly to OpenAI, Anthropic, or Groq.
+/// BYO API key provider — provider-agnostic. Speaks either the OpenAI-compatible
+/// chat-completions API or the Anthropic Messages API against an arbitrary base
+/// URL, with a user-supplied model string. No hardcoded provider or model list.
 pub struct BYOClient {
-    provider: BYOProvider,
+    /// Human-readable provider id (preset id, e.g. "openai", "grok", "custom").
+    /// Display/logging only — behavior is driven by `wire` + `base_url`.
+    provider_id: String,
+    wire: WireFormat,
+    base_url: String,
     model: String,
     api_key: String,
     max_tokens: u32,
@@ -50,9 +47,24 @@ pub struct BYOClient {
 }
 
 impl BYOClient {
-    pub fn new(provider: BYOProvider, model: String, api_key: String, max_tokens: u32) -> Self {
+    /// Construct a BYO client.
+    ///
+    /// - `provider_id`: preset id for display/logging (e.g. "openai", "grok").
+    /// - `wire`: which API dialect to speak.
+    /// - `base_url`: full endpoint URL (chat-completions or messages endpoint).
+    /// - `model`: free-form model identifier the endpoint accepts.
+    pub fn new(
+        provider_id: impl Into<String>,
+        wire: WireFormat,
+        base_url: impl Into<String>,
+        model: String,
+        api_key: String,
+        max_tokens: u32,
+    ) -> Self {
         Self {
-            provider,
+            provider_id: provider_id.into(),
+            wire,
+            base_url: base_url.into(),
             model,
             api_key,
             max_tokens,
@@ -77,7 +89,7 @@ impl BYOClient {
 
         let resp = self
             .http
-            .post(self.provider.endpoint())
+            .post(&self.base_url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .json(&body)
@@ -119,7 +131,7 @@ impl BYOClient {
 
         let resp = self
             .http
-            .post(BYOProvider::Anthropic.endpoint())
+            .post(&self.base_url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", "application/json")
@@ -143,6 +155,13 @@ impl BYOClient {
             .as_str()
             .map(|s| s.to_string())
             .ok_or_else(|| LychiError::Ai("No content in API response".to_string()))
+    }
+
+    async fn call(&self, system_prompt: &str, user_input: &str) -> Result<String, LychiError> {
+        match self.wire {
+            WireFormat::OpenAi => self.call_openai_compatible(system_prompt, user_input).await,
+            WireFormat::Anthropic => self.call_anthropic(system_prompt, user_input).await,
+        }
     }
 }
 
@@ -168,17 +187,11 @@ impl AiProvider for BYOClient {
         context_hint: Option<&str>,
     ) -> Result<AiResponse, LychiError> {
         let sys_prompt = prompt::system_prompt(known_actions, context_hint);
-
-        let response = match self.provider {
-            BYOProvider::OpenAI | BYOProvider::Groq => {
-                self.call_openai_compatible(&sys_prompt, input).await?
-            }
-            BYOProvider::Anthropic => self.call_anthropic(&sys_prompt, input).await?,
-        };
+        let response = self.call(&sys_prompt, input).await?;
 
         tracing::debug!(
             prompt_version = prompt::PROMPT_VERSION,
-            provider = self.name(),
+            provider = %self.provider_id,
             model = %self.model,
             "[ai] raw response: {response}"
         );
@@ -186,15 +199,21 @@ impl AiProvider for BYOClient {
     }
 
     async fn health_check(&self) -> bool {
-        let result = match self.provider {
-            BYOProvider::Anthropic => {
+        let result = match self.wire {
+            WireFormat::Anthropic => {
+                // Anthropic has no cheap unauthenticated probe; a 401/403 means
+                // the key is bad, anything else (incl. 400 for the dummy body)
+                // means the endpoint + auth are reachable.
                 let res = self
                     .http
-                    .post("https://api.anthropic.com/v1/messages")
+                    .post(&self.base_url)
                     .header("x-api-key", &self.api_key)
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json")
-                    .body(r#"{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+                    .body(format!(
+                        r#"{{"model":"{}","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}]}}"#,
+                        self.model
+                    ))
                     .send()
                     .await;
                 match res {
@@ -205,31 +224,47 @@ impl AiProvider for BYOClient {
                     Err(_) => false,
                 }
             }
-            BYOProvider::OpenAI | BYOProvider::Groq => {
-                let url = match self.provider {
-                    BYOProvider::OpenAI => "https://api.openai.com/v1/models",
-                    BYOProvider::Groq => "https://api.groq.com/openai/v1/models",
-                    _ => return false,
-                };
-                self.http
-                    .get(url)
-                    .header("Authorization", format!("Bearer {}", self.api_key))
-                    .send()
-                    .await
-                    .map(|r| r.status().is_success())
-                    .unwrap_or(false)
+            WireFormat::OpenAi => {
+                // Probe the sibling /models endpoint derived from the chat URL.
+                // Falls back to POSTing the chat endpoint if we can't derive it.
+                if let Some(models_url) = openai_models_url(&self.base_url) {
+                    self.http
+                        .get(models_url)
+                        .header("Authorization", format!("Bearer {}", self.api_key))
+                        .send()
+                        .await
+                        .map(|r| r.status().is_success())
+                        .unwrap_or(false)
+                } else {
+                    // No derivable /models — treat a non-auth-error response as healthy.
+                    let res = self
+                        .http
+                        .post(&self.base_url)
+                        .header("Authorization", format!("Bearer {}", self.api_key))
+                        .header("Content-Type", "application/json")
+                        .json(&json!({
+                            "model": self.model,
+                            "messages": [{ "role": "user", "content": "hi" }],
+                            "max_tokens": 1
+                        }))
+                        .send()
+                        .await;
+                    match res {
+                        Ok(r) => {
+                            let s = r.status().as_u16();
+                            s != 401 && s != 403
+                        }
+                        Err(_) => false,
+                    }
+                }
             }
         };
-        tracing::debug!("Health check for {}: {result}", self.name());
+        tracing::debug!("Health check for {}: {result}", self.provider_id);
         result
     }
 
     fn name(&self) -> &str {
-        match self.provider {
-            BYOProvider::OpenAI => "openai",
-            BYOProvider::Anthropic => "anthropic",
-            BYOProvider::Groq => "groq",
-        }
+        &self.provider_id
     }
 
     async fn answer_question(
@@ -237,11 +272,65 @@ impl AiProvider for BYOClient {
         system_prompt: &str,
         question: &str,
     ) -> Result<String, LychiError> {
-        match self.provider {
-            BYOProvider::OpenAI | BYOProvider::Groq => {
-                self.call_openai_compatible(system_prompt, question).await
-            }
-            BYOProvider::Anthropic => self.call_anthropic(system_prompt, question).await,
-        }
+        self.call(system_prompt, question).await
+    }
+}
+
+/// Derive the `/models` listing URL from an OpenAI-compatible chat endpoint.
+/// e.g. ".../v1/chat/completions" -> ".../v1/models". Returns None if the URL
+/// doesn't contain a recognizable "/chat/completions" segment.
+fn openai_models_url(chat_url: &str) -> Option<String> {
+    chat_url
+        .rsplit_once("/chat/completions")
+        .map(|(base, _)| format!("{base}/models"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_format_parses_known_and_falls_back() {
+        assert_eq!(WireFormat::parse("anthropic"), WireFormat::Anthropic);
+        assert_eq!(WireFormat::parse("Anthropic"), WireFormat::Anthropic);
+        assert_eq!(WireFormat::parse("openai"), WireFormat::OpenAi);
+        assert_eq!(WireFormat::parse("gemini"), WireFormat::OpenAi);
+        assert_eq!(WireFormat::parse("groq"), WireFormat::OpenAi);
+        assert_eq!(WireFormat::parse(""), WireFormat::OpenAi);
+        assert_eq!(WireFormat::parse("something-new"), WireFormat::OpenAi);
+    }
+
+    #[test]
+    fn models_url_derived_from_chat_endpoint() {
+        assert_eq!(
+            openai_models_url("https://api.openai.com/v1/chat/completions").as_deref(),
+            Some("https://api.openai.com/v1/models")
+        );
+        assert_eq!(
+            openai_models_url("https://openrouter.ai/api/v1/chat/completions").as_deref(),
+            Some("https://openrouter.ai/api/v1/models")
+        );
+        assert_eq!(
+            openai_models_url("https://api.groq.com/openai/v1/chat/completions").as_deref(),
+            Some("https://api.groq.com/openai/v1/models")
+        );
+    }
+
+    #[test]
+    fn models_url_none_for_unrecognized_endpoint() {
+        assert_eq!(openai_models_url("https://example.com/v1/responses"), None);
+    }
+
+    #[test]
+    fn name_reflects_provider_id() {
+        let c = BYOClient::new(
+            "grok",
+            WireFormat::OpenAi,
+            "https://api.x.ai/v1/chat/completions",
+            "grok-2".into(),
+            "sk-test".into(),
+            300,
+        );
+        assert_eq!(c.name(), "grok");
     }
 }

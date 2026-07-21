@@ -1,5 +1,6 @@
 pub mod byo;
 pub mod cloud;
+pub mod factory;
 pub mod ollama;
 
 use async_trait::async_trait;

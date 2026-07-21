@@ -17,9 +17,36 @@ pub async fn save_ai_config(
     state: State<'_, AppState>,
     ai_config: AiConfig,
 ) -> Result<(), LychiError> {
-    let mut config = state.config.write().await;
-    config.ai = ai_config;
-    config.save(&paths::config_file())
+    use lychi_core::config::db as config_db;
+    use lychi_core::events::{ConfigSection, DomainEvent};
+
+    // Persist, then release the write lock BEFORE emitting — the AiReactor
+    // acquires the config/executor locks with blocking_*, so this command must
+    // not still hold them when the event fans out.
+    {
+        let mut config = state.config.write().await;
+        config.ai = ai_config;
+        config.save(&paths::config_file())?;
+        config_db::save_config_to_db(&state.db, &config)?;
+    }
+
+    // The AiReactor rebuilds the provider, hot-swaps the router, and
+    // re-registers the AI-dependent handlers — no restart needed to switch.
+    //
+    // Emit on a blocking thread: the reactor reads the OS keyring (whose
+    // secret-service backend spins its own runtime) and takes locks with
+    // `blocking_*`. Running it on a tokio async worker would panic ("Cannot
+    // start a runtime from within a runtime"). `EventBus::emit` is synchronous,
+    // so we hop off the worker here.
+    let bus = state.event_bus.clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        bus.emit(DomainEvent::ConfigChanged {
+            section: ConfigSection::Ai,
+        });
+    })
+    .await;
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -73,41 +100,64 @@ pub async fn check_ai_health(state: State<'_, AppState>) -> Result<bool, LychiEr
         config.ai.mode,
         config.ai.provider
     );
-    if config.ai.mode == "disabled" {
-        return Ok(false);
-    }
+    // Build a temporary provider via the same factory the app uses, then probe
+    // it. Single source of truth for mode dispatch — no per-mode duplication.
+    let ai = config.ai.clone();
+    drop(config);
 
-    // Build a temporary provider to check health
-    if config.ai.mode == "byo" {
-        let key = get_stored_key(&config.ai.provider);
-        match &key {
-            Ok(_) => tracing::debug!("API key found for {}", config.ai.provider),
-            Err(e) => tracing::warn!("No API key for {}: {e}", config.ai.provider),
-        }
-        if let Ok(key) = key {
-            let provider: lychi_core::providers::byo::BYOProvider = config.ai.provider.parse()?;
-            let client = lychi_core::providers::byo::BYOClient::new(
-                provider,
-                config.ai.model.clone(),
-                key,
-                config.ai.max_tokens,
-            );
-            use lychi_core::providers::AiProvider;
-            return Ok(client.health_check().await);
-        }
+    match crate::state::AppState::build_ai_provider_async(ai).await {
+        Some(provider) => Ok(provider.health_check().await),
+        None => Ok(false),
     }
+}
 
-    if config.ai.mode == "ollama" {
-        let client = lychi_core::providers::ollama::OllamaClient::new(
-            config.ai.ollama_url.clone(),
-            config.ai.ollama_model.clone(),
-            config.ai.max_tokens,
-        );
-        use lychi_core::providers::AiProvider;
-        return Ok(client.health_check().await);
+/// Result of a live connection test — a real round-trip, not just a reachability
+/// ping. `ok` means the endpoint accepted the request AND the model produced a
+/// reply; `error` carries the reason (bad key, unknown model, unreachable, …)
+/// so the UI can show it inline.
+#[derive(serde::Serialize, specta::Type)]
+pub struct AiTestResult {
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// Actively test the configured AI provider by sending one real request through
+/// it. Unlike `check_ai_health` (which pings `/models` and passes even when the
+/// *model name* is wrong), this exercises the full path — endpoint, auth, AND
+/// model — so a typo'd free-form model id is caught here.
+#[tauri::command]
+#[specta::specta]
+pub async fn test_ai_connection(state: State<'_, AppState>) -> Result<AiTestResult, LychiError> {
+    let ai = { state.config.read().await.ai.clone() };
+
+    let Some(provider) = crate::state::AppState::build_ai_provider_async(ai.clone()).await else {
+        return Ok(AiTestResult {
+            ok: false,
+            error: Some("AI is not configured — set a mode, model, and API key first.".into()),
+        });
+    };
+
+    // A trivial prompt that forces a real inference call with the chosen model.
+    let fut = provider.answer_question(
+        "You are a connection test. Reply with the single word: ok.",
+        "ping",
+    );
+    // Bound the test so a hung endpoint doesn't wedge the settings UI.
+    let timeout = std::time::Duration::from_secs(ai.timeout_secs.clamp(2, 30));
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(_reply)) => Ok(AiTestResult {
+            ok: true,
+            error: None,
+        }),
+        Ok(Err(e)) => Ok(AiTestResult {
+            ok: false,
+            error: Some(e.to_string()),
+        }),
+        Err(_) => Ok(AiTestResult {
+            ok: false,
+            error: Some(format!("Timed out after {}s", timeout.as_secs())),
+        }),
     }
-
-    Ok(false)
 }
 
 #[tauri::command]

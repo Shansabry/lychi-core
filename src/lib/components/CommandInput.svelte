@@ -135,29 +135,35 @@ $effect(() => {
 // Animated placeholder suggestions. Split so we never advertise a capability
 // the current setup can't deliver:
 //   • BASE — deterministic commands that ALWAYS work (no AI, real handlers).
-//   • AI_ONLY — natural-language phrases that need an AI provider; without one
-//     they'd silently become a web search, so they only show when AI is on.
+//     Each maps to a real trigger keyword and works with zero setup.
+//   • AI_ONLY — phrases that need an AI provider; without one they'd silently
+//     become a web search, so they only show when AI is on. The `<paste text>`
+//     hint reflects the real mechanic: these operate on pasted/clipboard text,
+//     NOT on any file or note Lychi goes and fetches for you.
 const BASE_SUGGESTIONS = [
 	"open firefox",
-	"web how to make pasta",
-	"yt lofi hip hop",
+	"weather tokyo",
 	"=256 * 1024",
-	">ls -la ~/Downloads",
-	"resize ~/Photos/img.jpg to 800x600",
-	"summarize <paste text here>",
 	"convert 100 USD to EUR",
 	"define ephemeral",
-	"weather tokyo",
 	"spotify next",
+	"emoji rocket",
+	"qr lychi.app",
+	"color #3b82f6",
+	"timer 5m",
+	"reminder standup in 10m",
+	"note buy milk",
+	"bm docs",
+	"ssh myserver",
+	"screenshot area",
+	"open @report",
 	"github.com",
-	"snip email-intro",
 ];
 const AI_ONLY_SUGGESTIONS = [
 	"what's the weather today?",
-	"find large files in Downloads",
-	"create a new project folder",
-	"pause all music",
-	"summarize my meeting notes",
+	"translate <paste text> to spanish",
+	"summarize <paste text>",
+	"rewrite to formal <paste text>",
 ];
 // The active list depends on whether AI is configured.
 let SUGGESTIONS = $derived(

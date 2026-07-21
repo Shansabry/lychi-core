@@ -273,6 +273,18 @@ impl CommandResultDto {
     }
 }
 
+/// One row in the dynamic command catalog (Guide/help). Generated from the live
+/// registry so it never goes stale. See `ActionRegistry::command_catalog`.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct CommandInfo {
+    /// Handler id (e.g. "open", "translate").
+    pub id: String,
+    /// Primary keyword the user types (e.g. "open", "qr", "translate").
+    pub keyword: String,
+    /// One-line human description from the handler.
+    pub description: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, specta::Type)]
 pub struct CompletionItem {
     pub label: String,

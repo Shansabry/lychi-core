@@ -12,6 +12,7 @@ import {
 	listOllamaModels,
 	saveAiConfig,
 	setApiKey,
+	testAiConnection,
 } from "$lib/ipc";
 import Select from "../Select.svelte";
 
@@ -30,6 +31,11 @@ let confirmingClear = $state(false);
 let healthStatus: "checking" | "healthy" | "error" | "disabled" = $state("disabled");
 let saving = $state(false);
 
+// Live "Test connection" state — a real round-trip that also validates the
+// free-form model name (which the /models health ping can't catch).
+let testing = $state(false);
+let testResult: { ok: boolean; error: string | null } | null = $state(null);
+
 // Ollama state
 let ollamaModels: OllamaModelInfo[] = $state([]);
 let ollamaFetchError: string | null = $state(null);
@@ -44,34 +50,86 @@ let cloudUser: FirebaseUser | null = $state(null);
 let cloudCredits: CreditBalance | null = $state(null);
 let cloudLoading = $state(false);
 
-type ModelEntry = { value: string; label: string };
-type ModelManifest = Record<string, ModelEntry[]>;
-
-const MODELS_URL = "https://raw.githubusercontent.com/user/lychi/main/models.json";
-
-const FALLBACK_MODELS: ModelManifest = {
-	anthropic: [
-		{ value: "claude-haiku-4-5-20251001", label: "$ Claude Haiku 4.5" },
-		{ value: "claude-sonnet-4-5-20250929", label: "$$ Claude Sonnet 4.5" },
-		{ value: "claude-opus-4-6", label: "$$$ Claude Opus 4.6" },
-	],
-	openai: [
-		{ value: "gpt-4.1-nano", label: "$ GPT-4.1 Nano" },
-		{ value: "gpt-4.1-mini", label: "$ GPT-4.1 Mini" },
-		{ value: "gpt-4o-mini", label: "$ GPT-4o Mini" },
-		{ value: "gpt-4o", label: "$$ GPT-4o" },
-		{ value: "gpt-5.2", label: "$$$ GPT-5.2" },
-	],
-	groq: [
-		{ value: "llama-3.1-8b-instant", label: "$ Llama 3.1 8B" },
-		{ value: "llama-3.3-70b-versatile", label: "$ Llama 3.3 70B" },
-		{ value: "mixtral-8x7b-32768", label: "$ Mixtral 8x7B" },
-	],
+// BYO provider presets — endpoint + wire format only, NO model lists.
+// Mirrors `BYO_PRESETS` in crates/lychi-core/src/config/schema.rs. The model is
+// always a free-form text field; nothing here restricts which models are usable.
+type Preset = {
+	id: string;
+	label: string;
+	base_url: string;
+	wire_format: string;
+	// Optional hint shown under the model input to help the user (not a restriction).
+	model_hint?: string;
+	// Whether the base URL is user-editable in the UI (custom needs it).
+	editable_url?: boolean;
 };
 
-let cachedManifest: ModelManifest | null = null;
-let providerModels: ModelManifest = $state(FALLBACK_MODELS);
-let models = $derived(providerModels[aiConfig.provider] ?? []);
+const BYO_PRESETS: Preset[] = [
+	{
+		id: "anthropic",
+		label: "Anthropic",
+		base_url: "https://api.anthropic.com/v1/messages",
+		wire_format: "anthropic",
+		model_hint: "e.g. claude-sonnet-4-5-20250929, claude-haiku-4-5-20251001",
+	},
+	{
+		id: "openai",
+		label: "OpenAI",
+		base_url: "https://api.openai.com/v1/chat/completions",
+		wire_format: "openai",
+		model_hint: "e.g. gpt-4o-mini, gpt-4o, gpt-4.1-mini",
+	},
+	{
+		id: "groq",
+		label: "Groq",
+		base_url: "https://api.groq.com/openai/v1/chat/completions",
+		wire_format: "openai",
+		model_hint: "e.g. llama-3.3-70b-versatile, llama-3.1-8b-instant",
+	},
+	{
+		id: "grok",
+		label: "Grok (xAI)",
+		base_url: "https://api.x.ai/v1/chat/completions",
+		wire_format: "openai",
+		model_hint: "e.g. grok-2-latest, grok-beta",
+	},
+	{
+		id: "gemini",
+		label: "Gemini (Google)",
+		base_url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+		wire_format: "openai",
+		model_hint: "e.g. gemini-2.0-flash, gemini-1.5-pro",
+	},
+	{
+		id: "openrouter",
+		label: "OpenRouter",
+		base_url: "https://openrouter.ai/api/v1/chat/completions",
+		wire_format: "openai",
+		model_hint: "any OpenRouter model, e.g. anthropic/claude-3.5-sonnet",
+		editable_url: true,
+	},
+	{
+		id: "custom",
+		label: "Custom (OpenAI-compatible)",
+		base_url: "",
+		wire_format: "openai",
+		model_hint: "whatever your endpoint accepts",
+		editable_url: true,
+	},
+];
+
+const currentPreset = $derived(
+	BYO_PRESETS.find((p) => p.id === aiConfig.provider) ?? BYO_PRESETS[0],
+);
+// Show the base-URL field for presets that allow overriding it (custom/openrouter),
+// or whenever the user already has an override saved.
+const showBaseUrl = $derived(
+	currentPreset.editable_url === true || (aiConfig.base_url ?? "").trim() !== "",
+);
+// Effective endpoint shown as a hint: explicit override wins, else preset default.
+const effectiveUrl = $derived(
+	(aiConfig.base_url ?? "").trim() || currentPreset.base_url,
+);
 
 onMount(() => {
 	initModels(aiConfig.mode);
@@ -96,8 +154,7 @@ export async function initModels(aiMode: string) {
 		fetchOllamaModels();
 	} else if (aiMode === "cloud") {
 		if (CLOUD_ENABLED) refreshCloudUser();
-	} else {
-		providerModels = await fetchModels(aiMode);
+	} else if (aiMode === "byo") {
 		refreshMaskedKey(aiConfig.provider);
 	}
 	refreshHealth();
@@ -149,26 +206,6 @@ async function handleCloudSignOut() {
 	}
 }
 
-async function fetchModels(aiMode: string): Promise<ModelManifest> {
-	if (cachedManifest) return cachedManifest;
-	if (aiMode !== "disabled") {
-		try {
-			const res = await fetch(MODELS_URL, { signal: AbortSignal.timeout(3000) });
-			if (!res.ok) throw new Error(`HTTP ${res.status}`);
-			const data = await res.json();
-			if (data.providers && typeof data.providers === "object") {
-				const manifest: ModelManifest = data.providers;
-				cachedManifest = manifest;
-				return manifest;
-			}
-		} catch {
-			// Offline or bad response — use fallback
-		}
-	}
-	cachedManifest = FALLBACK_MODELS;
-	return FALLBACK_MODELS;
-}
-
 async function refreshHealth() {
 	if (aiConfig.mode === "disabled") {
 		healthStatus = "disabled";
@@ -180,6 +217,23 @@ async function refreshHealth() {
 		healthStatus = ok ? "healthy" : "error";
 	} catch {
 		healthStatus = "error";
+	}
+}
+
+async function runConnectionTest() {
+	testing = true;
+	testResult = null;
+	try {
+		// Persist first so the backend tests exactly what's on screen.
+		await saveAiConfig(aiConfig);
+		testResult = await testAiConnection();
+		// Keep the health dot in sync with the richer test outcome.
+		healthStatus = testResult.ok ? "healthy" : "error";
+	} catch (err) {
+		testResult = { ok: false, error: `${err}` };
+		healthStatus = "error";
+	} finally {
+		testing = false;
 	}
 }
 
@@ -226,22 +280,29 @@ function formatSize(bytes: number): string {
 }
 
 async function handleModeChange(val: string) {
+	testResult = null;
 	aiConfig.mode = val;
 	await saveAi();
 	if (val === "ollama") {
 		fetchOllamaModels();
 	} else if (val === "cloud") {
 		if (CLOUD_ENABLED) refreshCloudUser();
-	} else if (val !== "disabled") {
-		cachedManifest = null;
-		providerModels = await fetchModels(val);
+	} else if (val === "byo") {
+		refreshMaskedKey(aiConfig.provider);
 	}
 }
 
 async function handleProviderChange(val: string) {
+	testResult = null;
 	aiConfig.provider = val;
-	const available = providerModels[aiConfig.provider];
-	aiConfig.model = available?.[0]?.value ?? "";
+	const preset = BYO_PRESETS.find((p) => p.id === val) ?? BYO_PRESETS[0];
+	// Adopt the preset's endpoint + wire format. For custom, base_url is empty
+	// (user must supply one). We DON'T carry over a stale override from a
+	// different provider. Wire format follows the preset; model is user-typed,
+	// so clear it to avoid sending another provider's model id by mistake.
+	aiConfig.base_url = preset.editable_url ? (aiConfig.base_url ?? "") : "";
+	aiConfig.wire_format = preset.wire_format;
+	aiConfig.model = "";
 	apiKeyInput = "";
 	editingKey = false;
 	confirmingClear = false;
@@ -249,8 +310,11 @@ async function handleProviderChange(val: string) {
 	refreshMaskedKey(val);
 }
 
-async function handleModelChange(val: string) {
-	aiConfig.model = val;
+async function handleModelChange() {
+	await saveAi();
+}
+
+async function handleBaseUrlChange() {
 	await saveAi();
 }
 
@@ -305,6 +369,43 @@ export function dismissConfirm() {
 	return false;
 }
 </script>
+
+{#snippet statusBlock()}
+	<div class="field">
+		<span class="field-label">Status</span>
+		<div class="health-status">
+			<span
+				class="health-dot"
+				class:healthy={healthStatus === "healthy"}
+				class:error={healthStatus === "error"}
+				class:checking={healthStatus === "checking"}
+			></span>
+			<span class="health-label">
+				{#if healthStatus === "checking"}
+					Checking...
+				{:else if healthStatus === "healthy"}
+					Connected
+				{:else if healthStatus === "error"}
+					Not connected
+				{:else}
+					Disabled
+				{/if}
+			</span>
+			<button class="set-btn test-btn" onclick={runConnectionTest} disabled={testing}>
+				{testing ? "Testing..." : "Test"}
+			</button>
+		</div>
+	</div>
+	{#if testResult}
+		<div class="test-result" class:ok={testResult.ok} class:fail={!testResult.ok}>
+			{#if testResult.ok}
+				✓ Connection OK — endpoint, key, and model all responded.
+			{:else}
+				✗ {testResult.error ?? "Connection failed."}
+			{/if}
+		</div>
+	{/if}
+{/snippet}
 
 <div class="field">
 	<label for="ai-mode">Mode</label>
@@ -361,28 +462,7 @@ export function dismissConfirm() {
 			</button>
 		</div>
 
-		<div class="field">
-			<span class="field-label">Status</span>
-			<div class="health-status">
-				<span
-					class="health-dot"
-					class:healthy={healthStatus === "healthy"}
-					class:error={healthStatus === "error"}
-					class:checking={healthStatus === "checking"}
-				></span>
-				<span class="health-label">
-					{#if healthStatus === "checking"}
-						Checking...
-					{:else if healthStatus === "healthy"}
-						Connected
-					{:else if healthStatus === "error"}
-						Not connected
-					{:else}
-						Disabled
-					{/if}
-				</span>
-			</div>
-		</div>
+		{@render statusBlock()}
 	{:else}
 		<div class="field">
 			<span class="field-label">Account</span>
@@ -453,52 +533,46 @@ export function dismissConfirm() {
 		/>
 	</div>
 
-	<div class="field">
-		<span class="field-label">Status</span>
-		<div class="health-status">
-			<span
-				class="health-dot"
-				class:healthy={healthStatus === "healthy"}
-				class:error={healthStatus === "error"}
-				class:checking={healthStatus === "checking"}
-			></span>
-			<span class="health-label">
-				{#if healthStatus === "checking"}
-					Checking...
-				{:else if healthStatus === "healthy"}
-					Connected
-				{:else if healthStatus === "error"}
-					Not connected
-				{:else}
-					Disabled
-				{/if}
-			</span>
-		</div>
-	</div>
+	{@render statusBlock()}
 {:else if aiConfig.mode === "byo"}
 	<div class="field">
 		<label for="ai-provider">Provider</label>
 		<Select
 			id="ai-provider"
 			value={aiConfig.provider}
-			options={[
-				{ value: "anthropic", label: "Anthropic" },
-				{ value: "openai", label: "OpenAI" },
-				{ value: "groq", label: "Groq" },
-			]}
+			options={BYO_PRESETS.map((p) => ({ value: p.id, label: p.label }))}
 			onchange={handleProviderChange}
 		/>
 	</div>
 
+	{#if showBaseUrl}
+		<div class="field">
+			<label for="ai-base-url">Endpoint</label>
+			<input
+				id="ai-base-url"
+				type="text"
+				bind:value={aiConfig.base_url}
+				placeholder={currentPreset.base_url || "https://your-endpoint/v1/chat/completions"}
+				spellcheck="false"
+				onchange={handleBaseUrlChange}
+			/>
+		</div>
+	{/if}
+
 	<div class="field">
 		<label for="ai-model">Model</label>
-		<Select
+		<input
 			id="ai-model"
-			value={aiConfig.model}
-			options={models}
+			type="text"
+			bind:value={aiConfig.model}
+			placeholder="model name…"
+			spellcheck="false"
 			onchange={handleModelChange}
 		/>
 	</div>
+	{#if currentPreset.model_hint}
+		<div class="model-hint">{currentPreset.model_hint}</div>
+	{/if}
 
 	<div class="field">
 		<label for="ai-timeout">Timeout</label>
@@ -559,28 +633,7 @@ export function dismissConfirm() {
 		</div>
 	</div>
 
-	<div class="field">
-		<span class="field-label">Status</span>
-		<div class="health-status">
-			<span
-				class="health-dot"
-				class:healthy={healthStatus === "healthy"}
-				class:error={healthStatus === "error"}
-				class:checking={healthStatus === "checking"}
-			></span>
-			<span class="health-label">
-				{#if healthStatus === "checking"}
-					Checking...
-				{:else if healthStatus === "healthy"}
-					Connected
-				{:else if healthStatus === "error"}
-					Not connected
-				{:else}
-					Disabled
-				{/if}
-			</span>
-		</div>
-	</div>
+	{@render statusBlock()}
 {/if}
 
 <style>
@@ -760,6 +813,33 @@ export function dismissConfirm() {
 	.ollama-hint {
 		font-size: 11px;
 		color: var(--fg-muted);
+	}
+
+	.model-hint {
+		font-size: 11px;
+		color: var(--fg-muted);
+		padding: 0 0 6px 132px;
+		line-height: 1.4;
+	}
+
+	.test-btn {
+		margin-left: auto;
+		padding: 3px 10px;
+	}
+
+	.test-result {
+		font-size: 11px;
+		padding: 2px 0 8px 132px;
+		line-height: 1.4;
+		word-break: break-word;
+	}
+
+	.test-result.ok {
+		color: #44bb66;
+	}
+
+	.test-result.fail {
+		color: var(--error);
 	}
 
 	.cloud-email {

@@ -12,6 +12,52 @@ use crate::intent::{IntentResolver, RoutingMethod};
 use crate::providers::AgentPlan;
 use crate::rules::{RulesEngine, ValidationDecision, ValidationRequest};
 
+/// Expand `@<path>` file references into real filesystem paths before routing.
+///
+/// The `@` reference is a frontend affordance: the user types `@`, fuzzy-picks a
+/// file, and the input becomes e.g. `resize @~/Pictures/img.png to 800x600`. No
+/// handler understands the leading `@`, so we strip it here — ONE place, so every
+/// file-consuming command benefits — turning `@~/Pictures/img.png` into the
+/// tilde-expanded absolute path. Adaptable: works for any command + any path, no
+/// per-handler or per-filename special-casing.
+///
+/// Only a `@` that begins a token AND is followed by a path-like character
+/// (`~`, `/`, `.`, or an alphanumeric) is treated as a file reference; a bare
+/// `@` or an email-ish `foo@bar` (── `@` mid-token) is left untouched.
+fn expand_at_references(input: &str) -> String {
+    if !input.contains('@') {
+        return input.to_string();
+    }
+    let home = dirs::home_dir();
+    input
+        .split(' ')
+        .map(|tok| {
+            let Some(rest) = tok.strip_prefix('@') else {
+                return tok.to_string();
+            };
+            // Guard: `@` must be followed by a path-like start, else leave as-is.
+            let looks_like_path = rest
+                .chars()
+                .next()
+                .is_some_and(|c| c == '~' || c == '/' || c == '.' || c.is_alphanumeric());
+            if !looks_like_path {
+                return tok.to_string();
+            }
+            // Tilde-expand: `~` or `~/...` → home.
+            if let Some(after) = rest.strip_prefix('~') {
+                if after.is_empty() || after.starts_with('/') {
+                    if let Some(h) = home.as_ref() {
+                        let joined = format!("{}{}", h.display(), after);
+                        return joined;
+                    }
+                }
+            }
+            rest.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Result of executing a command: the handler's clean `ActionResult`, the
 /// resolved action_id, and the executor-owned envelope (risk/confirmation/
 /// routing metadata the handler never sets). The Tauri layer flattens these into
@@ -467,6 +513,12 @@ impl Executor {
             let hint = self.context.as_ref().and_then(|ctx| ctx.ai_hint());
             ai.set_context_hint(hint);
         }
+
+        // Expand `@<path>` file references into real paths FIRST, so every
+        // downstream step (routing, clipboard expansion, handler execution) sees
+        // a normal path instead of a literal `@…` token.
+        let expanded = expand_at_references(input);
+        let input = expanded.as_str();
 
         // Implicit object expansion: if input is an underspecified verb and clipboard
         // holds a compatible value, expand deterministically before hitting AI.
@@ -1250,6 +1302,40 @@ mod tests {
     use crate::history::HistoryStore;
     use crate::rules::RulesEngine;
     use async_trait::async_trait;
+
+    #[test]
+    fn expand_at_strips_reference_and_expands_tilde() {
+        let home = dirs::home_dir().unwrap();
+        let out = expand_at_references("resize @~/Pictures/img.png to 800x600");
+        assert_eq!(
+            out,
+            format!("resize {}/Pictures/img.png to 800x600", home.display())
+        );
+    }
+
+    #[test]
+    fn expand_at_strips_reference_on_absolute_path() {
+        assert_eq!(
+            expand_at_references("open @/tmp/a.png"),
+            "open /tmp/a.png"
+        );
+    }
+
+    #[test]
+    fn expand_at_leaves_email_and_bare_at_untouched() {
+        // `@` mid-token (email) is not a token-leading reference.
+        assert_eq!(
+            expand_at_references("mail foo@bar.com"),
+            "mail foo@bar.com"
+        );
+        // A leading `@` not followed by a path-like char is left as-is.
+        assert_eq!(expand_at_references("say @ hi"), "say @ hi");
+    }
+
+    #[test]
+    fn expand_at_noop_without_at() {
+        assert_eq!(expand_at_references("weather tokyo"), "weather tokyo");
+    }
 
     // --- Stub handlers ---
 

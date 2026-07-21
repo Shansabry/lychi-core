@@ -8,6 +8,48 @@
 
 use crate::action_registry::registry::ActionRegistry;
 
+/// Shorthand colon-prefix triggers → handler id. Longest match wins (multi-char
+/// prefixes are checked before single-char). This is the single source of truth
+/// for both routing (see `route`) and the dynamic Guide's Triggers list, so the
+/// two never drift.
+pub static COLON_TRIGGERS: &[(&str, &str)] = &[
+    ("bm:", "bm"),
+    ("cl:", "clip"),
+    ("sym:", "sym"),
+    ("sys:", "system"),
+    ("si:", "sysinfo"),
+    ("yt:", "yt"),
+    ("e:", "emoji"),
+    ("u:", "unicode"),
+    ("w:", "web"),
+    ("r:", "run"),
+    ("c:", "calc"),
+    ("f:", "file"),
+    ("o:", "open"),
+    ("n:", "note"),
+    ("m:", "media"),
+    ("p:", "project"),
+    ("tz:", "time"),
+    ("al:", "alias"),
+    ("sn:", "snip"),
+    ("tm:", "timer"),
+    ("rm:", "reminder"),
+    ("a:", "ask"),
+];
+
+/// The structural (character-sigil) triggers — input shapes that route without a
+/// keyword. These are truly structural (defined in code below), so they're a
+/// small fixed set paired here with a human description for the Guide.
+pub static SIGIL_TRIGGERS: &[(&str, &str)] = &[
+    ("=", "Evaluate a math or unit/currency expression"),
+    (">", "Run a shell command"),
+    ("/", "Fuzzy-search files"),
+    ("~/", "Open a path from home"),
+    ("@", "Reference a file inside a command"),
+    ("#hex", "Preview a hex color"),
+    ("example.com", "Open a URL"),
+];
+
 /// Common TLDs for URL detection.
 const TLDS: &[&str] = &[
     ".com", ".org", ".net", ".io", ".dev", ".app", ".co", ".me", ".info", ".xyz", ".edu", ".gov",
@@ -90,31 +132,6 @@ fn route_inner(raw: &str, check_aliases: bool, registry: &ActionRegistry) -> Pat
 
     // 2. Trigger characters & shorthand colon-prefixes
     //    Multi-char prefixes checked first (longest match wins), then single-char.
-    static COLON_TRIGGERS: &[(&str, &str)] = &[
-        ("bm:", "bm"),
-        ("cl:", "clip"),
-        ("sym:", "sym"),
-        ("sys:", "system"),
-        ("si:", "sysinfo"),
-        ("yt:", "yt"),
-        ("e:", "emoji"),
-        ("u:", "unicode"),
-        ("w:", "web"),
-        ("r:", "run"),
-        ("c:", "calc"),
-        ("f:", "file"),
-        ("o:", "open"),
-        ("n:", "note"),
-        ("t:", "todo"),
-        ("m:", "media"),
-        ("p:", "project"),
-        ("tz:", "time"),
-        ("al:", "alias"),
-        ("sn:", "snip"),
-        ("tm:", "timer"),
-        ("rm:", "reminder"),
-        ("a:", "ask"),
-    ];
     for &(prefix, handler) in COLON_TRIGGERS {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
             return PatternResult::Match(Route {
@@ -270,9 +287,14 @@ fn try_explicit_prefix(input: &str, registry: &ActionRegistry) -> Option<Route> 
     // return early. Everything else is resolved by `registry.route_prefix` below.
     let conditional: Option<(&'static str, String)> = match lower.as_str() {
         "open" => {
-            // "open https://github.com" → redirect to url handler; else open.
+            // "open https://github.com" → url handler.
+            // "open ~/Pictures/x.png" (a real file path) → file handler, so the
+            // user doesn't need to know apps use `open` and files use `file`.
+            // Otherwise treat as an app name.
             if looks_like_url(&args) {
                 Some(("url", args.clone()))
+            } else if looks_like_path(&args) {
+                Some(("file", args.clone()))
             } else {
                 Some(("open", args.clone()))
             }
@@ -325,6 +347,21 @@ fn try_explicit_prefix(input: &str, registry: &ActionRegistry) -> Option<Route> 
             explicit: true,
             confidence: Confidence::Explicit,
         })
+}
+
+/// Whether `input` is a filesystem path we should hand to the `file` handler.
+/// Path-shaped prefixes (`/`, `~/`, `./`, `../`) always qualify; anything else
+/// only qualifies if it actually exists on disk (adaptive — a real file the user
+/// referenced via `@` counts even without a leading slash).
+fn looks_like_path(input: &str) -> bool {
+    let s = input.trim();
+    if s.is_empty() {
+        return false;
+    }
+    if s.starts_with('/') || s.starts_with("~/") || s.starts_with("./") || s.starts_with("../") {
+        return true;
+    }
+    std::path::Path::new(s).exists()
 }
 
 fn looks_like_url(input: &str) -> bool {
@@ -383,6 +420,21 @@ mod tests {
     use crate::action_registry::{ActionHandler, ActionResult, Trigger};
     use crate::error::LychiError;
     use async_trait::async_trait;
+
+    #[test]
+    fn looks_like_path_accepts_path_prefixes() {
+        assert!(looks_like_path("/tmp/x"));
+        assert!(looks_like_path("~/Pictures/x.png"));
+        assert!(looks_like_path("./rel"));
+        assert!(looks_like_path("../up"));
+    }
+
+    #[test]
+    fn looks_like_path_rejects_plain_app_names() {
+        assert!(!looks_like_path("firefox"));
+        assert!(!looks_like_path("spotify"));
+        assert!(!looks_like_path(""));
+    }
 
     /// Minimal handler that only carries an id + trigger declaration — enough to
     /// drive the router's prefix index in unit tests without pulling in every real

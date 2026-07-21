@@ -56,6 +56,8 @@ pub fn run() {
         tauri_specta::Builder::<tauri::Wry>::new().commands(tauri_specta::collect_commands![
             commands::execute::execute_command,
             commands::execute::get_completions,
+            commands::execute::get_command_catalog,
+            commands::execute::get_trigger_catalog,
             commands::history::get_history,
             commands::history::clear_history,
             commands::config::get_all_settings,
@@ -67,6 +69,7 @@ pub fn run() {
             commands::ai::get_masked_api_key,
             commands::ai::get_ai_status,
             commands::ai::check_ai_health,
+            commands::ai::test_ai_connection,
             commands::ai::list_ollama_models,
             commands::config::get_general_config,
             commands::config::save_general_config,
@@ -93,6 +96,7 @@ pub fn run() {
             commands::agent::store_agent_plan,
             commands::agent::execute_agent_plan,
             commands::filesystem::list_path_completions,
+            commands::filesystem::fuzzy_path_completions,
             commands::filesystem::list_directories,
             commands::filesystem::get_mount_points,
             commands::filesystem::start_file_search,
@@ -240,6 +244,16 @@ pub fn run() {
             tauri::async_runtime::spawn_blocking(|| {
                 lychi_core::file_search::warmup_fs_cache();
             });
+            // Eagerly build the home fuzzy index so the first `@` reference (and
+            // `/` search) is instant instead of triggering a cold walk.
+            {
+                let index = app.state::<AppState>().file_index.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    if let Some(home) = dirs::home_dir() {
+                        index.get_or_build(&home.to_string_lossy(), std::sync::Arc::new(|| {}));
+                    }
+                });
+            }
             tauri::async_runtime::spawn_blocking(|| {
                 lychi_core::action_registry::handlers::app_launcher::AppLauncher::warmup();
             });

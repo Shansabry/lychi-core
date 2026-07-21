@@ -58,8 +58,6 @@ use lychi_core::intent::ai_router::AiRouter;
 #[cfg(feature = "mpris")]
 use lychi_core::mpris::MprisManager;
 use lychi_core::paths;
-use lychi_core::providers::byo::{BYOClient, BYOProvider};
-use lychi_core::providers::ollama::OllamaClient;
 use lychi_core::providers::{AgentPlan, AiProvider};
 use lychi_core::rules::RulesEngine;
 
@@ -259,53 +257,9 @@ impl AppState {
         ));
         registry.register(Box::new(weather_handler.clone()));
 
-        // Initialize AI provider if configured (shared between router and ask handler)
-        let ai_provider: Option<Arc<dyn AiProvider>> = if config.ai.mode == "byo" {
-            match Self::init_byo_client(&config.ai.provider, &config.ai.model, config.ai.max_tokens)
-            {
-                Ok(client) => {
-                    tracing::info!("AI initialized (BYO: {})", config.ai.provider);
-                    Some(client)
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to initialize AI: {e}");
-                    None
-                }
-            }
-        } else if config.ai.mode == "ollama" {
-            if config.ai.ollama_model.is_empty() {
-                tracing::warn!("Ollama mode enabled but no model selected");
-                None
-            } else {
-                let client = OllamaClient::new(
-                    config.ai.ollama_url.clone(),
-                    config.ai.ollama_model.clone(),
-                    config.ai.max_tokens,
-                );
-                tracing::info!(
-                    "AI initialized (Ollama: {} @ {})",
-                    config.ai.ollama_model,
-                    config.ai.ollama_url
-                );
-                Some(Arc::new(client))
-            }
-        } else if config.ai.mode == "cloud" {
-            let provider =
-                std::sync::Arc::new(crate::commands::firebase_auth::KeyringTokenProvider::new());
-            if !provider.is_signed_in() {
-                tracing::warn!("Cloud mode enabled but user not signed in");
-                None
-            } else {
-                let client = lychi_core::providers::cloud::CloudClient::new(
-                    "https://api.lychi.app".to_string(),
-                    provider,
-                );
-                tracing::info!("AI initialized (Cloud: api.lychi.app)");
-                Some(Arc::new(client))
-            }
-        } else {
-            None
-        };
+        // Initialize AI provider if configured (shared between router and ask
+        // handler). Single source of truth for mode dispatch is the core factory.
+        let ai_provider: Option<Arc<dyn AiProvider>> = Self::build_ai_provider(&config.ai);
 
         registry.register(Box::new(AskHandler::new(
             ai_provider.clone(),
@@ -373,22 +327,75 @@ impl AppState {
         );
     }
 
-    fn init_byo_client(
-        provider_name: &str,
-        model: &str,
-        max_tokens: u32,
-    ) -> Result<Arc<dyn AiProvider>, String> {
-        let provider: BYOProvider = provider_name
-            .parse()
-            .map_err(|e: lychi_core::error::LychiError| e.to_string())?;
-
-        let entry = keyring::Entry::new("lychi", &format!("byo-{provider_name}"))
-            .map_err(|e| format!("Keyring error: {e}"))?;
-        let api_key = entry
-            .get_password()
-            .map_err(|e| format!("No API key stored for {provider_name}: {e}"))?;
-
-        let client = BYOClient::new(provider, model.to_string(), api_key, max_tokens);
-        Ok(Arc::new(client))
+    /// Build the live AI provider from config via the core factory, logging the
+    /// outcome. Returns `None` (AI off) on any non-fatal reason. This is the ONE
+    /// place the Tauri layer turns config into a provider.
+    ///
+    /// IMPORTANT: this reads the OS keyring, whose secret-service backend spins
+    /// its own runtime internally (`block_on`) and PANICS if called on a tokio
+    /// async worker thread ("Cannot start a runtime from within a runtime").
+    /// Only call this from a synchronous/blocking context — app startup, a
+    /// `spawn_blocking` closure, or an event reactor running on its own thread.
+    /// Async command handlers must go through [`build_ai_provider_async`].
+    pub fn build_ai_provider(ai: &lychi_core::config::AiConfig) -> Option<Arc<dyn AiProvider>> {
+        use lychi_core::providers::factory::{ProviderError, build_provider_with_cloud};
+        // Pre-fetch the BYO key once (blocking keyring read) so the factory
+        // closure is a pure lookup with no further blocking work.
+        let key = if ai.mode == "byo" {
+            byo_key_lookup(&ai.provider)
+        } else {
+            None
+        };
+        match build_provider_with_cloud(ai, |_| key.clone(), cloud_provider) {
+            Ok(provider) => {
+                tracing::info!("AI initialized ({} / {})", ai.mode, provider.name());
+                Some(provider)
+            }
+            Err(ProviderError::Disabled) => None,
+            Err(e) => {
+                tracing::warn!("AI not initialized: {e}");
+                None
+            }
+        }
     }
+
+    /// Async-safe wrapper: builds the provider on a blocking thread so the
+    /// keyring's internal `block_on` never runs on a tokio worker. Use this from
+    /// `#[tauri::command] async fn` handlers.
+    pub async fn build_ai_provider_async(
+        ai: lychi_core::config::AiConfig,
+    ) -> Option<Arc<dyn AiProvider>> {
+        tauri::async_runtime::spawn_blocking(move || Self::build_ai_provider(&ai))
+            .await
+            .unwrap_or(None)
+    }
+}
+
+/// Read a stored BYO API key from the OS keyring for the factory's key lookup.
+/// Blocking — must run on a non-async thread (see `build_ai_provider`). Kept out
+/// of `lychi-core` so the core stays keyring-free.
+fn byo_key_lookup(provider_id: &str) -> Option<String> {
+    keyring::Entry::new("lychi", &format!("byo-{provider_id}"))
+        .ok()?
+        .get_password()
+        .ok()
+}
+
+/// Build a signed-in Lychi Cloud provider for the factory's cloud arm, or `None`
+/// if the user isn't signed in. Kept out of `lychi-core` so the Firebase/keyring
+/// token provider stays in the Tauri layer.
+///
+/// Lychi Cloud is deferred to Phase 2.3; until it ships this returns `None`
+/// unless a token is already present, so `mode = "cloud"` degrades to "not
+/// available yet" rather than erroring.
+fn cloud_provider() -> Option<Arc<dyn AiProvider>> {
+    use crate::commands::firebase_auth::{CLOUD_BASE_URL, KeyringTokenProvider};
+    let token_provider = Arc::new(KeyringTokenProvider::new());
+    if !token_provider.is_signed_in() {
+        return None;
+    }
+    Some(Arc::new(lychi_core::providers::cloud::CloudClient::new(
+        CLOUD_BASE_URL.to_string(),
+        token_provider,
+    )))
 }

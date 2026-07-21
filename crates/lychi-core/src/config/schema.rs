@@ -326,12 +326,23 @@ impl Default for ProjectsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(default)]
 pub struct AiConfig {
-    /// AI mode: "disabled", "byo", "ollama", "cloud"
+    /// AI mode: "disabled", "byo", "ollama" (cloud is deferred to Phase 2.3).
     pub mode: String,
-    /// BYO provider: "openai", "anthropic", "groq"
+    /// BYO provider preset id: "openai", "anthropic", "groq", "grok",
+    /// "gemini", "openrouter", or "custom". Selects the default base URL +
+    /// wire format; it is NOT a fixed model list.
     pub provider: String,
-    /// Model identifier (e.g. "claude-sonnet-4-5-20250929", "gpt-4o-mini")
+    /// Model identifier — free-form, whatever the endpoint accepts
+    /// (e.g. "claude-sonnet-4-5-20250929", "gpt-4o-mini", "llama-3.3-70b-versatile").
     pub model: String,
+    /// Override endpoint base URL for BYO. Empty = use the preset's default.
+    /// Lets any OpenAI-compatible endpoint (OpenRouter, local proxies, …) work.
+    #[serde(default)]
+    pub base_url: String,
+    /// Request/response wire format for BYO: "openai", "anthropic", "gemini".
+    /// Empty = infer from the preset. Grok/Groq/OpenRouter all speak "openai".
+    #[serde(default)]
+    pub wire_format: String,
     /// Ollama server URL
     pub ollama_url: String,
     /// Ollama model name (e.g. "mistral:latest", "llama3:8b")
@@ -343,6 +354,91 @@ pub struct AiConfig {
     /// Max tokens for routing/intent calls (default 300).
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+}
+
+/// Preset metadata for a known BYO provider: default endpoint + wire format.
+/// This is the ONLY place provider defaults live; the model is always free-form.
+pub struct ByoPreset {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub base_url: &'static str,
+    pub wire_format: &'static str,
+}
+
+/// Known BYO provider presets. `custom` intentionally has an empty base_url so
+/// the user must supply their own. No model lists — model is always user-typed.
+pub const BYO_PRESETS: &[ByoPreset] = &[
+    ByoPreset {
+        id: "anthropic",
+        label: "Anthropic",
+        base_url: "https://api.anthropic.com/v1/messages",
+        wire_format: "anthropic",
+    },
+    ByoPreset {
+        id: "openai",
+        label: "OpenAI",
+        base_url: "https://api.openai.com/v1/chat/completions",
+        wire_format: "openai",
+    },
+    ByoPreset {
+        id: "groq",
+        label: "Groq",
+        base_url: "https://api.groq.com/openai/v1/chat/completions",
+        wire_format: "openai",
+    },
+    ByoPreset {
+        id: "grok",
+        label: "Grok (xAI)",
+        base_url: "https://api.x.ai/v1/chat/completions",
+        wire_format: "openai",
+    },
+    ByoPreset {
+        id: "gemini",
+        label: "Gemini (Google)",
+        base_url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        wire_format: "openai",
+    },
+    ByoPreset {
+        id: "openrouter",
+        label: "OpenRouter",
+        base_url: "https://openrouter.ai/api/v1/chat/completions",
+        wire_format: "openai",
+    },
+    ByoPreset {
+        id: "custom",
+        label: "Custom (OpenAI-compatible)",
+        base_url: "",
+        wire_format: "openai",
+    },
+];
+
+impl AiConfig {
+    /// Look up a preset by id.
+    pub fn preset(id: &str) -> Option<&'static ByoPreset> {
+        BYO_PRESETS.iter().find(|p| p.id == id)
+    }
+
+    /// Resolve the effective BYO base URL: explicit `base_url` override wins,
+    /// else the preset default, else empty (invalid — caller must handle).
+    pub fn resolved_base_url(&self) -> String {
+        if !self.base_url.trim().is_empty() {
+            return self.base_url.trim().to_string();
+        }
+        Self::preset(&self.provider)
+            .map(|p| p.base_url.to_string())
+            .unwrap_or_default()
+    }
+
+    /// Resolve the effective wire format: explicit `wire_format` wins, else the
+    /// preset's, else "openai" (the safe default for unknown OpenAI-compatible endpoints).
+    pub fn resolved_wire_format(&self) -> String {
+        if !self.wire_format.trim().is_empty() {
+            return self.wire_format.trim().to_lowercase();
+        }
+        Self::preset(&self.provider)
+            .map(|p| p.wire_format.to_string())
+            .unwrap_or_else(|| "openai".to_string())
+    }
 }
 
 fn default_ai_timeout() -> u64 {
@@ -358,6 +454,8 @@ impl Default for AiConfig {
             mode: "disabled".to_string(),
             provider: "anthropic".to_string(),
             model: "claude-sonnet-4-5-20250929".to_string(),
+            base_url: String::new(),
+            wire_format: String::new(),
             ollama_url: "http://localhost:11434".to_string(),
             ollama_model: String::new(),
             timeout_secs: default_ai_timeout(),

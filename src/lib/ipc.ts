@@ -11,8 +11,10 @@ import type {
 	AgentPlan,
 	AiConfig,
 	AiStatus,
+	AiTestResult,
 	AllNotes,
 	AllSettings,
+	CommandInfo,
 	CommandsConfig,
 	CompletionItem,
 	CreditBalance,
@@ -43,10 +45,12 @@ export type {
 	AgentStep,
 	AiConfig,
 	AiStatus,
+	AiTestResult,
 	AliasItem,
 	AllNotes,
 	AllSettings,
 	ClipboardContentType,
+	CommandInfo,
 	CommandsConfig,
 	CompletionItem,
 	ContainerInfo,
@@ -179,9 +183,24 @@ export async function getCompletions(input: string): Promise<CompletionItem[]> {
 	return unwrap(await commands.getCompletions(input));
 }
 
+export async function getCommandCatalog(): Promise<CommandInfo[]> {
+	if (!isTauri()) return [];
+	return unwrap(await commands.getCommandCatalog());
+}
+
+export async function getTriggerCatalog(): Promise<CommandInfo[]> {
+	if (!isTauri()) return [];
+	return unwrap(await commands.getTriggerCatalog());
+}
+
 export async function listPathCompletions(partial: string): Promise<CompletionItem[]> {
 	if (!isTauri()) return [];
 	return unwrap(await commands.listPathCompletions(partial));
+}
+
+export async function fuzzyPathCompletions(query: string): Promise<CompletionItem[]> {
+	if (!isTauri()) return [];
+	return unwrap(await commands.fuzzyPathCompletions(query));
 }
 
 export async function listDirectories(path: string): Promise<DirEntry[]> {
@@ -241,6 +260,8 @@ export async function getAllSettings(): Promise<AllSettings> {
 				mode: "disabled",
 				provider: "anthropic",
 				model: "",
+				base_url: "",
+				wire_format: "",
 				ollama_url: "",
 				ollama_model: "",
 				timeout_secs: 8,
@@ -454,6 +475,8 @@ export async function getAiConfig(): Promise<AiConfig> {
 			mode: "disabled",
 			provider: "anthropic",
 			model: "",
+			base_url: "",
+			wire_format: "",
 			ollama_url: "",
 			ollama_model: "",
 			timeout_secs: 8,
@@ -485,6 +508,11 @@ export async function getAiStatus(): Promise<AiStatus> {
 export async function checkAiHealth(): Promise<boolean> {
 	if (!isTauri()) return false;
 	return unwrap(await commands.checkAiHealth());
+}
+
+export async function testAiConnection(): Promise<AiTestResult> {
+	if (!isTauri()) return { ok: false, error: "Not running in Tauri" };
+	return unwrap(await commands.testAiConnection());
 }
 
 export async function listOllamaModels(): Promise<OllamaModelInfo[]> {

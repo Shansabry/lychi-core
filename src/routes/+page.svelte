@@ -35,6 +35,7 @@ import {
 	getHistory,
 	getHotkeyStatus,
 	getMountPoints,
+	fuzzyPathCompletions,
 	grantPrivacyConsent,
 	hideWindow,
 	listPathCompletions,
@@ -274,10 +275,21 @@ $effect(() => {
 	return () => clearTimeout(mediaPollTimer);
 });
 
-// Immediate @ mode completion fetch (no debounce) — used when drilling into dirs
+// A partial is "path-like" (spelling out a path → drill/browse) vs a bare name
+// (fuzzy jump-to-file anywhere, Claude-Code style). Path-like = contains a
+// slash or starts with ~ / an absolute /.
+function isPathLikeAt(partial: string): boolean {
+	return partial.includes("/") || partial.startsWith("~");
+}
+
+// @ mode completion fetch. Bare queries fuzzy-jump across the whole home index;
+// path-like queries (drilling into a dir, or a typed path) list that directory.
 async function fetchAtCompletions(partial: string) {
 	try {
-		const results = await listPathCompletions(partial);
+		const results =
+			partial.length > 0 && !isPathLikeAt(partial)
+				? await fuzzyPathCompletions(partial)
+				: await listPathCompletions(partial);
 		// Defer state update to next frame so it never blocks a keystroke paint
 		requestAnimationFrame(() => {
 			completions = results;
@@ -401,7 +413,11 @@ function handleInput(val: string) {
 			atStart = atIdx;
 			cancelFileSearch();
 			const gen = ++completionGen;
-			listPathCompletions(partial)
+			const fetchAt =
+				partial.length > 0 && !isPathLikeAt(partial)
+					? fuzzyPathCompletions(partial)
+					: listPathCompletions(partial);
+			fetchAt
 				.then((results) => {
 					if (gen !== completionGen) return;
 					requestAnimationFrame(() => {

@@ -3,7 +3,7 @@ use std::process::Stdio;
 
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use lychi_core::action_registry::{CommandResultDto, CompletionItem};
+use lychi_core::action_registry::{CommandInfo, CommandResultDto, CompletionItem};
 use lychi_core::db::frecency;
 use lychi_core::error::LychiError;
 
@@ -262,4 +262,27 @@ pub async fn get_completions(
     let executor = state.executor.read().await;
     let results = executor.completions(&input, &suggestions_cfg).await;
     Ok(results)
+}
+
+/// Dynamic command catalog for the Guide — generated from the live action
+/// registry, so it never goes stale as handlers are added/removed.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_command_catalog(
+    state: State<'_, AppState>,
+) -> Result<Vec<CommandInfo>, LychiError> {
+    let executor = state.executor.read().await;
+    Ok(executor.registry.command_catalog())
+}
+
+/// Dynamic trigger list for the Guide — structural sigils + shorthand
+/// colon-triggers, the latter described by their live handler (centralised with
+/// the command catalog so they never drift).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_trigger_catalog(
+    state: State<'_, AppState>,
+) -> Result<Vec<CommandInfo>, LychiError> {
+    let executor = state.executor.read().await;
+    Ok(executor.registry.trigger_catalog())
 }

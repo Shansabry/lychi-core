@@ -1,0 +1,197 @@
+//! Single source of truth for turning an [`AiConfig`] into a live
+//! [`AiProvider`]. Every call site (app init, health check, hot-swap on save)
+//! goes through [`build_provider`] so the mode-dispatch logic exists in exactly
+//! one place instead of being copy-pasted across the Tauri layer.
+
+use std::sync::Arc;
+
+use crate::config::AiConfig;
+use crate::providers::AiProvider;
+use crate::providers::byo::{BYOClient, WireFormat};
+use crate::providers::ollama::OllamaClient;
+
+/// Why a provider could not be built. Callers surface these to the user (health
+/// UI, logs) rather than silently getting `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderError {
+    /// AI is intentionally off (`mode = "disabled"` or unknown mode).
+    Disabled,
+    /// BYO mode but no API key is stored for the selected provider.
+    MissingApiKey(String),
+    /// BYO mode but the resolved base URL is empty (custom preset, no URL given).
+    MissingBaseUrl,
+    /// Ollama mode but no model was selected.
+    OllamaNoModel,
+    /// Cloud mode selected but no signed-in cloud client is available yet
+    /// (user not signed in, or Lychi Cloud not enabled in this build).
+    CloudUnavailable,
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => write!(f, "AI is disabled"),
+            Self::MissingApiKey(p) => write!(f, "No API key stored for '{p}'"),
+            Self::MissingBaseUrl => {
+                write!(f, "No endpoint URL set for the custom provider")
+            }
+            Self::OllamaNoModel => write!(f, "No Ollama model selected"),
+            Self::CloudUnavailable => write!(f, "Lychi Cloud is not available yet"),
+        }
+    }
+}
+
+/// Build a live [`AiProvider`] from config, without cloud support.
+///
+/// Convenience wrapper over [`build_provider_with_cloud`] for call sites that
+/// don't wire cloud (e.g. tests). Cloud mode yields [`ProviderError::CloudUnavailable`].
+pub fn build_provider(
+    cfg: &AiConfig,
+    key_lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Arc<dyn AiProvider>, ProviderError> {
+    build_provider_with_cloud(cfg, key_lookup, || None)
+}
+
+/// Build a live [`AiProvider`] from config — the single source of truth for
+/// AI-mode dispatch.
+///
+/// Both provider-specific dependencies are injected so all of `lychi-core` stays
+/// free of any keyring/OS-secret or Firebase dependency:
+/// - `key_lookup(provider_id)` returns the stored BYO API key, or `None`.
+/// - `cloud_provider()` builds a signed-in cloud client, or `None` if the user
+///   isn't signed in / cloud isn't enabled. The Tauri layer supplies both.
+pub fn build_provider_with_cloud(
+    cfg: &AiConfig,
+    key_lookup: impl Fn(&str) -> Option<String>,
+    cloud_provider: impl Fn() -> Option<Arc<dyn AiProvider>>,
+) -> Result<Arc<dyn AiProvider>, ProviderError> {
+    match cfg.mode.as_str() {
+        "byo" => build_byo(cfg, key_lookup),
+        "ollama" => build_ollama(cfg),
+        "cloud" => cloud_provider().ok_or(ProviderError::CloudUnavailable),
+        // "disabled" and any unknown/legacy mode → off.
+        _ => Err(ProviderError::Disabled),
+    }
+}
+
+fn build_byo(
+    cfg: &AiConfig,
+    key_lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Arc<dyn AiProvider>, ProviderError> {
+    let base_url = cfg.resolved_base_url();
+    if base_url.is_empty() {
+        return Err(ProviderError::MissingBaseUrl);
+    }
+    let api_key = key_lookup(&cfg.provider)
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| ProviderError::MissingApiKey(cfg.provider.clone()))?;
+
+    let wire = WireFormat::parse(&cfg.resolved_wire_format());
+    let client = BYOClient::new(
+        cfg.provider.clone(),
+        wire,
+        base_url,
+        cfg.model.clone(),
+        api_key,
+        cfg.max_tokens,
+    );
+    Ok(Arc::new(client))
+}
+
+fn build_ollama(cfg: &AiConfig) -> Result<Arc<dyn AiProvider>, ProviderError> {
+    if cfg.ollama_model.trim().is_empty() {
+        return Err(ProviderError::OllamaNoModel);
+    }
+    let client = OllamaClient::new(
+        cfg.ollama_url.clone(),
+        cfg.ollama_model.clone(),
+        cfg.max_tokens,
+    );
+    Ok(Arc::new(client))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(mode: &str) -> AiConfig {
+        AiConfig {
+            mode: mode.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn disabled_mode_returns_disabled() {
+        let r = build_provider(&cfg("disabled"), |_| None);
+        assert_eq!(r.err(), Some(ProviderError::Disabled));
+    }
+
+    #[test]
+    fn unknown_mode_is_disabled_not_panic() {
+        let r = build_provider(&cfg("legacy-nonsense"), |_| None);
+        assert_eq!(r.err(), Some(ProviderError::Disabled));
+    }
+
+    #[test]
+    fn cloud_mode_reports_unavailable() {
+        let r = build_provider(&cfg("cloud"), |_| Some("k".into()));
+        assert_eq!(r.err(), Some(ProviderError::CloudUnavailable));
+    }
+
+    #[test]
+    fn byo_missing_key_reports_provider() {
+        let mut c = cfg("byo");
+        c.provider = "openai".into();
+        let r = build_provider(&c, |_| None);
+        assert_eq!(r.err(), Some(ProviderError::MissingApiKey("openai".into())));
+    }
+
+    #[test]
+    fn byo_custom_without_url_errors() {
+        let mut c = cfg("byo");
+        c.provider = "custom".into();
+        c.base_url = String::new();
+        let r = build_provider(&c, |_| Some("k".into()));
+        assert_eq!(r.err(), Some(ProviderError::MissingBaseUrl));
+    }
+
+    #[test]
+    fn byo_known_preset_builds_with_key() {
+        let mut c = cfg("byo");
+        c.provider = "grok".into();
+        c.model = "grok-2".into();
+        let r = build_provider(&c, |p| {
+            assert_eq!(p, "grok");
+            Some("sk-test".into())
+        });
+        let p = r.expect("should build");
+        assert_eq!(p.name(), "grok");
+    }
+
+    #[test]
+    fn byo_custom_with_url_builds() {
+        let mut c = cfg("byo");
+        c.provider = "custom".into();
+        c.base_url = "https://my-proxy.local/v1/chat/completions".into();
+        c.model = "local-model".into();
+        let r = build_provider(&c, |_| Some("sk".into()));
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn ollama_without_model_errors() {
+        let c = cfg("ollama");
+        let r = build_provider(&c, |_| None);
+        assert_eq!(r.err(), Some(ProviderError::OllamaNoModel));
+    }
+
+    #[test]
+    fn ollama_with_model_builds() {
+        let mut c = cfg("ollama");
+        c.ollama_model = "llama3:8b".into();
+        let r = build_provider(&c, |_| None);
+        assert!(r.is_ok());
+        assert_eq!(r.unwrap().name(), "ollama");
+    }
+}

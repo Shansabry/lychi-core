@@ -125,6 +125,11 @@ impl IntentResolver {
         self.ai_router = Some(router);
     }
 
+    /// Remove the AI router (switch AI off at runtime).
+    pub fn clear_ai_router(&mut self) {
+        self.ai_router = None;
+    }
+
     /// Resolve raw input into a structured intent.
     ///
     /// Four-phase pipeline:

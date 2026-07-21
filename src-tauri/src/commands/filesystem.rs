@@ -29,6 +29,28 @@ pub async fn list_path_completions(partial: String) -> Result<Vec<CompletionItem
         .map_err(|e| LychiError::ExecutionFailed(format!("path completions task panicked: {e}")))?
 }
 
+/// Fuzzy jump-to-file for the `@` reference (Claude-Code-style). Given a bare
+/// query (no path separators), returns the best matches ANYWHERE under home,
+/// ranked by the same tier + frecency blend the `/` search uses. Reuses the
+/// warm recursive index rather than listing a single directory.
+#[tauri::command]
+#[specta::specta]
+pub async fn fuzzy_path_completions(
+    query: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<CompletionItem>, LychiError> {
+    let index = state.file_index.clone();
+    let db = state.db.clone();
+    let scope = dirs::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    tauri::async_runtime::spawn_blocking(move || {
+        file_search::fuzzy_path_completions(&index, &scope, &query, &db, 15)
+    })
+    .await
+    .map_err(|e| LychiError::ExecutionFailed(format!("fuzzy completions task panicked: {e}")))
+}
+
 /// List subdirectories of the given path (directories only, absolute paths).
 /// Used by the in-app folder picker to avoid the native GTK dialog which
 /// crashes on Wayland layer-shell surfaces.

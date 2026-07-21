@@ -176,6 +176,122 @@ pub fn list_path_completions_sync(partial: String) -> Result<Vec<CompletionItem>
     Ok(entries)
 }
 
+/// Fuzzy jump-to-file for the `@` reference flow — the Claude-Code-style pointer.
+///
+/// Unlike [`list_path_completions_sync`] (which lists ONE directory's immediate
+/// children), this queries the persistent recursive fuzzy index for `scope` and
+/// returns the best matches ANYWHERE under it, ranked by the same tier +
+/// frecency/recency blend the `/` search uses. Returns a FLAT list (folders
+/// boosted to the top, no section-header rows) with the same `CompletionItem`
+/// shape the `@` browser already emits — so the frontend's drill/insert logic
+/// (trailing `/` = folder, no slash = file) keeps working unchanged.
+///
+/// The index builds lazily on first touch and fills in the background; an early
+/// call simply returns whatever has been indexed so far (same as `/` search).
+pub fn fuzzy_path_completions(
+    store: &std::sync::Arc<FileIndexStore>,
+    scope: &str,
+    query: &str,
+    db: &std::sync::Arc<redb::Database>,
+    limit: usize,
+) -> Vec<CompletionItem> {
+    use crate::file_search_score::{MatchScore, classify};
+
+    // Ensure the scope index exists (lazy build + fs-watcher). The redraw
+    // callback is a no-op: this is a one-shot synchronous call, not a stream.
+    let index = store.get_or_build(scope, std::sync::Arc::new(|| {}));
+
+    // Over-fetch from nucleo (it already fuzzy-filtered), then re-rank ourselves.
+    const CANDIDATE_POOL: usize = 400;
+    let (candidates, home) = {
+        let Ok(mut idx) = index.lock() else {
+            return Vec::new();
+        };
+        idx.search(query, 10);
+        idx.refresh(10);
+        (idx.top(CANDIDATE_POOL), dirs::home_dir())
+    };
+
+    let frecency_scores = crate::db::frecency::get_scores(db);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    struct Row {
+        score: MatchScore,
+        bonus: u16,
+        is_dir: bool,
+        item: CompletionItem,
+    }
+
+    let mut rows: Vec<Row> = candidates
+        .into_iter()
+        .filter_map(|d| {
+            // Same tier classifier as `/` search — drops anything that doesn't
+            // actually match name or an ancestor dir (guard on nucleo's filter).
+            let score = classify(query, &d.file_name, &d.rel_path)?;
+            let bonus = frecency_recency_bonus(
+                frecency_scores.get(&d.full_path).copied(),
+                d.modified_secs,
+                now_secs,
+            );
+            let description = if d.is_dir {
+                Some("Folder".to_string())
+            } else {
+                d.file_name
+                    .rsplit('.')
+                    .next()
+                    .filter(|ext| !ext.is_empty() && ext.len() < 6 && *ext != d.file_name)
+                    .map(|ext| ext.to_uppercase())
+            };
+            let label = search_display_label(Path::new(&d.full_path), d.is_dir, home.as_deref());
+            Some(Row {
+                score,
+                bonus,
+                is_dir: d.is_dir,
+                item: CompletionItem {
+                    label,
+                    icon_path: if d.is_dir {
+                        Some("__folder__".into())
+                    } else {
+                        None
+                    },
+                    score: 0, // set from final rank below
+                    description,
+                    ..Default::default()
+                },
+            })
+        })
+        .collect();
+
+    // Rank: tier → shorter name → shallower → more used → stable by label.
+    // Identical ordering to the `/` search, minus the folder/file partition
+    // (here dirs just get a score boost so they float up in one flat list).
+    rows.sort_by(|a, b| {
+        a.score
+            .tier
+            .cmp(&b.score.tier)
+            .then_with(|| a.score.name_len.cmp(&b.score.name_len))
+            .then_with(|| a.score.depth.cmp(&b.score.depth))
+            .then_with(|| b.bonus.cmp(&a.bonus))
+            .then_with(|| a.item.label.cmp(&b.item.label))
+    });
+    rows.truncate(limit);
+
+    // Assign a descending display score so the frontend's score-sort preserves
+    // this order; dirs keep a boost so they stay ahead at equal rank position.
+    let n = rows.len() as u16;
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, mut r)| {
+            let base = n.saturating_sub(i as u16);
+            r.item.score = if r.is_dir { 1000 + base } else { base };
+            r.item
+        })
+        .collect()
+}
+
 pub fn list_directories_sync(path: String) -> Result<Vec<DirEntry>, LychiError> {
     let dir = if path.is_empty() {
         dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))

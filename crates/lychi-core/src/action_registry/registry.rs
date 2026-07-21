@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::action_registry::trigger::ArgTransform;
-use crate::action_registry::{ActionHandler, CompletionItem};
+use crate::action_registry::{ActionHandler, CommandInfo, CompletionItem};
 
 /// A resolved routing entry: which handler a keyword prefix maps to, and how to
 /// shape the remaining text into that handler's args.
@@ -86,6 +86,72 @@ impl ActionRegistry {
             .values()
             .map(|h| (h.id(), h.description()))
             .collect()
+    }
+
+    /// Build a user-facing command catalog from the live registry — the dynamic
+    /// help/guide source. One entry per handler that has at least one keyword
+    /// trigger (structural-only handlers with no typable keyword are skipped),
+    /// carrying its primary keyword + description. Sorted by keyword.
+    ///
+    /// This never goes stale: registering a new handler makes it appear here
+    /// automatically, so the Guide is generated, not hand-maintained.
+    pub fn command_catalog(&self) -> Vec<CommandInfo> {
+        let mut items: Vec<CommandInfo> = self
+            .handlers
+            .values()
+            .filter_map(|h| {
+                // Primary keyword = first prefix of the first trigger. Handlers
+                // reached only structurally or via AI (no triggers) are omitted.
+                let keyword = h
+                    .triggers()
+                    .iter()
+                    .flat_map(|t| t.prefixes.iter().copied())
+                    .next()?;
+                Some(CommandInfo {
+                    id: h.id().to_string(),
+                    keyword: keyword.to_string(),
+                    description: h.description().to_string(),
+                })
+            })
+            .collect();
+        items.sort_by(|a, b| a.keyword.cmp(&b.keyword));
+        items
+    }
+
+    /// Build the dynamic Triggers list for the Guide. Structural sigils (`=`,
+    /// `>`, `~/`, …) carry fixed descriptions; shorthand colon-triggers (`e:`,
+    /// `w:`, …) pull their description from the SAME live handler the command
+    /// list uses — one source of truth, so a trigger and its command never drift.
+    /// Colon-triggers whose handler is absent are skipped.
+    pub fn trigger_catalog(&self) -> Vec<CommandInfo> {
+        use crate::intent::patterns::{COLON_TRIGGERS, SIGIL_TRIGGERS};
+
+        let mut items: Vec<CommandInfo> = Vec::new();
+
+        // Structural sigils first (in declared order — most common at top).
+        for &(sigil, desc) in SIGIL_TRIGGERS {
+            items.push(CommandInfo {
+                id: String::new(),
+                keyword: sigil.to_string(),
+                description: desc.to_string(),
+            });
+        }
+
+        // Colon shorthands, description sourced from the live handler.
+        let mut colon: Vec<CommandInfo> = COLON_TRIGGERS
+            .iter()
+            .filter_map(|&(prefix, handler_id)| {
+                let h = self.handlers.get(handler_id)?;
+                Some(CommandInfo {
+                    id: handler_id.to_string(),
+                    keyword: prefix.to_string(),
+                    description: h.description().to_string(),
+                })
+            })
+            .collect();
+        colon.sort_by(|a, b| a.keyword.cmp(&b.keyword));
+        items.extend(colon);
+        items
     }
 
     pub fn has(&self, id: &str) -> bool {

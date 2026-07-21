@@ -110,6 +110,89 @@ impl EventHandler for ProjectsReactor {
     }
 }
 
+/// Reacts to `ConfigChanged { Ai }`: rebuilds the AI provider from the live
+/// config via the core factory, hot-swaps the intent router, and re-registers
+/// the four AI-dependent handlers (ask, weather-ask, clipboard-transform,
+/// translate) so switching provider/model/mode goes live without a restart.
+///
+/// This is the runtime half of the unified AI switcher: `save_ai_config` writes
+/// and emits, this applies. The build/keyring logic lives in `AppState`
+/// via `build_ai_provider` so the keyring stays out of `lychi-core`.
+struct AiReactor {
+    executor: Arc<RwLock<Executor>>,
+    config: Arc<RwLock<Config>>,
+}
+
+impl EventHandler for AiReactor {
+    fn handle(&self, event: &DomainEvent) {
+        let DomainEvent::ConfigChanged {
+            section: ConfigSection::Ai,
+        } = event
+        else {
+            return;
+        };
+
+        use lychi_core::action_registry::handlers::{
+            ask::AskHandler, clipboard_transform::ClipboardTransformHandler,
+            translate::TranslateHandler, weather::WeatherHandler,
+            weather_ask::WeatherAskHandler,
+        };
+        use lychi_core::intent::ai_router::AiRouter;
+
+        let ai = self.config.blocking_read().ai.clone();
+        let search_engine = self
+            .config
+            .blocking_read()
+            .commands
+            .default_search_engine
+            .clone();
+        let weather = self.config.blocking_read().weather.clone();
+
+        // Single source of truth for provider construction.
+        let provider = crate::state::AppState::build_ai_provider(&ai);
+
+        let mut executor = self.executor.blocking_write();
+
+        // Re-register the AI-dependent handlers with the new provider (or None,
+        // which makes them emit a "set up AI" message). `register` overwrites by
+        // id, so this replaces the previously-registered instances in place.
+        executor.registry.register(Box::new(AskHandler::new(
+            provider.clone(),
+            search_engine,
+        )));
+        let weather_handler = Arc::new(WeatherHandler::new(
+            weather.unit.clone(),
+            weather.default_location.clone(),
+        ));
+        executor.registry.register(Box::new(WeatherAskHandler::new(
+            weather_handler,
+            provider.clone(),
+        )));
+        executor
+            .registry
+            .register(Box::new(ClipboardTransformHandler::new(provider.clone())));
+        executor
+            .registry
+            .register(Box::new(TranslateHandler::new(provider.clone())));
+
+        // Swap (or clear) the intent router.
+        match provider {
+            Some(p) => {
+                let router = AiRouter::new_shared(
+                    p,
+                    std::time::Duration::from_secs(ai.timeout_secs),
+                );
+                executor.resolver.set_ai_router(router);
+                tracing::info!("[reactor] ai config applied (provider: {}/{})", ai.mode, ai.provider);
+            }
+            None => {
+                executor.resolver.clear_ai_router();
+                tracing::info!("[reactor] ai config applied (AI off)");
+            }
+        }
+    }
+}
+
 /// Subscribe all config reactors to the bus. Called once from `AppState::wire_reactors`.
 pub fn register_config_reactors(
     bus: &EventBus,
@@ -120,5 +203,9 @@ pub fn register_config_reactors(
         executor: executor.clone(),
         config: config.clone(),
     }));
-    bus.subscribe(Arc::new(ProjectsReactor { executor, config }));
+    bus.subscribe(Arc::new(ProjectsReactor {
+        executor: executor.clone(),
+        config: config.clone(),
+    }));
+    bus.subscribe(Arc::new(AiReactor { executor, config }));
 }
