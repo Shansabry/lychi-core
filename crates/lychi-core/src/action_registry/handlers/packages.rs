@@ -10,11 +10,13 @@
 //! Commands:
 //!   - `search <query>`   → search available packages (read-only)
 //!   - `install <pkg>`    → install a package (needs root → pkexec)
+//!   - `remove <pkg>`     → remove/uninstall a package (needs root → pkexec)
+//!   - `upgrade [pkg]`    → upgrade one package, or the whole system if omitted
 //!
-//! Search is Low risk and auto-executes. Install mutates the system and is gated
-//! to a confirmation by the Rules Engine, then escalates via polkit (`pkexec`)
-//! rather than `sudo` — which would hang on a tty password prompt the launcher
-//! can't answer.
+//! Search is Low risk and auto-executes. install/remove/upgrade mutate the system
+//! and are gated to a confirmation by the Rules Engine, then escalate via polkit
+//! (`pkexec`) rather than `sudo` — which would hang on a tty password prompt the
+//! launcher can't answer. The mutating-verb list lives in `crate::rules::verbs`.
 
 use std::process::Command;
 
@@ -97,6 +99,47 @@ impl Manager {
             Manager::Apt => vec!["install".into(), "-y".into(), p],
             Manager::Pacman => vec!["-S".into(), "--noconfirm".into(), p],
             Manager::Zypper => vec!["--non-interactive".into(), "install".into(), p],
+        }
+    }
+
+    /// Remove/uninstall args (mutating, non-interactive). Removes just the named
+    /// package (no `--autoremove`/recursive-deps sweep — that's a bigger, riskier
+    /// operation the user should run deliberately).
+    fn remove_args(self, pkg: &str) -> Vec<String> {
+        let p = pkg.to_string();
+        match self {
+            Manager::Dnf => vec!["remove".into(), "-y".into(), p],
+            Manager::Apt => vec!["remove".into(), "-y".into(), p],
+            Manager::Pacman => vec!["-R".into(), "--noconfirm".into(), p],
+            Manager::Zypper => vec!["--non-interactive".into(), "remove".into(), p],
+        }
+    }
+
+    /// Upgrade args (mutating, non-interactive). With an empty package name this
+    /// upgrades everything; with a name it upgrades just that package where the
+    /// manager supports it (apt/dnf); pacman/zypper always do a full sync-upgrade.
+    fn upgrade_args(self, pkg: &str) -> Vec<String> {
+        let p = pkg.trim().to_string();
+        let one = !p.is_empty();
+        match self {
+            Manager::Dnf => {
+                if one {
+                    vec!["upgrade".into(), "-y".into(), p]
+                } else {
+                    vec!["upgrade".into(), "-y".into()]
+                }
+            }
+            Manager::Apt => {
+                if one {
+                    vec!["install".into(), "--only-upgrade".into(), "-y".into(), p]
+                } else {
+                    vec!["upgrade".into(), "-y".into()]
+                }
+            }
+            // pacman/zypper do a full system upgrade; per-package upgrade isn't a
+            // first-class op, so we sync-upgrade the system.
+            Manager::Pacman => vec!["-Syu".into(), "--noconfirm".into()],
+            Manager::Zypper => vec!["--non-interactive".into(), "update".into()],
         }
     }
 }
@@ -247,15 +290,63 @@ fn search(query: &str) -> Result<String, String> {
     Ok(sections.join("\n\n"))
 }
 
-/// Install a package. Native install needs root → pkexec (graphical polkit
-/// prompt). A `flatpak:` prefix targets flatpak (user scope, no root).
-fn install(pkg: &str) -> Result<String, String> {
+/// A mutating package operation, for shared privilege-escalation + messaging.
+#[derive(Clone, Copy)]
+enum PkgOp {
+    Install,
+    Remove,
+    Upgrade,
+}
+
+impl PkgOp {
+    /// Past-tense verb for the success line ("Installed …", "Removed …").
+    fn past(self) -> &'static str {
+        match self {
+            PkgOp::Install => "Installed",
+            PkgOp::Remove => "Removed",
+            PkgOp::Upgrade => "Upgraded",
+        }
+    }
+    /// Present-tense verb for the "needs root" hint.
+    fn present(self) -> &'static str {
+        match self {
+            PkgOp::Install => "Installing",
+            PkgOp::Remove => "Removing",
+            PkgOp::Upgrade => "Upgrading",
+        }
+    }
+    fn native_args(self, mgr: Manager, pkg: &str) -> Vec<String> {
+        match self {
+            PkgOp::Install => mgr.install_args(pkg),
+            PkgOp::Remove => mgr.remove_args(pkg),
+            PkgOp::Upgrade => mgr.upgrade_args(pkg),
+        }
+    }
+    /// flatpak equivalent of this op (user-scope, no root), if applicable.
+    fn flatpak_args(self, app: &str) -> Option<Vec<String>> {
+        match self {
+            PkgOp::Install => Some(vec!["install".into(), "-y".into(), app.into()]),
+            PkgOp::Remove => Some(vec!["uninstall".into(), "-y".into(), app.into()]),
+            PkgOp::Upgrade => Some(vec!["update".into(), "-y".into(), app.into()]),
+        }
+    }
+}
+
+/// Run a mutating package op. Native operations need root → pkexec (graphical
+/// polkit prompt). A `flatpak:` prefix targets flatpak (user scope, no root).
+/// `pkg` may be empty only for `upgrade` (upgrade everything).
+fn run_pkg_op(op: PkgOp, pkg: &str) -> Result<String, String> {
     let pkg = pkg.trim();
-    if pkg.is_empty() {
-        return Err("Usage: install <package>".to_string());
+    let needs_pkg = !matches!(op, PkgOp::Upgrade);
+    if needs_pkg && pkg.is_empty() {
+        return Err(match op {
+            PkgOp::Install => "Usage: install <package>".to_string(),
+            PkgOp::Remove => "Usage: remove <package>".to_string(),
+            PkgOp::Upgrade => unreachable!(),
+        });
     }
 
-    // Explicit flatpak target: `install flatpak:org.foo.Bar` or `install flatpak org.foo`.
+    // Explicit flatpak target: `... flatpak:org.foo.Bar` or `... flatpak org.foo`.
     if let Some(app) = pkg
         .strip_prefix("flatpak:")
         .or_else(|| pkg.strip_prefix("flatpak "))
@@ -263,14 +354,17 @@ fn install(pkg: &str) -> Result<String, String> {
         if !have("flatpak") {
             return Err("flatpak is not installed".to_string());
         }
+        let Some(args) = op.flatpak_args(app.trim()) else {
+            return Err("That operation isn't supported for flatpak".to_string());
+        };
         let status = Command::new("flatpak")
-            .args(["install", "-y", app.trim()])
+            .args(&args)
             .status()
             .map_err(|e| format!("Failed to run flatpak: {e}"))?;
         return if status.success() {
-            Ok(format!("Installed {app} via flatpak ✓"))
+            Ok(format!("{} {app} via flatpak ✓", op.past()))
         } else {
-            Err(format!("flatpak failed to install {app}"))
+            Err(format!("flatpak failed: {} {app}", op.present().to_lowercase()))
         };
     }
 
@@ -278,8 +372,9 @@ fn install(pkg: &str) -> Result<String, String> {
         return Err("No native package manager found (dnf, apt, pacman, zypper).".to_string());
     };
 
-    let args = mgr.install_args(pkg);
-    // Native install needs root. Prefer pkexec (graphical) over a hanging sudo.
+    let args = op.native_args(mgr, pkg);
+    let target = if pkg.is_empty() { "system" } else { pkg };
+    // Native mutation needs root. Prefer pkexec (graphical) over a hanging sudo.
     if have("pkexec") {
         let mut full = vec![mgr.binary().to_string()];
         full.extend(args);
@@ -288,15 +383,20 @@ fn install(pkg: &str) -> Result<String, String> {
             .status()
             .map_err(|e| format!("Failed to run pkexec: {e}"))?;
         return match status.code() {
-            Some(0) => Ok(format!("Installed {pkg} via {} ✓", mgr.binary())),
+            Some(0) => Ok(format!("{} {target} via {} ✓", op.past(), mgr.binary())),
             Some(126) | Some(127) => Err("Authorization dismissed or failed".to_string()),
-            _ => Err(format!("{} failed to install {pkg}", mgr.binary())),
+            _ => Err(format!(
+                "{} failed: {} {target}",
+                mgr.binary(),
+                op.present().to_lowercase()
+            )),
         };
     }
 
     Err(format!(
-        "Installing a package needs root — install `pkexec` (polkit) for a graphical \
+        "{} a package needs root — install `pkexec` (polkit) for a graphical \
          prompt, or run: sudo {} {}",
+        op.present(),
         mgr.binary(),
         args.join(" ")
     ))
@@ -308,6 +408,8 @@ impl ActionHandler for PackagesHandler {
         use crate::action_registry::{ArgTransform, Trigger};
         static TRIGGERS: &[Trigger] = &[
             Trigger::new(&["install"], ArgTransform::Prepend("install")),
+            Trigger::new(&["remove", "uninstall"], ArgTransform::Prepend("remove")),
+            Trigger::new(&["upgrade"], ArgTransform::Prepend("upgrade")),
             Trigger::keywords(&["pkg", "package"]),
         ];
         TRIGGERS
@@ -318,7 +420,7 @@ impl ActionHandler for PackagesHandler {
     }
 
     fn description(&self) -> &str {
-        "Search and install system packages (dnf/apt/pacman/zypper/flatpak)"
+        "Search, install, remove & upgrade system packages (dnf/apt/pacman/zypper/flatpak)"
     }
 
     fn assess_risk(
@@ -326,10 +428,10 @@ impl ActionHandler for PackagesHandler {
         args: &str,
         _ctx: &crate::action_registry::RiskContext<'_>,
     ) -> RiskAssessment {
-        // Search is read-only (auto); install mutates the system (root via
-        // pkexec) and needs confirmation.
+        // Search is read-only (auto); install/remove/upgrade mutate the system
+        // (root via pkexec) and need confirmation.
         if is_mutating(args) {
-            RiskAssessment::confirm(format!("Install a package: {}?", args.trim()))
+            RiskAssessment::confirm(format!("Run 'pkg {}'?", args.trim()))
         } else {
             RiskAssessment::level(RiskLevel::Low)
         }
@@ -340,6 +442,8 @@ impl ActionHandler for PackagesHandler {
         let hints = [
             ("search", "search <query>", "Search available packages"),
             ("install", "install <package>", "Install a package"),
+            ("remove", "remove <package>", "Remove a package"),
+            ("upgrade", "upgrade [package]", "Upgrade a package or the system"),
         ];
         hints
             .iter()
@@ -365,8 +469,12 @@ impl ActionHandler for PackagesHandler {
 
         let result = match verb {
             "search" => search(rest.trim()),
-            "install" => install(rest.trim()),
-            _ => Err("Usage: search <query>  |  install <package>".to_string()),
+            "install" => run_pkg_op(PkgOp::Install, rest.trim()),
+            "remove" | "uninstall" => run_pkg_op(PkgOp::Remove, rest.trim()),
+            "upgrade" => run_pkg_op(PkgOp::Upgrade, rest.trim()),
+            _ => Err(
+                "Usage: search <query> | install <pkg> | remove <pkg> | upgrade [pkg]".to_string(),
+            ),
         };
 
         match result {
@@ -376,14 +484,16 @@ impl ActionHandler for PackagesHandler {
     }
 }
 
-/// Is this a mutating packages invocation (install)? Used by the Rules Engine to
-/// decide whether to confirm. Search is read-only.
+/// Is this a mutating packages invocation (install/remove/upgrade/…)? Used to
+/// decide whether to confirm. Search/info/list are read-only. The verb list is
+/// owned by the central classifier ([`crate::rules::verbs`]).
 pub fn is_mutating(args: &str) -> bool {
-    args.trim_start()
+    let verb = args
+        .trim_start()
         .split_once(char::is_whitespace)
         .map(|(v, _)| v)
-        .unwrap_or_else(|| args.trim())
-        == "install"
+        .unwrap_or_else(|| args.trim());
+    crate::rules::verbs::is_mutating_package_verb(verb)
 }
 
 #[cfg(test)]
@@ -447,14 +557,30 @@ mod tests {
     }
 
     #[test]
-    fn is_mutating_only_for_install() {
+    fn is_mutating_for_mutating_verbs() {
         assert!(is_mutating("install neovim"));
+        assert!(is_mutating("remove neovim"));
+        assert!(is_mutating("uninstall neovim"));
+        assert!(is_mutating("upgrade"));
+        assert!(is_mutating("upgrade neovim"));
         assert!(!is_mutating("search neovim"));
         assert!(!is_mutating("search"));
     }
 
     #[test]
-    fn install_rejects_empty() {
-        assert!(install("").is_err());
+    fn install_and_remove_reject_empty() {
+        assert!(run_pkg_op(PkgOp::Install, "").is_err());
+        assert!(run_pkg_op(PkgOp::Remove, "").is_err());
+        // upgrade with no package is valid (upgrade everything) — it won't error
+        // on argument parsing (may fail later without a manager, but not here).
+    }
+
+    #[test]
+    fn upgrade_args_full_vs_single() {
+        // apt: single-package upgrade uses install --only-upgrade; full uses upgrade.
+        assert!(Manager::Apt.upgrade_args("vim").contains(&"--only-upgrade".to_string()));
+        assert!(Manager::Apt.upgrade_args("").contains(&"upgrade".to_string()));
+        // pacman always full sync-upgrade.
+        assert_eq!(Manager::Pacman.upgrade_args("vim"), vec!["-Syu", "--noconfirm"]);
     }
 }

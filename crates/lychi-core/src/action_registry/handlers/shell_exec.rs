@@ -16,6 +16,54 @@ pub use crate::action_registry::{ExecContext, OutputMode, TerminalTarget};
 
 // ── Command validation ──────────────────────────────────────────────────
 
+/// How much the caller has already cleared this command with the user. Passed
+/// into every shell-spawn function so authorization is enforced at the point the
+/// shell string is actually assembled — the single choke every handler that
+/// shells out (run, script commands, ssh, fan-out) must pass through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Clearance {
+    /// The user has NOT been shown/approved this exact command. Only an `Allow`
+    /// verdict may run; a `Confirm` is refused (the caller should route through
+    /// the Rules Engine confirmation flow instead of spawning directly).
+    None,
+    /// The user explicitly approved this exact command (e.g. the Rules Engine
+    /// confirmation flow returned, or a script opted into `# @lychi.risk`). A
+    /// `Confirm` verdict may run; `Deny` is still absolute.
+    UserConfirmed,
+}
+
+/// Ask the **central decider** (`rules::shell::authorize`) whether this exact
+/// shell string may run, and enforce the answer against the caller's clearance.
+/// This is the last line before `sh -ic`, so no execution path can define its
+/// own weaker rule than the Rules Engine.
+///
+/// - `Deny`    → always refused (returns `Err`), regardless of clearance.
+/// - `Confirm` → refused unless the caller passed `Clearance::UserConfirmed`.
+/// - `Allow`   → runs.
+///
+/// Returns `Err` (surfaced as a failed `ActionResult`) when execution is not
+/// authorized.
+fn check_shell_authorization(cmd: &str, clearance: Clearance) -> Result<(), LychiError> {
+    use crate::rules::shell::{authorize, ShellDecision};
+    match authorize(cmd) {
+        ShellDecision::Allow => Ok(()),
+        ShellDecision::Confirm { reason } if clearance == Clearance::UserConfirmed => {
+            tracing::debug!(%cmd, %reason, "[shell_exec] confirm cleared by user, running");
+            Ok(())
+        }
+        ShellDecision::Confirm { reason } => {
+            tracing::warn!(%cmd, %reason, "[shell_exec] refused: needs confirmation, none granted");
+            Err(LychiError::ExecutionFailed(format!(
+                "Command needs confirmation and was not approved: {reason}"
+            )))
+        }
+        ShellDecision::Deny { reason } => {
+            tracing::warn!(%cmd, %reason, "[shell_exec] hard-deny blocked shell execution");
+            Err(LychiError::ExecutionFailed(reason))
+        }
+    }
+}
+
 /// The command's first word — the executable/builtin/alias being invoked.
 /// Skips leading env-var assignments (`FOO=bar cmd`) so those still resolve.
 fn command_head(cmd: &str) -> Option<&str> {
@@ -43,6 +91,7 @@ pub(crate) fn open_in_terminal(
     cmd: &str,
     cwd: Option<&str>,
     terminal: Option<&str>,
+    clearance: Clearance,
 ) -> Result<u32, LychiError> {
     let terminal = terminal.unwrap_or("xterm").to_string();
     let shell = SHELL_ENV
@@ -50,7 +99,7 @@ pub(crate) fn open_in_terminal(
         .ok()
         .and_then(|g| g.as_ref().map(|(s, _)| s.clone()))
         .unwrap_or_else(|| "/bin/sh".to_string());
-    launch_in_terminal(&terminal, &shell, cmd, cwd)
+    launch_in_terminal(&terminal, &shell, cmd, cwd, clearance)
 }
 
 /// Return the cached login-shell env for `shell`, capturing (and caching) it on
@@ -82,7 +131,9 @@ pub(crate) async fn run_captured(
     cwd: Option<&str>,
     timeout: std::time::Duration,
     max_bytes: usize,
+    clearance: Clearance,
 ) -> Result<ActionResult, LychiError> {
+    check_shell_authorization(cmd, clearance)?;
     let env = cached_shell_env(shell);
     let shell = shell.to_string();
     let cmd = cmd.to_string();
@@ -231,7 +282,9 @@ fn launch_in_terminal(
     shell: &str,
     cmd: &str,
     cwd: Option<&str>,
+    clearance: Clearance,
 ) -> Result<u32, LychiError> {
+    check_shell_authorization(cmd, clearance)?;
     let cwd_prefix = cwd
         .map(|d| format!("cd {} && ", shell_escape(d)))
         .unwrap_or_default();
@@ -527,7 +580,9 @@ impl ShellExec {
         &self,
         cmd: &str,
         cwd: Option<&str>,
+        clearance: Clearance,
     ) -> Result<ActionResult, LychiError> {
+        check_shell_authorization(cmd, clearance)?;
         let start = Instant::now();
         let env = self.get_env();
         let mut command = Command::new(&self.shell);
@@ -677,10 +732,11 @@ impl ShellExec {
         ctx: &ExecContext,
         cmd: &str,
         cwd: Option<&str>,
+        clearance: Clearance,
     ) -> Result<ActionResult, LychiError> {
         let terminal = ctx.terminal.clone().unwrap_or_else(|| "xterm".to_string());
 
-        let pid = launch_in_terminal(&terminal, &self.shell, cmd, cwd)?;
+        let pid = launch_in_terminal(&terminal, &self.shell, cmd, cwd, clearance)?;
 
         // Track the spawned process so the user can list/kill it later
         crate::process_tracker::track(pid, cmd, cwd);
@@ -741,9 +797,14 @@ impl ActionHandler for ShellExec {
         };
         tracing::debug!("shell_exec: mode={mode:?} for cmd={cmd}");
 
-        // 3. Dispatch.
+        // 3. Dispatch. Reaching `execute()` means the Rules Engine already
+        //    authorized this command (the executor only calls the handler on
+        //    Allow, or on a Confirm the user approved), so the spawn-point
+        //    decider runs with `UserConfirmed` — it re-checks the absolute `Deny`
+        //    set (defense-in-depth) while honoring the already-granted confirm.
+        let clearance = Clearance::UserConfirmed;
         match mode {
-            RunMode::Inline => self.execute_inline(cmd, cwd).await,
+            RunMode::Inline => self.execute_inline(cmd, cwd, clearance).await,
             RunMode::Terminal => {
                 // Prefer routing into an already-open terminal; else a fresh one.
                 if ctx.routing_mode() != "off"
@@ -751,7 +812,7 @@ impl ActionHandler for ShellExec {
                 {
                     return Ok(result);
                 }
-                self.execute_in_terminal(ctx, cmd, cwd)
+                self.execute_in_terminal(ctx, cmd, cwd, clearance)
             }
         }
     }

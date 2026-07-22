@@ -788,7 +788,12 @@ pub fn ipc_path() -> PathBuf {
 }
 
 /// Open a URI with Wayland activation tokens via GDK AppLaunchContext.
+///
+/// Every URI-opening path funnels here, so this is where the central URI-scheme
+/// decider is enforced: a `javascript:`/`data:`/unknown-scheme URI (e.g. from a
+/// browser bookmark) is refused before it reaches the desktop's default handler.
 pub async fn open_uri(uri: &str) -> Result<(), String> {
+    lychi_core::rules::uri::check_uri(uri)?;
     let uri = uri.to_string();
     let (tx, rx) = oneshot::channel::<Result<(), String>>();
 

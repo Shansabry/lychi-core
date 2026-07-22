@@ -39,13 +39,36 @@ fn err_result(start: Instant, error: String) -> ActionResult {
     ActionResult::err(error).with_duration(start.elapsed().as_millis() as u64)
 }
 
+/// Case-insensitively find the last occurrence of an ASCII `needle` in `haystack`,
+/// returning a byte offset that is ALWAYS valid in `haystack`. We can't search a
+/// `to_lowercase()` copy and slice the original: `to_lowercase()` can change byte
+/// length (e.g. `İ` → `i̇`, 2→3 bytes), so offsets in the lowercased string may land
+/// mid-UTF-8-char in the original and panic. Since our needles are all ASCII, we
+/// walk `haystack`'s own byte indices and compare case-insensitively.
+fn rfind_ci_ascii(haystack: &str, needle: &str) -> Option<usize> {
+    debug_assert!(needle.is_ascii());
+    let hb = haystack.as_bytes();
+    let nb = needle.as_bytes();
+    if nb.is_empty() || hb.len() < nb.len() {
+        return None;
+    }
+    // Scan from the end so we return the LAST match (matches the old rfind).
+    (0..=hb.len() - nb.len()).rev().find(|&i| {
+        hb[i..i + nb.len()]
+            .iter()
+            .zip(nb)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
+}
+
 /// Try to split "buy milk in 30 minutes" into ("buy milk", "in 30 minutes").
 /// Searches for time-indicator words from the end of the string.
 fn split_text_and_time(input: &str) -> Option<(String, u64)> {
-    let lower = input.to_lowercase();
+    // Offsets come from a case-insensitive scan of `input` ITSELF, so slicing
+    // `input` at them is always on a char boundary (no lowercased-copy skew).
 
     // Try splitting at "at <time>" — find last occurrence of " at "
-    if let Some(pos) = lower.rfind(" at ") {
+    if let Some(pos) = rfind_ci_ascii(input, " at ") {
         let text = input[..pos].trim();
         let time_part = input[pos + 1..].trim(); // "at <time>"
         if let Some(due) = time_parse::parse_reminder_time(time_part).filter(|_| !text.is_empty()) {
@@ -54,7 +77,7 @@ fn split_text_and_time(input: &str) -> Option<(String, u64)> {
     }
 
     // Try splitting at "in <duration>" — find last occurrence of " in "
-    if let Some(pos) = lower.rfind(" in ") {
+    if let Some(pos) = rfind_ci_ascii(input, " in ") {
         let text = input[..pos].trim();
         let time_part = input[pos + 1..].trim(); // "in 30 minutes"
         if let Some(due) = time_parse::parse_reminder_time(time_part).filter(|_| !text.is_empty()) {
@@ -63,7 +86,7 @@ fn split_text_and_time(input: &str) -> Option<(String, u64)> {
     }
 
     // Try splitting at "tomorrow" — "buy milk tomorrow 9am"
-    if let Some(pos) = lower.rfind("tomorrow") {
+    if let Some(pos) = rfind_ci_ascii(input, "tomorrow") {
         let text = input[..pos].trim();
         let time_part = input[pos..].trim(); // "tomorrow 9am"
         if let Some(due) = time_parse::parse_reminder_time(time_part).filter(|_| !text.is_empty()) {
@@ -245,6 +268,18 @@ mod tests {
     fn split_text_and_time_in() {
         let (text, _due) = split_text_and_time("buy milk in 30 minutes").unwrap();
         assert_eq!(text, "buy milk");
+    }
+
+    #[test]
+    fn split_text_and_time_non_ascii_no_panic() {
+        // `İ` (U+0130) lowercases to 2 chars / 3 bytes, so a lowercased-copy
+        // offset would misalign into the original and panic on a char boundary.
+        // These must simply not panic (result content is unimportant here).
+        let _ = split_text_and_time("İ buy milk in 5 minutes");
+        let _ = split_text_and_time("çalış at 9am");
+        let _ = split_text_and_time("straße tomorrow 9am");
+        let _ = split_text_and_time("İİİ at İ");
+        let _ = rfind_ci_ascii("İ AT noon", " at ");
     }
 
     #[test]

@@ -22,6 +22,14 @@ let stepResults: (CommandResult | null)[] = $state(plan.steps.map(() => null));
 let executing = $state(false);
 let done = $state(false);
 
+// Steps that will prompt/deny at execution — surfaced up-front so the user
+// approves an INFORMED plan, not just a natural-language summary. `medium`
+// shell steps (rm on a real path, sudo, package installs) confirm; `high`
+// steps are the AI's own danger flag or a denylist-adjacent command.
+let riskyCount = $derived(
+	plan.steps.filter((s) => s.risk === "medium" || s.risk === "high").length,
+);
+
 export function handleStepEvent(event: StepEvent) {
 	if (event.plan_id !== plan.id) return;
 	stepStatuses[event.step_index] = event.status as StepStatus;
@@ -80,7 +88,7 @@ function statusIcon(status: StepStatus): string {
 
 	<div class="steps">
 		{#each plan.steps as step, i}
-			<div class="step" class:running={stepStatuses[i] === "running"} class:done={stepStatuses[i] === "done"} class:failed={stepStatuses[i] === "failed"} class:dangerous={step.risk === "high"}>
+			<div class="step" class:running={stepStatuses[i] === "running"} class:done={stepStatuses[i] === "done"} class:failed={stepStatuses[i] === "failed"} class:dangerous={step.risk === "high"} class:caution={step.risk === "medium"}>
 				<div class="step-line">
 					<span class="step-status" class:running={stepStatuses[i] === "running"} class:done={stepStatuses[i] === "done"} class:failed={stepStatuses[i] === "failed"}>
 						{statusIcon(stepStatuses[i])}
@@ -91,10 +99,12 @@ function statusIcon(status: StepStatus): string {
 						<span class="step-duration">{stepResults[i]?.duration_ms}ms</span>
 					{/if}
 				</div>
-				<div class="step-label" class:dangerous={step.risk === "high"}>
+				<div class="step-label" class:dangerous={step.risk === "high"} class:caution={step.risk === "medium"}>
 					{step.label}
 					{#if step.risk === "high"}
-						<span class="risk-badge">⚠ high risk</span>
+						<span class="risk-badge high">⚠ high risk</span>
+					{:else if step.risk === "medium"}
+						<span class="risk-badge medium">⚠ needs care</span>
 					{/if}
 				</div>
 				{#if stepResults[i]?.error}
@@ -105,6 +115,11 @@ function statusIcon(status: StepStatus): string {
 	</div>
 
 	{#if !executing && !done}
+		{#if riskyCount > 0}
+			<div class="plan-warning">
+				⚠ {riskyCount} step{riskyCount > 1 ? "s" : ""} can modify your system — review the commands above before running.
+			</div>
+		{/if}
 		<div class="plan-actions">
 			<span class="hint">Enter to execute</span>
 			<span class="hint-sep">·</span>
@@ -167,6 +182,10 @@ function statusIcon(status: StepStatus): string {
 
 	.step.dangerous {
 		border-color: #664400;
+	}
+
+	.step.caution {
+		border-color: #4a4020;
 	}
 
 	.step-line {
@@ -234,10 +253,32 @@ function statusIcon(status: StepStatus): string {
 		color: #ffaa00;
 	}
 
+	.step-label.caution {
+		color: #d0b060;
+	}
+
 	.risk-badge {
 		font-size: 10px;
-		color: #ffaa00;
 		margin-left: 4px;
+	}
+
+	.risk-badge.high {
+		color: #ffaa00;
+	}
+
+	.risk-badge.medium {
+		color: #d0b060;
+	}
+
+	.plan-warning {
+		font-size: 11px;
+		color: #d0b060;
+		background: rgba(208, 176, 96, 0.08);
+		border: 1px solid rgba(208, 176, 96, 0.25);
+		border-radius: 4px;
+		padding: 6px 8px;
+		margin-top: 10px;
+		line-height: 1.4;
 	}
 
 	.step-error {

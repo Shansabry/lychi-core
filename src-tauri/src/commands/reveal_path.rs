@@ -36,6 +36,10 @@ fn expand_home(path: &str) -> PathBuf {
 #[specta::specta]
 pub async fn open_path(path: String) -> Result<bool, LychiError> {
     let abs = expand_home(&path);
+    // Central path decider: reject malformed / root-escaping paths and act on the
+    // cleaned form. A traversal-laden string here signals input that didn't come
+    // straight from the user.
+    let abs = lychi_core::rules::path::check_path(&abs).map_err(LychiError::ExecutionFailed)?;
     if !abs.exists() {
         return Ok(false);
     }
@@ -51,6 +55,7 @@ pub async fn open_path(path: String) -> Result<bool, LychiError> {
 #[specta::specta]
 pub async fn reveal_path(path: String) -> Result<(), LychiError> {
     let abs = expand_home(&path);
+    let abs = lychi_core::rules::path::check_path(&abs).map_err(LychiError::ExecutionFailed)?;
     let uri = format!("file://{}", abs.display());
 
     match show_items(&uri).await {

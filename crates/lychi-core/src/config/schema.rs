@@ -415,6 +415,71 @@ impl AiConfig {
             .map(|p| p.wire_format.to_string())
             .unwrap_or_else(|| "openai".to_string())
     }
+
+    /// Validate the effective BYO base URL before it is saved and used.
+    ///
+    /// The base URL is free text and receives the user's real API key as an auth
+    /// header on every request. An `http://` (cleartext) or malformed/typo'd host
+    /// would leak that key to whoever owns it — so we require `https://`, with the
+    /// single exception of a **loopback** host (localhost / 127.0.0.1 / [::1]),
+    /// which is the legitimate local-proxy case (Ollama, a local gateway) where
+    /// cleartext never leaves the machine.
+    ///
+    /// Only enforced for BYO mode with a non-empty URL — other modes and the
+    /// empty-preset-default case are unaffected.
+    pub fn validate_base_url(&self) -> Result<(), String> {
+        // Only BYO mode sends a user key to a user-chosen URL.
+        if self.mode != "byo" {
+            return Ok(());
+        }
+        let url = self.resolved_base_url();
+        let url = url.trim();
+        if url.is_empty() {
+            // Empty resolves to a preset default elsewhere; not this check's job.
+            return Ok(());
+        }
+
+        let is_https = url.starts_with("https://");
+        let is_http = url.starts_with("http://");
+        if !is_https && !is_http {
+            return Err(format!(
+                "AI endpoint must start with https:// (got: {url})"
+            ));
+        }
+
+        if is_http {
+            // Cleartext is only acceptable to a loopback host.
+            let host = host_of(url);
+            let loopback = matches!(host.as_deref(), Some("localhost") | Some("127.0.0.1") | Some("[::1]") | Some("::1"))
+                || host.as_deref().is_some_and(|h| h.starts_with("127."));
+            if !loopback {
+                return Err(format!(
+                    "Refusing to send your API key over cleartext http:// to a non-local host \
+                     — use https:// (got: {url})"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Extract the host portion of a `scheme://host[:port]/...` URL (no external URL
+/// crate — this is a coarse split sufficient for the loopback check).
+fn host_of(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest)?;
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // Strip userinfo if present, then split off the port (but keep [::1] intact).
+    let authority = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        // IPv6 literal: keep the brackets for matching `[::1]`.
+        format!("[{}]", rest.split(']').next().unwrap_or(rest))
+    } else {
+        authority.split(':').next().unwrap_or(authority).to_string()
+    };
+    if host.is_empty() { None } else { Some(host) }
 }
 
 fn default_ai_timeout() -> u64 {
@@ -523,6 +588,57 @@ mod tests {
     /// Stand-in for the action registry's reserved-command check.
     fn reserved(w: &str) -> bool {
         ["open", "kill", "qr", "base64", "json"].contains(&w)
+    }
+
+    fn byo(base_url: &str) -> AiConfig {
+        AiConfig {
+            mode: "byo".to_string(),
+            provider: "custom".to_string(),
+            base_url: base_url.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn base_url_requires_https_for_remote() {
+        // https is fine.
+        assert!(byo("https://api.example.com/v1").validate_base_url().is_ok());
+        // cleartext http to a remote host is rejected (key exfiltration risk).
+        assert!(byo("http://api.example.com/v1").validate_base_url().is_err());
+        assert!(byo("http://attacker.example/v1/messages").validate_base_url().is_err());
+        // a non-URL / typo is rejected.
+        assert!(byo("api.example.com").validate_base_url().is_err());
+        assert!(byo("ftp://x").validate_base_url().is_err());
+    }
+
+    #[test]
+    fn base_url_allows_loopback_http() {
+        // Local proxies (Ollama, a local gateway) over cleartext are fine —
+        // nothing leaves the machine.
+        assert!(byo("http://localhost:11434/v1").validate_base_url().is_ok());
+        assert!(byo("http://127.0.0.1:8080/v1").validate_base_url().is_ok());
+        assert!(byo("http://127.0.0.53/v1").validate_base_url().is_ok());
+        assert!(byo("http://[::1]:1234/v1").validate_base_url().is_ok());
+        // but a host merely CONTAINING "localhost" is not loopback.
+        assert!(byo("http://localhost.attacker.com/v1").validate_base_url().is_err());
+    }
+
+    #[test]
+    fn base_url_check_scoped_to_byo_and_nonempty() {
+        // Non-BYO modes are unaffected.
+        let mut local = byo("http://api.example.com");
+        local.mode = "local".to_string();
+        assert!(local.validate_base_url().is_ok());
+        // Empty base_url (resolves to preset default elsewhere) is not this check's job.
+        assert!(byo("").validate_base_url().is_ok());
+    }
+
+    #[test]
+    fn host_of_extracts_host() {
+        assert_eq!(host_of("https://api.example.com/v1").as_deref(), Some("api.example.com"));
+        assert_eq!(host_of("http://localhost:11434/v1").as_deref(), Some("localhost"));
+        assert_eq!(host_of("http://user:pass@host.com/x").as_deref(), Some("host.com"));
+        assert_eq!(host_of("http://[::1]:1234/v1").as_deref(), Some("[::1]"));
     }
 
     #[test]

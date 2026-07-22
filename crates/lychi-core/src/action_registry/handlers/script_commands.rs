@@ -17,6 +17,8 @@ use crate::action_registry::{
 use crate::error::LychiError;
 use crate::script_commands::{ScriptCommand, ScriptMode};
 
+use super::shell_exec::Clearance;
+
 /// Timeout for an inline (captured) script — a hanging script must not wedge the
 /// launcher. Terminal-mode scripts detach and aren't bounded here.
 const SCRIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -97,20 +99,42 @@ impl ActionHandler for ScriptCommandsHandler {
         let command = build_command(cmd, &script_args);
         let cwd = ctx.cwd.as_deref();
 
+        // Clearance for the assembled command line. A script that opted into a
+        // confirmation (`# @lychi.risk medium`) has already been approved by the
+        // Rules Engine before we get here, so it carries user clearance for a
+        // `Confirm` verdict. A default (Low-risk) script carries none — so the
+        // central decider independently authorizes its command line: a benign
+        // `'<path>' <args>` is `Allow` and runs, but if the resolved line hits a
+        // dangerous/denylisted pattern it is refused rather than silently run.
+        // This is the fix for script commands bypassing the shell gate (C1).
+        let clearance = if cmd.confirm {
+            Clearance::UserConfirmed
+        } else {
+            Clearance::None
+        };
+
         match cmd.mode {
             ScriptMode::Inline => {
-                super::shell_exec::run_captured(
+                // Surface a refusal (denied / needs-confirmation) as a failed
+                // result rather than a hard error, so it reads cleanly in the UI
+                // — matching the terminal arm below.
+                match super::shell_exec::run_captured(
                     &self.shell,
                     &command,
                     cwd,
                     SCRIPT_TIMEOUT,
                     MAX_OUTPUT_BYTES,
+                    clearance,
                 )
                 .await
+                {
+                    Ok(r) => Ok(r),
+                    Err(e) => Ok(ActionResult::err(e.to_string())),
+                }
             }
             ScriptMode::Terminal => {
                 let terminal = ctx.terminal.as_deref();
-                match super::shell_exec::open_in_terminal(&command, cwd, terminal) {
+                match super::shell_exec::open_in_terminal(&command, cwd, terminal, clearance) {
                     Ok(_) => Ok(ActionResult::ok(
                         format!("Launched “{}” in a terminal", cmd.title),
                         crate::action_registry::OutputType::Status,
@@ -206,5 +230,55 @@ mod tests {
     fn no_confirm_is_low_risk() {
         let h = ScriptCommandsHandler::new(vec![cmd("safe", ScriptMode::Inline)], "/bin/sh".into());
         assert_eq!(h.assess_risk("safe", &Default::default()).level, RiskLevel::Low);
+    }
+
+    // Build a real script file on disk and a handler wrapping it, so `execute`
+    // resolves + assembles a genuine command line. Returns (handler, cleanup).
+    fn script_on_disk(keyword: &str, confirm: bool) -> (ScriptCommandsHandler, PathBuf) {
+        use std::io::Write;
+        let dir = std::env::temp_dir()
+            .join(format!("lychi-scripttest-{}-{keyword}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join(format!("{keyword}.sh"));
+        let mut f = std::fs::File::create(&script).unwrap();
+        writeln!(f, "#!/bin/sh\ntrue").unwrap();
+        let c = ScriptCommand {
+            keyword: keyword.into(),
+            path: script,
+            title: keyword.into(),
+            description: String::new(),
+            mode: ScriptMode::Inline,
+            confirm,
+        };
+        (ScriptCommandsHandler::new(vec![c], "/bin/sh".into()), dir)
+    }
+
+    // A script whose resolved command line is denylisted must be blocked at the
+    // shell-assembly chokepoint, even though the script handler itself is Low
+    // risk (it never went through the Rules Engine `run` path). Guards the C1
+    // fix: script commands used to reach `sh -ic` with no denylist check.
+    #[tokio::test]
+    async fn denylisted_script_command_is_rejected() {
+        let (h, dir) = script_on_disk("noop", false);
+        let ctx = ExecContext::default();
+        // Assembled line: `'<path>' rm -rf /` → hard Deny.
+        let res = h.execute(&ctx, "noop rm -rf /").await.unwrap();
+        assert!(!res.success, "denylisted command line must not execute");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A Low-risk (no-confirm) script whose command line hits a *Confirm* pattern
+    // (not a hard deny) must be refused — it carries no user clearance, so the
+    // decider won't silently run a mutating command. This is the other half of
+    // the C1/C2 fix: not just catastrophes, but un-vetted dangerous commands.
+    #[tokio::test]
+    async fn unconfirmed_script_with_dangerous_line_is_refused() {
+        let (h, dir) = script_on_disk("noop", false);
+        let ctx = ExecContext::default();
+        // Assembled line contains `sudo ` → Confirm; clearance None → refused.
+        let res = h.execute(&ctx, "noop && sudo rm somefile").await.unwrap();
+        assert!(!res.success, "unconfirmed dangerous line must be refused");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

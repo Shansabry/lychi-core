@@ -21,8 +21,10 @@ impl Default for SystemCommand {
     }
 }
 
-/// Actions that require confirmation (destructive / irreversible).
-pub const DESTRUCTIVE_ACTIONS: &[&str] = &["shutdown", "reboot", "hibernate", "logout"];
+/// Actions that require confirmation (destructive / irreversible). Aliased to
+/// the central classifier so the list has a single audit surface
+/// ([`crate::rules::verbs`]); this name is kept for local/test use.
+pub const DESTRUCTIVE_ACTIONS: &[&str] = crate::rules::verbs::DESTRUCTIVE_SYSTEM_ACTIONS;
 
 /// Static action with no parameters.
 struct SimpleAction {
@@ -654,7 +656,7 @@ impl ActionHandler for SystemCommand {
         // bluetooth) auto-execute. This ownership lives here, not in the Rules
         // Engine.
         let action = args.trim().to_lowercase();
-        if DESTRUCTIVE_ACTIONS.iter().any(|d| action.starts_with(d)) {
+        if crate::rules::verbs::is_destructive_system_action(&action) {
             RiskAssessment::confirm(format!(
                 "System action '{}' requires confirmation",
                 args.trim()
