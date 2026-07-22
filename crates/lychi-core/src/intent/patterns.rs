@@ -34,7 +34,6 @@ pub static COLON_TRIGGERS: &[(&str, &str)] = &[
     ("sn:", "snip"),
     ("tm:", "timer"),
     ("rm:", "reminder"),
-    ("a:", "ask"),
 ];
 
 /// The structural (character-sigil) triggers — input shapes that route without a
@@ -706,7 +705,6 @@ mod tests {
             ("cl:", "clip", ""),
             ("m:pause", "media", "pause"),
             ("p:lychi", "project", "lychi"),
-            ("a:what is rust", "ask", "what is rust"),
             ("si:cpu", "sysinfo", "cpu"),
             ("sys:lock", "system", "lock"),
             ("e:fire", "emoji", "fire"),

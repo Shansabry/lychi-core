@@ -1,7 +1,6 @@
 pub mod aliases;
 pub mod app_control;
 pub mod app_launcher;
-pub mod ask;
 pub mod bang;
 pub mod bookmarks;
 pub mod browse;
@@ -45,7 +44,6 @@ pub mod translate;
 pub mod unicode;
 pub mod url_open;
 pub mod weather;
-pub mod weather_ask;
 pub mod web_search;
 pub mod window_switcher;
 #[cfg(target_os = "linux")]

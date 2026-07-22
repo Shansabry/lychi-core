@@ -5,6 +5,7 @@ pub mod config;
 pub mod context;
 pub mod db;
 pub mod desktop_apps;
+pub mod coordinator;
 pub mod error;
 pub mod events;
 pub mod executor;

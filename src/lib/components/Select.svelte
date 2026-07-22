@@ -1,7 +1,7 @@
 <script lang="ts">
 import { Coins } from "lucide-svelte";
 
-type Option = { value: string; label: string };
+type Option = { value: string; label: string; disabled?: boolean };
 
 let {
 	id = "",
@@ -51,6 +51,7 @@ function toggle() {
 }
 
 function select(opt: Option) {
+	if (opt.disabled) return; // e.g. "coming soon" — visible but not selectable
 	open = false;
 	if (opt.value !== value) {
 		onchange(opt.value);
@@ -78,8 +79,15 @@ function handleKeydown(e: KeyboardEvent) {
 	if (e.key === "ArrowDown" || e.key === "ArrowUp") {
 		e.preventDefault();
 		const idx = options.findIndex((o) => o.value === value);
-		const next =
-			e.key === "ArrowDown" ? Math.min(idx + 1, options.length - 1) : Math.max(idx - 1, 0);
+		const step = e.key === "ArrowDown" ? 1 : -1;
+		// Skip disabled options (e.g. "coming soon").
+		let next = idx;
+		for (let i = idx + step; i >= 0 && i < options.length; i += step) {
+			if (!options[i].disabled) {
+				next = i;
+				break;
+			}
+		}
 		if (next !== idx) {
 			onchange(options[next].value);
 		}
@@ -135,9 +143,11 @@ function handleBlur(e: FocusEvent) {
 				<button
 					class="select-option"
 					class:selected={opt.value === value}
+					class:disabled={opt.disabled}
 					type="button"
 					role="option"
 					aria-selected={opt.value === value}
+					aria-disabled={opt.disabled}
 					onclick={() => select(opt)}
 					onblur={handleBlur}
 				>
@@ -246,6 +256,16 @@ function handleBlur(e: FocusEvent) {
 
 	.select-option.selected {
 		color: var(--accent);
+	}
+
+	.select-option.disabled {
+		color: var(--fg-muted);
+		opacity: 0.55;
+		cursor: default;
+	}
+	.select-option.disabled:hover,
+	.select-option.disabled:focus {
+		background: none;
 	}
 
 	.tier-icons {

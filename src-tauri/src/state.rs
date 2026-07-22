@@ -7,7 +7,6 @@ use redb::Database;
 use lychi_core::action_registry::handlers::aliases::AliasHandler;
 use lychi_core::action_registry::handlers::app_control::AppControlHandler;
 use lychi_core::action_registry::handlers::app_launcher::AppLauncher;
-use lychi_core::action_registry::handlers::ask::AskHandler;
 use lychi_core::action_registry::handlers::bang::BangHandler;
 use lychi_core::action_registry::handlers::bookmarks::BookmarkHandler;
 use lychi_core::action_registry::handlers::browse::BrowseHandler;
@@ -45,7 +44,6 @@ use lychi_core::action_registry::handlers::translate::TranslateHandler;
 use lychi_core::action_registry::handlers::unicode::UnicodeHandler;
 use lychi_core::action_registry::handlers::url_open::UrlOpen;
 use lychi_core::action_registry::handlers::weather::WeatherHandler;
-use lychi_core::action_registry::handlers::weather_ask::WeatherAskHandler;
 use lychi_core::action_registry::handlers::web_search::WebSearch;
 use lychi_core::action_registry::handlers::window_switcher::WindowSwitcherHandler;
 use lychi_core::action_registry::handlers::youtube::YouTube;
@@ -105,6 +103,25 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub history: HistoryStore,
     pub config: Arc<RwLock<Config>>,
+    /// The live AI provider, reachable from the streaming-chat command (which
+    /// runs outside the executor). Today the provider lives inside the executor's
+    /// handlers/router; this is a second handle the `AiReactor` writes in the same
+    /// pass it rebuilds those, so `ai_chat_stream` can drive `AiProvider::chat`
+    /// directly. `None` when AI is disabled.
+    pub ai_provider: Arc<RwLock<Option<Arc<dyn AiProvider>>>>,
+    /// Monotonic generation counter for the streaming chat. Each new stream bumps
+    /// it; the frontend drops tokens tagged with a stale `gen`. Also gates the
+    /// terminal `done`/`error` event so a superseded stream can't paint over a
+    /// newer one.
+    pub ai_generation: Arc<AtomicU64>,
+    /// The in-flight chat stream's cancellation token. Cancelling it stops the
+    /// stream at its source (drops the HTTP body / halts the local loop). A new
+    /// stream replaces it; `cancel_ai_chat` cancels the current one.
+    pub ai_cancel: Arc<RwLock<Option<lychi_core::providers::CancellationToken>>>,
+    /// The agent coordinator's suspended session, awaiting a tool approval. Set
+    /// when a run pauses on a destructive tool; `agent_approve` takes it to
+    /// resume. Single-slot (the UI shows one approval at a time).
+    pub agent_session: Arc<RwLock<Option<lychi_core::coordinator::Session>>>,
     pub pending_plan: Arc<RwLock<Option<AgentPlan>>>,
     /// The action awaiting user confirmation (G1). Captured when the pipeline
     /// returns `needs_confirmation`; the `confirm_execution` command executes
@@ -298,25 +315,20 @@ impl AppState {
         registry.register(Box::new(SshHandler::new()));
         registry.register(Box::new(ColorHandler::new()));
         registry.register(Box::new(WindowSwitcherHandler::new(db.clone())));
-        let weather_handler = Arc::new(WeatherHandler::new(
+        registry.register(Box::new(WeatherHandler::new(
             config.weather.unit.clone(),
             config.weather.default_location.clone(),
-        ));
-        registry.register(Box::new(weather_handler.clone()));
+        )));
 
         // Initialize AI provider if configured (shared between router and ask
         // handler). Single source of truth for mode dispatch is the core factory.
         let ai_provider: Option<Arc<dyn AiProvider>> = Self::build_ai_provider(&config.ai);
 
-        registry.register(Box::new(AskHandler::with_timeout(
-            ai_provider.clone(),
-            config.commands.default_search_engine.clone(),
-            Self::ask_timeout(&config.ai),
-        )));
-        registry.register(Box::new(WeatherAskHandler::new(
-            weather_handler,
-            ai_provider.clone(),
-        )));
+        // NOTE: `ask` and `weather_ask` were deleted in the AI rewrite — the
+        // streaming agent (fork card / full chat) subsumes AI Q&A, and the
+        // deterministic `weather` handler is a tool the agent can call. The
+        // `translate` / `convert` AI transforms are kept until Phase 3 re-homes
+        // them as prompt presets (the one sanctioned temporary keep).
         registry.register(Box::new(ClipboardTransformHandler::new(
             ai_provider.clone(),
         )));
@@ -340,7 +352,9 @@ impl AppState {
             ),
         ));
 
-        let ai_router = ai_provider.map(|p| {
+        // Clone for the router; the original `ai_provider` is stored on AppState
+        // (below) as the handle the streaming-chat command reads.
+        let ai_router = ai_provider.clone().map(|p| {
             AiRouter::new_shared(p, Self::ask_timeout(&config.ai))
         });
 
@@ -357,6 +371,12 @@ impl AppState {
             db,
             history,
             config: Arc::new(RwLock::new(config)),
+            // Reuse the provider built above (line ~319) for the executor's
+            // handlers, so the streaming-chat command shares the same instance.
+            ai_provider: Arc::new(RwLock::new(ai_provider)),
+            ai_generation: Arc::new(AtomicU64::new(0)),
+            ai_cancel: Arc::new(RwLock::new(None)),
+            agent_session: Arc::new(RwLock::new(None)),
             pending_plan: Arc::new(RwLock::new(None)),
             pending_execution: Arc::new(RwLock::new(None)),
             active_file_search: Arc::new(AtomicU64::new(0)),
@@ -387,6 +407,7 @@ impl AppState {
             &self.event_bus,
             self.executor.clone(),
             self.config.clone(),
+            self.ai_provider.clone(),
         );
     }
 

@@ -4,7 +4,10 @@ use serde_json::{Value, json};
 
 use crate::error::LychiError;
 
-use super::{AiProvider, AiResponse, AiRoute};
+use super::wire::{AuthStyle, Dialect, WireClient};
+use super::{
+    AiProvider, AiResponse, AiRoute, CancellationToken, ChatMessage, EventStream, ToolDef,
+};
 use crate::intent::prompt;
 
 /// Request/response wire format spoken to the endpoint.
@@ -163,6 +166,24 @@ impl BYOClient {
             WireFormat::Anthropic => self.call_anthropic(system_prompt, user_input).await,
         }
     }
+
+    /// Build the shared streaming client for this provider's dialect + auth. The
+    /// whole HTTP→SSE→event mechanism lives in `WireClient`; this just maps the
+    /// BYO config (wire format + key) onto it.
+    fn wire_client(&self) -> WireClient {
+        let (dialect, auth) = match self.wire {
+            WireFormat::Anthropic => (Dialect::Anthropic, AuthStyle::AnthropicKey(self.api_key.clone())),
+            WireFormat::OpenAi => (Dialect::OpenAi, AuthStyle::Bearer(self.api_key.clone())),
+        };
+        WireClient::new(
+            self.http.clone(),
+            dialect,
+            self.base_url.clone(),
+            self.model.clone(),
+            self.max_tokens,
+            auth,
+        )
+    }
 }
 
 #[async_trait]
@@ -188,7 +209,6 @@ impl AiProvider for BYOClient {
     ) -> Result<AiResponse, LychiError> {
         let sys_prompt = prompt::system_prompt(known_actions, context_hint);
         let response = self.call(&sys_prompt, input).await?;
-
         tracing::debug!(
             prompt_version = prompt::PROMPT_VERSION,
             provider = %self.provider_id,
@@ -201,9 +221,6 @@ impl AiProvider for BYOClient {
     async fn health_check(&self) -> bool {
         let result = match self.wire {
             WireFormat::Anthropic => {
-                // Anthropic has no cheap unauthenticated probe; a 401/403 means
-                // the key is bad, anything else (incl. 400 for the dummy body)
-                // means the endpoint + auth are reachable.
                 let res = self
                     .http
                     .post(&self.base_url)
@@ -225,8 +242,6 @@ impl AiProvider for BYOClient {
                 }
             }
             WireFormat::OpenAi => {
-                // Probe the sibling /models endpoint derived from the chat URL.
-                // Falls back to POSTing the chat endpoint if we can't derive it.
                 if let Some(models_url) = openai_models_url(&self.base_url) {
                     self.http
                         .get(models_url)
@@ -236,7 +251,6 @@ impl AiProvider for BYOClient {
                         .map(|r| r.status().is_success())
                         .unwrap_or(false)
                 } else {
-                    // No derivable /models — treat a non-auth-error response as healthy.
                     let res = self
                         .http
                         .post(&self.base_url)
@@ -273,6 +287,15 @@ impl AiProvider for BYOClient {
         question: &str,
     ) -> Result<String, LychiError> {
         self.call(system_prompt, question).await
+    }
+
+    fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDef],
+        cancel: CancellationToken,
+    ) -> EventStream {
+        self.wire_client().stream(messages, tools, cancel)
     }
 }
 
@@ -333,4 +356,5 @@ mod tests {
         );
         assert_eq!(c.name(), "grok");
     }
+
 }

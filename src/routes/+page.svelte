@@ -3,8 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { onMount } from "svelte";
-import AgentPlanPanel from "$lib/components/AgentPlanPanel.svelte";
 import ActionPanel from "$lib/components/ActionPanel.svelte";
+import AgentPlanPanel from "$lib/components/AgentPlanPanel.svelte";
+import AiAnswer from "$lib/components/AiAnswer.svelte";
 import CommandInput from "$lib/components/CommandInput.svelte";
 import CompletionsList from "$lib/components/CompletionsList.svelte";
 import FilePreview from "$lib/components/FilePreview.svelte";
@@ -15,6 +16,7 @@ import ResultPanel from "$lib/components/ResultPanel.svelte";
 import SettingsPanel from "$lib/components/SettingsPanel.svelte";
 import StatusBar from "$lib/components/StatusBar.svelte";
 import type {
+	AgentEventDto,
 	AgentPlan,
 	CommandResult,
 	CompletionItem,
@@ -25,9 +27,13 @@ import type {
 	TrackInfo,
 } from "$lib/ipc";
 import {
+	agentApprove,
+	agentChatStart,
+	cancelAiChat,
 	cancelFileSearch,
 	confirmExecution,
 	executeCommand,
+	fuzzyPathCompletions,
 	getActiveWindowStrategy,
 	getAgentPlan,
 	getAiStatus,
@@ -37,7 +43,6 @@ import {
 	getHistory,
 	getHotkeyStatus,
 	getMountPoints,
-	fuzzyPathCompletions,
 	grantPrivacyConsent,
 	hideWindow,
 	listPathCompletions,
@@ -51,6 +56,7 @@ import {
 } from "$lib/ipc";
 import { loadKeybindings, matchesAction } from "$lib/keybindings";
 import { preloadAll } from "$lib/preloadCache";
+import { decideSubmit } from "$lib/submit-router";
 
 let inputValue = $state("");
 let isExecuting = $state(false);
@@ -65,6 +71,40 @@ let aiLoading = $state(false);
 let backendReady = $state(false);
 let lastResult: CommandResult | null = $state(null);
 let lastCommand = $state("");
+
+// --- AI agent (streaming, tool-calling) state ---
+// `aiText` is the assistant answer streaming in; `aiStreaming` gates the cursor;
+// `aiError` shows a failure. `aiGen` is the generation id — bumped per query so
+// stale-stream events (a superseded answer) are dropped. `aiToolSteps` records
+// the tool calls the agent runs; `aiApproval` holds a pending destructive-tool
+// approval prompt (the loop is suspended until the user decides).
+let aiText = $state("");
+let aiStreaming = $state(false);
+let aiError: string | null = $state(null);
+let aiGen = 0;
+// Whether the AI answer view is the active surface (vs. a command result).
+let aiActive = $state(false);
+// Quick-AI "fork card" mode: a short streamed answer for an unknown query,
+// with [Search web] / [Full chat] buttons. Distinct from the full agent chat
+// (aiActive without aiQuick). `aiQuickPrompt` is what the buttons act on.
+let aiQuick = $state(false);
+let aiQuickPrompt = $state("");
+type ToolStep = {
+	callId: string;
+	name: string;
+	args: string;
+	status: "running" | "done" | "failed";
+	output?: string;
+};
+let aiToolSteps: ToolStep[] = $state([]);
+let aiApproval: { callId: string; toolName: string; args: string; reason: string } | null =
+	$state(null);
+// Completed prior turns in this conversation (shown above the streaming answer).
+type AiTurn = { user: string; text: string; toolSteps: ToolStep[] };
+let aiTurns: AiTurn[] = $state([]);
+let aiLastUser = $state("");
+// The in-panel follow-up reply box text.
+let aiReply = $state("");
 
 let historyEntries: string[] = $state([]);
 let historyOpen = $state(false);
@@ -570,6 +610,61 @@ onMount(() => {
 		});
 		unlisteners.push(unlistenStep);
 
+		// Listen for agent events (the tool-calling coordinator). Drops events
+		// from a superseded run (`gen` mismatch). Multiplexes prose, tool-call
+		// lifecycle, approval prompts, and the final answer into the AI surface.
+		const unlistenAgent = await win.listen<AgentEventDto>("lychi://agent-event", (e) => {
+			const ev = e.payload;
+			if (ev.gen !== aiGen) return; // stale run — ignore
+			switch (ev.kind) {
+				case "text":
+					aiText += ev.text ?? "";
+					break;
+				case "tool_started":
+					aiToolSteps = [
+						...aiToolSteps,
+						{
+							callId: ev.call_id ?? "",
+							name: ev.tool_name ?? "",
+							args: ev.tool_args ?? "",
+							status: "running",
+						},
+					];
+					break;
+				case "tool_completed":
+				case "tool_failed": {
+					const status = ev.kind === "tool_failed" ? "failed" : "done";
+					aiToolSteps = aiToolSteps.map((s) =>
+						s.callId === ev.call_id ? { ...s, status, output: ev.text } : s,
+					);
+					break;
+				}
+				case "awaiting_approval":
+					aiStreaming = false;
+					aiApproval = {
+						callId: ev.call_id ?? "",
+						toolName: ev.tool_name ?? "",
+						args: ev.tool_args ?? "",
+						reason: ev.reason ?? "This action needs your approval.",
+					};
+					break;
+				case "final":
+					aiStreaming = false;
+					if (ev.text) aiText = ev.text;
+					break;
+				case "stopped":
+					aiStreaming = false;
+					aiError = ev.text ?? "Stopped.";
+					break;
+				case "error":
+					aiStreaming = false;
+					aiError = ev.text ?? "The agent failed.";
+					break;
+				// turn_started / reasoning: no UI change for now.
+			}
+		});
+		unlisteners.push(unlistenAgent);
+
 		// Ready signal — emitted post-map (with a 150ms watchdog re-emit).
 		// Idempotent: only flips visibility readiness. Without it, a lost
 		// summon leaves an invisible surface that blocks all desktop clicks.
@@ -588,6 +683,8 @@ onMount(() => {
 			pendingPlan = null;
 			mediaOpen = false;
 			notesOpen = false;
+			// Fresh AI conversation each summon (decision: reset-every-summon).
+			resetChat();
 			// Clear stale context immediately — fast path re-populates if same window,
 			// fresh gather populates for changed windows. Prevents flash of wrong context.
 			envContext = null;
@@ -819,310 +916,288 @@ onMount(() => {
 	};
 });
 
+/** The system prompt for the agent — a launcher assistant that can act via tools. */
+const AGENT_SYSTEM =
+	"You are Lychi, a helpful assistant inside a Linux launcher. Answer concisely in markdown. You can call tools to act on the user's system when helpful; otherwise just answer.";
+
+/** Clear the active AI conversation (fresh start). */
+function resetChat() {
+	aiGen++; // supersede any in-flight run
+	aiText = "";
+	aiError = null;
+	aiStreaming = false;
+	aiActive = false;
+	aiToolSteps = [];
+	aiApproval = null;
+	aiTurns = [];
+	aiLastUser = "";
+	aiReply = "";
+	aiQuick = false;
+	aiQuickPrompt = "";
+}
+
+/** Send a follow-up from the in-panel reply box (continues the conversation). */
+async function sendReply() {
+	const text = aiReply.trim();
+	if (!text || aiStreaming) return;
+	aiReply = "";
+	await startChat(text, /* fresh */ false);
+}
+
+/**
+ * Start (fresh) or continue (follow-up) a tool-calling agent run for `prompt`.
+ * `fresh` = new conversation; else the backend appends this as a follow-up to the
+ * running session (history + tool results as context). Progress (prose, tool
+ * steps, approval prompts, final answer) arrives via the `lychi://agent-event`
+ * listener. For a follow-up, previous turns stay on screen above the new answer.
+ */
+async function startChat(prompt: string, fresh = true) {
+	const text = prompt.trim();
+	if (!text) return;
+	if (fresh) {
+		aiTurns = [];
+	} else if (aiText) {
+		// Snapshot the completed answer into the transcript before the new turn.
+		aiTurns = [...aiTurns, { user: aiLastUser, text: aiText, toolSteps: aiToolSteps }];
+	}
+	aiLastUser = text;
+	aiText = "";
+	aiToolSteps = [];
+	aiError = null;
+	aiApproval = null;
+	aiStreaming = true;
+	aiActive = true;
+	aiQuick = false; // full agent chat, not the fork card
+	lastResult = null; // AI answer takes over the result area
+	const gen = ++aiGen;
+	try {
+		await agentChatStart(AGENT_SYSTEM, text, fresh, /* withTools */ true, gen);
+	} catch (e) {
+		if (gen === aiGen) {
+			aiStreaming = false;
+			aiError = e instanceof Error ? e.message : String(e);
+		}
+	}
+}
+
+/** The system prompt for the quick-AI fork card — a short, tool-free answer. */
+const QUICK_AI_SYSTEM =
+	"You are Lychi, a helpful assistant inside a Linux launcher. Answer the user's question directly and concisely — 2-3 sentences, plain and factual. Use minimal markdown. If you can't answer confidently, say so in one line.";
+
+/**
+ * The fork card: stream a SHORT, tool-free answer for an unknown query, with
+ * [Search web] / [Full chat] buttons the user picks from. Reuses the same
+ * `lychi://agent-event` streaming plumbing as the full agent (with_tools=false).
+ */
+async function startQuickAi(prompt: string) {
+	const text = prompt.trim();
+	if (!text) return;
+	aiTurns = [];
+	aiLastUser = text;
+	aiQuickPrompt = text;
+	aiText = "";
+	aiToolSteps = [];
+	aiError = null;
+	aiApproval = null;
+	aiStreaming = true;
+	aiActive = true;
+	aiQuick = true; // the fork card
+	lastResult = null;
+	const gen = ++aiGen;
+	try {
+		await agentChatStart(QUICK_AI_SYSTEM, text, /* fresh */ true, /* withTools */ false, gen);
+	} catch (e) {
+		if (gen === aiGen) {
+			aiStreaming = false;
+			aiError = e instanceof Error ? e.message : String(e);
+		}
+	}
+}
+
+/** Fork-card button: escalate the quick answer into the full tool-calling agent. */
+/**
+ * Fork-card button: continue the quick answer in the full agent — WITHOUT
+ * re-asking. The short Q→A is already on screen and its session is stashed in
+ * the backend (with_tools=false). Escalating just flips the UI to full-chat
+ * mode: the answer becomes the first transcript turn and the reply box drives
+ * the next question, which continues the stashed session (fresh=false). No
+ * duplicate request; the model keeps the context it already produced.
+ */
+function escalateToChat() {
+	if (!aiText) {
+		// Nothing streamed yet (still thinking / errored) — fall back to a fresh
+		// full-agent run so the button always does something useful.
+		const prompt = aiQuickPrompt;
+		aiQuick = false;
+		if (prompt) startChat(prompt, /* fresh */ true);
+		return;
+	}
+	// Snapshot the quick answer as a completed turn, then switch to full chat.
+	aiTurns = [...aiTurns, { user: aiLastUser, text: aiText, toolSteps: aiToolSteps }];
+	aiText = "";
+	aiToolSteps = [];
+	aiQuick = false;
+	aiStreaming = false;
+	// The reply box is now shown (quick=false, not streaming); the user's
+	// follow-up continues the existing session via sendReply → startChat(fresh=false).
+}
+
+/** Fork-card button: bail out to a plain web search for the query. */
+async function quickWebSearch() {
+	const prompt = aiQuickPrompt;
+	resetChat();
+	if (prompt) await runCommand(`web ${prompt}`);
+}
+
+/** Resolve a pending destructive-tool approval and resume the agent. */
+async function approveTool(approve: boolean) {
+	if (!aiApproval) return;
+	aiApproval = null;
+	aiStreaming = true;
+	const gen = aiGen; // same run continues
+	try {
+		await agentApprove(approve, gen);
+	} catch (e) {
+		if (gen === aiGen) {
+			aiStreaming = false;
+			aiError = e instanceof Error ? e.message : String(e);
+		}
+	}
+}
+
+/** Cancel an in-flight agent run (Esc while streaming). */
+function cancelChat() {
+	aiGen++; // drop late events on the frontend
+	aiStreaming = false;
+	cancelAiChat().catch(() => {});
+}
+
 async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
+	if (isExecuting || !backendReady) return;
+
+	// Fork card shortcuts (quick-AI answer is on screen and idle):
+	//   Enter        → escalate to full chat
+	//   ⌘/Ctrl+Enter → bail out to a web search
+	// The input box is empty during the card, so these would otherwise no-op.
+	if (aiQuick && !aiStreaming && !inputValue.trim()) {
+		if (opts?.ctrlKey) await quickWebSearch();
+		else await escalateToChat();
+		return;
+	}
+
+	// ALL routing lives in one pure decider (src/lib/submit-router.ts). This
+	// function is a thin dispatcher: build the context, ask where to go, do it.
+	// One place decides command-vs-agent-vs-panel — no scattered `runCommand`
+	// branches. Natural language always ends at the agent (the single AI path);
+	// it never errors out to "unknown command".
 	const trimmed = inputValue.trim();
-	// Allow submit when input is empty but a context suggestion is selected
-	const hasSelectedCompletion = completions.length > 0 && completionIndex >= 0;
-	if ((!trimmed && !hasSelectedCompletion) || isExecuting || !backendReady) return;
+	const action = decideSubmit({
+		trimmed,
+		ctrlKey: opts?.ctrlKey ?? false,
+		runInline: opts?.runInline ?? false,
+		searchMode,
+		atMode,
+		pendingPlan: !!pendingPlan,
+		completions,
+		completionIndex,
+		aiEnabled,
+	});
 
-	// In / search mode, Ctrl+Enter reveals the selected result in the file
-	// manager (not web search — the input is a path like "/Android/", never a
-	// query). Plain Enter opens; handled below via handleCompletionSelect.
-	if (opts?.ctrlKey && searchMode) {
-		if (hasSelectedCompletion) revealSelected();
-		return;
-	}
-
-	// Ctrl+Enter: force web search regardless of completions or routing
-	if (opts?.ctrlKey && trimmed) {
-		await runCommand(`web ${trimmed}`);
-		return;
-	}
-
-	// Shift+Enter: capture a `run` command's output inline instead of a
-	// terminal (terminal is the default). Ignored by non-run handlers.
-	if (opts?.runInline && trimmed) {
-		await runCommand(trimmed, { runInline: true });
-		return;
-	}
-
-	// If a plan is showing and user presses Enter, execute it
-	if (pendingPlan) return;
-
-	// Intercept built-in panel keywords before completions
-	const lower = trimmed.toLowerCase();
-	if (lower === "settings") {
-		inputValue = "";
-		settingsOpen = true;
-		historyOpen = false;
-		completions = [];
-		completionIndex = -1;
-		return;
-	}
-
-	if (lower === "history") {
-		inputValue = "";
-		historyOpen = true;
-		settingsOpen = false;
-		notesOpen = false;
-		mediaOpen = false;
-		completions = [];
-		completionIndex = -1;
-		return;
-	}
-
-	if (lower === "spotify" || lower === "media" || lower === "music") {
-		inputValue = "";
-		mediaOpen = true;
-		historyOpen = false;
-		completions = [];
-		completionIndex = -1;
-		return;
-	}
-
-	if (
-		lower === "note" ||
-		lower === "notes" ||
-		lower === "todo" ||
-		lower === "todos" ||
-		lower === "reminder" ||
-		lower === "reminders" ||
-		lower === "timer" ||
-		lower === "timers" ||
-		lower === "stopwatch" ||
-		lower === "snip" ||
-		lower === "snippet" ||
-		lower === "snippets"
-	) {
-		inputValue = "";
-		notesOpen = true;
-		historyOpen = false;
-		completions = [];
-		completionIndex = -1;
-		if (lower === "reminder" || lower === "reminders") {
-			initialNotesTab = "reminders";
-		} else if (lower === "timer" || lower === "timers" || lower === "stopwatch") {
-			initialNotesTab = "timers";
-		} else if (lower === "todo" || lower === "todos") {
-			initialNotesTab = "todos";
-		} else if (lower === "snip" || lower === "snippet" || lower === "snippets") {
-			initialNotesTab = "snippets";
-		} else {
-			initialNotesTab = "notes";
-		}
-		return;
-	}
-
-	// In search mode, auto-select first selectable result (skip a leading
-	// section header) if none explicitly selected.
-	if (searchMode && completions.length > 0 && completionIndex < 0) {
-		const first = completions.findIndex((c) => c.icon_path !== "__separator__");
-		completionIndex = first >= 0 ? first : 0;
-	}
-
-	// Colon triggers (e.g. "al:list", "tz:tokyo") — send directly to backend, skip completion selection
-	if (/^[a-z]{1,4}:/.test(lower) && !lower.startsWith("http")) {
-		await runCommand(trimmed);
-		return;
-	}
-
-	// If completions are visible and one is selected, execute based on context
-	if (completions.length > 0 && completionIndex >= 0) {
-		const selected = completions[completionIndex];
-		if (selected && selected.icon_path !== "__separator__") {
-			// Calc results start with "= " — just display, don't execute
-			if (selected.label.startsWith("= ")) {
-				lastResult = {
-					success: true,
-					output: selected.label.slice(2),
-					error: null,
-					duration_ms: 0,
-					auto_open: false,
-				};
-				inputValue = "";
-				completions = [];
-				completionIndex = -1;
-				return;
-			}
-			// "Did you mean: X?" typo suggestion — fill input with corrected text
-			if (selected.label.startsWith("Did you mean:") && selected.description) {
-				inputValue = selected.description;
-				completions = [];
-				completionIndex = -1;
-				handleInput(inputValue);
-				return;
-			}
-			// @ browse or / search mode — drill into directory or open file
-			if (atMode || searchMode) {
-				handleCompletionSelect(selected.label, opts?.ctrlKey);
-				return;
-			}
-			// The backend declared the exact command to run (search handlers,
-			// emoji, etc.) — run it verbatim. No label reverse-parsing, no
-			// prefix guessing. This is the single scalable path.
-			// Argument-needing hint (e.g. "volume <n>"): insert the runnable
-			// prefix into the input so the user types the value, then Enter
-			// runs it. Tab-to-complete, a la Raycast/Alfred.
-			if (selected.fill) {
-				inputValue = selected.fill;
-				completions = [];
-				completionIndex = -1;
-				handleInput(inputValue);
-				return;
-			}
-			if (selected.run) {
-				await runCommand(selected.run);
-				return;
-			}
-			// Check if input has an explicit prefix (e.g. "spotify ", "system ", "media ")
-			// If so, append the selected completion to the prefix.
-			// But if the first word isn't a known handler prefix, this is a natural
-			// language query (e.g. "what is the weather here") — run it as-is so the
-			// backend's keyword/AI routing handles it correctly.
-			const KNOWN_PREFIXES = new Set([
-				"ask",
-				"bm",
-				"bookmark",
-				"browse",
-				"clip",
-				"clipboard",
-				"clear",
-				"close",
-				"emoji",
-				"focus",
-				"kill",
-				"open",
-				"sym",
-				"unicode",
-				"web",
-				"yt",
-				"run",
-				"calc",
-				"file",
-				"url",
-				"media",
-				"project",
-				"quit",
-				"system",
-				"note",
-				"notes",
-				"todo",
-				"todos",
-				"weather",
-				"sysinfo",
-				"ip",
-				"cpu",
-				"mem",
-				"disk",
-				"temp",
-				"gpu",
-				"battery",
-				"net",
-				"audio",
-				"display",
-				"os",
-				"speedtest",
-				"time",
-				"tz",
-				"clock",
-				"alias",
-				"aliases",
-				"timer",
-				"stopwatch",
-			]);
-			const spaceIdx = trimmed.indexOf(" ");
-			if (spaceIdx !== -1) {
-				const prefix = trimmed.slice(0, spaceIdx).toLowerCase();
-				if (KNOWN_PREFIXES.has(prefix)) {
-					// Don't re-prefix if the label already carries the prefix
-					// (e.g. input "run htop", label "run htop") — that would
-					// produce "run run htop". Run the label as-is in that case.
-					if (selected.label.toLowerCase().startsWith(`${prefix} `)) {
-						await runCommand(selected.label);
-					} else {
-						await runCommand(`${prefix} ${selected.label}`);
-					}
-				} else {
-					// Natural language — let the backend route the original input
-					await runCommand(trimmed);
-				}
-			} else if (KNOWN_PREFIXES.has(lower)) {
-				// Input is a bare prefix (e.g. "clip", "focus") — send prefix + selected label
-				await runCommand(`${lower} ${selected.label}`);
-			} else if (selected.icon_path === "__context__") {
-				// Context suggestion — label is a complete command (e.g. "git commit", "run cargo build")
-				await runCommand(selected.label);
-			} else if (selected.label.toLowerCase() === lower) {
-				// Completion matches input exactly (e.g. "mem" → sysinfo "mem")
-				// Let the backend router handle it directly
-				await runCommand(trimmed);
-			} else {
-				// No prefix — these are app completions, launch via open
-				await runCommand(`open ${selected.label}`);
-			}
+	switch (action.kind) {
+		case "noop":
 			return;
-		}
-	}
 
-	// In search mode with nothing selectable to act on, the user may have typed
-	// or pasted a literal absolute path (e.g. "/home/sab/Android/Sdk"). Try to
-	// open it directly; only if it doesn't exist do we give up (no silent no-op
-	// on a valid path). The leading "/" is the search-mode trigger AND the root
-	// of an absolute path, so the input value is the path as-is.
-	if (searchMode) {
-		const opened = await openPath(trimmed);
-		if (opened) {
+		case "panel": {
 			inputValue = "";
 			completions = [];
 			completionIndex = -1;
-			cancelFileSearch();
-			await hide();
+			settingsOpen = action.panel === "settings";
+			historyOpen = action.panel === "history";
+			mediaOpen = action.panel === "media";
+			notesOpen = action.panel === "notes";
+			if (action.panel === "notes") initialNotesTab = action.notesTab;
+			return;
 		}
-		return;
-	}
 
-	// C1/C15: Race AI plan against a short timeout.
-	// If AI responds within 200ms, use the plan. Otherwise, execute immediately.
-	// ESC cancels via generation counter — stale responses are discarded.
-	const gen = ++routingGeneration;
-	isRouting = true;
+		case "reveal":
+			revealSelected();
+			return;
 
-	const planPromise = getAgentPlan(trimmed).catch((err) => {
-		console.error("[agent plan] error:", err);
-		return null;
-	});
-	const timeout = new Promise<null>((r) => setTimeout(() => r(null), 200));
+		case "completion-select":
+			handleCompletionSelect(action.label, action.ctrlKey);
+			return;
 
-	const fastPlan = await Promise.race([planPromise, timeout]);
+		case "fill":
+		case "correct":
+			inputValue = action.value;
+			completions = [];
+			completionIndex = -1;
+			handleInput(inputValue);
+			return;
 
-	// If ESC was pressed during the race, bail out
-	if (gen !== routingGeneration) {
-		isRouting = false;
-		return;
-	}
+		case "calc-display":
+			lastResult = {
+				success: true,
+				output: action.text,
+				error: null,
+				duration_ms: 0,
+				auto_open: false,
+			};
+			inputValue = "";
+			completions = [];
+			completionIndex = -1;
+			return;
 
-	if (fastPlan) {
-		// AI responded quickly with a plan — show preview
-		isRouting = false;
-		pendingPlan = fastPlan;
-		completions = [];
-		completionIndex = -1;
-		historyOpen = false;
-		return;
-	}
-
-	// AI didn't respond in time — execute immediately, but let plan arrive in background
-	isRouting = false;
-	const commandPromise = runCommand(trimmed);
-
-	// If AI plan arrives later and we're still on the same generation, offer it
-	planPromise.then((plan) => {
-		if (plan && gen === routingGeneration && !pendingPlan) {
-			pendingPlan = plan;
+		case "open-path": {
+			const opened = await openPath(action.path);
+			if (opened) {
+				inputValue = "";
+				completions = [];
+				completionIndex = -1;
+				cancelFileSearch();
+				await hide();
+			}
+			return;
 		}
-	});
 
-	await commandPromise;
+		case "command":
+			await runCommand(action.command, { runInline: action.runInline });
+			return;
+
+		case "quick-ai":
+			inputValue = "";
+			completions = [];
+			completionIndex = -1;
+			await startQuickAi(action.prompt);
+			return;
+
+		case "agent":
+			inputValue = "";
+			completions = [];
+			completionIndex = -1;
+			await startChat(action.prompt, /* fresh */ true);
+			return;
+
+		case "ai-disabled": {
+			// The user made an AI request but no provider is configured. Warn
+			// (more prominently for an explicit `ask`), then fall to a web search.
+			inputValue = "";
+			completions = [];
+			completionIndex = -1;
+			const note = action.explicit
+				? "AI is disabled — enable it in Settings. Searching the web instead."
+				: "AI is disabled — searching the web instead.";
+			lastResult = {
+				success: true,
+				output: note,
+				error: null,
+				duration_ms: 0,
+				auto_open: false,
+			};
+			await runCommand(`web ${action.prompt}`);
+			return;
+		}
+	}
 }
 
 async function runCommand(command: string, opts?: { runInline?: boolean }) {
@@ -1624,6 +1699,24 @@ function handleShowPlan() {
 	completionIndex = -1;
 }
 
+/**
+ * Reflect the arrow-selected completion into the input box, so navigating a
+ * suggestion (history, context, etc.) previews what Enter will run and lets the
+ * user edit it — the Raycast/shell-history feel. Only fills rows that carry a
+ * concrete command (`run`) or a plain label; skips fill-hints and info rows.
+ * Search/@-browse modes are left alone (the input there is a path, not a query).
+ */
+function fillFromSelection() {
+	if (atMode || searchMode) return;
+	const sel = completions[completionIndex];
+	if (!sel || sel.icon_path === "__separator__" || sel.icon_path === "__info__") return;
+	// A calc row ("= 42") or a "Did you mean" row isn't a runnable command — don't
+	// clobber the input with their display text.
+	if (sel.label.startsWith("= ") || sel.label.startsWith("Did you mean:")) return;
+	const text = sel.run ?? sel.fill ?? sel.label;
+	if (text) inputValue = text;
+}
+
 function handleArrowUp() {
 	if (completions.length > 0) {
 		let next = completionIndex - 1;
@@ -1633,6 +1726,7 @@ function handleArrowUp() {
 		// than landing on a non-selectable separator.
 		if (next < 0 || completions[next]?.icon_path === "__separator__") return;
 		completionIndex = next;
+		fillFromSelection();
 	}
 }
 
@@ -1642,6 +1736,7 @@ function handleArrowDown() {
 		// Skip separator items
 		while (next < completions.length && completions[next]?.icon_path === "__separator__") next++;
 		completionIndex = Math.min(completions.length - 1, next);
+		fillFromSelection();
 	}
 }
 
@@ -1679,6 +1774,20 @@ async function openInlineUrl() {
 }
 
 async function handleDismiss() {
+	// AI chat Esc: first Esc cancels a live stream (keeps the answer + launcher);
+	// a second Esc (answer showing, not streaming) clears it back to the launcher.
+	// Only a third Esc hides. This keeps the fast-and-forget feel without losing
+	// an answer to an accidental keypress.
+	if (aiStreaming) {
+		cancelChat();
+		return;
+	}
+	if (aiActive) {
+		resetChat();
+		inputValue = "";
+		return;
+	}
+
 	// C15: Cancel in-flight AI routing immediately on ESC
 	if (isRouting) {
 		routingGeneration++;
@@ -1832,7 +1941,23 @@ async function handleDismiss() {
 		<div class="settings-wrapper" class:panel-hidden={!settingsOpen}>
 			<SettingsPanel ondismiss={() => { settingsOpen = false; }} />
 		</div>
-		{#if pendingPlan}
+		{#if aiActive}
+			<AiAnswer
+				turns={aiTurns}
+				text={aiText}
+				streaming={aiStreaming}
+				error={aiError}
+				toolSteps={aiToolSteps}
+				approval={aiApproval}
+				onapprove={approveTool}
+				bind:reply={aiReply}
+				onreply={sendReply}
+				onstop={cancelChat}
+				quick={aiQuick}
+				onwebsearch={quickWebSearch}
+				onfullchat={escalateToChat}
+			/>
+		{:else if pendingPlan}
 			<AgentPlanPanel
 				bind:this={planPanelRef}
 				plan={pendingPlan}

@@ -54,8 +54,10 @@ let localModels: LocalModelInfo[] = $state([]);
 // The model the user is being warned about before download (warning gate).
 let pendingDownload: LocalModelInfo | null = $state(null);
 // model_id → { downloaded, total, error } while a download is in flight.
-let downloadProgress: Record<string, { downloaded: number; total: number | null; error: string | null }> =
-	$state({});
+let downloadProgress: Record<
+	string,
+	{ downloaded: number; total: number | null; error: string | null }
+> = $state({});
 
 async function refreshLocalModels() {
 	try {
@@ -194,9 +196,7 @@ const showBaseUrl = $derived(
 	currentPreset.editable_url === true || (aiConfig.base_url ?? "").trim() !== "",
 );
 // Effective endpoint shown as a hint: explicit override wins, else preset default.
-const effectiveUrl = $derived(
-	(aiConfig.base_url ?? "").trim() || currentPreset.base_url,
-);
+const effectiveUrl = $derived((aiConfig.base_url ?? "").trim() || currentPreset.base_url);
 
 onMount(() => {
 	initModels(aiConfig.mode);
@@ -516,12 +516,9 @@ export function dismissConfirm() {
 		value={aiConfig.mode}
 		options={[
 			{ value: "disabled", label: "Disabled" },
-			// Lychi Cloud is hidden until lychi-cloud ships (Phase 2.3) —
-			// launch supports BYOK + Ollama only. The entry below only appears
-			// if an existing config still has mode="cloud".
-			...(aiConfig.mode === "cloud"
-				? [{ value: "cloud", label: "Lychi Cloud (coming soon)" }]
-				: []),
+			// Shown but not yet selectable (lychi-cloud ships Phase 2.3). `disabled`
+			// dims it + blocks selection; an existing mode="cloud" config is let through.
+			{ value: "cloud", label: "Lychi Cloud (coming soon)", disabled: !CLOUD_ENABLED && aiConfig.mode !== "cloud" },
 			{ value: "local", label: "Local AI (bundled)" },
 			{ value: "ollama", label: "Ollama (Local)" },
 			{ value: "byo", label: "BYO API Key" },

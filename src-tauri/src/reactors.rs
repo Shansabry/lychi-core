@@ -121,6 +121,10 @@ impl EventHandler for ProjectsReactor {
 struct AiReactor {
     executor: Arc<RwLock<Executor>>,
     config: Arc<RwLock<Config>>,
+    /// The AppState handle the streaming-chat command reads. Written here in the
+    /// same pass that rebuilds the executor's AI handlers, so a mode switch
+    /// updates both paths atomically-enough (the command reads it per request).
+    ai_provider: Arc<RwLock<Option<Arc<dyn lychi_core::providers::AiProvider>>>>,
 }
 
 impl EventHandler for AiReactor {
@@ -133,42 +137,25 @@ impl EventHandler for AiReactor {
         };
 
         use lychi_core::action_registry::handlers::{
-            ask::AskHandler, clipboard_transform::ClipboardTransformHandler,
-            translate::TranslateHandler, weather::WeatherHandler,
-            weather_ask::WeatherAskHandler,
+            clipboard_transform::ClipboardTransformHandler, translate::TranslateHandler,
         };
         use lychi_core::intent::ai_router::AiRouter;
 
         let ai = self.config.blocking_read().ai.clone();
-        let search_engine = self
-            .config
-            .blocking_read()
-            .commands
-            .default_search_engine
-            .clone();
-        let weather = self.config.blocking_read().weather.clone();
 
         // Single source of truth for provider construction.
         let provider = crate::state::AppState::build_ai_provider(&ai);
+
+        // Update the streaming-chat command's handle (one line, same pass). This
+        // is what the agent (fork card / full chat) uses — the primary AI path.
+        *self.ai_provider.blocking_write() = provider.clone();
 
         let mut executor = self.executor.blocking_write();
 
         // Re-register the AI-dependent handlers with the new provider (or None,
         // which makes them emit a "set up AI" message). `register` overwrites by
         // id, so this replaces the previously-registered instances in place.
-        executor.registry.register(Box::new(AskHandler::with_timeout(
-            provider.clone(),
-            search_engine,
-            crate::state::AppState::ask_timeout(&ai),
-        )));
-        let weather_handler = Arc::new(WeatherHandler::new(
-            weather.unit.clone(),
-            weather.default_location.clone(),
-        ));
-        executor.registry.register(Box::new(WeatherAskHandler::new(
-            weather_handler,
-            provider.clone(),
-        )));
+        // (`ask` / `weather_ask` were deleted — the agent subsumes them.)
         executor
             .registry
             .register(Box::new(ClipboardTransformHandler::new(provider.clone())));
@@ -197,6 +184,7 @@ pub fn register_config_reactors(
     bus: &EventBus,
     executor: Arc<RwLock<Executor>>,
     config: Arc<RwLock<Config>>,
+    ai_provider: Arc<RwLock<Option<Arc<dyn lychi_core::providers::AiProvider>>>>,
 ) {
     bus.subscribe(Arc::new(CommandsReactor {
         executor: executor.clone(),
@@ -206,5 +194,9 @@ pub fn register_config_reactors(
         executor: executor.clone(),
         config: config.clone(),
     }));
-    bus.subscribe(Arc::new(AiReactor { executor, config }));
+    bus.subscribe(Arc::new(AiReactor {
+        executor,
+        config,
+        ai_provider,
+    }));
 }

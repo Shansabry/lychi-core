@@ -20,6 +20,7 @@
     "clippy": "cargo clippy --workspace",
     "test": "cargo test --workspace",
     "test:core": "cargo test -p lychi-core",
+    "test:fe": "vitest run",
     "clean": "rm -rf .svelte-kit node_modules/.vite",
     "tauri": "tauri",
     "build:cli": "cargo build --release -p lychi-cli && mkdir -p src-tauri/binaries && cp target/release/lychi src-tauri/binaries/lychi-x86_64-unknown-linux-gnu",
@@ -35,7 +36,8 @@
     "svelte": "^5",
     "svelte-check": "^4",
     "typescript": "^5",
-    "vite": "^8"
+    "vite": "^8",
+    "vitest": "^4.1.10"
   },
   "dependencies": {
     "ansi-to-html": "^0.7.2",

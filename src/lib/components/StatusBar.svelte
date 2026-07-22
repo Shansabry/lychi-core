@@ -75,12 +75,7 @@ let resultVisible = $derived(
 // pill yields its space so that content is unobstructed; once the slot clears,
 // the pill slides back in. This keeps the busy state legible without crowding.
 let statusBusy = $derived(
-	aiLoading ||
-		routing ||
-		executing ||
-		Boolean(result) ||
-		contextRefreshing ||
-		contextStale,
+	aiLoading || routing || executing || Boolean(result) || contextRefreshing || contextStale,
 );
 
 async function togglePlayPause() {

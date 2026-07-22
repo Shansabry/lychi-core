@@ -92,9 +92,10 @@ function hexToRgb(hex: string): RGB | null {
 }
 
 function rgbToHex([r, g, b]: RGB): string {
-	const c = (v: number) => Math.round(Math.max(0, Math.min(255, v)))
-		.toString(16)
-		.padStart(2, "0");
+	const c = (v: number) =>
+		Math.round(Math.max(0, Math.min(255, v)))
+			.toString(16)
+			.padStart(2, "0");
 	return `#${c(r)}${c(g)}${c(b)}`;
 }
 

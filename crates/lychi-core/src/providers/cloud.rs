@@ -8,7 +8,9 @@ use std::time::Duration;
 use crate::error::LychiError;
 use crate::intent::prompt;
 
-use super::{AiProvider, AiResponse, AiRoute};
+use super::{
+    AiProvider, AiResponse, AiRoute, CancellationToken, ChatMessage, EventStream, ToolDef,
+};
 
 /// A source of Firebase ID tokens — implemented by the src-tauri layer
 /// using the OS keyring. This trait lives in core so CloudClient can be
@@ -188,6 +190,27 @@ impl AiProvider for CloudClient {
             .as_str()
             .map(|s| s.to_string())
             .ok_or_else(|| LychiError::Ai("No answer in cloud response".to_string()))
+    }
+
+    /// Cloud streaming chat is not available until the lychi-cloud proxy exposes
+    /// an SSE `/v1/chat` endpoint (separate closed-source repo). Per the
+    /// no-fallback rule we do NOT add a buffered client-side shim — cloud mode
+    /// stays disabled for launch (see the AI-rewrite plan). Returns a stream that
+    /// yields a single terminal error.
+    fn chat(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[ToolDef],
+        _cancel: CancellationToken,
+    ) -> EventStream {
+        use futures_util::{StreamExt as _, stream};
+        stream::once(async {
+            Err(LychiError::Ai(
+                "Cloud AI streaming is not available yet — use a local model or your own API key."
+                    .to_string(),
+            ))
+        })
+        .boxed()
     }
 }
 

@@ -8,79 +8,6 @@ use crate::providers::{AgentPlan, AiResponse};
 use ai_router::AiRouter;
 use patterns::{Confidence, PatternResult};
 
-/// Whether an unmatched input is worth an AI routing call, or is clearly noise
-/// that should skip straight to the web fallback (saves a network round-trip +
-/// tokens on gibberish like "asdfghjkl").
-///
-/// DELIBERATELY CONSERVATIVE — AI is good at messy input, so we only skip when
-/// there is genuinely nothing to route:
-///   - Multi-word input always keeps AI (could be a real phrasing).
-///   - Any app candidate (even weak) keeps AI.
-///   - Only a LONE token with NO app candidate AND a random/unpronounceable
-///     shape (no vowels, or mostly non-letters) is treated as noise.
-/// False negatives just mean one wasted AI call — never a missed real request.
-fn input_worth_ai(input: &str) -> bool {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    // Multi-token input: always worth AI.
-    if trimmed.split_whitespace().count() > 1 {
-        return true;
-    }
-    // A single token that the app index can place at all → worth routing.
-    if crate::desktop_apps::app_index()
-        .best_match(trimmed)
-        .is_some()
-    {
-        return true;
-    }
-    // Lone token, no app candidate: worth AI only if it looks like a real word.
-    token_looks_like_word(trimmed)
-}
-
-/// Whether a lone token looks like a pronounceable word (worth AI) versus random
-/// noise (skip). Real words are mostly letters, have a reasonable VOWEL RATIO,
-/// and don't contain long consonant runs — so keyboard-mash like "asdfghjkl"
-/// (one vowel, a 7-consonant run) reads as noise even though it has a vowel.
-/// Pure function — unit-testable without the app index.
-fn token_looks_like_word(token: &str) -> bool {
-    let lower = token.to_lowercase();
-    let total = lower.chars().count();
-    if total == 0 {
-        return false;
-    }
-    let is_vowel = |c: char| matches!(c, 'a' | 'e' | 'i' | 'o' | 'u' | 'y');
-    let letters = lower.chars().filter(|c| c.is_alphabetic()).count();
-    // Short tokens (≤3) with a vowel are given the benefit of the doubt ("cat",
-    // "os"); the ratio/run heuristics are unreliable at that length.
-    if total <= 3 {
-        return lower.chars().any(&is_vowel) && letters * 2 >= total;
-    }
-    // Mostly letters.
-    if letters * 2 < total {
-        return false;
-    }
-    // Vowel ratio: real words are ~30-60% vowels; noise is vowel-starved.
-    let vowels = lower.chars().filter(|&c| is_vowel(c)).count();
-    if vowels * 5 < total {
-        // < 20% vowels → unpronounceable
-        return false;
-    }
-    // No consonant run longer than 4 (English tops out ~"strengths").
-    let mut run = 0;
-    for c in lower.chars() {
-        if c.is_alphabetic() && !is_vowel(c) {
-            run += 1;
-            if run > 4 {
-                return false;
-            }
-        } else {
-            run = 0;
-        }
-    }
-    true
-}
 
 /// How the intent was resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,42 +136,16 @@ impl IntentResolver {
             }
         }
 
-        // Phase 2: Try AI routing (for both Weak matches and NoMatch).
-        // Skip the network round-trip for input that is clearly noise — a lone
-        // gibberish token AI can't map to any handler and that has no app
-        // candidate. Conservative on purpose: multi-word input, a weak pattern
-        // fallback, or any app candidate all keep AI (it's good at messy input);
-        // we only skip when there's genuinely nothing to route. Saves tokens +
-        // latency on "asdfghjkl" without ever starving a real request.
-        let worth_asking_ai = weak_fallback.is_some() || input_worth_ai(&no_match_input);
-        if let Some(ai) = &self.ai_router
-            && worth_asking_ai
-        {
-            // Exclude "open" from known IDs — it's the no-match fallback, not a real intent.
-            let known: Vec<&str> = registry
-                .list_ids()
-                .into_iter()
-                .filter(|id| *id != "open")
-                .collect();
-            if let Ok(Some(ai_route)) = ai.try_route(raw, &known).await
-                && registry.has(&ai_route.action_id)
-                && ai_route.action_id != "open"
-            {
-                tracing::debug!(
-                    phase = "ai",
-                    action = %ai_route.action_id,
-                    "[resolve] phase=ai action={}",
-                    ai_route.action_id
-                );
-                return ResolvedIntent {
-                    action_id: ai_route.action_id,
-                    args: ai_route.args,
-                    routing: RoutingMethod::Ai,
-                };
-            }
-        }
+        // NOTE: The old AI intent-routing phase (route_intent/route_or_plan →
+        // an `ask` handler) has been REMOVED. Natural language is now owned
+        // entirely by the streaming tool-calling agent (coordinator/), invoked
+        // from the launcher input box — NOT by the executor. The executor's
+        // resolver is purely deterministic: pattern match → weak fallback →
+        // web search. There is ONE AI path, and it is the agent. Anything that
+        // reaches here without a deterministic match falls through to web
+        // search (a safe, instant default), never a hidden second AI call.
 
-        // Phase 2b: AI failed or unavailable — use weak pattern match if we have one
+        // Phase 2b: use a weak pattern match if we have one.
         if let Some(fallback) = weak_fallback {
             tracing::debug!(
                 phase = "weak-fallback",
@@ -307,45 +208,3 @@ impl IntentResolver {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::token_looks_like_word;
-
-    #[test]
-    fn real_words_are_worth_ai() {
-        for w in ["spotify", "brighten", "louder", "sleep", "help", "code"] {
-            assert!(token_looks_like_word(w), "{w} should look like a word");
-        }
-    }
-
-    #[test]
-    fn gibberish_is_noise() {
-        // Keyboard-mash: vowel-starved and/or long consonant runs.
-        for w in [
-            "asdfghjkl",
-            "xkcdq",
-            "zxcvbn",
-            "qwrtp",
-            "1234",
-            "@#$%",
-            "hjkl",
-        ] {
-            assert!(!token_looks_like_word(w), "{w} should be noise");
-        }
-    }
-
-    #[test]
-    fn pronounceable_words_survive() {
-        // Real single-word requests AI could map. (App acronyms like "vlc"/"npm"
-        // don't rely on this shape check — the app-index branch in input_worth_ai
-        // catches them first; this function is only the last-resort noise filter.)
-        for w in ["gmail", "sync", "crypt", "sleep", "reboot", "screenshot"] {
-            assert!(token_looks_like_word(w), "{w} should survive as a word");
-        }
-    }
-
-    #[test]
-    fn empty_is_noise() {
-        assert!(!token_looks_like_word(""));
-    }
-}

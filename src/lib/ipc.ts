@@ -25,10 +25,10 @@ import type {
 	GeneralConfig,
 	HotkeyStatus,
 	KeybindingsConfig,
+	LocalModelInfo,
 	MountPoint,
 	NoteItem,
 	OllamaModelInfo,
-	LocalModelInfo,
 	PrivacyConfig,
 	ProjectsConfig,
 	ReminderItem,
@@ -66,11 +66,11 @@ export type {
 	GitContext,
 	HotkeyStatus,
 	KeybindingsConfig,
+	LocalModelInfo,
 	MountPoint,
 	NetworkContext,
 	NoteItem,
 	OllamaModelInfo,
-	LocalModelInfo,
 	OutputType,
 	PlaybackStatus,
 	PrivacyConfig,
@@ -118,6 +118,24 @@ export interface StepEvent {
 	step_index: number;
 	status: "running" | "done" | "failed";
 	result?: CommandResult | null;
+}
+
+/**
+ * A `lychi://agent-event` payload — the tool-calling agent's unified stream. Kind
+ * discriminates the shape (mirrors the Rust `AgentEventDto`; hand-written here
+ * because tauri-specta only exports types reachable from command signatures, and
+ * this rides an event). Kinds: turn_started | text | reasoning | tool_started |
+ * tool_completed | tool_failed | awaiting_approval | final | stopped | error.
+ */
+export interface AgentEventDto {
+	gen: number;
+	kind: string;
+	text?: string;
+	call_id?: string;
+	tool_name?: string;
+	tool_args?: string;
+	reason?: string;
+	step: number | null;
 }
 
 export interface BrowserContext {
@@ -299,17 +317,17 @@ export async function getAllSettings(): Promise<AllSettings> {
 				youtube_url: "https://www.youtube.com/results?search_query=",
 				shell: "/bin/bash",
 				terminal: "",
-					extra_terminals: [],
-					extra_ides: [],
+				extra_terminals: [],
+				extra_ides: [],
 				terminal_routing: "manual",
 				search_engines: {},
 			},
-				projects: {
-					directories: [],
-					extra_strong_markers: [],
-					extra_soft_markers: [],
-					pinned_workspace: null,
-				},
+			projects: {
+				directories: [],
+				extra_strong_markers: [],
+				extra_soft_markers: [],
+				pinned_workspace: null,
+			},
 			privacy: { allow_ip_geolocation: false, allow_public_ip: false },
 			keybindings: {
 				toggle_history: "Ctrl+1",
@@ -540,6 +558,35 @@ export async function getAiStatus(): Promise<AiStatus> {
 export async function checkAiHealth(): Promise<boolean> {
 	if (!isTauri()) return false;
 	return unwrap(await commands.checkAiHealth());
+}
+
+/** Cancel any in-flight AI chat stream. */
+export async function cancelAiChat(): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.cancelAiChat());
+}
+
+/**
+ * Start a tool-calling agent chat (Phase 2). Seeds a session from a system +
+ * user prompt and drives the coordinator loop; progress arrives via the
+ * `lychi://agent-event` event. May pause on a destructive tool (an
+ * `awaiting_approval` event) — resolve with `agentApprove`.
+ */
+export async function agentChatStart(
+	system: string,
+	user: string,
+	fresh: boolean,
+	withTools: boolean,
+	generation: number,
+): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.agentChatStart(system, user, fresh, withTools, generation));
+}
+
+/** Approve (or reject) a pending destructive tool call, resuming the agent. */
+export async function agentApprove(approve: boolean, generation: number): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.agentApprove(approve, generation));
 }
 
 export async function testAiConnection(): Promise<AiTestResult> {
