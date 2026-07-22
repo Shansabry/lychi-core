@@ -10,6 +10,7 @@
 import type {
 	AgentPlan,
 	AiConfig,
+	AiPresetItem,
 	AiStatus,
 	AiTestResult,
 	AllNotes,
@@ -45,6 +46,7 @@ export type {
 	AgentPlan,
 	AgentStep,
 	AiConfig,
+	AiPresetItem,
 	AiStatus,
 	AiTestResult,
 	AliasItem,
@@ -797,6 +799,37 @@ export async function updateSnippet(id: string, name: string, body: string): Pro
 export async function deleteSnippet(id: string): Promise<void> {
 	if (!isTauri()) return;
 	unwrap(await commands.deleteSnippet(id));
+}
+
+// --- AI Presets (AI Commands) ---
+
+export async function getAiPresets(): Promise<AiPresetItem[]> {
+	if (!isTauri()) return [];
+	return unwrap(await commands.getAiPresets());
+}
+
+export async function addAiPreset(
+	keyword: string,
+	name: string,
+	template: string,
+): Promise<AiPresetItem> {
+	if (!isTauri()) return { id: "", keyword, name, template, created_at: 0, updated_at: 0 };
+	return unwrap(await commands.addAiPreset(keyword, name, template));
+}
+
+export async function updateAiPreset(
+	id: string,
+	keyword: string,
+	name: string,
+	template: string,
+): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.updateAiPreset(id, keyword, name, template));
+}
+
+export async function deleteAiPreset(id: string): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.deleteAiPreset(id));
 }
 
 // --- Context Awareness ---

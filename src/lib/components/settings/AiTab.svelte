@@ -24,13 +24,17 @@ import {
 	testAiConnection,
 } from "$lib/ipc";
 import Select from "../Select.svelte";
+import AiPresetsTab from "./AiPresetsTab.svelte";
 
 let {
 	aiConfig = $bindable(),
 	onsaveerror,
+	onpresetchange,
 }: {
 	aiConfig: AiConfig;
 	onsaveerror: (msg: string) => void;
+	/** Called when the user adds/edits/deletes a preset (launcher reloads them). */
+	onpresetchange?: () => void;
 } = $props();
 
 let apiKeyInput = $state("");
@@ -805,7 +809,30 @@ export function dismissConfirm() {
 	{@render statusBlock()}
 {/if}
 
+<div class="preset-divider">
+	<span>AI Commands</span>
+</div>
+<AiPresetsTab onchange={onpresetchange} />
+
 <style>
+	.preset-divider {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		margin: 18px 20px 4px;
+		font-family: var(--font-mono);
+		font-size: 11px;
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+		color: var(--fg-muted);
+	}
+	.preset-divider::after {
+		content: "";
+		flex: 1;
+		height: 1px;
+		background: var(--border);
+	}
+
 	.field {
 		display: flex;
 		align-items: center;

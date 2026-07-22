@@ -136,9 +136,6 @@ impl EventHandler for AiReactor {
             return;
         };
 
-        use lychi_core::action_registry::handlers::{
-            clipboard_transform::ClipboardTransformHandler, translate::TranslateHandler,
-        };
         use lychi_core::intent::ai_router::AiRouter;
 
         let ai = self.config.blocking_read().ai.clone();
@@ -146,22 +143,14 @@ impl EventHandler for AiReactor {
         // Single source of truth for provider construction.
         let provider = crate::state::AppState::build_ai_provider(&ai);
 
-        // Update the streaming-chat command's handle (one line, same pass). This
-        // is what the agent (fork card / full chat) uses — the primary AI path.
+        // Update the streaming-chat command's handle. This is what the agent
+        // (fork card / full chat / presets) uses — the primary and only AI path.
+        // The old AI handlers (ask/weather_ask/translate/convert) were all
+        // deleted; presets replace the text transforms, so there's nothing to
+        // re-register here on a provider hot-swap.
         *self.ai_provider.blocking_write() = provider.clone();
 
         let mut executor = self.executor.blocking_write();
-
-        // Re-register the AI-dependent handlers with the new provider (or None,
-        // which makes them emit a "set up AI" message). `register` overwrites by
-        // id, so this replaces the previously-registered instances in place.
-        // (`ask` / `weather_ask` were deleted — the agent subsumes them.)
-        executor
-            .registry
-            .register(Box::new(ClipboardTransformHandler::new(provider.clone())));
-        executor
-            .registry
-            .register(Box::new(TranslateHandler::new(provider.clone())));
 
         // Swap (or clear) the intent router.
         match provider {

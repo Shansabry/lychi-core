@@ -56,6 +56,25 @@ export interface SubmitContext {
 	 * keywords/web, never a dead-end.
 	 */
 	aiEnabled: boolean;
+	/**
+	 * User-defined AI presets (keyword → prompt template). Typing
+	 * `<keyword> <text>` renders the template and sends it to the full agent.
+	 */
+	presets?: AiPreset[];
+}
+
+/** An AI preset as the router needs it (subset of AiPresetItem). */
+export interface AiPreset {
+	keyword: string;
+	/** The template with a `{input}` placeholder. */
+	template: string;
+}
+
+/** Render a preset template, substituting `{input}` (mirrors the Rust `render`). */
+export function renderPreset(template: string, input: string): string {
+	if (template.includes("{input}")) return template.replaceAll("{input}", input);
+	if (!input) return template;
+	return `${template}\n\n${input}`;
 }
 
 /**
@@ -263,6 +282,19 @@ function decideSubmitInner(ctx: SubmitContext): SubmitAction {
 	if (lower === "ask" || lower.startsWith("ask ")) {
 		const q = trimmed.slice(3).trim();
 		if (q) return { kind: "agent", prompt: q };
+	}
+
+	// 2c. AI preset invocation: `<keyword> <text>` (or a bare `<keyword>`).
+	// The user typed a saved AI-command keyword → render its template with the
+	// rest as {input} and send to the full agent. Explicit AI, so no fork card.
+	if (ctx.presets && ctx.presets.length > 0) {
+		const spaceIdx = trimmed.indexOf(" ");
+		const firstWord = (spaceIdx === -1 ? lower : lower.slice(0, spaceIdx)).trim();
+		const preset = ctx.presets.find((p) => p.keyword.toLowerCase() === firstWord);
+		if (preset) {
+			const rest = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+			return { kind: "agent", prompt: renderPreset(preset.template, rest) };
+		}
 	}
 
 	// 3. Bare panel keywords.

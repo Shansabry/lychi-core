@@ -3,6 +3,7 @@ import {
 	decideSubmit,
 	isDeterministicCommand,
 	type RouterCompletion,
+	renderPreset,
 	type SubmitContext,
 } from "./submit-router";
 
@@ -161,6 +162,57 @@ describe("decideSubmit — the single AI path (the dual-path bug)", () => {
 	it("bare `ask` with no query does not become an agent call", () => {
 		// no query after "ask" → falls through (quick-ai on the bare word)
 		expect(decideSubmit(ctx({ trimmed: "ask" })).kind).not.toBe("agent");
+	});
+});
+
+describe("renderPreset", () => {
+	it("substitutes {input}", () => {
+		expect(renderPreset("Translate: {input}", "hola")).toBe("Translate: hola");
+	});
+	it("replaces every {input}", () => {
+		expect(renderPreset("{input} / {input}", "x")).toBe("x / x");
+	});
+	it("appends when no placeholder and input present", () => {
+		expect(renderPreset("Summarize:", "text")).toBe("Summarize:\n\ntext");
+	});
+	it("returns template as-is when no placeholder and no input", () => {
+		expect(renderPreset("Say hi", "")).toBe("Say hi");
+	});
+});
+
+describe("decideSubmit — AI presets", () => {
+	const presets = [
+		{ keyword: "translate", template: "Translate to English: {input}" },
+		{ keyword: "email", template: "Write a professional email about: {input}" },
+	];
+
+	it("`translate hola` renders the template → full agent", () => {
+		expect(decideSubmit(ctx({ trimmed: "translate hola", presets }))).toEqual({
+			kind: "agent",
+			prompt: "Translate to English: hola",
+		});
+	});
+
+	it("a custom user preset works the same way", () => {
+		expect(decideSubmit(ctx({ trimmed: "email quarterly results", presets }))).toEqual({
+			kind: "agent",
+			prompt: "Write a professional email about: quarterly results",
+		});
+	});
+
+	it("a bare preset keyword with no input still renders (empty {input})", () => {
+		expect(decideSubmit(ctx({ trimmed: "translate", presets }))).toEqual({
+			kind: "agent",
+			prompt: "Translate to English: ",
+		});
+	});
+
+	it("a non-preset query is unaffected", () => {
+		expect(decideSubmit(ctx({ trimmed: "what is rust?", presets })).kind).toBe("quick-ai");
+	});
+
+	it("preset matching is case-insensitive on the keyword", () => {
+		expect(decideSubmit(ctx({ trimmed: "TRANSLATE hola", presets })).kind).toBe("agent");
 	});
 });
 

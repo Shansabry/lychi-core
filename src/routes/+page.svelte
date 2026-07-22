@@ -36,6 +36,7 @@ import {
 	fuzzyPathCompletions,
 	getActiveWindowStrategy,
 	getAgentPlan,
+	getAiPresets,
 	getAiStatus,
 	getCompletions,
 	getContext,
@@ -262,6 +263,9 @@ let mediaPlayers: TrackInfo[] = $state([]);
 // placeholder suggestions so we never advertise AI-only actions to a user who
 // has no key (they'd silently web-search instead).
 let aiEnabled = $state(false);
+// AI presets (keyword → template). Loaded on mount; typing `<keyword> <text>`
+// renders the template and sends it to the agent. See submit-router.
+let aiPresets: { keyword: string; template: string }[] = $state([]);
 let envContext: EnvironmentContext | null = $state(null);
 let contextLoading = $state(false);
 let contextLoadingTimer: ReturnType<typeof setTimeout> | undefined;
@@ -549,6 +553,9 @@ onMount(() => {
 	getAiStatus().then((s) => {
 		aiEnabled = s.has_ai_router;
 	});
+	getAiPresets().then((ps) => {
+		aiPresets = ps.map((p) => ({ keyword: p.keyword, template: p.template }));
+	});
 	getMountPoints().then((mounts) => {
 		mountPoints = mounts;
 	});
@@ -685,6 +692,11 @@ onMount(() => {
 			notesOpen = false;
 			// Fresh AI conversation each summon (decision: reset-every-summon).
 			resetChat();
+			// Keep AI presets fresh (cheap) — guarantees they're loaded before the
+			// user types a preset keyword, and picks up any Settings edits.
+			getAiPresets().then((ps) => {
+				aiPresets = ps.map((p) => ({ keyword: p.keyword, template: p.template }));
+			});
 			// Clear stale context immediately — fast path re-populates if same window,
 			// fresh gather populates for changed windows. Prevents flash of wrong context.
 			envContext = null;
@@ -1101,6 +1113,7 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 		completions,
 		completionIndex,
 		aiEnabled,
+		presets: aiPresets,
 	});
 
 	switch (action.kind) {
@@ -1939,7 +1952,14 @@ async function handleDismiss() {
 			<MediaPanel visible={mediaOpen} ondismiss={() => { mediaOpen = false; }} players={mediaPlayers} />
 		</div>
 		<div class="settings-wrapper" class:panel-hidden={!settingsOpen}>
-			<SettingsPanel ondismiss={() => { settingsOpen = false; }} />
+			<SettingsPanel
+				ondismiss={() => { settingsOpen = false; }}
+				onpresetchange={() => {
+					getAiPresets().then((ps) => {
+						aiPresets = ps.map((p) => ({ keyword: p.keyword, template: p.template }));
+					});
+				}}
+			/>
 		</div>
 		{#if aiActive}
 			<AiAnswer

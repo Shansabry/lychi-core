@@ -13,7 +13,6 @@ use lychi_core::action_registry::handlers::browse::BrowseHandler;
 use lychi_core::action_registry::handlers::calc::CalcHandler;
 use lychi_core::action_registry::handlers::clear::ClearHandler;
 use lychi_core::action_registry::handlers::clipboard::ClipboardHandler;
-use lychi_core::action_registry::handlers::clipboard_transform::ClipboardTransformHandler;
 use lychi_core::action_registry::handlers::color::ColorHandler;
 use lychi_core::action_registry::handlers::context_debug::ContextDebugHandler;
 use lychi_core::action_registry::handlers::define::DefineHandler;
@@ -40,7 +39,6 @@ use lychi_core::action_registry::handlers::sysinfo::SysInfoHandler;
 use lychi_core::action_registry::handlers::system::SystemCommand;
 use lychi_core::action_registry::handlers::time::TimeHandler;
 use lychi_core::action_registry::handlers::timer::{TimerHandler, TimerState};
-use lychi_core::action_registry::handlers::translate::TranslateHandler;
 use lychi_core::action_registry::handlers::unicode::UnicodeHandler;
 use lychi_core::action_registry::handlers::url_open::UrlOpen;
 use lychi_core::action_registry::handlers::weather::WeatherHandler;
@@ -195,6 +193,13 @@ impl AppState {
             tracing::error!("Failed to seed settings: {e}");
         }
 
+        // Seed the built-in AI presets (translate/summarize/rewrite) on first run.
+        // Idempotent: only installs a keyword that isn't already present, so it
+        // never clobbers user edits. Users can add/edit/delete any preset.
+        if let Err(e) = lychi_core::ai_presets::store::AiPresetsStore::new().seed_builtins(&db) {
+            tracing::error!("Failed to seed AI presets: {e}");
+        }
+
         // Sync TOML hand-edits → DB (if user edited TOML between launches)
         match lychi_core::config::db::load_syncable(&db) {
             Ok(db_settings) => {
@@ -324,15 +329,12 @@ impl AppState {
         // handler). Single source of truth for mode dispatch is the core factory.
         let ai_provider: Option<Arc<dyn AiProvider>> = Self::build_ai_provider(&config.ai);
 
-        // NOTE: `ask` and `weather_ask` were deleted in the AI rewrite — the
-        // streaming agent (fork card / full chat) subsumes AI Q&A, and the
-        // deterministic `weather` handler is a tool the agent can call. The
-        // `translate` / `convert` AI transforms are kept until Phase 3 re-homes
-        // them as prompt presets (the one sanctioned temporary keep).
-        registry.register(Box::new(ClipboardTransformHandler::new(
-            ai_provider.clone(),
-        )));
-        registry.register(Box::new(TranslateHandler::new(ai_provider.clone())));
+        // NOTE: the old AI handlers (`ask`, `weather_ask`, `translate`, `convert`)
+        // were all deleted in the AI rewrite. AI Q&A is the streaming agent (fork
+        // card / full chat); `translate` / `summarize` / `rewrite` / `convert` are
+        // now AI PRESETS (Phase 3) — user-editable prompt templates that stream a
+        // fast answer, replacing the slow buffered handlers. `ai_provider` below
+        // feeds the router/agent, not any handler.
 
         // Custom search-engine shortcuts ("bangs") — user-extensible via config.
         let bang_keywords: Vec<String> = config.commands.search_engines.keys().cloned().collect();

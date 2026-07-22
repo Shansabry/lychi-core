@@ -40,6 +40,10 @@ pub const SNIPPETS: TableDefinition<&str, &[u8]> = TableDefinition::new("snippet
 /// running countdowns/stopwatches survive an app restart (rehydrated on boot).
 pub const TIMERS: TableDefinition<&str, &[u8]> = TableDefinition::new("timers");
 
+/// AI presets: key = UUID v7 string, value = postcard-serialized AiPresetEntry.
+/// User-defined saved prompt templates invoked by keyword (Phase 3 AI Commands).
+pub const AI_PRESETS: TableDefinition<&str, &[u8]> = TableDefinition::new("ai_presets");
+
 /// Open (or create) the redb database at the given path.
 /// If the file exists but uses an older format version, back it up and recreate.
 pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
@@ -69,6 +73,7 @@ pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
     txn.open_table(REMINDERS)?;
     txn.open_table(SNIPPETS)?;
     txn.open_table(TIMERS)?;
+    txn.open_table(AI_PRESETS)?;
     txn.commit()?;
 
     Ok(Arc::new(db))
