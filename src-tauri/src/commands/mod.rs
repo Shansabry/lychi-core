@@ -1,5 +1,9 @@
 pub mod agent;
+pub mod agent_chat;
 pub mod ai;
+pub mod ai_chat;
+pub mod ai_history;
+pub mod ai_presets;
 pub mod aliases;
 pub mod config;
 pub mod context;

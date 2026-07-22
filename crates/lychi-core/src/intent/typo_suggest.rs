@@ -14,6 +14,12 @@ const MAX_DISTANCE: usize = 2;
 /// Minimum word length to consider for typo matching (skip very short inputs).
 const MIN_WORD_LEN: usize = 3;
 
+/// Lower bound for app-name "Did you mean" suggestions. A fuzzy app score in
+/// `[APP_SUGGEST_FLOOR, AUTO_LAUNCH_THRESHOLD)` is confident enough to OFFER the
+/// app ("spoti" → Spotify) but not to auto-launch it. Above the threshold the
+/// resolver already launches directly; below the floor it's too weak to suggest.
+const APP_SUGGEST_FLOOR: f32 = 0.55;
+
 /// Known multi-word patterns (checked as full phrases after lowering).
 const PHRASES: &[(&str, &str)] = &[
     ("time in", "time in <city>"),
@@ -115,6 +121,32 @@ pub fn suggest(raw: &str, registry: &ActionRegistry) -> Option<CompletionItem> {
                 thumb_b64: None,
                 ..Default::default()
             });
+        }
+    }
+
+    // 3. App-name near-miss (e.g. "spoti" → Spotify, "chrom" → Google Chrome).
+    //    A single-word query that fuzzy-matches an installed app in the SUGGEST
+    //    band — confident enough to offer, but below AUTO_LAUNCH_THRESHOLD so we
+    //    don't silently launch the wrong app. Only fires for an unknown first
+    //    word (a real command keyword is handled above).
+    if words.len() == 1 && first.len() >= MIN_WORD_LEN && !is_known {
+        if let Some((id, score)) = crate::desktop_apps::app_index().best_match(first)
+            && (APP_SUGGEST_FLOOR..crate::desktop_apps::AUTO_LAUNCH_THRESHOLD).contains(&score)
+        {
+            let name = crate::desktop_apps::app_index().entry(id).name.clone();
+            // Skip if the query already IS the app name (case-insensitive) — no typo.
+            if name.to_lowercase() != first {
+                let suggestion = format!("open {name}");
+                return Some(CompletionItem {
+                    label: format!("Did you mean: {suggestion}?"),
+                    icon_path: Some("__none__".to_string()),
+                    score: 90,
+                    description: Some(suggestion),
+                    reason: None,
+                    thumb_b64: None,
+                    ..Default::default()
+                });
+            }
         }
     }
 

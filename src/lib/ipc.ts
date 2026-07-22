@@ -10,13 +10,17 @@
 import type {
 	AgentPlan,
 	AiConfig,
+	AiPresetItem,
 	AiStatus,
 	AiTestResult,
 	AllNotes,
 	AllSettings,
+	ChatMessage,
 	CommandInfo,
 	CommandsConfig,
 	CompletionItem,
+	Conversation,
+	ConversationSummary,
 	CreditBalance,
 	DirEntry,
 	EnvironmentContext,
@@ -25,10 +29,10 @@ import type {
 	GeneralConfig,
 	HotkeyStatus,
 	KeybindingsConfig,
+	LocalModelInfo,
 	MountPoint,
 	NoteItem,
 	OllamaModelInfo,
-	LocalModelInfo,
 	PrivacyConfig,
 	ProjectsConfig,
 	ReminderItem,
@@ -45,16 +49,20 @@ export type {
 	AgentPlan,
 	AgentStep,
 	AiConfig,
+	AiPresetItem,
 	AiStatus,
 	AiTestResult,
 	AliasItem,
 	AllNotes,
 	AllSettings,
+	ChatMessage,
 	ClipboardContentType,
 	CommandInfo,
 	CommandsConfig,
 	CompletionItem,
 	ContainerInfo,
+	Conversation,
+	ConversationSummary,
 	CreditBalance,
 	DirChild,
 	DirEntry,
@@ -66,11 +74,11 @@ export type {
 	GitContext,
 	HotkeyStatus,
 	KeybindingsConfig,
+	LocalModelInfo,
 	MountPoint,
 	NetworkContext,
 	NoteItem,
 	OllamaModelInfo,
-	LocalModelInfo,
 	OutputType,
 	PlaybackStatus,
 	PrivacyConfig,
@@ -118,6 +126,29 @@ export interface StepEvent {
 	step_index: number;
 	status: "running" | "done" | "failed";
 	result?: CommandResult | null;
+}
+
+/**
+ * A `lychi://agent-event` payload — the tool-calling agent's unified stream. Kind
+ * discriminates the shape (mirrors the Rust `AgentEventDto`; hand-written here
+ * because tauri-specta only exports types reachable from command signatures, and
+ * this rides an event). Kinds: turn_started | text | reasoning | tool_started |
+ * tool_completed | tool_failed | awaiting_approval | final | stopped | error.
+ */
+export interface AgentEventDto {
+	gen: number;
+	kind: string;
+	text?: string;
+	call_id?: string;
+	tool_name?: string;
+	tool_args?: string;
+	reason?: string;
+	step: number | null;
+	/** final: the answer was cut off at the token cap. */
+	truncated?: boolean;
+	/** usage: token counts for the turn. */
+	input_tokens?: number;
+	output_tokens?: number;
 }
 
 export interface BrowserContext {
@@ -195,6 +226,16 @@ export async function getHideOnBlur(): Promise<boolean> {
 export async function getCompletions(input: string): Promise<CompletionItem[]> {
 	if (!isTauri()) return [];
 	return unwrap(await commands.getCompletions(input));
+}
+
+/**
+ * A "Did you mean: X?" correction for a near-miss single word (e.g. "spoti" →
+ * "open Spotify"), or null. Used on Enter before falling to the AI, so an app
+ * typo is corrected instead of sent to the model. Returns the corrected command.
+ */
+export async function suggestCorrection(input: string): Promise<string | null> {
+	if (!isTauri()) return null;
+	return unwrap(await commands.suggestCorrection(input));
 }
 
 export async function getCommandCatalog(): Promise<CommandInfo[]> {
@@ -299,17 +340,17 @@ export async function getAllSettings(): Promise<AllSettings> {
 				youtube_url: "https://www.youtube.com/results?search_query=",
 				shell: "/bin/bash",
 				terminal: "",
-					extra_terminals: [],
-					extra_ides: [],
+				extra_terminals: [],
+				extra_ides: [],
 				terminal_routing: "manual",
 				search_engines: {},
 			},
-				projects: {
-					directories: [],
-					extra_strong_markers: [],
-					extra_soft_markers: [],
-					pinned_workspace: null,
-				},
+			projects: {
+				directories: [],
+				extra_strong_markers: [],
+				extra_soft_markers: [],
+				pinned_workspace: null,
+			},
 			privacy: { allow_ip_geolocation: false, allow_public_ip: false },
 			keybindings: {
 				toggle_history: "Ctrl+1",
@@ -542,6 +583,35 @@ export async function checkAiHealth(): Promise<boolean> {
 	return unwrap(await commands.checkAiHealth());
 }
 
+/** Cancel any in-flight AI chat stream. */
+export async function cancelAiChat(): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.cancelAiChat());
+}
+
+/**
+ * Start a tool-calling agent chat (Phase 2). Seeds a session from a system +
+ * user prompt and drives the coordinator loop; progress arrives via the
+ * `lychi://agent-event` event. May pause on a destructive tool (an
+ * `awaiting_approval` event) — resolve with `agentApprove`.
+ */
+export async function agentChatStart(
+	system: string,
+	user: string,
+	fresh: boolean,
+	withTools: boolean,
+	generation: number,
+): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.agentChatStart(system, user, fresh, withTools, generation));
+}
+
+/** Approve (or reject) a pending destructive tool call, resuming the agent. */
+export async function agentApprove(approve: boolean, generation: number): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.agentApprove(approve, generation));
+}
+
 export async function testAiConnection(): Promise<AiTestResult> {
 	if (!isTauri()) return { ok: false, error: "Not running in Tauri" };
 	return unwrap(await commands.testAiConnection());
@@ -752,11 +822,80 @@ export async function deleteSnippet(id: string): Promise<void> {
 	unwrap(await commands.deleteSnippet(id));
 }
 
+// --- AI Presets (AI Commands) ---
+
+export async function getAiPresets(): Promise<AiPresetItem[]> {
+	if (!isTauri()) return [];
+	return unwrap(await commands.getAiPresets());
+}
+
+export async function addAiPreset(
+	keyword: string,
+	name: string,
+	template: string,
+): Promise<AiPresetItem> {
+	if (!isTauri()) return { id: "", keyword, name, template, created_at: 0, updated_at: 0 };
+	return unwrap(await commands.addAiPreset(keyword, name, template));
+}
+
+export async function updateAiPreset(
+	id: string,
+	keyword: string,
+	name: string,
+	template: string,
+): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.updateAiPreset(id, keyword, name, template));
+}
+
+export async function deleteAiPreset(id: string): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.deleteAiPreset(id));
+}
+
+// --- AI Conversation History (recall) ---
+
+export async function getConversations(): Promise<ConversationSummary[]> {
+	if (!isTauri()) return [];
+	return unwrap(await commands.getConversations());
+}
+
+export async function getConversation(id: string): Promise<Conversation | null> {
+	if (!isTauri()) return null;
+	return unwrap(await commands.getConversation(id));
+}
+
+export async function deleteConversation(id: string): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.deleteConversation(id));
+}
+
+export async function clearConversations(): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.clearConversations());
+}
+
+/** Prime the agent session with a stored conversation so it can be continued. */
+export async function loadConversation(id: string): Promise<Conversation | null> {
+	if (!isTauri()) return null;
+	return unwrap(await commands.loadConversation(id));
+}
+
 // --- Context Awareness ---
 
 export async function getContext(): Promise<EnvironmentContext | null> {
 	if (!isTauri()) return null;
 	return unwrap(await commands.getContext());
+}
+
+/**
+ * Read the PRIMARY selection — text the user has highlighted (not copied) in the
+ * focused window. Returns null if nothing is selected. Used to auto-fill AI
+ * commands: `summarize` with no typed text acts on the selection.
+ */
+export async function readSelection(): Promise<string | null> {
+	if (!isTauri()) return null;
+	return unwrap(await commands.readSelection());
 }
 
 // --- File Preview ---

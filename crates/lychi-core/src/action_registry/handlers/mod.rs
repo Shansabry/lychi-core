@@ -1,14 +1,12 @@
 pub mod aliases;
 pub mod app_control;
 pub mod app_launcher;
-pub mod ask;
 pub mod bang;
 pub mod bookmarks;
 pub mod browse;
 pub mod calc;
 pub mod clear;
 pub mod clipboard;
-pub mod clipboard_transform;
 pub mod color;
 pub mod context_debug;
 pub mod define;
@@ -41,11 +39,9 @@ pub mod system;
 pub mod terminal_send;
 pub mod time;
 pub mod timer;
-pub mod translate;
 pub mod unicode;
 pub mod url_open;
 pub mod weather;
-pub mod weather_ask;
 pub mod web_search;
 pub mod window_switcher;
 #[cfg(target_os = "linux")]

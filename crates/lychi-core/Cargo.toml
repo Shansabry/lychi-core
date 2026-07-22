@@ -56,6 +56,13 @@ zbus = { version = "5", features = ["tokio"], optional = true }
 # the mpris/local-ai features. Tiny crate.
 futures-util = "0.3"
 futures-core = { version = "0.3", optional = true }
+# Streaming provider seam: ReceiverStream (sync spawn_blocking → async Stream
+# bridge for the local engine) + CancellationToken (uniform cancel across all
+# providers; the local spawn_blocking loop can't be aborted by drop, so it polls
+# the token each token — see providers/mod.rs StreamEvent seam).
+tokio-stream = "0.1"
+tokio-util = "0.7"
+async-stream = "0.3"
 # Local AI (feature = "local-ai"): CPU inference via statically-linked llama.cpp.
 # default-features off = CPU-only, static (no CUDA/Vulkan/BLAS/OpenMP), so the
 # AppImage stays a single self-contained binary. Built with an AVX2 baseline

@@ -32,7 +32,10 @@ use crate::error::LychiError;
 use crate::intent::prompt;
 use crate::providers::local_models::{self, ChatFormat, ModelSpec};
 
-use super::{AiProvider, AiResponse, AiRoute};
+use super::{
+    AiProvider, AiResponse, AiRoute, CancellationToken, ChatMessage, EventStream, Role, StopReason,
+    StreamEvent, ToolDef,
+};
 
 /// The one-time, process-global llama.cpp backend. `LlamaBackend::init()` sets up
 /// ggml/llama globals and must be called exactly once for the process lifetime.
@@ -187,17 +190,23 @@ fn run_generation(
     max_tokens: u32,
     grammar: Option<&str>,
 ) -> Result<String, LychiError> {
-    generate_inner(model, system, user, max_tokens, grammar).map(|(out, _)| out)
+    generate_inner(model, system, user, max_tokens, grammar, None).map(|(out, _)| out)
 }
 
 /// The generation core, returning `(text, decoded_token_count)` so the benchmark
 /// can compute an exact tokens/sec. `run_generation` is the thin public wrapper.
+///
+/// `on_delta`, when `Some`, is called with each newly-decoded text fragment as it
+/// generates (streaming). Returning `false` from it requests cancellation — the
+/// loop stops and returns what it has. Grammar-constrained calls (routing / tool
+/// calls) pass `None` (the JSON isn't meaningful to stream token-by-token).
 fn generate_inner(
     model: &LoadedModel,
     system: &str,
     user: &str,
     max_tokens: u32,
     grammar: Option<&str>,
+    mut on_delta: Option<&mut dyn FnMut(&str) -> bool>,
 ) -> Result<(String, usize), LychiError> {
     let _guard = INFER_LOCK
         .lock()
@@ -279,6 +288,9 @@ fn generate_inner(
     let mut bytes: Vec<u8> = Vec::new();
     let mut n_cur = batch.n_tokens();
     let mut decoded = 0usize;
+    // How many chars of the decoded text we've already streamed to `on_delta`,
+    // so each step emits only the newly-produced suffix.
+    let mut emitted_chars = 0usize;
 
     for _ in 0..max_tokens {
         // Sample from the logits of the last decoded position. `sample()` already
@@ -301,7 +313,29 @@ fn generate_inner(
         // Stop-string guard (belt-and-suspenders alongside the EOG check).
         let text = String::from_utf8_lossy(&bytes);
         if let Some(idx) = stops.iter().filter_map(|s| text.find(s)).min() {
+            // Flush any not-yet-emitted text before the stop marker.
+            if let Some(cb) = on_delta.as_deref_mut() {
+                let final_text = &text[..idx];
+                if let Some(tail) = suffix_from_char(final_text, emitted_chars) {
+                    cb(tail);
+                }
+            }
             return Ok((text[..idx].trim().to_string(), decoded));
+        }
+
+        // Stream the newly-decoded suffix (only complete chars — a token can
+        // split a codepoint, so `from_utf8_lossy` may end in a replacement char
+        // that a later token completes; emitting on char boundaries avoids
+        // showing the � placeholder).
+        if let Some(cb) = on_delta.as_deref_mut()
+            && let Some(delta) = suffix_from_char(&text, emitted_chars)
+            && !delta.is_empty()
+        {
+            emitted_chars = text.chars().count();
+            if !cb(delta) {
+                // Cancellation requested — return what we have.
+                return Ok((text.trim().to_string(), decoded));
+            }
         }
 
         // Feed the sampled token back in for the next step.
@@ -314,7 +348,25 @@ fn generate_inner(
             .map_err(|e| LychiError::Ai(format!("decode: {e}")))?;
     }
 
+    // Flush any final not-yet-emitted text.
+    if let Some(cb) = on_delta.as_deref_mut() {
+        let text = String::from_utf8_lossy(&bytes);
+        if let Some(tail) = suffix_from_char(&text, emitted_chars) {
+            cb(tail);
+        }
+    }
+
     Ok((String::from_utf8_lossy(&bytes).trim().to_string(), decoded))
+}
+
+/// Return the substring of `s` starting at char index `from`, or `None` if `from`
+/// is at/after the end. Used to stream only the newly-generated suffix.
+fn suffix_from_char(s: &str, from: usize) -> Option<&str> {
+    let byte_idx = s.char_indices().nth(from).map(|(i, _)| i);
+    match byte_idx {
+        Some(i) => Some(&s[i..]),
+        None => None,
+    }
 }
 
 /// The bundled local-AI provider. Holds the resolved model spec + gguf path;
@@ -362,6 +414,7 @@ impl LocalClient {
         .await
         .map_err(|e| LychiError::Ai(format!("inference task panicked: {e}")))?
     }
+
 }
 
 /// How to constrain the model's output for a given call.
@@ -373,17 +426,61 @@ enum GrammarMode {
     /// the model from inventing a nonexistent action — the biggest quality win for
     /// small models, and correct for any model.
     Route(Vec<String>),
+    /// Tool-calling (the `chat` primitive): the output is EITHER a tool call
+    /// `{"tool": <one of these>, "args": "..."}` OR a final answer
+    /// `{"answer": "..."}`. The enum-constrained `tool` name means the small
+    /// local model can only pick a real tool; the two-way union lets it also just
+    /// answer. One tool call per turn — the coordinator loops.
+    ///
+    /// TODO(local-tools): the local `chat` impl doesn't yet drive this grammar —
+    /// local AI currently answers (tools=[]) but can't call tools. Wiring this is
+    /// the remaining piece of local-model agent support; `tool_grammar` + this
+    /// variant are the scaffolding, kept intentionally.
+    #[allow(dead_code)]
+    Tool(Vec<String>),
 }
 
 impl GrammarMode {
     /// Build the GBNF grammar string for this mode (None = free text). The
-    /// route grammar is cached per action-set so we don't rebuild it every call.
+    /// route/tool grammars are cached per name-set so we don't rebuild each call.
     fn grammar(&self) -> Result<Option<String>, LychiError> {
         match self {
             GrammarMode::Free => Ok(None),
             GrammarMode::Route(actions) => Ok(Some(route_grammar(actions)?)),
+            GrammarMode::Tool(tools) => Ok(Some(tool_grammar(tools)?)),
         }
     }
+}
+
+/// Build a GBNF grammar for a tool-calling response: EITHER
+/// `{"tool": (<enum of tool names>), "args": <string>}` (call a tool) OR
+/// `{"answer": <string>}` (final answer). `tool` is enum-constrained to real
+/// tool names. Cached per tool-set. Empty tool set → answer-only grammar.
+fn tool_grammar(tools: &[String]) -> Result<String, LychiError> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, String>>> = OnceLock::new();
+    let key = tools.join("\u{1}");
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some(g) = cache.lock().ok().and_then(|c| c.get(&key).cloned()) {
+        return Ok(g);
+    }
+
+    let answer_schema = r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}"#;
+    let schema = if tools.is_empty() {
+        answer_schema.to_string()
+    } else {
+        let enum_json = serde_json::to_string(tools)
+            .map_err(|e| LychiError::Ai(format!("build tool schema: {e}")))?;
+        let call_schema = format!(
+            r#"{{"type":"object","properties":{{"tool":{{"type":"string","enum":{enum_json}}},"args":{{"type":"string"}}}},"required":["tool","args"],"additionalProperties":false}}"#
+        );
+        format!(r#"{{"anyOf":[{call_schema},{answer_schema}]}}"#)
+    };
+    let grammar = llama_cpp_2::json_schema_to_grammar(&schema)
+        .map_err(|e| LychiError::Ai(format!("build tool grammar: {e}")))?;
+    if let Ok(mut c) = cache.lock() {
+        c.insert(key, grammar.clone());
+    }
+    Ok(grammar)
 }
 
 /// Build a GBNF grammar for a routing response constrained to the given action
@@ -467,7 +564,134 @@ impl AiProvider for LocalClient {
         // Free-form answer → no grammar constraint.
         self.generate(system_prompt, question, GrammarMode::Free).await
     }
+
+    /// Streaming, grammar-constrained tool-calling chat as a normalized event
+    /// stream. The bundled small model is single-turn oriented, so the
+    /// conversation is flattened into a system + user prompt. With no tools it
+    /// streams free-text `TextDelta`s; with tools it runs the tool-grammar (one
+    /// call OR an answer per turn — the coordinator loops).
+    ///
+    /// The sync llama.cpp loop runs on `spawn_blocking` and pushes events over a
+    /// bounded channel drained by a `ReceiverStream` (the standard sync→async
+    /// bridge). Cancellation: `spawn_blocking` can't be aborted by drop, so the
+    /// loop polls `cancel` each token; a dropped consumer is detected because
+    /// `blocking_send` returns `Err` once the receiver is gone.
+    fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDef],
+        cancel: CancellationToken,
+    ) -> EventStream {
+        use futures_util::StreamExt as _;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let (system, user) = flatten_conversation(messages);
+        let spec = self.spec;
+        let path = self.gguf_path.clone();
+        let max = self.max_tokens;
+        let model_id = self.spec.id.to_string();
+        let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+        let has_tools = !tool_names.is_empty();
+
+        // Bounded channel → backpressure (the generation thread blocks on a slow
+        // consumer instead of buffering unbounded tokens).
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamEvent, LychiError>>(16);
+
+        tokio::task::spawn_blocking(move || {
+            // Load (or reuse resident) weights.
+            let model = match load_resident(spec, &path) {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    return;
+                }
+            };
+            let _ = tx.blocking_send(Ok(StreamEvent::MessageStart { model: model_id.clone() }));
+
+            if has_tools {
+                // Tool mode: grammar-constrain to a tool call OR an answer (one
+                // shot — grammar JSON isn't meaningful to stream token-by-token).
+                let grammar = match tool_grammar(&tool_names) {
+                    Ok(g) => Some(g),
+                    Err(e) => { let _ = tx.blocking_send(Err(e)); return; }
+                };
+                let raw = match generate_inner(&model, &system, &user, max, grammar.as_deref(), None) {
+                    Ok((out, _)) => out,
+                    Err(e) => { let _ = tx.blocking_send(Err(e)); return; }
+                };
+                tracing::debug!(provider = "local", model = %model_id, "[ai] tool response: {raw}");
+                match serde_json::from_str::<serde_json::Value>(&raw) {
+                    Ok(v) if v["tool"].is_string() => {
+                        let id = format!("local-{model_id}");
+                        let name = v["tool"].as_str().unwrap_or_default().to_string();
+                        let args = v["args"].as_str().unwrap_or_default().to_string();
+                        let _ = tx.blocking_send(Ok(StreamEvent::ToolCallStart { id: id.clone(), name: name.clone() }));
+                        let _ = tx.blocking_send(Ok(StreamEvent::ToolCallComplete { id, name, args }));
+                        let _ = tx.blocking_send(Ok(StreamEvent::Done { stop_reason: StopReason::ToolUse, usage: None }));
+                    }
+                    Ok(v) => {
+                        let answer = v["answer"].as_str().unwrap_or(&raw).to_string();
+                        let _ = tx.blocking_send(Ok(StreamEvent::TextDelta(answer)));
+                        let _ = tx.blocking_send(Ok(StreamEvent::Done { stop_reason: StopReason::EndTurn, usage: None }));
+                    }
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(LychiError::Ai(format!("local tool JSON parse: {e} (raw: {raw})"))));
+                    }
+                }
+                return;
+            }
+
+            // Pure chat: stream free text. `on_delta` pushes each fragment; it
+            // returns false to stop when the consumer is gone OR cancel fired.
+            let mut cb = |delta: &str| {
+                if cancel.is_cancelled() {
+                    return false;
+                }
+                // blocking_send Err ⇒ ReceiverStream dropped ⇒ stop generating.
+                tx.blocking_send(Ok(StreamEvent::TextDelta(delta.to_string()))).is_ok()
+            };
+            match generate_inner(&model, &system, &user, max, None, Some(&mut cb)) {
+                Ok(_) => {
+                    let _ = tx.blocking_send(Ok(StreamEvent::Done { stop_reason: StopReason::EndTurn, usage: None }));
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                }
+            }
+        });
+
+        ReceiverStream::new(rx).boxed()
+    }
 }
+
+/// Flatten a chat history into a (system, user) pair for the single-turn local
+/// model. System messages are joined into the system prompt; the rest of the
+/// conversation (user/assistant/tool turns) is rendered into the user slot as a
+/// transcript so the model still sees context.
+fn flatten_conversation(messages: &[ChatMessage]) -> (String, String) {
+    let mut system = Vec::new();
+    let mut transcript = Vec::new();
+    for m in messages {
+        match m.role {
+            Role::System => system.push(m.content.clone()),
+            Role::User => transcript.push(format!("User: {}", m.content)),
+            Role::Assistant => {
+                if !m.content.is_empty() {
+                    transcript.push(format!("Assistant: {}", m.content));
+                }
+                for tc in &m.tool_calls {
+                    transcript.push(format!("Assistant called tool `{}` with: {}", tc.name, tc.args));
+                }
+            }
+            Role::Tool => {
+                let tag = if m.is_error { "Tool error" } else { "Tool result" };
+                transcript.push(format!("{tag}: {}", m.content));
+            }
+        }
+    }
+    (system.join("\n\n"), transcript.join("\n"))
+}
+
 
 #[cfg(test)]
 mod bench {
@@ -512,6 +736,7 @@ mod bench {
                 "Write a detailed paragraph about the history of the Eiffel Tower.",
                 128,
                 None,
+                None,
             )
             .unwrap_or_else(|e| (format!("<gen failed: {e}>"), 0));
             let gen_s = t1.elapsed().as_secs_f64();
@@ -549,7 +774,7 @@ mod bench {
             .map(|s| s.to_string())
             .collect();
         let grammar = route_grammar(&actions).expect("grammar builds");
-        let (out, _) = generate_inner(&model, &big, "open firefox", 48, Some(&grammar))
+        let (out, _) = generate_inner(&model, &big, "open firefox", 48, Some(&grammar), None)
             .expect("large prompt must not abort");
         println!("route-grammar output: {out:?}");
         // The grammar guarantees a parseable object with a KNOWN action_id.
@@ -570,5 +795,41 @@ mod bench {
         let actions: Vec<String> = ["open", "ask", "web"].iter().map(|s| s.to_string()).collect();
         let g = route_grammar(&actions).expect("route grammar builds");
         assert!(g.contains("open") && g.contains("ask") && g.contains("web"));
+    }
+
+    #[test]
+    fn tool_grammar_constrains_to_tool_or_answer() {
+        // Pure (no model): the tool grammar must mention the tool names and allow
+        // an answer branch. Empty tool set → answer-only.
+        let tools: Vec<String> = ["weather", "open"].iter().map(|s| s.to_string()).collect();
+        let g = tool_grammar(&tools).expect("tool grammar builds");
+        assert!(g.contains("weather") && g.contains("open"), "tool names constrained");
+        assert!(g.contains("answer"), "answer branch present");
+
+        let empty: Vec<String> = vec![];
+        let g0 = tool_grammar(&empty).expect("answer-only grammar builds");
+        assert!(g0.contains("answer"));
+    }
+
+    #[test]
+    fn flatten_conversation_renders_history_and_system() {
+        use crate::providers::{ChatMessage, Role, ToolCall};
+        let msgs = vec![
+            ChatMessage::system("You are helpful."),
+            ChatMessage::user("open firefox"),
+            ChatMessage {
+                role: Role::Assistant,
+                content: "Opening it".into(),
+                tool_call_id: None,
+                tool_calls: vec![ToolCall { id: "t1".into(), name: "open".into(), args: "firefox".into() }],
+                is_error: false,
+            },
+            ChatMessage::tool_result("t1", "opened", false),
+        ];
+        let (system, transcript) = flatten_conversation(&msgs);
+        assert_eq!(system, "You are helpful.");
+        assert!(transcript.contains("User: open firefox"));
+        assert!(transcript.contains("called tool `open`"));
+        assert!(transcript.contains("Tool result: opened"));
     }
 }

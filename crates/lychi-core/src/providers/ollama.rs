@@ -7,7 +7,10 @@ use std::time::Duration;
 use crate::error::LychiError;
 use crate::intent::prompt;
 
-use super::{AiProvider, AiResponse, AiRoute};
+use super::wire::{AuthStyle, Dialect, WireClient};
+use super::{
+    AiProvider, AiResponse, AiRoute, CancellationToken, ChatMessage, EventStream, ToolDef,
+};
 
 /// Model info returned by Ollama's `/api/tags` endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
@@ -181,6 +184,25 @@ impl AiProvider for OllamaClient {
         question: &str,
     ) -> Result<String, LychiError> {
         self.call_chat(system_prompt, question).await
+    }
+
+    /// Streaming chat: Ollama is just the OpenAI dialect against its local
+    /// endpoint, with no auth. The whole flow lives in `WireClient`.
+    fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDef],
+        cancel: CancellationToken,
+    ) -> EventStream {
+        WireClient::new(
+            self.http.clone(),
+            Dialect::OpenAi,
+            format!("{}/v1/chat/completions", self.base_url),
+            self.model.clone(),
+            self.max_tokens,
+            AuthStyle::None,
+        )
+        .stream(messages, tools, cancel)
     }
 }
 

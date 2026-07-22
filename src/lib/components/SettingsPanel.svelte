@@ -17,7 +17,8 @@ import GuideTab from "./settings/GuideTab.svelte";
 import ProjectsTab from "./settings/ProjectsTab.svelte";
 import ShortcutsTab from "./settings/ShortcutsTab.svelte";
 
-let { ondismiss }: { ondismiss: () => void } = $props();
+let { ondismiss, onpresetchange }: { ondismiss: () => void; onpresetchange?: () => void } =
+	$props();
 
 let activeTab: "general" | "ai" | "projects" | "shortcuts" | "guide" | "about" = $state("general");
 let appVersion = $state("");
@@ -175,6 +176,7 @@ function handleKeydown(e: KeyboardEvent) {
 				bind:this={aiTabRef}
 				bind:aiConfig
 				onsaveerror={(msg) => (saveError = msg)}
+				{onpresetchange}
 			/>
 		{:else if activeTab === "projects"}
 			<ProjectsTab

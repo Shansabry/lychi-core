@@ -38,6 +38,9 @@ pub enum LychiError {
     #[error("Snippet error: {0}")]
     Snippet(String),
 
+    #[error("AI preset error: {0}")]
+    AiPreset(String),
+
     #[error("Database error: {0}")]
     Database(String),
 }

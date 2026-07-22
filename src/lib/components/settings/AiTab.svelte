@@ -24,13 +24,17 @@ import {
 	testAiConnection,
 } from "$lib/ipc";
 import Select from "../Select.svelte";
+import AiPresetsTab from "./AiPresetsTab.svelte";
 
 let {
 	aiConfig = $bindable(),
 	onsaveerror,
+	onpresetchange,
 }: {
 	aiConfig: AiConfig;
 	onsaveerror: (msg: string) => void;
+	/** Called when the user adds/edits/deletes a preset (launcher reloads them). */
+	onpresetchange?: () => void;
 } = $props();
 
 let apiKeyInput = $state("");
@@ -54,8 +58,10 @@ let localModels: LocalModelInfo[] = $state([]);
 // The model the user is being warned about before download (warning gate).
 let pendingDownload: LocalModelInfo | null = $state(null);
 // model_id → { downloaded, total, error } while a download is in flight.
-let downloadProgress: Record<string, { downloaded: number; total: number | null; error: string | null }> =
-	$state({});
+let downloadProgress: Record<
+	string,
+	{ downloaded: number; total: number | null; error: string | null }
+> = $state({});
 
 async function refreshLocalModels() {
 	try {
@@ -194,9 +200,7 @@ const showBaseUrl = $derived(
 	currentPreset.editable_url === true || (aiConfig.base_url ?? "").trim() !== "",
 );
 // Effective endpoint shown as a hint: explicit override wins, else preset default.
-const effectiveUrl = $derived(
-	(aiConfig.base_url ?? "").trim() || currentPreset.base_url,
-);
+const effectiveUrl = $derived((aiConfig.base_url ?? "").trim() || currentPreset.base_url);
 
 onMount(() => {
 	initModels(aiConfig.mode);
@@ -516,12 +520,9 @@ export function dismissConfirm() {
 		value={aiConfig.mode}
 		options={[
 			{ value: "disabled", label: "Disabled" },
-			// Lychi Cloud is hidden until lychi-cloud ships (Phase 2.3) —
-			// launch supports BYOK + Ollama only. The entry below only appears
-			// if an existing config still has mode="cloud".
-			...(aiConfig.mode === "cloud"
-				? [{ value: "cloud", label: "Lychi Cloud (coming soon)" }]
-				: []),
+			// Shown but not yet selectable (lychi-cloud ships Phase 2.3). `disabled`
+			// dims it + blocks selection; an existing mode="cloud" config is let through.
+			{ value: "cloud", label: "Lychi Cloud (coming soon)", disabled: !CLOUD_ENABLED && aiConfig.mode !== "cloud" },
 			{ value: "local", label: "Local AI (bundled)" },
 			{ value: "ollama", label: "Ollama (Local)" },
 			{ value: "byo", label: "BYO API Key" },
@@ -698,8 +699,8 @@ export function dismissConfirm() {
 		<input
 			id="ollama-max-tokens"
 			type="number"
-			min="100"
-			max="4000"
+			min="256"
+			max="16000"
 			bind:value={aiConfig.max_tokens}
 			onchange={saveAi}
 		/>
@@ -766,8 +767,8 @@ export function dismissConfirm() {
 		<input
 			id="ai-max-tokens"
 			type="number"
-			min="100"
-			max="2000"
+			min="256"
+			max="16000"
 			bind:value={aiConfig.max_tokens}
 			onchange={saveAi}
 		/>
@@ -808,7 +809,30 @@ export function dismissConfirm() {
 	{@render statusBlock()}
 {/if}
 
+<div class="preset-divider">
+	<span>AI Commands</span>
+</div>
+<AiPresetsTab onchange={onpresetchange} />
+
 <style>
+	.preset-divider {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		margin: 18px 20px 4px;
+		font-family: var(--font-mono);
+		font-size: 11px;
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+		color: var(--fg-muted);
+	}
+	.preset-divider::after {
+		content: "";
+		flex: 1;
+		height: 1px;
+		background: var(--border);
+	}
+
 	.field {
 		display: flex;
 		align-items: center;

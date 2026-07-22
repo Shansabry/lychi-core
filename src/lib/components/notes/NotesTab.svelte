@@ -1,13 +1,7 @@
 <script lang="ts">
 import { ChevronLeft, Plus, X } from "lucide-svelte";
 import type { ScratchItem } from "$lib/ipc";
-import {
-	addNote,
-	addTodo,
-	deleteItem,
-	toggleItem,
-	updateNote,
-} from "$lib/ipc";
+import { addNote, addTodo, deleteItem, toggleItem, updateNote } from "$lib/ipc";
 
 const MAX_NOTE_CHARS = 500;
 
@@ -31,9 +25,7 @@ let todoInput = $state("");
 // Split the unified list for rendering: checklist lines grouped (unchecked
 // first), plain notes shown as openable titles.
 let checklist = $derived(
-	items
-		.filter((i) => i.done !== null)
-		.sort((a, b) => Number(a.done) - Number(b.done)),
+	items.filter((i) => i.done !== null).sort((a, b) => Number(a.done) - Number(b.done)),
 );
 let plainNotes = $derived(items.filter((i) => i.done === null));
 
@@ -92,9 +84,7 @@ async function handleAddTodo() {
 async function handleToggle(id: string) {
 	try {
 		await toggleItem(id);
-		items = items.map((i) =>
-			i.id === id && i.done !== null ? { ...i, done: !i.done } : i,
-		);
+		items = items.map((i) => (i.id === id && i.done !== null ? { ...i, done: !i.done } : i));
 	} catch (err) {
 		console.error("[notes] toggle error:", err);
 	}

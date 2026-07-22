@@ -4,6 +4,7 @@ import {
 	Clock,
 	Lightbulb,
 	LoaderCircle,
+	MessageSquare,
 	Music,
 	Settings,
 	Sparkles,
@@ -20,12 +21,14 @@ let {
 	historyOpen = false,
 	settingsOpen = false,
 	mediaOpen = false,
+	chatHistoryOpen = false,
 	nowPlaying = null,
 	multiplePlayers = false,
 	ontogglehistory,
 	ontogglesettings,
 	ontogglemedia,
 	ontogglenotes,
+	ontogglechathistory = () => {},
 	onshowresult,
 	onshowplan,
 	notesOpen = false,
@@ -43,12 +46,14 @@ let {
 	historyOpen: boolean;
 	settingsOpen: boolean;
 	mediaOpen: boolean;
+	chatHistoryOpen?: boolean;
 	nowPlaying: TrackInfo | null;
 	multiplePlayers: boolean;
 	ontogglehistory: () => void;
 	ontogglesettings: () => void;
 	ontogglemedia: () => void;
 	ontogglenotes: () => void;
+	ontogglechathistory?: () => void;
 	onshowresult: () => void;
 	onshowplan: () => void;
 	notesOpen?: boolean;
@@ -75,12 +80,7 @@ let resultVisible = $derived(
 // pill yields its space so that content is unobstructed; once the slot clears,
 // the pill slides back in. This keeps the busy state legible without crowding.
 let statusBusy = $derived(
-	aiLoading ||
-		routing ||
-		executing ||
-		Boolean(result) ||
-		contextRefreshing ||
-		contextStale,
+	aiLoading || routing || executing || Boolean(result) || contextRefreshing || contextStale,
 );
 
 async function togglePlayPause() {
@@ -208,6 +208,16 @@ async function togglePlayPause() {
 		{#if (result && (result.output || result.error)) || hasPlan}
 			<span class="toolbar-sep"></span>
 		{/if}
+		<button
+			class="bar-icon"
+			class:active={chatHistoryOpen}
+			onmousedown={(e) => e.preventDefault()}
+			onclick={ontogglechathistory}
+			title="AI chat history (type: chat)"
+			tabindex={-1}
+		>
+			<MessageSquare size={14} strokeWidth={1.5} />
+		</button>
 		<button
 			class="bar-icon"
 			class:active={historyOpen}

@@ -2,18 +2,8 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Clipboard, Clock, StickyNote, Timer } from "lucide-svelte";
 import { onMount } from "svelte";
-import type {
-	ReminderItem,
-	ScratchItem,
-	SnippetItem,
-	TimerStatus,
-} from "$lib/ipc";
-import {
-	getAllItems,
-	getReminders,
-	getSnippets,
-	getTimers,
-} from "$lib/ipc";
+import type { ReminderItem, ScratchItem, SnippetItem, TimerStatus } from "$lib/ipc";
+import { getAllItems, getReminders, getSnippets, getTimers } from "$lib/ipc";
 import { invalidateNotes } from "$lib/preloadCache";
 import NotesTab from "./notes/NotesTab.svelte";
 import RemindersTab from "./notes/RemindersTab.svelte";

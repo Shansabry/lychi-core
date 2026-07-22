@@ -34,7 +34,6 @@ pub static COLON_TRIGGERS: &[(&str, &str)] = &[
     ("sn:", "snip"),
     ("tm:", "timer"),
     ("rm:", "reminder"),
-    ("a:", "ask"),
 ];
 
 /// The structural (character-sigil) triggers — input shapes that route without a
@@ -299,14 +298,9 @@ fn try_explicit_prefix(input: &str, registry: &ActionRegistry) -> Option<Route> 
                 Some(("open", args.clone()))
             }
         }
-        // Unit conversion alias — routes to calc handler, unless clipboard transform.
-        "convert" => {
-            if args.starts_with("clipboard") {
-                Some(("clipboard_transform", format!("convert {args}")))
-            } else {
-                Some(("calc", args.clone()))
-            }
-        }
+        // Unit conversion alias — routes to the calc handler. (The old AI
+        // "convert clipboard" transform is now an AI preset, not a handler.)
+        "convert" => Some(("calc", args.clone())),
         // Power commands with trailing args ("shutdown in N") fall through to the
         // structured-phrase step; a bare word routes via the registry (system).
         "shutdown" | "poweroff" => {
@@ -505,7 +499,6 @@ mod tests {
             &[Trigger::keywords(&["win", "window", "windows"])]
         ));
         r.register(h!("resize", &[Trigger::keywords(&["resize"])]));
-        r.register(h!("translate", &[Trigger::keywords(&["translate"])]));
         r.register(h!("qr", &[Trigger::keywords(&["qr"])]));
         r.register(h!("reminder", &[Trigger::keywords(&["reminder"])]));
         r.register(h!("alias", &[Trigger::keywords(&["alias", "aliases"])]));
@@ -634,13 +627,6 @@ mod tests {
             ]
         ));
         r.register(h!(
-            "clipboard_transform",
-            &[
-                Trigger::new(&["summarize"], ArgTransform::Prepend("summarize")),
-                Trigger::new(&["rewrite"], ArgTransform::Prepend("rewrite")),
-            ]
-        ));
-        r.register(h!(
             "packages",
             &[
                 Trigger::new(&["install"], ArgTransform::Prepend("install")),
@@ -706,7 +692,6 @@ mod tests {
             ("cl:", "clip", ""),
             ("m:pause", "media", "pause"),
             ("p:lychi", "project", "lychi"),
-            ("a:what is rust", "ask", "what is rust"),
             ("si:cpu", "sysinfo", "cpu"),
             ("sys:lock", "system", "lock"),
             ("e:fire", "emoji", "fire"),

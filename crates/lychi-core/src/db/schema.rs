@@ -107,6 +107,22 @@ pub struct SnippetEntry {
     pub sync_status: SyncStatus,
 }
 
+/// A user-defined AI prompt preset (Phase 3 "AI Commands"). `keyword` is the
+/// typed shortcut that invokes it; `template` is a prompt with a `{input}`
+/// placeholder replaced by whatever the user typed after the keyword.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AiPresetEntry {
+    pub keyword: String,
+    pub name: String,
+    pub template: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    #[serde(default)]
+    pub deleted_at: Option<u64>,
+    #[serde(default)]
+    pub sync_status: SyncStatus,
+}
+
 /// Persisted timer/stopwatch, so a running countdown survives an app restart.
 ///
 /// The live `Timer` uses a monotonic `Instant` (not persistable across process

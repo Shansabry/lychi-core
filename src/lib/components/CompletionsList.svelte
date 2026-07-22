@@ -6,6 +6,7 @@ import {
 	Folder,
 	Lightbulb,
 	LoaderCircle,
+	MessageSquare,
 	Terminal,
 	TriangleAlert,
 	Zap,
@@ -195,9 +196,10 @@ function formatSize(bytes: number | null | undefined): string {
 		{@const isTerminal = item?.icon_path === "__terminal__"}
 		{@const isInfo = item?.icon_path === "__info__"}
 		{@const isClipImage = item?.icon_path === "__clipboard_image__"}
+		{@const isAiChat = item?.icon_path === "__ai_chat__"}
 		{@const isWeb = item?.label?.startsWith("Search web:")}
 		{@const hideIcon = item?.icon_path === "__none__" || item?.icon_path === "__web__" || isWeb || isSeparator}
-		{@const hasCustomIcon = !!(item?.icon_path && item.icon_path !== "__folder__" && item.icon_path !== "__none__" && item.icon_path !== "__web__" && item.icon_path !== "__history__" && item.icon_path !== "__separator__" && item.icon_path !== "__warning__" && item.icon_path !== "__context__" && item.icon_path !== "__terminal__" && item.icon_path !== "__info__" && item.icon_path !== "__clipboard_image__")}
+		{@const hasCustomIcon = !!(item?.icon_path && item.icon_path !== "__folder__" && item.icon_path !== "__none__" && item.icon_path !== "__web__" && item.icon_path !== "__history__" && item.icon_path !== "__separator__" && item.icon_path !== "__warning__" && item.icon_path !== "__context__" && item.icon_path !== "__terminal__" && item.icon_path !== "__info__" && item.icon_path !== "__clipboard_image__" && item.icon_path !== "__ai_chat__")}
 		{@const noIcon = !item?.icon_path}
 		{@const iconKey = item?.icon_path ?? ""}
 		{@const iconBroken = hasCustomIcon && brokenIcons.has(iconKey)}
@@ -245,6 +247,9 @@ function formatSize(bytes: number | null | undefined): string {
 				</span>
 				<span style:visibility={isInfo ? "visible" : "hidden"} class="icon-slot">
 					<Lightbulb size={20} strokeWidth={1.5} class="icon-info" />
+				</span>
+				<span style:visibility={isAiChat ? "visible" : "hidden"} class="icon-slot">
+					<MessageSquare size={19} strokeWidth={1.5} class="icon-ai-chat" />
 				</span>
 				<span style:visibility={isClipImage && item?.thumb_b64 ? "visible" : "hidden"} class="icon-slot clip-thumb-slot">
 					<img
@@ -541,6 +546,9 @@ function formatSize(bytes: number | null | undefined): string {
 	.icon :global(.icon-context) {
 		color: var(--accent);
 		opacity: 0.8;
+	}
+	.icon :global(.icon-ai-chat) {
+		color: var(--ai);
 	}
 
 	.icon :global(.icon-terminal) {

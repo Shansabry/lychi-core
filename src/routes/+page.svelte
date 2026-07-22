@@ -3,8 +3,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { onMount } from "svelte";
-import AgentPlanPanel from "$lib/components/AgentPlanPanel.svelte";
 import ActionPanel from "$lib/components/ActionPanel.svelte";
+import AgentPlanPanel from "$lib/components/AgentPlanPanel.svelte";
+import AiAnswer from "$lib/components/AiAnswer.svelte";
+import ChatHistoryPanel from "$lib/components/ChatHistoryPanel.svelte";
 import CommandInput from "$lib/components/CommandInput.svelte";
 import CompletionsList from "$lib/components/CompletionsList.svelte";
 import FilePreview from "$lib/components/FilePreview.svelte";
@@ -15,6 +17,7 @@ import ResultPanel from "$lib/components/ResultPanel.svelte";
 import SettingsPanel from "$lib/components/SettingsPanel.svelte";
 import StatusBar from "$lib/components/StatusBar.svelte";
 import type {
+	AgentEventDto,
 	AgentPlan,
 	CommandResult,
 	CompletionItem,
@@ -25,32 +28,44 @@ import type {
 	TrackInfo,
 } from "$lib/ipc";
 import {
+	agentApprove,
+	agentChatStart,
+	cancelAiChat,
 	cancelFileSearch,
+	clearConversations,
 	confirmExecution,
+	deleteConversation,
 	executeCommand,
+	fuzzyPathCompletions,
 	getActiveWindowStrategy,
 	getAgentPlan,
+	getAiPresets,
 	getAiStatus,
 	getCompletions,
 	getContext,
+	getConversation,
+	getConversations,
 	getHideOnBlur,
 	getHistory,
 	getHotkeyStatus,
 	getMountPoints,
-	fuzzyPathCompletions,
 	grantPrivacyConsent,
 	hideWindow,
 	listPathCompletions,
+	loadConversation,
 	mediaGetStatus,
 	openPath,
 	openUri,
+	readSelection,
 	revealPath,
 	saveGeneralConfig,
 	saveWindowPosition,
 	startFileSearch,
+	suggestCorrection,
 } from "$lib/ipc";
 import { loadKeybindings, matchesAction } from "$lib/keybindings";
 import { preloadAll } from "$lib/preloadCache";
+import { decideSubmit, renderPreset } from "$lib/submit-router";
 
 let inputValue = $state("");
 let isExecuting = $state(false);
@@ -66,8 +81,53 @@ let backendReady = $state(false);
 let lastResult: CommandResult | null = $state(null);
 let lastCommand = $state("");
 
+// --- AI agent (streaming, tool-calling) state ---
+// `aiText` is the assistant answer streaming in; `aiStreaming` gates the cursor;
+// `aiError` shows a failure. `aiGen` is the generation id — bumped per query so
+// stale-stream events (a superseded answer) are dropped. `aiToolSteps` records
+// the tool calls the agent runs; `aiApproval` holds a pending destructive-tool
+// approval prompt (the loop is suspended until the user decides).
+let aiText = $state("");
+let aiStreaming = $state(false);
+let aiError: string | null = $state(null);
+let aiGen = 0;
+// Whether the AI answer view is the active surface (vs. a command result).
+let aiActive = $state(false);
+// Quick-AI "fork card" mode: a short streamed answer for an unknown query,
+// with [Search web] / [Full chat] buttons. Distinct from the full agent chat
+// (aiActive without aiQuick). `aiQuickPrompt` is what the buttons act on.
+let aiQuick = $state(false);
+let aiQuickPrompt = $state("");
+type ToolStep = {
+	callId: string;
+	name: string;
+	args: string;
+	status: "running" | "done" | "failed";
+	output?: string;
+};
+let aiToolSteps: ToolStep[] = $state([]);
+let aiApproval: { callId: string; toolName: string; args: string; reason: string } | null =
+	$state(null);
+// Completed prior turns in this conversation (shown above the streaming answer).
+type AiTurn = { user: string; text: string; toolSteps: ToolStep[] };
+let aiTurns: AiTurn[] = $state([]);
+let aiLastUser = $state("");
+// The in-panel follow-up reply box text.
+let aiReply = $state("");
+// Ref to the AiAnswer component, so explicit actions (Full chat / recall) can
+// shift focus to its reply box. The launcher input stays primary otherwise.
+let aiAnswerRef: AiAnswer | undefined = $state();
+// The current answer was cut off at the token cap (shows a truncation notice).
+let aiTruncated = $state(false);
+// Accumulated token spend for the conversation (input + output).
+let aiTokensIn = $state(0);
+let aiTokensOut = $state(0);
+
 let historyEntries: string[] = $state([]);
 let historyOpen = $state(false);
+// Chat-history recall panel (the `chat` keyword) + its loaded conversation list.
+let chatHistoryOpen = $state(false);
+let conversations: import("$lib/ipc").ConversationSummary[] = $state([]);
 
 let completions: CompletionItem[] = $state([]);
 let completionIndex = $state(-1);
@@ -127,21 +187,37 @@ let compactMode = $state(false);
 let launcherRowEl: HTMLDivElement | undefined = $state();
 
 // Keep the compact window's height matched to content (rofi-style resize).
+// Debounced: coalesces bursts of content changes (e.g. suggestions landing just
+// after the window shows) into a SINGLE resize, so the window doesn't visibly
+// jump twice on open. Also ignores sub-pixel/tiny deltas that aren't real
+// content changes.
 $effect(() => {
 	if (!compactMode || !launcherRowEl || !("__TAURI_INTERNALS__" in window)) return;
 	const el = launcherRowEl;
 	const win = getCurrentWindow();
 	let lastH = 0;
-	const observer = new ResizeObserver(() => {
+	let raf = 0;
+	const apply = () => {
+		raf = 0;
 		const maxH = Math.round(window.screen.height * 0.6);
 		const h = Math.min(Math.ceil(el.getBoundingClientRect().height), maxH);
-		if (h > 0 && h !== lastH) {
+		// Ignore ≤1px jitter — only resize on a real content-height change.
+		if (h > 0 && Math.abs(h - lastH) > 1) {
 			lastH = h;
 			win.setSize(new LogicalSize(680, h)).catch(() => {});
 		}
+	};
+	const observer = new ResizeObserver(() => {
+		// Coalesce to the next frame — several observer callbacks in one tick
+		// (suggestions arriving) collapse into one setSize.
+		if (raf) cancelAnimationFrame(raf);
+		raf = requestAnimationFrame(apply);
 	});
 	observer.observe(el);
-	return () => observer.disconnect();
+	return () => {
+		if (raf) cancelAnimationFrame(raf);
+		observer.disconnect();
+	};
 });
 // First-run Wayland onboarding: shown when the in-app hotkey can't work
 // system-wide and the user hasn't dismissed the tip yet.
@@ -196,6 +272,41 @@ function extractContextStale(results: CompletionItem[]): CompletionItem[] {
 	return stale ? results.filter((c) => c.icon_path !== "__context_stale__") : results;
 }
 
+/**
+ * Load the empty-input suggestions (recents / context rows) into the completions
+ * list. Called immediately on summon (so recents appear at once, not after the
+ * context round-trip) AND again when fresh context arrives (to enrich in place).
+ * Guarded by `completionGen` so a typist's query is never overwritten, and only
+ * applies while the input is still empty.
+ */
+/** Sentinel prefix stashed in a completion's `run` to mark it as an AI-chat
+ *  recall row: `__chat__:<conversationId>`. Chosen → opens the conversation. */
+const CHAT_RUN_PREFIX = "__chat__:";
+
+function loadEmptySuggestions() {
+	if (inputValue.trim().length > 0) return;
+	const gen = ++completionGen;
+	// Fetch command recents + a few recent AI chats in parallel, then merge:
+	// chats first (with an AI icon), then the command/context recents.
+	Promise.all([getCompletions(""), getConversations().catch(() => [])])
+		.then(([rawResults, convs]) => {
+			if (gen !== completionGen || inputValue.trim().length > 0) return;
+			const recents = extractContextStale(rawResults);
+			const chatRows: CompletionItem[] = convs.slice(0, 4).map((c) => ({
+				label: c.title,
+				icon_path: "__ai_chat__",
+				score: 0,
+				description: `${c.turn_count} turn${c.turn_count === 1 ? "" : "s"} · AI chat`,
+				run: `${CHAT_RUN_PREFIX}${c.id}`,
+			}));
+			completions = [...chatRows, ...recents];
+			// Do NOT preselect: on an empty box these are recents, not a query
+			// result. Selection happens only on mouse press or arrow key.
+			completionIndex = -1;
+		})
+		.catch(() => {});
+}
+
 // Transient confirmation shown in the completions hints bar (e.g. "Path copied").
 let flashMessage = $state("");
 let flashTimer: ReturnType<typeof setTimeout> | undefined;
@@ -222,6 +333,9 @@ let mediaPlayers: TrackInfo[] = $state([]);
 // placeholder suggestions so we never advertise AI-only actions to a user who
 // has no key (they'd silently web-search instead).
 let aiEnabled = $state(false);
+// AI presets (keyword → template). Loaded on mount; typing `<keyword> <text>`
+// renders the template and sends it to the agent. See submit-router.
+let aiPresets: { keyword: string; template: string }[] = $state([]);
 let envContext: EnvironmentContext | null = $state(null);
 let contextLoading = $state(false);
 let contextLoadingTimer: ReturnType<typeof setTimeout> | undefined;
@@ -336,6 +450,12 @@ function handleInput(val: string) {
 		mediaOpen = false;
 	}
 	historyOpen = false;
+	chatHistoryOpen = false;
+	// Typing a new query dismisses an on-screen AI answer so completions show.
+	// (The conversation is already persisted; recall it via `chat` if needed.)
+	if (aiActive && val.trim().length > 0) {
+		resetChat();
+	}
 	clearTimeout(debounceTimer);
 	atNoResults = false;
 
@@ -488,7 +608,9 @@ function handleInput(val: string) {
  */
 function defaultMatchIndex(results: CompletionItem[], input: string): number {
 	const q = input.trim().toLowerCase();
-	if (!q) return results.length > 0 ? 0 : -1;
+	// Empty input → recents/suggestions, NOT a query result: never preselect, so
+	// Enter doesn't run a row the user didn't choose. Selection is mouse/arrow only.
+	if (!q) return -1;
 	for (let i = 0; i < results.length; i++) {
 		const c = results[i];
 		if (c.icon_path === "__separator__" || c.icon_path === "__info__") continue;
@@ -508,6 +630,9 @@ onMount(() => {
 	});
 	getAiStatus().then((s) => {
 		aiEnabled = s.has_ai_router;
+	});
+	getAiPresets().then((ps) => {
+		aiPresets = ps.map((p) => ({ keyword: p.keyword, template: p.template }));
 	});
 	getMountPoints().then((mounts) => {
 		mountPoints = mounts;
@@ -570,6 +695,66 @@ onMount(() => {
 		});
 		unlisteners.push(unlistenStep);
 
+		// Listen for agent events (the tool-calling coordinator). Drops events
+		// from a superseded run (`gen` mismatch). Multiplexes prose, tool-call
+		// lifecycle, approval prompts, and the final answer into the AI surface.
+		const unlistenAgent = await win.listen<AgentEventDto>("lychi://agent-event", (e) => {
+			const ev = e.payload;
+			if (ev.gen !== aiGen) return; // stale run — ignore
+			switch (ev.kind) {
+				case "text":
+					aiText += ev.text ?? "";
+					break;
+				case "tool_started":
+					aiToolSteps = [
+						...aiToolSteps,
+						{
+							callId: ev.call_id ?? "",
+							name: ev.tool_name ?? "",
+							args: ev.tool_args ?? "",
+							status: "running",
+						},
+					];
+					break;
+				case "tool_completed":
+				case "tool_failed": {
+					const status = ev.kind === "tool_failed" ? "failed" : "done";
+					aiToolSteps = aiToolSteps.map((s) =>
+						s.callId === ev.call_id ? { ...s, status, output: ev.text } : s,
+					);
+					break;
+				}
+				case "awaiting_approval":
+					aiStreaming = false;
+					aiApproval = {
+						callId: ev.call_id ?? "",
+						toolName: ev.tool_name ?? "",
+						args: ev.tool_args ?? "",
+						reason: ev.reason ?? "This action needs your approval.",
+					};
+					break;
+				case "final":
+					aiStreaming = false;
+					if (ev.text) aiText = ev.text;
+					aiTruncated = ev.truncated ?? false;
+					break;
+				case "usage":
+					aiTokensIn += ev.input_tokens ?? 0;
+					aiTokensOut += ev.output_tokens ?? 0;
+					break;
+				case "stopped":
+					aiStreaming = false;
+					aiError = ev.text ?? "Stopped.";
+					break;
+				case "error":
+					aiStreaming = false;
+					aiError = ev.text ?? "The agent failed.";
+					break;
+				// turn_started / reasoning: no UI change for now.
+			}
+		});
+		unlisteners.push(unlistenAgent);
+
 		// Ready signal — emitted post-map (with a 150ms watchdog re-emit).
 		// Idempotent: only flips visibility readiness. Without it, a lost
 		// summon leaves an invisible surface that blocks all desktop clicks.
@@ -584,10 +769,18 @@ onMount(() => {
 			inputValue = "";
 			lastResult = null;
 			historyOpen = false;
+			chatHistoryOpen = false;
 			settingsOpen = false;
 			pendingPlan = null;
 			mediaOpen = false;
 			notesOpen = false;
+			// Fresh AI conversation each summon (decision: reset-every-summon).
+			resetChat();
+			// Keep AI presets fresh (cheap) — guarantees they're loaded before the
+			// user types a preset keyword, and picks up any Settings edits.
+			getAiPresets().then((ps) => {
+				aiPresets = ps.map((p) => ({ keyword: p.keyword, template: p.template }));
+			});
 			// Clear stale context immediately — fast path re-populates if same window,
 			// fresh gather populates for changed windows. Prevents flash of wrong context.
 			envContext = null;
@@ -598,7 +791,6 @@ onMount(() => {
 				contextLoading = true;
 			}, 120);
 
-			completions = [];
 			completionIndex = -1;
 			atMode = false;
 			atStart = -1;
@@ -607,6 +799,11 @@ onMount(() => {
 			routingGeneration++;
 			isRouting = false;
 			cancelFileSearch();
+			// Load recents/suggestions IMMEDIATELY (don't wait for context-ready) so
+			// they're present as the window appears — no post-paint pop-in. Fresh
+			// context (below) re-fetches to enrich in place. We keep the old
+			// completions until the new ones arrive (no empty→populated flash).
+			loadEmptySuggestions();
 			// Force focus the input (layer shell may not auto-focus DOM elements).
 			// Double-tap: rAF for immediate attempt, setTimeout for delayed retry
 			// in case the compositor grants surface focus slightly late.
@@ -632,21 +829,10 @@ onMount(() => {
 			contextRefreshing = false;
 			clearTimeout(contextLoadingTimer);
 			contextLoading = false;
-			// Fetch context suggestions only if the input is still empty.
-			// Use Svelte state (inputValue) not a DOM query — DOM can be stale when
-			// focus hasn't been granted yet. Guard with completionGen so a fast typist
-			// doesn't get their completions overwritten by the context response.
-			if (inputValue.trim().length < 1) {
-				const gen = ++completionGen;
-				getCompletions("")
-					.then((rawResults) => {
-						if (gen !== completionGen) return;
-						const results = extractContextStale(rawResults);
-						completions = results;
-						completionIndex = results.length > 0 ? 0 : -1;
-					})
-					.catch(() => {});
-			}
+			// Fresh context arrived — re-fetch suggestions to enrich them in place
+			// (same helper as summon; guarded, empty-input-only). The fixed-pool
+			// CompletionsList updates without DOM churn, so this never causes a jump.
+			loadEmptySuggestions();
 		});
 		unlisteners.push(unlistenContext);
 
@@ -819,310 +1005,441 @@ onMount(() => {
 	};
 });
 
+/** The system prompt for the agent — a launcher assistant that can act via tools. */
+const AGENT_SYSTEM =
+	"You are Lychi, a helpful assistant inside a Linux launcher. Answer concisely in markdown. You can call tools to act on the user's system when helpful; otherwise just answer.";
+
+/** Clear the active AI conversation (fresh start). */
+function resetChat() {
+	aiGen++; // supersede any in-flight run
+	aiText = "";
+	aiError = null;
+	aiStreaming = false;
+	aiActive = false;
+	aiToolSteps = [];
+	aiApproval = null;
+	aiTurns = [];
+	aiLastUser = "";
+	aiReply = "";
+	aiQuick = false;
+	aiQuickPrompt = "";
+	aiTruncated = false;
+	aiTokensIn = 0;
+	aiTokensOut = 0;
+}
+
+/** Send a follow-up from the in-panel reply box (continues the conversation). */
+async function sendReply() {
+	const text = aiReply.trim();
+	if (!text || aiStreaming) return;
+	aiReply = "";
+	await startChat(text, /* fresh */ false);
+}
+
+/**
+ * Start (fresh) or continue (follow-up) a tool-calling agent run for `prompt`.
+ * `fresh` = new conversation; else the backend appends this as a follow-up to the
+ * running session (history + tool results as context). Progress (prose, tool
+ * steps, approval prompts, final answer) arrives via the `lychi://agent-event`
+ * listener. For a follow-up, previous turns stay on screen above the new answer.
+ */
+async function startChat(prompt: string, fresh = true) {
+	const text = prompt.trim();
+	if (!text) return;
+	if (fresh) {
+		aiTurns = [];
+	} else if (aiText) {
+		// Snapshot the completed answer into the transcript before the new turn.
+		aiTurns = [...aiTurns, { user: aiLastUser, text: aiText, toolSteps: aiToolSteps }];
+	}
+	aiLastUser = text;
+	aiText = "";
+	aiToolSteps = [];
+	aiError = null;
+	aiApproval = null;
+	aiTruncated = false;
+	aiStreaming = true;
+	aiActive = true;
+	aiQuick = false; // full agent chat, not the fork card
+	lastResult = null; // AI answer takes over the result area
+	const gen = ++aiGen;
+	try {
+		await agentChatStart(AGENT_SYSTEM, text, fresh, /* withTools */ true, gen);
+	} catch (e) {
+		if (gen === aiGen) {
+			aiStreaming = false;
+			aiError = e instanceof Error ? e.message : String(e);
+		}
+	}
+}
+
+/**
+ * The system prompt for the quick-AI fork card. The agent CAN act (it has the
+ * tool catalog): if the query is an action Lychi can perform (weather, open an
+ * app, media control, system info…), DO it via a tool rather than describing how.
+ * Otherwise answer the question directly and concisely.
+ */
+const QUICK_AI_SYSTEM =
+	"You are Lychi, a smart assistant inside a Linux launcher. You can ACT on the user's system by calling tools. If the request is something a tool can do (check the weather, open/launch an app, control media, read system info, search, etc.), call the tool and give the result — never tell the user to run a command themselves when you have a tool for it. Otherwise, answer the question directly and concisely in 2-3 sentences with minimal markdown.";
+
+/** System prompt for AI presets (text transforms) — do the task, nothing else. */
+const PRESET_SYSTEM =
+	"You are Lychi's AI command runner. Perform the task in the user's message directly and return only the result — no preamble, no explanation, no tool use. Use minimal markdown.";
+
+/**
+ * Run an AI preset (a text transform like translate/summarize). Tool-FREE and
+ * streaming — presets never need to call tools, so we skip the ~40-tool catalog
+ * entirely (smaller request, no tool-choice reasoning = noticeably faster). The
+ * answer streams into the full chat surface (not the fork card — the user
+ * explicitly invoked a command), and follow-ups continue the session.
+ */
+async function startPreset(prompt: string) {
+	const text = prompt.trim();
+	if (!text) return;
+	aiTurns = [];
+	aiLastUser = text;
+	aiText = "";
+	aiToolSteps = [];
+	aiError = null;
+	aiApproval = null;
+	aiTruncated = false;
+	aiStreaming = true;
+	aiActive = true;
+	aiQuick = false; // full answer surface, not the fork card
+	lastResult = null;
+	const gen = ++aiGen;
+	try {
+		await agentChatStart(PRESET_SYSTEM, text, /* fresh */ true, /* withTools */ false, gen);
+	} catch (e) {
+		if (gen === aiGen) {
+			aiStreaming = false;
+			aiError = e instanceof Error ? e.message : String(e);
+		}
+	}
+}
+
+/**
+ * Recall a stored conversation (from the `chat` panel): prime the backend
+ * session with its history, render its turns on the AI surface, and show the
+ * reply box so the next message continues it. No new AI request is made — the
+ * user's follow-up drives the next turn.
+ */
+async function openConversation(id: string) {
+	const conv = await loadConversation(id).catch(() => null);
+	if (!conv) return;
+	chatHistoryOpen = false;
+	// Pair the stored messages into user→assistant turns for the transcript.
+	// Tool/system messages are skipped in this view (the raw session still has
+	// them for the model's context).
+	const turns: AiTurn[] = [];
+	let pendingUser = "";
+	for (const m of conv.messages) {
+		if (m.role === "user") {
+			pendingUser = m.content;
+		} else if (m.role === "assistant" && m.content) {
+			turns.push({ user: pendingUser, text: m.content, toolSteps: [] });
+			pendingUser = "";
+		}
+	}
+	aiTurns = turns.slice(0, -1); // last pair goes into the live slot
+	const last = turns[turns.length - 1];
+	aiLastUser = last?.user ?? pendingUser;
+	aiText = last?.text ?? "";
+	aiToolSteps = [];
+	aiError = null;
+	aiApproval = null;
+	aiStreaming = false;
+	aiActive = true;
+	aiQuick = false;
+	lastResult = null;
+	aiGen++; // fresh generation for any follow-up
+	// Opening a recalled conversation is an explicit action → focus the reply box.
+	aiAnswerRef?.focusReply();
+}
+
+/** Delete one stored conversation from the recall list. */
+async function deleteConversationEntry(id: string) {
+	await deleteConversation(id).catch(() => {});
+	conversations = conversations.filter((c) => c.id !== id);
+}
+
+/** Clear all stored conversations. */
+async function clearAllConversations() {
+	await clearConversations().catch(() => {});
+	conversations = [];
+}
+
+/**
+ * The fork card: stream a short answer for an unknown query, with [Search web] /
+ * [Full chat] buttons the user picks from. The agent HAS tools (with_tools=true)
+ * so it can act on action-queries ("weather now" → calls the weather tool)
+ * instead of just describing what to run.
+ */
+async function startQuickAi(prompt: string) {
+	const text = prompt.trim();
+	if (!text) return;
+	aiTurns = [];
+	aiLastUser = text;
+	aiQuickPrompt = text;
+	aiText = "";
+	aiToolSteps = [];
+	aiError = null;
+	aiApproval = null;
+	aiTruncated = false;
+	aiStreaming = true;
+	aiActive = true;
+	aiQuick = true; // the fork card
+	lastResult = null;
+	const gen = ++aiGen;
+	try {
+		await agentChatStart(QUICK_AI_SYSTEM, text, /* fresh */ true, /* withTools */ true, gen);
+	} catch (e) {
+		if (gen === aiGen) {
+			aiStreaming = false;
+			aiError = e instanceof Error ? e.message : String(e);
+		}
+	}
+}
+
+/** Fork-card button: escalate the quick answer into the full tool-calling agent. */
+/**
+ * Fork-card button: continue the quick answer in the full agent — WITHOUT
+ * re-asking. The short Q→A is already on screen and its session is stashed in
+ * the backend (with_tools=false). Escalating just flips the UI to full-chat
+ * mode: the answer becomes the first transcript turn and the reply box drives
+ * the next question, which continues the stashed session (fresh=false). No
+ * duplicate request; the model keeps the context it already produced.
+ */
+function escalateToChat() {
+	if (!aiText) {
+		// Nothing streamed yet (still thinking / errored) — fall back to a fresh
+		// full-agent run so the button always does something useful.
+		const prompt = aiQuickPrompt;
+		aiQuick = false;
+		if (prompt) startChat(prompt, /* fresh */ true);
+		return;
+	}
+	// Snapshot the quick answer as a completed turn, then switch to full chat.
+	// Clear the live-turn fields (user + text) so the snapshotted turn doesn't
+	// ALSO render as the current bubble (that was the duplicate-question bug).
+	aiTurns = [...aiTurns, { user: aiLastUser, text: aiText, toolSteps: aiToolSteps }];
+	aiLastUser = "";
+	aiText = "";
+	aiToolSteps = [];
+	aiQuick = false;
+	aiStreaming = false;
+	// The reply box is now shown (quick=false, not streaming); the user's
+	// follow-up continues the existing session via sendReply → startChat(fresh=false).
+	// Explicit action → shift focus to the reply box.
+	aiAnswerRef?.focusReply();
+}
+
+/** Fork-card button: bail out to a plain web search for the query. */
+async function quickWebSearch() {
+	const prompt = aiQuickPrompt;
+	resetChat();
+	if (prompt) await runCommand(`web ${prompt}`);
+}
+
+/** Resolve a pending destructive-tool approval and resume the agent. */
+async function approveTool(approve: boolean) {
+	if (!aiApproval) return;
+	aiApproval = null;
+	aiTruncated = false;
+	aiStreaming = true;
+	const gen = aiGen; // same run continues
+	try {
+		await agentApprove(approve, gen);
+	} catch (e) {
+		if (gen === aiGen) {
+			aiStreaming = false;
+			aiError = e instanceof Error ? e.message : String(e);
+		}
+	}
+}
+
+/** Cancel an in-flight agent run (Esc while streaming). */
+function cancelChat() {
+	aiGen++; // drop late events on the frontend
+	aiStreaming = false;
+	cancelAiChat().catch(() => {});
+}
+
 async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
+	if (isExecuting || !backendReady) return;
+
+	// Fork card shortcuts (quick-AI answer is on screen and idle):
+	//   Enter        → escalate to full chat
+	//   ⌘/Ctrl+Enter → bail out to a web search
+	// The input box is empty during the card, so these would otherwise no-op.
+	if (aiQuick && !aiStreaming && !inputValue.trim()) {
+		if (opts?.ctrlKey) await quickWebSearch();
+		else await escalateToChat();
+		return;
+	}
+
+	// ALL routing lives in one pure decider (src/lib/submit-router.ts). This
+	// function is a thin dispatcher: build the context, ask where to go, do it.
+	// One place decides command-vs-agent-vs-panel — no scattered `runCommand`
+	// branches. Natural language always ends at the agent (the single AI path);
+	// it never errors out to "unknown command".
 	const trimmed = inputValue.trim();
-	// Allow submit when input is empty but a context suggestion is selected
-	const hasSelectedCompletion = completions.length > 0 && completionIndex >= 0;
-	if ((!trimmed && !hasSelectedCompletion) || isExecuting || !backendReady) return;
+	const action = decideSubmit({
+		trimmed,
+		ctrlKey: opts?.ctrlKey ?? false,
+		runInline: opts?.runInline ?? false,
+		searchMode,
+		atMode,
+		pendingPlan: !!pendingPlan,
+		completions,
+		completionIndex,
+		aiEnabled,
+		presets: aiPresets,
+	});
 
-	// In / search mode, Ctrl+Enter reveals the selected result in the file
-	// manager (not web search — the input is a path like "/Android/", never a
-	// query). Plain Enter opens; handled below via handleCompletionSelect.
-	if (opts?.ctrlKey && searchMode) {
-		if (hasSelectedCompletion) revealSelected();
-		return;
-	}
-
-	// Ctrl+Enter: force web search regardless of completions or routing
-	if (opts?.ctrlKey && trimmed) {
-		await runCommand(`web ${trimmed}`);
-		return;
-	}
-
-	// Shift+Enter: capture a `run` command's output inline instead of a
-	// terminal (terminal is the default). Ignored by non-run handlers.
-	if (opts?.runInline && trimmed) {
-		await runCommand(trimmed, { runInline: true });
-		return;
-	}
-
-	// If a plan is showing and user presses Enter, execute it
-	if (pendingPlan) return;
-
-	// Intercept built-in panel keywords before completions
-	const lower = trimmed.toLowerCase();
-	if (lower === "settings") {
-		inputValue = "";
-		settingsOpen = true;
-		historyOpen = false;
-		completions = [];
-		completionIndex = -1;
-		return;
-	}
-
-	if (lower === "history") {
-		inputValue = "";
-		historyOpen = true;
-		settingsOpen = false;
-		notesOpen = false;
-		mediaOpen = false;
-		completions = [];
-		completionIndex = -1;
-		return;
-	}
-
-	if (lower === "spotify" || lower === "media" || lower === "music") {
-		inputValue = "";
-		mediaOpen = true;
-		historyOpen = false;
-		completions = [];
-		completionIndex = -1;
-		return;
-	}
-
-	if (
-		lower === "note" ||
-		lower === "notes" ||
-		lower === "todo" ||
-		lower === "todos" ||
-		lower === "reminder" ||
-		lower === "reminders" ||
-		lower === "timer" ||
-		lower === "timers" ||
-		lower === "stopwatch" ||
-		lower === "snip" ||
-		lower === "snippet" ||
-		lower === "snippets"
-	) {
-		inputValue = "";
-		notesOpen = true;
-		historyOpen = false;
-		completions = [];
-		completionIndex = -1;
-		if (lower === "reminder" || lower === "reminders") {
-			initialNotesTab = "reminders";
-		} else if (lower === "timer" || lower === "timers" || lower === "stopwatch") {
-			initialNotesTab = "timers";
-		} else if (lower === "todo" || lower === "todos") {
-			initialNotesTab = "todos";
-		} else if (lower === "snip" || lower === "snippet" || lower === "snippets") {
-			initialNotesTab = "snippets";
-		} else {
-			initialNotesTab = "notes";
-		}
-		return;
-	}
-
-	// In search mode, auto-select first selectable result (skip a leading
-	// section header) if none explicitly selected.
-	if (searchMode && completions.length > 0 && completionIndex < 0) {
-		const first = completions.findIndex((c) => c.icon_path !== "__separator__");
-		completionIndex = first >= 0 ? first : 0;
-	}
-
-	// Colon triggers (e.g. "al:list", "tz:tokyo") — send directly to backend, skip completion selection
-	if (/^[a-z]{1,4}:/.test(lower) && !lower.startsWith("http")) {
-		await runCommand(trimmed);
-		return;
-	}
-
-	// If completions are visible and one is selected, execute based on context
-	if (completions.length > 0 && completionIndex >= 0) {
-		const selected = completions[completionIndex];
-		if (selected && selected.icon_path !== "__separator__") {
-			// Calc results start with "= " — just display, don't execute
-			if (selected.label.startsWith("= ")) {
-				lastResult = {
-					success: true,
-					output: selected.label.slice(2),
-					error: null,
-					duration_ms: 0,
-					auto_open: false,
-				};
-				inputValue = "";
-				completions = [];
-				completionIndex = -1;
-				return;
-			}
-			// "Did you mean: X?" typo suggestion — fill input with corrected text
-			if (selected.label.startsWith("Did you mean:") && selected.description) {
-				inputValue = selected.description;
-				completions = [];
-				completionIndex = -1;
-				handleInput(inputValue);
-				return;
-			}
-			// @ browse or / search mode — drill into directory or open file
-			if (atMode || searchMode) {
-				handleCompletionSelect(selected.label, opts?.ctrlKey);
-				return;
-			}
-			// The backend declared the exact command to run (search handlers,
-			// emoji, etc.) — run it verbatim. No label reverse-parsing, no
-			// prefix guessing. This is the single scalable path.
-			// Argument-needing hint (e.g. "volume <n>"): insert the runnable
-			// prefix into the input so the user types the value, then Enter
-			// runs it. Tab-to-complete, a la Raycast/Alfred.
-			if (selected.fill) {
-				inputValue = selected.fill;
-				completions = [];
-				completionIndex = -1;
-				handleInput(inputValue);
-				return;
-			}
-			if (selected.run) {
-				await runCommand(selected.run);
-				return;
-			}
-			// Check if input has an explicit prefix (e.g. "spotify ", "system ", "media ")
-			// If so, append the selected completion to the prefix.
-			// But if the first word isn't a known handler prefix, this is a natural
-			// language query (e.g. "what is the weather here") — run it as-is so the
-			// backend's keyword/AI routing handles it correctly.
-			const KNOWN_PREFIXES = new Set([
-				"ask",
-				"bm",
-				"bookmark",
-				"browse",
-				"clip",
-				"clipboard",
-				"clear",
-				"close",
-				"emoji",
-				"focus",
-				"kill",
-				"open",
-				"sym",
-				"unicode",
-				"web",
-				"yt",
-				"run",
-				"calc",
-				"file",
-				"url",
-				"media",
-				"project",
-				"quit",
-				"system",
-				"note",
-				"notes",
-				"todo",
-				"todos",
-				"weather",
-				"sysinfo",
-				"ip",
-				"cpu",
-				"mem",
-				"disk",
-				"temp",
-				"gpu",
-				"battery",
-				"net",
-				"audio",
-				"display",
-				"os",
-				"speedtest",
-				"time",
-				"tz",
-				"clock",
-				"alias",
-				"aliases",
-				"timer",
-				"stopwatch",
-			]);
-			const spaceIdx = trimmed.indexOf(" ");
-			if (spaceIdx !== -1) {
-				const prefix = trimmed.slice(0, spaceIdx).toLowerCase();
-				if (KNOWN_PREFIXES.has(prefix)) {
-					// Don't re-prefix if the label already carries the prefix
-					// (e.g. input "run htop", label "run htop") — that would
-					// produce "run run htop". Run the label as-is in that case.
-					if (selected.label.toLowerCase().startsWith(`${prefix} `)) {
-						await runCommand(selected.label);
-					} else {
-						await runCommand(`${prefix} ${selected.label}`);
-					}
-				} else {
-					// Natural language — let the backend route the original input
-					await runCommand(trimmed);
-				}
-			} else if (KNOWN_PREFIXES.has(lower)) {
-				// Input is a bare prefix (e.g. "clip", "focus") — send prefix + selected label
-				await runCommand(`${lower} ${selected.label}`);
-			} else if (selected.icon_path === "__context__") {
-				// Context suggestion — label is a complete command (e.g. "git commit", "run cargo build")
-				await runCommand(selected.label);
-			} else if (selected.label.toLowerCase() === lower) {
-				// Completion matches input exactly (e.g. "mem" → sysinfo "mem")
-				// Let the backend router handle it directly
-				await runCommand(trimmed);
-			} else {
-				// No prefix — these are app completions, launch via open
-				await runCommand(`open ${selected.label}`);
-			}
+	switch (action.kind) {
+		case "noop":
 			return;
-		}
-	}
 
-	// In search mode with nothing selectable to act on, the user may have typed
-	// or pasted a literal absolute path (e.g. "/home/sab/Android/Sdk"). Try to
-	// open it directly; only if it doesn't exist do we give up (no silent no-op
-	// on a valid path). The leading "/" is the search-mode trigger AND the root
-	// of an absolute path, so the input value is the path as-is.
-	if (searchMode) {
-		const opened = await openPath(trimmed);
-		if (opened) {
+		case "panel": {
 			inputValue = "";
 			completions = [];
 			completionIndex = -1;
-			cancelFileSearch();
-			await hide();
+			settingsOpen = action.panel === "settings";
+			historyOpen = action.panel === "history";
+			mediaOpen = action.panel === "media";
+			notesOpen = action.panel === "notes";
+			chatHistoryOpen = action.panel === "chat-history";
+			if (action.panel === "notes") initialNotesTab = action.notesTab;
+			if (action.panel === "chat-history") {
+				aiActive = false; // hide any on-screen AI answer behind the recall list
+				getConversations().then((cs) => {
+					conversations = cs;
+				});
+			}
+			return;
 		}
-		return;
-	}
 
-	// C1/C15: Race AI plan against a short timeout.
-	// If AI responds within 200ms, use the plan. Otherwise, execute immediately.
-	// ESC cancels via generation counter — stale responses are discarded.
-	const gen = ++routingGeneration;
-	isRouting = true;
+		case "reveal":
+			revealSelected();
+			return;
 
-	const planPromise = getAgentPlan(trimmed).catch((err) => {
-		console.error("[agent plan] error:", err);
-		return null;
-	});
-	const timeout = new Promise<null>((r) => setTimeout(() => r(null), 200));
+		case "completion-select":
+			handleCompletionSelect(action.label, action.ctrlKey);
+			return;
 
-	const fastPlan = await Promise.race([planPromise, timeout]);
+		case "fill":
+		case "correct":
+			inputValue = action.value;
+			completions = [];
+			completionIndex = -1;
+			handleInput(inputValue);
+			return;
 
-	// If ESC was pressed during the race, bail out
-	if (gen !== routingGeneration) {
-		isRouting = false;
-		return;
-	}
+		case "calc-display":
+			lastResult = {
+				success: true,
+				output: action.text,
+				error: null,
+				duration_ms: 0,
+				auto_open: false,
+			};
+			inputValue = "";
+			completions = [];
+			completionIndex = -1;
+			return;
 
-	if (fastPlan) {
-		// AI responded quickly with a plan — show preview
-		isRouting = false;
-		pendingPlan = fastPlan;
-		completions = [];
-		completionIndex = -1;
-		historyOpen = false;
-		return;
-	}
-
-	// AI didn't respond in time — execute immediately, but let plan arrive in background
-	isRouting = false;
-	const commandPromise = runCommand(trimmed);
-
-	// If AI plan arrives later and we're still on the same generation, offer it
-	planPromise.then((plan) => {
-		if (plan && gen === routingGeneration && !pendingPlan) {
-			pendingPlan = plan;
+		case "open-path": {
+			const opened = await openPath(action.path);
+			if (opened) {
+				inputValue = "";
+				completions = [];
+				completionIndex = -1;
+				cancelFileSearch();
+				await hide();
+			}
+			return;
 		}
-	});
 
-	await commandPromise;
+		case "command":
+			// An AI-chat recall row (from the empty-box recents) → open the chat,
+			// not the executor.
+			if (action.command.startsWith(CHAT_RUN_PREFIX)) {
+				completions = [];
+				completionIndex = -1;
+				await openConversation(action.command.slice(CHAT_RUN_PREFIX.length));
+				return;
+			}
+			await runCommand(action.command, { runInline: action.runInline });
+			return;
+
+		case "quick-ai": {
+			// A single unknown word (no spaces) might be an app-name typo — check
+			// for a "Did you mean" correction BEFORE going to AI. Instant local
+			// fuzzy match; multi-word / real questions skip this and go to AI.
+			if (aiEnabled && !action.prompt.includes(" ")) {
+				const corrected = await suggestCorrection(action.prompt).catch(() => null);
+				if (corrected) {
+					// Fill the input with the correction so the user confirms with a
+					// second Enter (or edits it) — never auto-runs the wrong app.
+					inputValue = corrected;
+					completions = [];
+					completionIndex = -1;
+					handleInput(inputValue);
+					return;
+				}
+			}
+			inputValue = "";
+			completions = [];
+			completionIndex = -1;
+			await startQuickAi(action.prompt);
+			return;
+		}
+
+		case "agent":
+			inputValue = "";
+			completions = [];
+			completionIndex = -1;
+			await startChat(action.prompt, /* fresh */ true);
+			return;
+
+		case "preset": {
+			// An AI preset. If the user typed no text after the keyword, fall back
+			// to the PRIMARY selection (highlighted text in the focused window) —
+			// so `summarize` alone acts on what you've selected in VSCode/browser.
+			// Runs tool-free (startPreset) — a text transform needs no tools.
+			inputValue = "";
+			completions = [];
+			completionIndex = -1;
+			let input = action.input;
+			if (!input) {
+				const sel = await readSelection().catch(() => null);
+				if (sel) input = sel;
+			}
+			await startPreset(renderPreset(action.template, input));
+			return;
+		}
+
+		case "ai-disabled": {
+			// The user made an AI request but no provider is configured. Warn
+			// (more prominently for an explicit `ask`), then fall to a web search.
+			inputValue = "";
+			completions = [];
+			completionIndex = -1;
+			const note = action.explicit
+				? "AI is disabled — enable it in Settings. Searching the web instead."
+				: "AI is disabled — searching the web instead.";
+			lastResult = {
+				success: true,
+				output: note,
+				error: null,
+				duration_ms: 0,
+				auto_open: false,
+			};
+			await runCommand(`web ${action.prompt}`);
+			return;
+		}
+	}
 }
 
 async function runCommand(command: string, opts?: { runInline?: boolean }) {
@@ -1347,6 +1664,14 @@ let panelActions = $derived.by((): PanelAction[] => {
 	const hasPath = searchMode || atMode || filePathMap.has(item.label);
 	const isApp = item.run?.startsWith("appctl") || item.run?.startsWith("open ");
 	const isCalc = item.label.startsWith("= ");
+	const isAiChat = item.run?.startsWith(CHAT_RUN_PREFIX);
+
+	if (isAiChat) {
+		// An AI-chat recall row: open/continue it, or delete it.
+		acts.push({ id: "open", label: "Open conversation", hint: "Enter" });
+		acts.push({ id: "ai_delete_chat", label: "Delete conversation" });
+		return acts;
+	}
 
 	if (hasPath) {
 		acts.push({ id: "open", label: isFolder ? "Open folder" : "Open", hint: "Enter" });
@@ -1368,6 +1693,12 @@ let panelActions = $derived.by((): PanelAction[] => {
 		if (item.run) {
 			acts.push({ id: "copy_command", label: "Copy command" });
 		}
+	}
+
+	// AI actions available for any non-path row (ask the agent about it / open a
+	// fresh chat seeded with the label). Only when AI is configured.
+	if (aiEnabled && !hasPath && !isCalc) {
+		acts.push({ id: "ai_ask", label: "Ask AI about this", hint: "" });
 	}
 	return acts;
 });
@@ -1439,12 +1770,35 @@ function runPanelAction(id: string) {
 			}
 			closeActionPanel();
 			break;
+		case "ai_ask":
+			// Seed a fresh agent chat with the row's label.
+			closeActionPanel();
+			inputValue = "";
+			completions = [];
+			completionIndex = -1;
+			startChat(item.label, /* fresh */ true);
+			break;
+		case "ai_delete_chat":
+			// Delete a recalled conversation (AI-chat recent row).
+			if (item.run?.startsWith(CHAT_RUN_PREFIX)) {
+				deleteConversationEntry(item.run.slice(CHAT_RUN_PREFIX.length));
+			}
+			closeActionPanel();
+			break;
 		default:
 			closeActionPanel();
 	}
 }
 
 function handleCompletionSelect(label: string, forceOpen?: boolean) {
+	// An AI-chat recall row (empty-box recents) → open the conversation.
+	const clicked = completions.find((c) => c.label === label);
+	if (clicked?.run?.startsWith(CHAT_RUN_PREFIX)) {
+		completions = [];
+		completionIndex = -1;
+		openConversation(clicked.run.slice(CHAT_RUN_PREFIX.length));
+		return;
+	}
 	// / search mode — Enter opens the folder/file; Ctrl+Enter (forceOpen) reveals
 	// it in the file manager. Drilling into a folder is Tab / → (see drillIntoFolder).
 	if (searchMode) {
@@ -1561,11 +1915,30 @@ function handleToggleHistory() {
 	settingsOpen = false;
 	mediaOpen = false;
 	notesOpen = false;
+	chatHistoryOpen = false;
 	if (historyOpen) {
 		completions = [];
 		completionIndex = -1;
 	} else {
 		// Re-fetch completions for current input
+		handleInput(inputValue);
+	}
+}
+
+function handleToggleChatHistory() {
+	chatHistoryOpen = !chatHistoryOpen;
+	historyOpen = false;
+	settingsOpen = false;
+	mediaOpen = false;
+	notesOpen = false;
+	if (chatHistoryOpen) {
+		aiActive = false; // hide any on-screen AI answer behind the recall list
+		completions = [];
+		completionIndex = -1;
+		getConversations().then((cs) => {
+			conversations = cs;
+		});
+	} else {
 		handleInput(inputValue);
 	}
 }
@@ -1624,6 +1997,24 @@ function handleShowPlan() {
 	completionIndex = -1;
 }
 
+/**
+ * Reflect the arrow-selected completion into the input box, so navigating a
+ * suggestion (history, context, etc.) previews what Enter will run and lets the
+ * user edit it — the Raycast/shell-history feel. Only fills rows that carry a
+ * concrete command (`run`) or a plain label; skips fill-hints and info rows.
+ * Search/@-browse modes are left alone (the input there is a path, not a query).
+ */
+function fillFromSelection() {
+	if (atMode || searchMode) return;
+	const sel = completions[completionIndex];
+	if (!sel || sel.icon_path === "__separator__" || sel.icon_path === "__info__") return;
+	// A calc row ("= 42") or a "Did you mean" row isn't a runnable command — don't
+	// clobber the input with their display text.
+	if (sel.label.startsWith("= ") || sel.label.startsWith("Did you mean:")) return;
+	const text = sel.run ?? sel.fill ?? sel.label;
+	if (text) inputValue = text;
+}
+
 function handleArrowUp() {
 	if (completions.length > 0) {
 		let next = completionIndex - 1;
@@ -1633,6 +2024,7 @@ function handleArrowUp() {
 		// than landing on a non-selectable separator.
 		if (next < 0 || completions[next]?.icon_path === "__separator__") return;
 		completionIndex = next;
+		fillFromSelection();
 	}
 }
 
@@ -1642,6 +2034,7 @@ function handleArrowDown() {
 		// Skip separator items
 		while (next < completions.length && completions[next]?.icon_path === "__separator__") next++;
 		completionIndex = Math.min(completions.length - 1, next);
+		fillFromSelection();
 	}
 }
 
@@ -1679,6 +2072,20 @@ async function openInlineUrl() {
 }
 
 async function handleDismiss() {
+	// AI chat Esc: first Esc cancels a live stream (keeps the answer + launcher);
+	// a second Esc (answer showing, not streaming) clears it back to the launcher.
+	// Only a third Esc hides. This keeps the fast-and-forget feel without losing
+	// an answer to an accidental keypress.
+	if (aiStreaming) {
+		cancelChat();
+		return;
+	}
+	if (aiActive) {
+		resetChat();
+		inputValue = "";
+		return;
+	}
+
 	// C15: Cancel in-flight AI routing immediately on ESC
 	if (isRouting) {
 		routingGeneration++;
@@ -1823,6 +2230,16 @@ async function handleDismiss() {
 		<div class:panel-hidden={!historyOpen}>
 			<HistoryPanel entries={historyEntries} onselect={handleHistorySelect} />
 		</div>
+		<div class:panel-hidden={!chatHistoryOpen}>
+			<ChatHistoryPanel
+				{conversations}
+				visible={chatHistoryOpen}
+				onselect={openConversation}
+				ondelete={deleteConversationEntry}
+				onclear={clearAllConversations}
+				ondismiss={() => { chatHistoryOpen = false; }}
+			/>
+		</div>
 		<div class:panel-hidden={!notesOpen}>
 			<NotesPanel ondismiss={() => { notesOpen = false; pendingNoteText = null; initialNotesTab = undefined; }} {pendingNoteText} onpendingcleared={() => { pendingNoteText = null; }} {initialNotesTab} visible={notesOpen} />
 		</div>
@@ -1830,9 +2247,37 @@ async function handleDismiss() {
 			<MediaPanel visible={mediaOpen} ondismiss={() => { mediaOpen = false; }} players={mediaPlayers} />
 		</div>
 		<div class="settings-wrapper" class:panel-hidden={!settingsOpen}>
-			<SettingsPanel ondismiss={() => { settingsOpen = false; }} />
+			<SettingsPanel
+				ondismiss={() => { settingsOpen = false; }}
+				onpresetchange={() => {
+					getAiPresets().then((ps) => {
+						aiPresets = ps.map((p) => ({ keyword: p.keyword, template: p.template }));
+					});
+				}}
+			/>
 		</div>
-		{#if pendingPlan}
+		{#if aiActive}
+			<AiAnswer
+				bind:this={aiAnswerRef}
+				turns={aiTurns}
+				lastUser={aiLastUser}
+				text={aiText}
+				truncated={aiTruncated}
+				tokensIn={aiTokensIn}
+				tokensOut={aiTokensOut}
+				streaming={aiStreaming}
+				error={aiError}
+				toolSteps={aiToolSteps}
+				approval={aiApproval}
+				onapprove={approveTool}
+				bind:reply={aiReply}
+				onreply={sendReply}
+				onstop={cancelChat}
+				quick={aiQuick}
+				onwebsearch={quickWebSearch}
+				onfullchat={escalateToChat}
+			/>
+		{:else if pendingPlan}
 			<AgentPlanPanel
 				bind:this={planPanelRef}
 				plan={pendingPlan}
@@ -1842,7 +2287,7 @@ async function handleDismiss() {
 				}}
 				ondismiss={() => { pendingPlan = null; }}
 			/>
-		{:else if !settingsOpen && !notesOpen && !mediaOpen && !historyOpen}
+		{:else if !settingsOpen && !notesOpen && !mediaOpen && !historyOpen && !chatHistoryOpen}
 			<CompletionsList
 				items={completions}
 				selectedIndex={completionIndex}
@@ -1889,12 +2334,14 @@ async function handleDismiss() {
 			{historyOpen}
 			{settingsOpen}
 			mediaOpen={mediaOpen}
+			{chatHistoryOpen}
 			{nowPlaying}
 			{multiplePlayers}
 			ontogglehistory={handleToggleHistory}
 			ontogglesettings={handleToggleSettings}
 			ontogglemedia={handleToggleMedia}
 			ontogglenotes={handleToggleNotes}
+			ontogglechathistory={handleToggleChatHistory}
 			{notesOpen}
 		onshowresult={handleShowResult}
 		onshowplan={handleShowPlan}
@@ -1903,7 +2350,7 @@ async function handleDismiss() {
 		{contextStaleHint}
 		{contextRefreshing}
 		{aiLoading}
-		actionsAvailable={!settingsOpen && !notesOpen && !mediaOpen && !historyOpen && panelActions.length > 0}
+		actionsAvailable={!settingsOpen && !notesOpen && !mediaOpen && !historyOpen && !chatHistoryOpen && panelActions.length > 0}
 		onactionpanel={openActionPanel}
 		/>
 	</main>

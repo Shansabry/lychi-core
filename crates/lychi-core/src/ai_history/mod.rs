@@ -1,0 +1,57 @@
+//! AI conversation history — persist completed agent conversations so they can
+//! be recalled and continued (Phase 4, "the assistant remembers").
+//!
+//! The one-box surface stays fast-and-forget (each summon starts fresh), but
+//! nothing is lost: every completed conversation is upserted here, and a recall
+//! entry point (the `chat` keyword) lists recent threads to pick from and
+//! continue. Persistence is nearly free — the message array already lives in
+//! memory as a `Session`; this just serializes it.
+
+pub mod store;
+
+use serde::{Deserialize, Serialize};
+
+use crate::providers::ChatMessage;
+
+/// A persisted conversation. `messages` is the full `Session` history (system +
+/// user/assistant/tool turns), so recall can continue it exactly.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct Conversation {
+    pub id: String,
+    /// A short title for the recall list — the first user line, truncated.
+    pub title: String,
+    pub messages: Vec<ChatMessage>,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+/// A lightweight row for the recall list — no message bodies, so listing is cheap.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct ConversationSummary {
+    pub id: String,
+    pub title: String,
+    /// Number of user+assistant turns (excludes the system prompt & tool msgs).
+    pub turn_count: u32,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+/// Derive a title from the first user message: trimmed, single-line, truncated.
+pub fn derive_title(messages: &[ChatMessage]) -> String {
+    use crate::providers::Role;
+    let first_user = messages
+        .iter()
+        .find(|m| m.role == Role::User)
+        .map(|m| m.content.as_str())
+        .unwrap_or("");
+    let line = first_user.lines().next().unwrap_or("").trim();
+    const MAX: usize = 60;
+    if line.chars().count() > MAX {
+        let truncated: String = line.chars().take(MAX).collect();
+        format!("{truncated}…")
+    } else if line.is_empty() {
+        "Conversation".to_string()
+    } else {
+        line.to_string()
+    }
+}
