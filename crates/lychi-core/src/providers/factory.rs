@@ -20,6 +20,9 @@ pub enum ProviderError {
     MissingApiKey(String),
     /// BYO mode but the resolved base URL is empty (custom preset, no URL given).
     MissingBaseUrl,
+    /// BYO mode but the base URL is unsafe (cleartext http to a non-loopback
+    /// host, or a non-URL). Refused so the API key is never attached to it.
+    UnsafeBaseUrl(String),
     /// Ollama mode but no model was selected.
     OllamaNoModel,
     /// Local mode but no model was selected.
@@ -41,6 +44,7 @@ impl std::fmt::Display for ProviderError {
             Self::MissingBaseUrl => {
                 write!(f, "No endpoint URL set for the custom provider")
             }
+            Self::UnsafeBaseUrl(m) => write!(f, "{m}"),
             Self::OllamaNoModel => write!(f, "No Ollama model selected"),
             Self::LocalNoModel => write!(f, "No local model selected"),
             Self::LocalModelMissing(m) => {
@@ -118,6 +122,13 @@ fn build_byo(
     if base_url.is_empty() {
         return Err(ProviderError::MissingBaseUrl);
     }
+    // Enforce the https-or-loopback policy HERE, at the point the API key is
+    // about to be attached to requests for this URL — not only in the save
+    // command. This holds even if config.toml is edited directly on disk: an
+    // unsafe base_url yields a build error instead of silently exfiltrating the
+    // key on the first request. Same decider as the save-time check (M1).
+    cfg.validate_base_url()
+        .map_err(ProviderError::UnsafeBaseUrl)?;
     let api_key = key_lookup(&cfg.provider)
         .filter(|k| !k.is_empty())
         .ok_or_else(|| ProviderError::MissingApiKey(cfg.provider.clone()))?;
@@ -190,6 +201,31 @@ mod tests {
         c.base_url = String::new();
         let r = build_provider(&c, |_| Some("k".into()));
         assert_eq!(r.err(), Some(ProviderError::MissingBaseUrl));
+    }
+
+    #[test]
+    fn byo_unsafe_base_url_refuses_before_attaching_key() {
+        // A cleartext-http remote base_url (as if config was edited on disk) must
+        // fail the build, so the API key is never attached to it.
+        let mut c = cfg("byo");
+        c.provider = "custom".into();
+        c.base_url = "http://attacker.example/v1".into();
+        let r = build_provider(&c, |_| Some("real-key".into()));
+        assert!(matches!(r.err(), Some(ProviderError::UnsafeBaseUrl(_))));
+
+        // https is fine (it'll fail later for other reasons, but not UnsafeBaseUrl).
+        let mut ok = cfg("byo");
+        ok.provider = "custom".into();
+        ok.base_url = "https://api.example.com/v1".into();
+        let r = build_provider(&ok, |_| Some("real-key".into()));
+        assert!(!matches!(r.err(), Some(ProviderError::UnsafeBaseUrl(_))));
+
+        // loopback http is allowed (local proxy).
+        let mut local = cfg("byo");
+        local.provider = "custom".into();
+        local.base_url = "http://localhost:11434/v1".into();
+        let r = build_provider(&local, |_| Some("real-key".into()));
+        assert!(!matches!(r.err(), Some(ProviderError::UnsafeBaseUrl(_))));
     }
 
     #[test]

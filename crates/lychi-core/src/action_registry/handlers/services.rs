@@ -45,14 +45,13 @@ impl Default for ServicesHandler {
     }
 }
 
-/// Verbs that change service state (as opposed to read-only status/list). Used
-/// both here and by the Rules Engine to decide when to require confirmation.
-pub const MUTATING_VERBS: &[&str] = &[
-    "start", "stop", "restart", "reload", "enable", "disable", "kill",
-];
+/// Verbs that change service state (as opposed to read-only status/list).
+/// Aliased to the central classifier ([`crate::rules::verbs`]) — the single
+/// audit surface — but kept as a local name for dispatch/completion use here.
+pub const MUTATING_VERBS: &[&str] = crate::rules::verbs::MUTATING_SERVICE_VERBS;
 
 /// Read-only verbs that never need confirmation.
-const READONLY_VERBS: &[&str] = &["status", "show", "is-active", "is-enabled"];
+const READONLY_VERBS: &[&str] = crate::rules::verbs::READONLY_SERVICE_VERBS;
 
 fn have(tool: &str) -> bool {
     which::which(tool).is_ok()
@@ -385,7 +384,7 @@ impl ActionHandler for ServicesListHandler {
 /// whether to confirm)? Read-only status/list calls return false.
 pub fn is_mutating(args: &str) -> bool {
     match parse(args.trim()) {
-        Some((_, verb)) => MUTATING_VERBS.contains(&verb.as_str()),
+        Some((_, verb)) => crate::rules::verbs::is_mutating_service_verb(&verb),
         None => false,
     }
 }

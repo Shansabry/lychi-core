@@ -1,4 +1,7 @@
+pub mod path;
 pub mod shell;
+pub mod uri;
+pub mod verbs;
 
 use crate::action_registry::{RiskAssessment, RiskLevel};
 use crate::config::schema::PrivacyConfig;

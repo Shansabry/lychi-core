@@ -402,7 +402,15 @@ impl ActionHandler for SshHandler {
             format!("ssh {query}")
         };
 
-        let pid = shell_exec::open_in_terminal(&ssh_cmd, None, ctx.terminal.as_deref())?;
+        // The ssh invocation is a plain `ssh <host>` (no shell metacharacters),
+        // and it has already been routed/validated by the Rules Engine, so it
+        // carries user clearance for the shell gate's decider.
+        let pid = shell_exec::open_in_terminal(
+            &ssh_cmd,
+            None,
+            ctx.terminal.as_deref(),
+            shell_exec::Clearance::UserConfirmed,
+        )?;
         crate::process_tracker::track(pid, &ssh_cmd, None);
 
         let desc = host

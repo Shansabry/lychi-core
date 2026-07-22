@@ -32,19 +32,40 @@ impl TranslateHandler {
     }
 }
 
+/// Case-insensitively find the last occurrence of an ASCII `needle` in
+/// `haystack`, returning a byte offset ALWAYS valid in `haystack`. Searching a
+/// `to_lowercase()` copy and slicing the original panics when lowercasing
+/// changes byte length (`İ` → `i̇`, 2→3 bytes) and the offset lands mid-char.
+/// Our needles are ASCII, so we scan `haystack`'s own byte indices.
+fn rfind_ci_ascii(haystack: &str, needle: &str) -> Option<usize> {
+    debug_assert!(needle.is_ascii());
+    let hb = haystack.as_bytes();
+    let nb = needle.as_bytes();
+    if nb.is_empty() || hb.len() < nb.len() {
+        return None;
+    }
+    (0..=hb.len() - nb.len()).rev().find(|&i| {
+        hb[i..i + nb.len()]
+            .iter()
+            .zip(nb)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
+}
+
 /// Split `<text> to <language>` on the LAST ` to ` so the language is the
 /// trailing clause and the text may itself contain " to " (e.g. "I want to go
 /// home to spanish"). Returns `(text, language)`. If there's no ` to `, the
 /// whole input is treated as text with no language (caller errors).
 fn parse_text_and_language(input: &str) -> (String, Option<String>) {
     let trimmed = input.trim();
-    let lower = trimmed.to_lowercase();
 
     // Leading `to <lang>` (no text) → clipboard shorthand: empty text, the rest
     // is the language. Handled first because a leading "to" has no preceding
-    // space for the ` to ` split to catch.
-    if let Some(rest) = lower.strip_prefix("to ") {
-        let language = trimmed[trimmed.len() - rest.len()..].trim().to_string();
+    // space for the ` to ` split to catch. `is_char_boundary(3)` guards the
+    // slice: a multibyte leading char (`çğı…`) makes byte 3 land mid-char, and
+    // such input can't start with ASCII "to " anyway.
+    if trimmed.is_char_boundary(3) && trimmed[..3].eq_ignore_ascii_case("to ") {
+        let language = trimmed[3..].trim().to_string();
         return (
             String::new(),
             if language.is_empty() {
@@ -56,8 +77,9 @@ fn parse_text_and_language(input: &str) -> (String, Option<String>) {
     }
 
     // Otherwise split on the LAST ` to ` so the language is the trailing clause
-    // and the text may itself contain " to ".
-    match lower.rfind(" to ") {
+    // and the text may itself contain " to ". Offsets come from a case-insensitive
+    // scan of `trimmed` itself, so slicing it is always on a char boundary.
+    match rfind_ci_ascii(trimmed, " to ") {
         Some(idx) => {
             let text = trimmed[..idx].trim().to_string();
             let language = trimmed[idx + 4..].trim().to_string();
@@ -180,6 +202,18 @@ mod tests {
         let (t, l) = parse_text_and_language("I want to go home to french");
         assert_eq!(t, "I want to go home");
         assert_eq!(l.as_deref(), Some("french"));
+    }
+
+    #[test]
+    fn non_ascii_input_does_not_panic() {
+        // Length-changing uppercase chars (`İ` → 2 chars) before ` to ` used to
+        // misalign a lowercased-copy offset and panic. Must not panic now.
+        let _ = parse_text_and_language("İstanbul to english");
+        let _ = parse_text_and_language("TO spanish");
+        let _ = parse_text_and_language("çğı to türkçe");
+        let (t, l) = parse_text_and_language("İ love this TO english");
+        assert_eq!(l.as_deref(), Some("english"));
+        assert_eq!(t, "İ love this");
     }
 
     #[test]

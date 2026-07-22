@@ -54,8 +54,16 @@ pub async fn execute_agent_plan(
             },
         );
 
-        // Execute step through the executor pipeline (resolve → validate → execute)
-        // Plan steps are pre-confirmed (confirmed=true) since user approved the plan
+        // Execute step through the executor pipeline (resolve → validate → execute).
+        // Plan steps run confirmed=true because the user approved the plan AFTER
+        // seeing each step's LITERAL action_id + args in AgentPlanPanel (risk
+        // badges flag which steps modify the system). Two safety nets survive
+        // confirmed=true: (1) the executor enforces `Deny` regardless of confirmed
+        // (run_inner), and (2) the shell hard-deny fires at the point the shell
+        // string is assembled (shell_exec::reject_if_denied), so a catastrophic
+        // command (rm -rf /, disk wipe, curl|sh) an AI hallucinates into a step
+        // is blocked even here. confirmed=true only skips the *Confirm* prompt for
+        // steps the user already vetted on screen — it never bypasses a hard deny.
         let exec = executor
             .run(
                 &format!("{} {}", step.action_id, step.args),

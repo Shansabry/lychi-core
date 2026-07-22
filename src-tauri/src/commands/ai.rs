@@ -21,6 +21,15 @@ pub async fn save_ai_config(
     use lychi_core::config::db as config_db;
     use lychi_core::events::{ConfigSection, DomainEvent};
 
+    // Reject an unsafe BYO endpoint before persisting: the base_url receives the
+    // user's real API key as an auth header, so a cleartext-http or typo'd host
+    // would leak it. Requires https:// (loopback http:// allowed for local
+    // proxies). Fails the save with a clear message rather than silently
+    // exfiltrating the key on the next request.
+    ai_config
+        .validate_base_url()
+        .map_err(LychiError::Config)?;
+
     // Persist, then release the write lock BEFORE emitting — the AiReactor
     // acquires the config/executor locks with blocking_*, so this command must
     // not still hold them when the event fans out.

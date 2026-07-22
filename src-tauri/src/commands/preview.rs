@@ -133,7 +133,11 @@ pub async fn get_file_preview(
 }
 
 fn get_file_preview_sync(path: String) -> Result<FilePreviewData, LychiError> {
-    let file_path = Path::new(&path);
+    // Central path decider: reject malformed / root-escaping input before we
+    // touch the filesystem. Consistent with open_path/reveal_path.
+    let checked = lychi_core::rules::path::check_path(Path::new(&path))
+        .map_err(LychiError::ExecutionFailed)?;
+    let file_path = checked.as_path();
     let full_path = file_path
         .canonicalize()
         .unwrap_or_else(|_| file_path.to_path_buf())

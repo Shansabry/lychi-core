@@ -155,7 +155,13 @@ mod tests {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     fn temp_dir() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("lychi_scripts_test_{n}"));
+        // Include the pid so parallel test binaries (and reruns that leave stale
+        // dirs behind) can't collide on `..._{n}` and see each other's scripts —
+        // which made `discover` pick up a foreign keyword ("deploy") under -j.
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("lychi_scripts_test_{pid}_{n}"));
+        // Start from a clean dir even if a previous run left one behind.
+        let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
     }
