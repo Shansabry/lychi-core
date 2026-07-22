@@ -113,13 +113,21 @@ export type SubmitAction =
 	 */
 	| { kind: "agent"; prompt: string }
 	/**
+	 * An AI preset invocation. `template` + the user's `input`; the dispatcher
+	 * renders it, and when `input` is empty it first tries the PRIMARY selection
+	 * (highlighted text) as `{input}` — so `summarize` alone acts on the
+	 * selection. Kept separate from `agent` so that selection lookup (async IO)
+	 * stays out of the pure router.
+	 */
+	| { kind: "preset"; template: string; input: string }
+	/**
 	 * The user made an AI request but no provider is configured. Warn them, then
 	 * fall back to a web search for `prompt`. `explicit` = they typed `ask …`
 	 * (a deliberate AI ask) vs. a bare natural-language query.
 	 */
 	| { kind: "ai-disabled"; prompt: string; explicit: boolean };
 
-export type PanelName = "settings" | "history" | "media" | "notes";
+export type PanelName = "settings" | "history" | "media" | "notes" | "chat-history";
 export type NotesTab = "notes" | "todos" | "reminders" | "timers" | "snippets";
 
 /**
@@ -183,6 +191,9 @@ export const KNOWN_PREFIXES: ReadonlySet<string> = new Set([
 const PANEL_KEYWORDS: Record<string, { panel: PanelName; notesTab?: NotesTab }> = {
 	settings: { panel: "settings" },
 	history: { panel: "history" },
+	chat: { panel: "chat-history" },
+	chats: { panel: "chat-history" },
+	conversations: { panel: "chat-history" },
 	spotify: { panel: "media" },
 	media: { panel: "media" },
 	music: { panel: "media" },
@@ -245,13 +256,15 @@ export function decideSubmit(ctx: SubmitContext): SubmitAction {
 	const action = decideSubmitInner(ctx);
 	// No AI configured → there's no agent or fork card to open. Surface an
 	// `ai-disabled` action so the UI can warn the user, then fall to web.
-	// `explicit` (they typed `ask …`) → the agent kind; a bare NL query → quick-ai.
-	if (!ctx.aiEnabled && (action.kind === "quick-ai" || action.kind === "agent")) {
-		return {
-			kind: "ai-disabled",
-			prompt: action.prompt,
-			explicit: action.kind === "agent",
-		};
+	// `explicit` (they typed `ask …`/a preset) → agent-like; a bare NL query →
+	// quick-ai. A preset has no meaningful web fallback text, so use its input.
+	if (!ctx.aiEnabled) {
+		if (action.kind === "quick-ai" || action.kind === "agent") {
+			return { kind: "ai-disabled", prompt: action.prompt, explicit: action.kind === "agent" };
+		}
+		if (action.kind === "preset") {
+			return { kind: "ai-disabled", prompt: action.input, explicit: true };
+		}
 	}
 	return action;
 }
@@ -293,7 +306,7 @@ function decideSubmitInner(ctx: SubmitContext): SubmitAction {
 		const preset = ctx.presets.find((p) => p.keyword.toLowerCase() === firstWord);
 		if (preset) {
 			const rest = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
-			return { kind: "agent", prompt: renderPreset(preset.template, rest) };
+			return { kind: "preset", template: preset.template, input: rest };
 		}
 	}
 

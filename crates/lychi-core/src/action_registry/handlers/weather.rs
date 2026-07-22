@@ -16,7 +16,7 @@ use crate::error::LychiError;
 const USER_AGENT: &str = "Lychi/1.0 (https://lychi.app)";
 const GEOCODE_URL: &str = "https://nominatim.openstreetmap.org/search";
 const FORECAST_URL: &str = "https://api.met.no/weatherapi/locationforecast/2.0/compact";
-const IP_GEO_URL: &str = "https://freeipapi.com/api/json";
+const IP_GEO_URL: &str = "https://ipwho.is/";
 
 /// Cache TTL for weather data (10 minutes).
 const WEATHER_CACHE_SECS: u64 = 600;
@@ -84,14 +84,42 @@ struct ForecastSummary {
     symbol_code: String,
 }
 
-// --- IP geolocation response (freeipapi.com) ---
+// --- IP geolocation response (ipwho.is) ---
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct IpGeoResult {
     latitude: f64,
     longitude: f64,
-    city_name: String,
+    city: String,
+}
+
+/// Time/self-reference qualifiers that mean "here, right now" rather than a
+/// place. Stripping them makes the location auto-detect (IP geolocation) instead
+/// of geocoding the word as a place name. The agent passes natural phrasings
+/// ("weather now", "weather today") straight through, so we normalize them here.
+const LOCAL_QUALIFIERS: &[&str] = &[
+    "here",
+    "now",
+    "today",
+    "right now",
+    "current",
+    "currently",
+    "my location",
+    "current location",
+    "local",
+    "outside",
+];
+
+/// Normalize a weather location argument: trim, and if it's purely a "here/now"
+/// qualifier (or empty), return "" to trigger auto-detect. Otherwise return the
+/// place as typed ("tokyo" → "tokyo", "weather now" → auto-detect).
+fn normalize_weather_location(args: &str) -> &str {
+    let t = args.trim();
+    let lower = t.to_lowercase();
+    if lower.is_empty() || LOCAL_QUALIFIERS.contains(&lower.as_str()) {
+        return "";
+    }
+    t
 }
 
 // --- Structured output for frontend ---
@@ -158,7 +186,7 @@ impl WeatherHandler {
         }
     }
 
-    /// Auto-detect location from IP address using freeipapi.com.
+    /// Auto-detect location from IP address using ipwho.is (free, HTTPS, no key).
     async fn detect_location(&self) -> Result<(f64, f64, String), LychiError> {
         let geo: IpGeoResult = self
             .client
@@ -172,13 +200,13 @@ impl WeatherHandler {
             .await
             .map_err(|e| LychiError::ExecutionFailed(format!("IP geolocation parse error: {e}")))?;
 
-        if geo.city_name.is_empty() {
+        if geo.city.is_empty() {
             return Err(LychiError::ExecutionFailed(
                 "Could not detect city from IP address".to_string(),
             ));
         }
 
-        Ok((geo.latitude, geo.longitude, geo.city_name))
+        Ok((geo.latitude, geo.longitude, geo.city))
     }
 
     async fn geocode(&self, query: &str) -> Result<(f64, f64, String), LychiError> {
@@ -403,13 +431,11 @@ impl ActionHandler for WeatherHandler {
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        // "here" = auto-detect location (same as empty args)
-        let input = args.trim();
-        let input = if input.eq_ignore_ascii_case("here") {
-            ""
-        } else {
-            input
-        };
+        // Normalize the location argument. Words that mean "here / right now" —
+        // not a place — resolve to auto-detect (IP geolocation), so "weather now"
+        // and "weather here" both give the LOCAL weather instead of geocoding the
+        // qualifier as a place name (which mis-resolved "now" → a random city).
+        let input = normalize_weather_location(args);
 
         let cache_key = if input.is_empty() {
             "__auto__".to_string()
@@ -551,5 +577,25 @@ fn symbol_to_description(code: &str) -> &str {
         "heavysnow" => "heavy snow",
         "fog" => "fog",
         _ => code,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_weather_location;
+
+    #[test]
+    fn local_qualifiers_resolve_to_autodetect() {
+        for q in ["here", "now", "today", "right now", "current", "currently",
+                  "my location", "local", "NOW", " Here ", ""] {
+            assert_eq!(normalize_weather_location(q), "", "{q:?} should auto-detect");
+        }
+    }
+
+    #[test]
+    fn real_places_pass_through() {
+        assert_eq!(normalize_weather_location("tokyo"), "tokyo");
+        assert_eq!(normalize_weather_location("  Nagercoil "), "Nagercoil");
+        assert_eq!(normalize_weather_location("new york"), "new york");
     }
 }

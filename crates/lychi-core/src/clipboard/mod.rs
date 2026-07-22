@@ -1,4 +1,5 @@
 pub mod image_utils;
+pub mod selection;
 pub mod store;
 
 use serde::{Deserialize, Serialize};

@@ -699,8 +699,8 @@ export function dismissConfirm() {
 		<input
 			id="ollama-max-tokens"
 			type="number"
-			min="100"
-			max="4000"
+			min="256"
+			max="16000"
 			bind:value={aiConfig.max_tokens}
 			onchange={saveAi}
 		/>
@@ -767,8 +767,8 @@ export function dismissConfirm() {
 		<input
 			id="ai-max-tokens"
 			type="number"
-			min="100"
-			max="2000"
+			min="256"
+			max="16000"
 			bind:value={aiConfig.max_tokens}
 			onchange={saveAi}
 		/>

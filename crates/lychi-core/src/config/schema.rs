@@ -486,7 +486,10 @@ fn default_ai_timeout() -> u64 {
     8
 }
 fn default_max_tokens() -> u32 {
-    300
+    // The streaming agent produces full markdown answers (not the old 2-3
+    // sentence `ask` cap), so this needs real headroom — 300 truncated rich
+    // answers mid-sentence. 4096 covers a thorough answer without being wasteful.
+    4096
 }
 
 impl Default for AiConfig {

@@ -1,4 +1,5 @@
 pub mod action_registry;
+pub mod ai_history;
 pub mod ai_presets;
 pub mod aliases;
 pub mod clipboard;

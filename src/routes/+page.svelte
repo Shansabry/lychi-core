@@ -6,6 +6,7 @@ import { onMount } from "svelte";
 import ActionPanel from "$lib/components/ActionPanel.svelte";
 import AgentPlanPanel from "$lib/components/AgentPlanPanel.svelte";
 import AiAnswer from "$lib/components/AiAnswer.svelte";
+import ChatHistoryPanel from "$lib/components/ChatHistoryPanel.svelte";
 import CommandInput from "$lib/components/CommandInput.svelte";
 import CompletionsList from "$lib/components/CompletionsList.svelte";
 import FilePreview from "$lib/components/FilePreview.svelte";
@@ -31,7 +32,9 @@ import {
 	agentChatStart,
 	cancelAiChat,
 	cancelFileSearch,
+	clearConversations,
 	confirmExecution,
+	deleteConversation,
 	executeCommand,
 	fuzzyPathCompletions,
 	getActiveWindowStrategy,
@@ -40,6 +43,8 @@ import {
 	getAiStatus,
 	getCompletions,
 	getContext,
+	getConversation,
+	getConversations,
 	getHideOnBlur,
 	getHistory,
 	getHotkeyStatus,
@@ -47,17 +52,20 @@ import {
 	grantPrivacyConsent,
 	hideWindow,
 	listPathCompletions,
+	loadConversation,
 	mediaGetStatus,
 	openPath,
 	openUri,
+	readSelection,
 	revealPath,
 	saveGeneralConfig,
 	saveWindowPosition,
 	startFileSearch,
+	suggestCorrection,
 } from "$lib/ipc";
 import { loadKeybindings, matchesAction } from "$lib/keybindings";
 import { preloadAll } from "$lib/preloadCache";
-import { decideSubmit } from "$lib/submit-router";
+import { decideSubmit, renderPreset } from "$lib/submit-router";
 
 let inputValue = $state("");
 let isExecuting = $state(false);
@@ -106,9 +114,20 @@ let aiTurns: AiTurn[] = $state([]);
 let aiLastUser = $state("");
 // The in-panel follow-up reply box text.
 let aiReply = $state("");
+// Ref to the AiAnswer component, so explicit actions (Full chat / recall) can
+// shift focus to its reply box. The launcher input stays primary otherwise.
+let aiAnswerRef: AiAnswer | undefined = $state();
+// The current answer was cut off at the token cap (shows a truncation notice).
+let aiTruncated = $state(false);
+// Accumulated token spend for the conversation (input + output).
+let aiTokensIn = $state(0);
+let aiTokensOut = $state(0);
 
 let historyEntries: string[] = $state([]);
 let historyOpen = $state(false);
+// Chat-history recall panel (the `chat` keyword) + its loaded conversation list.
+let chatHistoryOpen = $state(false);
+let conversations: import("$lib/ipc").ConversationSummary[] = $state([]);
 
 let completions: CompletionItem[] = $state([]);
 let completionIndex = $state(-1);
@@ -168,21 +187,37 @@ let compactMode = $state(false);
 let launcherRowEl: HTMLDivElement | undefined = $state();
 
 // Keep the compact window's height matched to content (rofi-style resize).
+// Debounced: coalesces bursts of content changes (e.g. suggestions landing just
+// after the window shows) into a SINGLE resize, so the window doesn't visibly
+// jump twice on open. Also ignores sub-pixel/tiny deltas that aren't real
+// content changes.
 $effect(() => {
 	if (!compactMode || !launcherRowEl || !("__TAURI_INTERNALS__" in window)) return;
 	const el = launcherRowEl;
 	const win = getCurrentWindow();
 	let lastH = 0;
-	const observer = new ResizeObserver(() => {
+	let raf = 0;
+	const apply = () => {
+		raf = 0;
 		const maxH = Math.round(window.screen.height * 0.6);
 		const h = Math.min(Math.ceil(el.getBoundingClientRect().height), maxH);
-		if (h > 0 && h !== lastH) {
+		// Ignore ≤1px jitter — only resize on a real content-height change.
+		if (h > 0 && Math.abs(h - lastH) > 1) {
 			lastH = h;
 			win.setSize(new LogicalSize(680, h)).catch(() => {});
 		}
+	};
+	const observer = new ResizeObserver(() => {
+		// Coalesce to the next frame — several observer callbacks in one tick
+		// (suggestions arriving) collapse into one setSize.
+		if (raf) cancelAnimationFrame(raf);
+		raf = requestAnimationFrame(apply);
 	});
 	observer.observe(el);
-	return () => observer.disconnect();
+	return () => {
+		if (raf) cancelAnimationFrame(raf);
+		observer.disconnect();
+	};
 });
 // First-run Wayland onboarding: shown when the in-app hotkey can't work
 // system-wide and the user hasn't dismissed the tip yet.
@@ -235,6 +270,41 @@ function extractContextStale(results: CompletionItem[]): CompletionItem[] {
 	contextStale = !!stale;
 	contextStaleHint = stale?.description ?? "";
 	return stale ? results.filter((c) => c.icon_path !== "__context_stale__") : results;
+}
+
+/**
+ * Load the empty-input suggestions (recents / context rows) into the completions
+ * list. Called immediately on summon (so recents appear at once, not after the
+ * context round-trip) AND again when fresh context arrives (to enrich in place).
+ * Guarded by `completionGen` so a typist's query is never overwritten, and only
+ * applies while the input is still empty.
+ */
+/** Sentinel prefix stashed in a completion's `run` to mark it as an AI-chat
+ *  recall row: `__chat__:<conversationId>`. Chosen → opens the conversation. */
+const CHAT_RUN_PREFIX = "__chat__:";
+
+function loadEmptySuggestions() {
+	if (inputValue.trim().length > 0) return;
+	const gen = ++completionGen;
+	// Fetch command recents + a few recent AI chats in parallel, then merge:
+	// chats first (with an AI icon), then the command/context recents.
+	Promise.all([getCompletions(""), getConversations().catch(() => [])])
+		.then(([rawResults, convs]) => {
+			if (gen !== completionGen || inputValue.trim().length > 0) return;
+			const recents = extractContextStale(rawResults);
+			const chatRows: CompletionItem[] = convs.slice(0, 4).map((c) => ({
+				label: c.title,
+				icon_path: "__ai_chat__",
+				score: 0,
+				description: `${c.turn_count} turn${c.turn_count === 1 ? "" : "s"} · AI chat`,
+				run: `${CHAT_RUN_PREFIX}${c.id}`,
+			}));
+			completions = [...chatRows, ...recents];
+			// Do NOT preselect: on an empty box these are recents, not a query
+			// result. Selection happens only on mouse press or arrow key.
+			completionIndex = -1;
+		})
+		.catch(() => {});
 }
 
 // Transient confirmation shown in the completions hints bar (e.g. "Path copied").
@@ -380,6 +450,12 @@ function handleInput(val: string) {
 		mediaOpen = false;
 	}
 	historyOpen = false;
+	chatHistoryOpen = false;
+	// Typing a new query dismisses an on-screen AI answer so completions show.
+	// (The conversation is already persisted; recall it via `chat` if needed.)
+	if (aiActive && val.trim().length > 0) {
+		resetChat();
+	}
 	clearTimeout(debounceTimer);
 	atNoResults = false;
 
@@ -532,7 +608,9 @@ function handleInput(val: string) {
  */
 function defaultMatchIndex(results: CompletionItem[], input: string): number {
 	const q = input.trim().toLowerCase();
-	if (!q) return results.length > 0 ? 0 : -1;
+	// Empty input → recents/suggestions, NOT a query result: never preselect, so
+	// Enter doesn't run a row the user didn't choose. Selection is mouse/arrow only.
+	if (!q) return -1;
 	for (let i = 0; i < results.length; i++) {
 		const c = results[i];
 		if (c.icon_path === "__separator__" || c.icon_path === "__info__") continue;
@@ -658,6 +736,11 @@ onMount(() => {
 				case "final":
 					aiStreaming = false;
 					if (ev.text) aiText = ev.text;
+					aiTruncated = ev.truncated ?? false;
+					break;
+				case "usage":
+					aiTokensIn += ev.input_tokens ?? 0;
+					aiTokensOut += ev.output_tokens ?? 0;
 					break;
 				case "stopped":
 					aiStreaming = false;
@@ -686,6 +769,7 @@ onMount(() => {
 			inputValue = "";
 			lastResult = null;
 			historyOpen = false;
+			chatHistoryOpen = false;
 			settingsOpen = false;
 			pendingPlan = null;
 			mediaOpen = false;
@@ -707,7 +791,6 @@ onMount(() => {
 				contextLoading = true;
 			}, 120);
 
-			completions = [];
 			completionIndex = -1;
 			atMode = false;
 			atStart = -1;
@@ -716,6 +799,11 @@ onMount(() => {
 			routingGeneration++;
 			isRouting = false;
 			cancelFileSearch();
+			// Load recents/suggestions IMMEDIATELY (don't wait for context-ready) so
+			// they're present as the window appears — no post-paint pop-in. Fresh
+			// context (below) re-fetches to enrich in place. We keep the old
+			// completions until the new ones arrive (no empty→populated flash).
+			loadEmptySuggestions();
 			// Force focus the input (layer shell may not auto-focus DOM elements).
 			// Double-tap: rAF for immediate attempt, setTimeout for delayed retry
 			// in case the compositor grants surface focus slightly late.
@@ -741,21 +829,10 @@ onMount(() => {
 			contextRefreshing = false;
 			clearTimeout(contextLoadingTimer);
 			contextLoading = false;
-			// Fetch context suggestions only if the input is still empty.
-			// Use Svelte state (inputValue) not a DOM query — DOM can be stale when
-			// focus hasn't been granted yet. Guard with completionGen so a fast typist
-			// doesn't get their completions overwritten by the context response.
-			if (inputValue.trim().length < 1) {
-				const gen = ++completionGen;
-				getCompletions("")
-					.then((rawResults) => {
-						if (gen !== completionGen) return;
-						const results = extractContextStale(rawResults);
-						completions = results;
-						completionIndex = results.length > 0 ? 0 : -1;
-					})
-					.catch(() => {});
-			}
+			// Fresh context arrived — re-fetch suggestions to enrich them in place
+			// (same helper as summon; guarded, empty-input-only). The fixed-pool
+			// CompletionsList updates without DOM churn, so this never causes a jump.
+			loadEmptySuggestions();
 		});
 		unlisteners.push(unlistenContext);
 
@@ -946,6 +1023,9 @@ function resetChat() {
 	aiReply = "";
 	aiQuick = false;
 	aiQuickPrompt = "";
+	aiTruncated = false;
+	aiTokensIn = 0;
+	aiTokensOut = 0;
 }
 
 /** Send a follow-up from the in-panel reply box (continues the conversation). */
@@ -977,6 +1057,7 @@ async function startChat(prompt: string, fresh = true) {
 	aiToolSteps = [];
 	aiError = null;
 	aiApproval = null;
+	aiTruncated = false;
 	aiStreaming = true;
 	aiActive = true;
 	aiQuick = false; // full agent chat, not the fork card
@@ -992,14 +1073,107 @@ async function startChat(prompt: string, fresh = true) {
 	}
 }
 
-/** The system prompt for the quick-AI fork card — a short, tool-free answer. */
+/**
+ * The system prompt for the quick-AI fork card. The agent CAN act (it has the
+ * tool catalog): if the query is an action Lychi can perform (weather, open an
+ * app, media control, system info…), DO it via a tool rather than describing how.
+ * Otherwise answer the question directly and concisely.
+ */
 const QUICK_AI_SYSTEM =
-	"You are Lychi, a helpful assistant inside a Linux launcher. Answer the user's question directly and concisely — 2-3 sentences, plain and factual. Use minimal markdown. If you can't answer confidently, say so in one line.";
+	"You are Lychi, a smart assistant inside a Linux launcher. You can ACT on the user's system by calling tools. If the request is something a tool can do (check the weather, open/launch an app, control media, read system info, search, etc.), call the tool and give the result — never tell the user to run a command themselves when you have a tool for it. Otherwise, answer the question directly and concisely in 2-3 sentences with minimal markdown.";
+
+/** System prompt for AI presets (text transforms) — do the task, nothing else. */
+const PRESET_SYSTEM =
+	"You are Lychi's AI command runner. Perform the task in the user's message directly and return only the result — no preamble, no explanation, no tool use. Use minimal markdown.";
 
 /**
- * The fork card: stream a SHORT, tool-free answer for an unknown query, with
- * [Search web] / [Full chat] buttons the user picks from. Reuses the same
- * `lychi://agent-event` streaming plumbing as the full agent (with_tools=false).
+ * Run an AI preset (a text transform like translate/summarize). Tool-FREE and
+ * streaming — presets never need to call tools, so we skip the ~40-tool catalog
+ * entirely (smaller request, no tool-choice reasoning = noticeably faster). The
+ * answer streams into the full chat surface (not the fork card — the user
+ * explicitly invoked a command), and follow-ups continue the session.
+ */
+async function startPreset(prompt: string) {
+	const text = prompt.trim();
+	if (!text) return;
+	aiTurns = [];
+	aiLastUser = text;
+	aiText = "";
+	aiToolSteps = [];
+	aiError = null;
+	aiApproval = null;
+	aiTruncated = false;
+	aiStreaming = true;
+	aiActive = true;
+	aiQuick = false; // full answer surface, not the fork card
+	lastResult = null;
+	const gen = ++aiGen;
+	try {
+		await agentChatStart(PRESET_SYSTEM, text, /* fresh */ true, /* withTools */ false, gen);
+	} catch (e) {
+		if (gen === aiGen) {
+			aiStreaming = false;
+			aiError = e instanceof Error ? e.message : String(e);
+		}
+	}
+}
+
+/**
+ * Recall a stored conversation (from the `chat` panel): prime the backend
+ * session with its history, render its turns on the AI surface, and show the
+ * reply box so the next message continues it. No new AI request is made — the
+ * user's follow-up drives the next turn.
+ */
+async function openConversation(id: string) {
+	const conv = await loadConversation(id).catch(() => null);
+	if (!conv) return;
+	chatHistoryOpen = false;
+	// Pair the stored messages into user→assistant turns for the transcript.
+	// Tool/system messages are skipped in this view (the raw session still has
+	// them for the model's context).
+	const turns: AiTurn[] = [];
+	let pendingUser = "";
+	for (const m of conv.messages) {
+		if (m.role === "user") {
+			pendingUser = m.content;
+		} else if (m.role === "assistant" && m.content) {
+			turns.push({ user: pendingUser, text: m.content, toolSteps: [] });
+			pendingUser = "";
+		}
+	}
+	aiTurns = turns.slice(0, -1); // last pair goes into the live slot
+	const last = turns[turns.length - 1];
+	aiLastUser = last?.user ?? pendingUser;
+	aiText = last?.text ?? "";
+	aiToolSteps = [];
+	aiError = null;
+	aiApproval = null;
+	aiStreaming = false;
+	aiActive = true;
+	aiQuick = false;
+	lastResult = null;
+	aiGen++; // fresh generation for any follow-up
+	// Opening a recalled conversation is an explicit action → focus the reply box.
+	aiAnswerRef?.focusReply();
+}
+
+/** Delete one stored conversation from the recall list. */
+async function deleteConversationEntry(id: string) {
+	await deleteConversation(id).catch(() => {});
+	conversations = conversations.filter((c) => c.id !== id);
+}
+
+/** Clear all stored conversations. */
+async function clearAllConversations() {
+	await clearConversations().catch(() => {});
+	conversations = [];
+}
+
+/**
+ * The fork card: stream a short answer for an unknown query, with [Search web] /
+ * [Full chat] buttons the user picks from. The agent HAS tools (with_tools=true)
+ * so it can act on action-queries ("weather now" → calls the weather tool)
+ * instead of just describing what to run.
  */
 async function startQuickAi(prompt: string) {
 	const text = prompt.trim();
@@ -1011,13 +1185,14 @@ async function startQuickAi(prompt: string) {
 	aiToolSteps = [];
 	aiError = null;
 	aiApproval = null;
+	aiTruncated = false;
 	aiStreaming = true;
 	aiActive = true;
 	aiQuick = true; // the fork card
 	lastResult = null;
 	const gen = ++aiGen;
 	try {
-		await agentChatStart(QUICK_AI_SYSTEM, text, /* fresh */ true, /* withTools */ false, gen);
+		await agentChatStart(QUICK_AI_SYSTEM, text, /* fresh */ true, /* withTools */ true, gen);
 	} catch (e) {
 		if (gen === aiGen) {
 			aiStreaming = false;
@@ -1045,13 +1220,18 @@ function escalateToChat() {
 		return;
 	}
 	// Snapshot the quick answer as a completed turn, then switch to full chat.
+	// Clear the live-turn fields (user + text) so the snapshotted turn doesn't
+	// ALSO render as the current bubble (that was the duplicate-question bug).
 	aiTurns = [...aiTurns, { user: aiLastUser, text: aiText, toolSteps: aiToolSteps }];
+	aiLastUser = "";
 	aiText = "";
 	aiToolSteps = [];
 	aiQuick = false;
 	aiStreaming = false;
 	// The reply box is now shown (quick=false, not streaming); the user's
 	// follow-up continues the existing session via sendReply → startChat(fresh=false).
+	// Explicit action → shift focus to the reply box.
+	aiAnswerRef?.focusReply();
 }
 
 /** Fork-card button: bail out to a plain web search for the query. */
@@ -1065,6 +1245,7 @@ async function quickWebSearch() {
 async function approveTool(approve: boolean) {
 	if (!aiApproval) return;
 	aiApproval = null;
+	aiTruncated = false;
 	aiStreaming = true;
 	const gen = aiGen; // same run continues
 	try {
@@ -1128,7 +1309,14 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 			historyOpen = action.panel === "history";
 			mediaOpen = action.panel === "media";
 			notesOpen = action.panel === "notes";
+			chatHistoryOpen = action.panel === "chat-history";
 			if (action.panel === "notes") initialNotesTab = action.notesTab;
+			if (action.panel === "chat-history") {
+				aiActive = false; // hide any on-screen AI answer behind the recall list
+				getConversations().then((cs) => {
+					conversations = cs;
+				});
+			}
 			return;
 		}
 
@@ -1174,15 +1362,39 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 		}
 
 		case "command":
+			// An AI-chat recall row (from the empty-box recents) → open the chat,
+			// not the executor.
+			if (action.command.startsWith(CHAT_RUN_PREFIX)) {
+				completions = [];
+				completionIndex = -1;
+				await openConversation(action.command.slice(CHAT_RUN_PREFIX.length));
+				return;
+			}
 			await runCommand(action.command, { runInline: action.runInline });
 			return;
 
-		case "quick-ai":
+		case "quick-ai": {
+			// A single unknown word (no spaces) might be an app-name typo — check
+			// for a "Did you mean" correction BEFORE going to AI. Instant local
+			// fuzzy match; multi-word / real questions skip this and go to AI.
+			if (aiEnabled && !action.prompt.includes(" ")) {
+				const corrected = await suggestCorrection(action.prompt).catch(() => null);
+				if (corrected) {
+					// Fill the input with the correction so the user confirms with a
+					// second Enter (or edits it) — never auto-runs the wrong app.
+					inputValue = corrected;
+					completions = [];
+					completionIndex = -1;
+					handleInput(inputValue);
+					return;
+				}
+			}
 			inputValue = "";
 			completions = [];
 			completionIndex = -1;
 			await startQuickAi(action.prompt);
 			return;
+		}
 
 		case "agent":
 			inputValue = "";
@@ -1190,6 +1402,23 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 			completionIndex = -1;
 			await startChat(action.prompt, /* fresh */ true);
 			return;
+
+		case "preset": {
+			// An AI preset. If the user typed no text after the keyword, fall back
+			// to the PRIMARY selection (highlighted text in the focused window) —
+			// so `summarize` alone acts on what you've selected in VSCode/browser.
+			// Runs tool-free (startPreset) — a text transform needs no tools.
+			inputValue = "";
+			completions = [];
+			completionIndex = -1;
+			let input = action.input;
+			if (!input) {
+				const sel = await readSelection().catch(() => null);
+				if (sel) input = sel;
+			}
+			await startPreset(renderPreset(action.template, input));
+			return;
+		}
 
 		case "ai-disabled": {
 			// The user made an AI request but no provider is configured. Warn
@@ -1435,6 +1664,14 @@ let panelActions = $derived.by((): PanelAction[] => {
 	const hasPath = searchMode || atMode || filePathMap.has(item.label);
 	const isApp = item.run?.startsWith("appctl") || item.run?.startsWith("open ");
 	const isCalc = item.label.startsWith("= ");
+	const isAiChat = item.run?.startsWith(CHAT_RUN_PREFIX);
+
+	if (isAiChat) {
+		// An AI-chat recall row: open/continue it, or delete it.
+		acts.push({ id: "open", label: "Open conversation", hint: "Enter" });
+		acts.push({ id: "ai_delete_chat", label: "Delete conversation" });
+		return acts;
+	}
 
 	if (hasPath) {
 		acts.push({ id: "open", label: isFolder ? "Open folder" : "Open", hint: "Enter" });
@@ -1456,6 +1693,12 @@ let panelActions = $derived.by((): PanelAction[] => {
 		if (item.run) {
 			acts.push({ id: "copy_command", label: "Copy command" });
 		}
+	}
+
+	// AI actions available for any non-path row (ask the agent about it / open a
+	// fresh chat seeded with the label). Only when AI is configured.
+	if (aiEnabled && !hasPath && !isCalc) {
+		acts.push({ id: "ai_ask", label: "Ask AI about this", hint: "" });
 	}
 	return acts;
 });
@@ -1527,12 +1770,35 @@ function runPanelAction(id: string) {
 			}
 			closeActionPanel();
 			break;
+		case "ai_ask":
+			// Seed a fresh agent chat with the row's label.
+			closeActionPanel();
+			inputValue = "";
+			completions = [];
+			completionIndex = -1;
+			startChat(item.label, /* fresh */ true);
+			break;
+		case "ai_delete_chat":
+			// Delete a recalled conversation (AI-chat recent row).
+			if (item.run?.startsWith(CHAT_RUN_PREFIX)) {
+				deleteConversationEntry(item.run.slice(CHAT_RUN_PREFIX.length));
+			}
+			closeActionPanel();
+			break;
 		default:
 			closeActionPanel();
 	}
 }
 
 function handleCompletionSelect(label: string, forceOpen?: boolean) {
+	// An AI-chat recall row (empty-box recents) → open the conversation.
+	const clicked = completions.find((c) => c.label === label);
+	if (clicked?.run?.startsWith(CHAT_RUN_PREFIX)) {
+		completions = [];
+		completionIndex = -1;
+		openConversation(clicked.run.slice(CHAT_RUN_PREFIX.length));
+		return;
+	}
 	// / search mode — Enter opens the folder/file; Ctrl+Enter (forceOpen) reveals
 	// it in the file manager. Drilling into a folder is Tab / → (see drillIntoFolder).
 	if (searchMode) {
@@ -1649,11 +1915,30 @@ function handleToggleHistory() {
 	settingsOpen = false;
 	mediaOpen = false;
 	notesOpen = false;
+	chatHistoryOpen = false;
 	if (historyOpen) {
 		completions = [];
 		completionIndex = -1;
 	} else {
 		// Re-fetch completions for current input
+		handleInput(inputValue);
+	}
+}
+
+function handleToggleChatHistory() {
+	chatHistoryOpen = !chatHistoryOpen;
+	historyOpen = false;
+	settingsOpen = false;
+	mediaOpen = false;
+	notesOpen = false;
+	if (chatHistoryOpen) {
+		aiActive = false; // hide any on-screen AI answer behind the recall list
+		completions = [];
+		completionIndex = -1;
+		getConversations().then((cs) => {
+			conversations = cs;
+		});
+	} else {
 		handleInput(inputValue);
 	}
 }
@@ -1945,6 +2230,16 @@ async function handleDismiss() {
 		<div class:panel-hidden={!historyOpen}>
 			<HistoryPanel entries={historyEntries} onselect={handleHistorySelect} />
 		</div>
+		<div class:panel-hidden={!chatHistoryOpen}>
+			<ChatHistoryPanel
+				{conversations}
+				visible={chatHistoryOpen}
+				onselect={openConversation}
+				ondelete={deleteConversationEntry}
+				onclear={clearAllConversations}
+				ondismiss={() => { chatHistoryOpen = false; }}
+			/>
+		</div>
 		<div class:panel-hidden={!notesOpen}>
 			<NotesPanel ondismiss={() => { notesOpen = false; pendingNoteText = null; initialNotesTab = undefined; }} {pendingNoteText} onpendingcleared={() => { pendingNoteText = null; }} {initialNotesTab} visible={notesOpen} />
 		</div>
@@ -1963,8 +2258,13 @@ async function handleDismiss() {
 		</div>
 		{#if aiActive}
 			<AiAnswer
+				bind:this={aiAnswerRef}
 				turns={aiTurns}
+				lastUser={aiLastUser}
 				text={aiText}
+				truncated={aiTruncated}
+				tokensIn={aiTokensIn}
+				tokensOut={aiTokensOut}
 				streaming={aiStreaming}
 				error={aiError}
 				toolSteps={aiToolSteps}
@@ -1987,7 +2287,7 @@ async function handleDismiss() {
 				}}
 				ondismiss={() => { pendingPlan = null; }}
 			/>
-		{:else if !settingsOpen && !notesOpen && !mediaOpen && !historyOpen}
+		{:else if !settingsOpen && !notesOpen && !mediaOpen && !historyOpen && !chatHistoryOpen}
 			<CompletionsList
 				items={completions}
 				selectedIndex={completionIndex}
@@ -2034,12 +2334,14 @@ async function handleDismiss() {
 			{historyOpen}
 			{settingsOpen}
 			mediaOpen={mediaOpen}
+			{chatHistoryOpen}
 			{nowPlaying}
 			{multiplePlayers}
 			ontogglehistory={handleToggleHistory}
 			ontogglesettings={handleToggleSettings}
 			ontogglemedia={handleToggleMedia}
 			ontogglenotes={handleToggleNotes}
+			ontogglechathistory={handleToggleChatHistory}
 			{notesOpen}
 		onshowresult={handleShowResult}
 		onshowplan={handleShowPlan}
@@ -2048,7 +2350,7 @@ async function handleDismiss() {
 		{contextStaleHint}
 		{contextRefreshing}
 		{aiLoading}
-		actionsAvailable={!settingsOpen && !notesOpen && !mediaOpen && !historyOpen && panelActions.length > 0}
+		actionsAvailable={!settingsOpen && !notesOpen && !mediaOpen && !historyOpen && !chatHistoryOpen && panelActions.length > 0}
 		onactionpanel={openActionPanel}
 		/>
 	</main>

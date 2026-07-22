@@ -74,6 +74,13 @@ describe("decideSubmit — panels & colon triggers", () => {
 		});
 	});
 
+	it("bare 'chat' opens the chat-history recall panel", () => {
+		expect(decideSubmit(ctx({ trimmed: "chat" }))).toEqual({
+			kind: "panel",
+			panel: "chat-history",
+		});
+	});
+
 	it("bare 'todos' opens notes on the todos tab", () => {
 		expect(decideSubmit(ctx({ trimmed: "todos" }))).toEqual({
 			kind: "panel",
@@ -188,22 +195,25 @@ describe("decideSubmit — AI presets", () => {
 
 	it("`translate hola` renders the template → full agent", () => {
 		expect(decideSubmit(ctx({ trimmed: "translate hola", presets }))).toEqual({
-			kind: "agent",
-			prompt: "Translate to English: hola",
+			kind: "preset",
+			template: "Translate to English: {input}",
+			input: "hola",
 		});
 	});
 
 	it("a custom user preset works the same way", () => {
 		expect(decideSubmit(ctx({ trimmed: "email quarterly results", presets }))).toEqual({
-			kind: "agent",
-			prompt: "Write a professional email about: quarterly results",
+			kind: "preset",
+			template: "Write a professional email about: {input}",
+			input: "quarterly results",
 		});
 	});
 
 	it("a bare preset keyword with no input still renders (empty {input})", () => {
 		expect(decideSubmit(ctx({ trimmed: "translate", presets }))).toEqual({
-			kind: "agent",
-			prompt: "Translate to English: ",
+			kind: "preset",
+			template: "Translate to English: {input}",
+			input: "",
 		});
 	});
 
@@ -212,7 +222,7 @@ describe("decideSubmit — AI presets", () => {
 	});
 
 	it("preset matching is case-insensitive on the keyword", () => {
-		expect(decideSubmit(ctx({ trimmed: "TRANSLATE hola", presets })).kind).toBe("agent");
+		expect(decideSubmit(ctx({ trimmed: "TRANSLATE hola", presets })).kind).toBe("preset");
 	});
 });
 

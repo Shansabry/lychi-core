@@ -21,6 +21,16 @@
 	--font-mono: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
 	--font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
 	--font-brand: "Lexend", sans-serif;
+
+	/* Syntax-highlight tokens (highlight.js) — dark palette. */
+	--hl-keyword: #c586c0;
+	--hl-string: #98c379;
+	--hl-number: #d19a66;
+	--hl-function: #61afef;
+	--hl-comment: #7d8590;
+	--hl-type: #e5c07b;
+	--hl-variable: #e06c75;
+	--hl-attr: #56b6c2;
 }
 
 :root[data-theme="light"] {
@@ -35,6 +45,71 @@
 	--success: #228822;
 	--border: #ddd;
 	--ai: #7c3aed;
+
+	/* Syntax-highlight tokens — light palette. */
+	--hl-keyword: #a626a4;
+	--hl-string: #50a14f;
+	--hl-number: #986801;
+	--hl-function: #4078f2;
+	--hl-comment: #a0a1a7;
+	--hl-type: #c18401;
+	--hl-variable: #e45649;
+	--hl-attr: #0184bc;
+}
+
+/* highlight.js token → CSS-variable mapping (theme-aware, self-contained;
+   avoids shipping a third-party theme CSS file). Scoped to .hljs blocks. */
+.hljs-keyword,
+.hljs-built_in,
+.hljs-literal,
+.hljs-selector-tag {
+	color: var(--hl-keyword);
+}
+.hljs-string,
+.hljs-regexp,
+.hljs-meta .hljs-string {
+	color: var(--hl-string);
+}
+.hljs-number,
+.hljs-symbol,
+.hljs-bullet {
+	color: var(--hl-number);
+}
+.hljs-title,
+.hljs-title.function_,
+.hljs-section {
+	color: var(--hl-function);
+}
+.hljs-comment,
+.hljs-quote {
+	color: var(--hl-comment);
+	font-style: italic;
+}
+.hljs-type,
+.hljs-class .hljs-title,
+.hljs-title.class_,
+.hljs-params {
+	color: var(--hl-type);
+}
+.hljs-variable,
+.hljs-template-variable,
+.hljs-name,
+.hljs-selector-id,
+.hljs-selector-class {
+	color: var(--hl-variable);
+}
+.hljs-attr,
+.hljs-attribute,
+.hljs-property,
+.hljs-meta,
+.hljs-tag {
+	color: var(--hl-attr);
+}
+.hljs-emphasis {
+	font-style: italic;
+}
+.hljs-strong {
+	font-weight: 600;
 }
 
 * {

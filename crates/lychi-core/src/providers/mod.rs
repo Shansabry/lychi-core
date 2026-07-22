@@ -139,8 +139,16 @@ pub enum StreamEvent {
     /// A tool call is fully assembled. `args` is the single Lychi argument string
     /// (the provider has already unwrapped its `{"args": …}` wire object).
     ToolCallComplete { id: String, name: String, args: String },
-    /// The turn ended.
-    Done { stop_reason: StopReason },
+    /// The turn ended. `usage` carries token counts when the provider reports them
+    /// (Anthropic/OpenAI SSE); `None` for providers that don't (e.g. local).
+    Done { stop_reason: StopReason, usage: Option<Usage> },
+}
+
+/// Token usage for one model turn, when the provider reports it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
 }
 
 /// The stream a provider returns: a boxed, `Send + 'static` stream of events (or

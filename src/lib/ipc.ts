@@ -15,9 +15,12 @@ import type {
 	AiTestResult,
 	AllNotes,
 	AllSettings,
+	ChatMessage,
 	CommandInfo,
 	CommandsConfig,
 	CompletionItem,
+	Conversation,
+	ConversationSummary,
 	CreditBalance,
 	DirEntry,
 	EnvironmentContext,
@@ -52,11 +55,14 @@ export type {
 	AliasItem,
 	AllNotes,
 	AllSettings,
+	ChatMessage,
 	ClipboardContentType,
 	CommandInfo,
 	CommandsConfig,
 	CompletionItem,
 	ContainerInfo,
+	Conversation,
+	ConversationSummary,
 	CreditBalance,
 	DirChild,
 	DirEntry,
@@ -138,6 +144,11 @@ export interface AgentEventDto {
 	tool_args?: string;
 	reason?: string;
 	step: number | null;
+	/** final: the answer was cut off at the token cap. */
+	truncated?: boolean;
+	/** usage: token counts for the turn. */
+	input_tokens?: number;
+	output_tokens?: number;
 }
 
 export interface BrowserContext {
@@ -215,6 +226,16 @@ export async function getHideOnBlur(): Promise<boolean> {
 export async function getCompletions(input: string): Promise<CompletionItem[]> {
 	if (!isTauri()) return [];
 	return unwrap(await commands.getCompletions(input));
+}
+
+/**
+ * A "Did you mean: X?" correction for a near-miss single word (e.g. "spoti" →
+ * "open Spotify"), or null. Used on Enter before falling to the AI, so an app
+ * typo is corrected instead of sent to the model. Returns the corrected command.
+ */
+export async function suggestCorrection(input: string): Promise<string | null> {
+	if (!isTauri()) return null;
+	return unwrap(await commands.suggestCorrection(input));
 }
 
 export async function getCommandCatalog(): Promise<CommandInfo[]> {
@@ -832,11 +853,49 @@ export async function deleteAiPreset(id: string): Promise<void> {
 	unwrap(await commands.deleteAiPreset(id));
 }
 
+// --- AI Conversation History (recall) ---
+
+export async function getConversations(): Promise<ConversationSummary[]> {
+	if (!isTauri()) return [];
+	return unwrap(await commands.getConversations());
+}
+
+export async function getConversation(id: string): Promise<Conversation | null> {
+	if (!isTauri()) return null;
+	return unwrap(await commands.getConversation(id));
+}
+
+export async function deleteConversation(id: string): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.deleteConversation(id));
+}
+
+export async function clearConversations(): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.clearConversations());
+}
+
+/** Prime the agent session with a stored conversation so it can be continued. */
+export async function loadConversation(id: string): Promise<Conversation | null> {
+	if (!isTauri()) return null;
+	return unwrap(await commands.loadConversation(id));
+}
+
 // --- Context Awareness ---
 
 export async function getContext(): Promise<EnvironmentContext | null> {
 	if (!isTauri()) return null;
 	return unwrap(await commands.getContext());
+}
+
+/**
+ * Read the PRIMARY selection — text the user has highlighted (not copied) in the
+ * focused window. Returns null if nothing is selected. Used to auto-fill AI
+ * commands: `summarize` with no typed text acts on the selection.
+ */
+export async function readSelection(): Promise<string | null> {
+	if (!isTauri()) return null;
+	return unwrap(await commands.readSelection());
 }
 
 // --- File Preview ---

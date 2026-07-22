@@ -43,7 +43,7 @@ let { appVersion }: { appVersion: string } = $props();
 			</div>
 			<div class="about-link-row">
 				<span class="about-link-label">Geolocation</span>
-				<span class="about-link-value">freeipapi.com</span>
+				<span class="about-link-value">ipwho.is</span>
 			</div>
 			<div class="about-link-row">
 				<span class="about-link-label">Icons</span>

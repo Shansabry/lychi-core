@@ -361,6 +361,22 @@ pub async fn get_completions(
     Ok(results)
 }
 
+/// A "Did you mean: X?" correction for a near-miss input (e.g. an app-name typo
+/// "spoti" → "open Spotify"), or `None`. Called on Enter for a single unknown
+/// word BEFORE falling to the AI, so a fat-fingered app name is corrected
+/// instead of sent to the model. Local + instant (in-memory fuzzy match).
+/// Returns the corrected command string (the `description` of the suggestion).
+#[tauri::command]
+#[specta::specta]
+pub async fn suggest_correction(
+    input: String,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, LychiError> {
+    let executor = state.executor.read().await;
+    Ok(lychi_core::intent::typo_suggest::suggest(&input, &executor.registry)
+        .and_then(|item| item.description))
+}
+
 /// Dynamic command catalog for the Guide — generated from the live action
 /// registry, so it never goes stale as handlers are added/removed.
 #[tauri::command]

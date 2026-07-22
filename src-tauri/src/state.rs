@@ -120,6 +120,9 @@ pub struct AppState {
     /// when a run pauses on a destructive tool; `agent_approve` takes it to
     /// resume. Single-slot (the UI shows one approval at a time).
     pub agent_session: Arc<RwLock<Option<lychi_core::coordinator::Session>>>,
+    /// Stable id for the current conversation, so follow-ups upsert the SAME
+    /// history row (Phase 4). Set on a fresh start, reused on continue/approve.
+    pub agent_conversation_id: Arc<RwLock<Option<String>>>,
     pub pending_plan: Arc<RwLock<Option<AgentPlan>>>,
     /// The action awaiting user confirmation (G1). Captured when the pipeline
     /// returns `needs_confirmation`; the `confirm_execution` command executes
@@ -379,6 +382,7 @@ impl AppState {
             ai_generation: Arc::new(AtomicU64::new(0)),
             ai_cancel: Arc::new(RwLock::new(None)),
             agent_session: Arc::new(RwLock::new(None)),
+            agent_conversation_id: Arc::new(RwLock::new(None)),
             pending_plan: Arc::new(RwLock::new(None)),
             pending_execution: Arc::new(RwLock::new(None)),
             active_file_search: Arc::new(AtomicU64::new(0)),

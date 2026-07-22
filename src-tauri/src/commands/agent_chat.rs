@@ -132,6 +132,14 @@ pub struct AgentEventDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub step: Option<u32>,
+    /// The final answer was cut off at the token cap (kind = final).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    /// Token usage (kind = usage).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u32>,
 }
 
 impl AgentEventDto {
@@ -145,6 +153,9 @@ impl AgentEventDto {
             tool_args: None,
             reason: None,
             step: None,
+            truncated: false,
+            input_tokens: None,
+            output_tokens: None,
         };
         match ev {
             AgentEvent::TurnStarted { step } => {
@@ -182,9 +193,15 @@ impl AgentEventDto {
                 d.tool_args = Some(req.args);
                 d.reason = Some(req.reason);
             }
-            AgentEvent::Final { text } => {
+            AgentEvent::Final { text, truncated } => {
                 d.kind = "final".into();
                 d.text = Some(text);
+                d.truncated = truncated;
+            }
+            AgentEvent::Usage { input_tokens, output_tokens } => {
+                d.kind = "usage".into();
+                d.input_tokens = Some(input_tokens);
+                d.output_tokens = Some(output_tokens);
             }
             AgentEvent::Stopped { reason } => {
                 d.kind = "stopped".into();
@@ -239,11 +256,14 @@ async fn build_coordinator(
 /// Drive a coordinator run/resume: forward every `AgentEvent` as
 /// `lychi://agent-event`, and on completion stash the session (for a pending
 /// approval) or clear it.
+#[allow(clippy::too_many_arguments)]
 fn drive(
     app: AppHandle,
     state_generation: Arc<std::sync::atomic::AtomicU64>,
     generation: u64,
     pending_session: Arc<RwLock<Option<Session>>>,
+    db: Arc<redb::Database>,
+    conversation_id: Arc<RwLock<Option<String>>>,
     mut stream: lychi_core::coordinator::AgentEventStream,
     handle: lychi_core::coordinator::OutcomeHandle,
 ) {
@@ -261,10 +281,13 @@ fn drive(
         if state_generation.load(Ordering::Relaxed) == generation {
             match outcome {
                 Outcome::AwaitingApproval { session, .. } | Outcome::Done { session } => {
+                    // A completed (or waiting) turn — persist it to history so it
+                    // can be recalled later, then stash for the next turn.
+                    persist_conversation(&db, &conversation_id, &session).await;
                     *pending_session.write().await = Some(session);
                 }
                 Outcome::Stopped { session, .. } => {
-                    // Keep the history so the user can still follow up after a cap.
+                    persist_conversation(&db, &conversation_id, &session).await;
                     *pending_session.write().await = Some(session);
                 }
                 Outcome::Error(_) => {
@@ -273,6 +296,27 @@ fn drive(
             }
         }
     });
+}
+
+/// Upsert the conversation into history (best-effort; a persist failure never
+/// breaks the chat). Runs off the async runtime since redb is blocking.
+async fn persist_conversation(
+    db: &Arc<redb::Database>,
+    conversation_id: &Arc<RwLock<Option<String>>>,
+    session: &Session,
+) {
+    let Some(id) = conversation_id.read().await.clone() else {
+        return;
+    };
+    let db = db.clone();
+    let messages = session.messages.clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        let store = lychi_core::ai_history::store::AiHistoryStore::new();
+        if let Err(e) = store.upsert(&db, &id, &messages) {
+            tracing::warn!("[history] failed to persist conversation: {e}");
+        }
+    })
+    .await;
 }
 
 /// Start (or continue) an agent chat. `fresh` = start a new conversation; else
@@ -300,11 +344,20 @@ pub async fn agent_chat_start(
         }
     }
 
-    // Continue the running conversation (follow-up) or start fresh.
+    // Continue the running conversation (follow-up) or start fresh. A fresh start
+    // mints a new conversation id (for history persistence); a follow-up reuses
+    // the existing one so it upserts the same history row.
     let session = if fresh {
         state.agent_session.write().await.take(); // drop any prior conversation
+        *state.agent_conversation_id.write().await = Some(lychi_core::db::new_id());
         Session::new(system, user)
     } else {
+        {
+            let mut id = state.agent_conversation_id.write().await;
+            if id.is_none() {
+                *id = Some(lychi_core::db::new_id());
+            }
+        }
         match state.agent_session.write().await.take() {
             Some(mut s) => {
                 // Keep the caller's system prompt authoritative on continue. This
@@ -326,6 +379,8 @@ pub async fn agent_chat_start(
         state.ai_generation.clone(),
         generation,
         state.agent_session.clone(),
+        state.db.clone(),
+        state.agent_conversation_id.clone(),
         stream,
         handle,
     );
@@ -365,6 +420,8 @@ pub async fn agent_approve(
         state.ai_generation.clone(),
         generation,
         state.agent_session.clone(),
+        state.db.clone(),
+        state.agent_conversation_id.clone(),
         stream,
         handle,
     );

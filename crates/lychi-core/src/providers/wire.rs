@@ -338,6 +338,7 @@ where
         yield StreamEvent::MessageStart { model };
         let mut tool_blocks: std::collections::HashMap<u64, ToolAccum> = std::collections::HashMap::new();
         let mut stop = StopReason::EndTurn;
+        let mut usage = super::Usage::default();
         let mut sse = SseReader::new(byte_stream);
 
         loop {
@@ -345,6 +346,26 @@ where
             let evt = match sse.next_event().await? { Some(e) => e, None => break };
             let data: Value = match serde_json::from_str(&evt) { Ok(v) => v, Err(_) => continue };
             match data["type"].as_str() {
+                Some("message_start") => {
+                    // input_tokens is reported here; output_tokens accrues in message_delta.
+                    if let Some(n) = data["message"]["usage"]["input_tokens"].as_u64() {
+                        usage.input_tokens = n as u32;
+                    }
+                }
+                Some("message_delta") => {
+                    // The authoritative stop_reason (incl. "max_tokens") + running
+                    // output token count arrive here.
+                    if let Some(sr) = data["delta"]["stop_reason"].as_str() {
+                        stop = match sr {
+                            "max_tokens" => StopReason::MaxTokens,
+                            "tool_use" => StopReason::ToolUse,
+                            _ => StopReason::EndTurn,
+                        };
+                    }
+                    if let Some(n) = data["usage"]["output_tokens"].as_u64() {
+                        usage.output_tokens = n as u32;
+                    }
+                }
                 Some("content_block_start") => {
                     let idx = data["index"].as_u64().unwrap_or(0);
                     let block = &data["content_block"];
@@ -386,7 +407,7 @@ where
                 _ => {}
             }
         }
-        yield StreamEvent::Done { stop_reason: stop };
+        yield StreamEvent::Done { stop_reason: stop, usage: Some(usage) };
     }
     .boxed()
 }
@@ -455,7 +476,7 @@ where
             let acc = tool_blocks.remove(&idx).unwrap();
             yield StreamEvent::ToolCallComplete { id: acc.id, name: acc.name, args: unwrap_args(&acc.args_buf) };
         }
-        yield StreamEvent::Done { stop_reason: stop };
+        yield StreamEvent::Done { stop_reason: stop, usage: None };
     }
     .boxed()
 }
@@ -625,7 +646,34 @@ mod tests {
             StreamEvent::TextDelta(t) => Some(t.clone()), _ => None,
         }).collect();
         assert_eq!(text, "Hello");
-        assert!(matches!(events.last(), Some(StreamEvent::Done { stop_reason: StopReason::EndTurn })));
+        assert!(matches!(events.last(), Some(StreamEvent::Done { stop_reason: StopReason::EndTurn, .. })));
+    }
+
+    // message_delta carries the authoritative stop_reason (max_tokens) + usage.
+    #[tokio::test]
+    async fn anthropic_stream_reports_truncation_and_usage() {
+        let sse = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":42}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"cut off\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":300}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let chunks: Vec<reqwest::Result<Vec<u8>>> = vec![Ok(sse.as_bytes().to_vec())];
+        let stream = super::anthropic_event_stream(
+            futures_util::stream::iter(chunks),
+            "m".into(),
+            CancellationToken::new(),
+        );
+        let events = collect(stream).await;
+        match events.last() {
+            Some(StreamEvent::Done { stop_reason, usage }) => {
+                assert_eq!(*stop_reason, StopReason::MaxTokens);
+                let u = usage.expect("usage reported");
+                assert_eq!(u.input_tokens, 42);
+                assert_eq!(u.output_tokens, 300);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -648,7 +696,7 @@ mod tests {
             StreamEvent::ToolCallComplete { name, args, .. } => Some((name.clone(), args.clone())), _ => None,
         });
         assert_eq!(complete, Some(("open".into(), "firefox".into())));
-        assert!(matches!(events.last(), Some(StreamEvent::Done { stop_reason: StopReason::ToolUse })));
+        assert!(matches!(events.last(), Some(StreamEvent::Done { stop_reason: StopReason::ToolUse, .. })));
     }
 
     // Canned OpenAI SSE with fragmented tool-call args (id/name on first chunk).

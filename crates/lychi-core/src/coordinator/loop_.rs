@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use tokio::sync::{mpsc, oneshot};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::error::LychiError;
 use crate::providers::{
@@ -45,7 +45,11 @@ pub enum AgentEvent {
     /// A tool needs user approval — the loop is suspending.
     AwaitingApproval(ApprovalRequest),
     /// The final assistant answer text (turn ended with no tool calls).
-    Final { text: String },
+    /// `truncated` = the model hit its token cap mid-answer (cut off, not done).
+    Final { text: String, truncated: bool },
+    /// Token usage for a completed turn (when the provider reports it). Emitted
+    /// per turn; the UI accumulates across a multi-turn conversation.
+    Usage { input_tokens: u32, output_tokens: u32 },
     /// The loop stopped on the step cap.
     Stopped { reason: String },
     /// An infrastructure error aborted the loop.
@@ -156,7 +160,14 @@ impl<E: ToolExecutor + 'static> Coordinator<E> {
         decision: Option<ApprovalDecision>,
         cancel: CancellationToken,
     ) -> (AgentEventStream, OutcomeHandle) {
-        let (ev_tx, ev_rx) = mpsc::channel::<AgentEvent>(64);
+        // UNBOUNDED on purpose: `emit` must NEVER block the loop's reading of the
+        // provider's HTTP stream. With a bounded channel, a slow/hidden webview
+        // consumer fills the buffer, `emit().await` stalls between stream reads,
+        // the unread HTTP/2 body triggers a flow-control stall, and the server
+        // resets the stream (RST_STREAM CANCEL) — truncating the answer. Draining
+        // the network at full speed into an unbounded buffer avoids that; the
+        // buffer is naturally bounded by one response's worth of deltas.
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let (out_tx, out_rx) = oneshot::channel::<Outcome>();
 
         let provider = self.provider.clone();
@@ -170,7 +181,7 @@ impl<E: ToolExecutor + 'static> Coordinator<E> {
             let _ = out_tx.send(outcome);
         });
 
-        (ReceiverStream::new(ev_rx).boxed(), OutcomeHandle(out_rx))
+        (UnboundedReceiverStream::new(ev_rx).boxed(), OutcomeHandle(out_rx))
     }
 }
 
@@ -180,13 +191,15 @@ struct LoopCtx<E: ToolExecutor + 'static> {
     executor: Arc<E>,
     tools: Vec<ToolDef>,
     stop: Arc<dyn StopCondition>,
-    ev_tx: mpsc::Sender<AgentEvent>,
+    ev_tx: mpsc::UnboundedSender<AgentEvent>,
     cancel: CancellationToken,
 }
 
 impl<E: ToolExecutor + 'static> LoopCtx<E> {
-    async fn emit(&self, ev: AgentEvent) {
-        let _ = self.ev_tx.send(ev).await;
+    fn emit(&self, ev: AgentEvent) {
+        // Non-blocking (unbounded) — never stalls the HTTP read. Err = the UI
+        // dropped the stream; harmless, the loop still finishes for persistence.
+        let _ = self.ev_tx.send(ev);
     }
 
     /// The core loop. `resume_decision` applies a pending approval first (on a
@@ -208,25 +221,25 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
             }
             if self.stop.should_stop(&session, step) {
                 let reason = format!("reached step limit ({step})");
-                self.emit(AgentEvent::Stopped { reason: reason.clone() }).await;
+                self.emit(AgentEvent::Stopped { reason: reason.clone() });
                 return Outcome::Stopped { reason, session };
             }
-            self.emit(AgentEvent::TurnStarted { step }).await;
+            self.emit(AgentEvent::TurnStarted { step });
 
             // Stream one model turn, forwarding prose + collecting tool calls.
             let turn = match self.consume_turn(&session.messages).await {
                 Ok(t) => t,
                 Err(e) => {
-                    self.emit(AgentEvent::Error(e.to_string())).await;
+                    self.emit(AgentEvent::Error(e.to_string()));
                     return Outcome::Error(e);
                 }
             };
-            let (text, calls) = (turn.text, turn.tool_calls);
+            let (text, calls, truncated) = (turn.text, turn.tool_calls, turn.truncated);
             session.push_assistant(text.clone(), calls.clone());
 
             // No tool calls → final answer, done.
             if calls.is_empty() {
-                self.emit(AgentEvent::Final { text }).await;
+                self.emit(AgentEvent::Final { text, truncated });
                 return Outcome::Done { session };
             }
 
@@ -250,6 +263,7 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
         let mut stream: ProviderStream = self.provider.chat(messages, &self.tools, self.cancel.clone());
         let mut text = String::new();
         let mut calls: Vec<ToolCall> = Vec::new();
+        let mut truncated = false;
 
         while let Some(item) = stream.next().await {
             if self.cancel.is_cancelled() {
@@ -259,10 +273,10 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                 StreamEvent::MessageStart { .. } => {}
                 StreamEvent::TextDelta(d) => {
                     text.push_str(&d);
-                    self.emit(AgentEvent::TextDelta(d)).await;
+                    self.emit(AgentEvent::TextDelta(d));
                 }
                 StreamEvent::ReasoningDelta(d) => {
-                    self.emit(AgentEvent::ReasoningDelta(d)).await;
+                    self.emit(AgentEvent::ReasoningDelta(d));
                 }
                 // The provider already assembles complete calls; the delta
                 // variants are for live "typing args…" UI, which we skip here.
@@ -270,13 +284,21 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                 StreamEvent::ToolCallComplete { id, name, args } => {
                     calls.push(ToolCall { id, name, args });
                 }
-                StreamEvent::Done { stop_reason } => {
-                    let _ = stop_reason; // ToolUse vs EndTurn is implied by calls.is_empty()
+                StreamEvent::Done { stop_reason, usage } => {
+                    // ToolUse vs EndTurn is implied by calls.is_empty(); MaxTokens
+                    // means the answer was cut off at the token cap.
+                    truncated = matches!(stop_reason, crate::providers::StopReason::MaxTokens);
+                    if let Some(u) = usage {
+                        self.emit(AgentEvent::Usage {
+                            input_tokens: u.input_tokens,
+                            output_tokens: u.output_tokens,
+                        });
+                    }
                     break;
                 }
             }
         }
-        Ok(TurnResult { text, tool_calls: calls })
+        Ok(TurnResult { text, tool_calls: calls, truncated })
     }
 
     /// Execute one tool call. Appends the result to `session` and returns `None`
@@ -286,16 +308,15 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
             call_id: call.id.clone(),
             name: call.name.clone(),
             args: call.args.clone(),
-        })
-        .await;
+        });
 
         match self.executor.execute(&call.name, &call.args).await {
             Ok(ToolOutcome::Ran { output, is_error }) => {
                 session.push_tool_result(&call.id, output.clone(), is_error);
                 if is_error {
-                    self.emit(AgentEvent::ToolCallFailed { call_id: call.id, error: output }).await;
+                    self.emit(AgentEvent::ToolCallFailed { call_id: call.id, error: output });
                 } else {
-                    self.emit(AgentEvent::ToolCallCompleted { call_id: call.id, output }).await;
+                    self.emit(AgentEvent::ToolCallCompleted { call_id: call.id, output });
                 }
                 None
             }
@@ -308,11 +329,11 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                 };
                 // Record the pending call in the session so resume can run it.
                 session.pending.push(PendingApproval { call, reason, resume });
-                self.emit(AgentEvent::AwaitingApproval(request.clone())).await;
+                self.emit(AgentEvent::AwaitingApproval(request.clone()));
                 Some(Outcome::AwaitingApproval { request, session: session.clone() })
             }
             Err(e) => {
-                self.emit(AgentEvent::Error(e.to_string())).await;
+                self.emit(AgentEvent::Error(e.to_string()));
                 Some(Outcome::Error(e))
             }
         }
@@ -334,13 +355,13 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                 match self.executor.run_approved(resume).await {
                     Ok(output) => {
                         session.push_tool_result(&call_id, output.clone(), false);
-                        self.emit(AgentEvent::ToolCallCompleted { call_id, output }).await;
+                        self.emit(AgentEvent::ToolCallCompleted { call_id, output });
                         None
                     }
                     Err(e) => {
                         // A tool-logic failure feeds back; an infra failure aborts.
                         session.push_tool_result(&call_id, e.to_string(), true);
-                        self.emit(AgentEvent::ToolCallFailed { call_id, error: e.to_string() }).await;
+                        self.emit(AgentEvent::ToolCallFailed { call_id, error: e.to_string() });
                         None
                     }
                 }
@@ -348,7 +369,7 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
             ApprovalDecision::Reject { message } => {
                 let msg = message.unwrap_or_else(|| "User declined this action.".to_string());
                 session.push_tool_result(&call_id, msg.clone(), true);
-                self.emit(AgentEvent::ToolCallFailed { call_id, error: msg }).await;
+                self.emit(AgentEvent::ToolCallFailed { call_id, error: msg });
                 None
             }
         }
@@ -358,6 +379,8 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
 struct TurnResult {
     text: String,
     tool_calls: Vec<ToolCall>,
+    /// The model hit its `max_tokens` cap — the answer is cut off, not complete.
+    truncated: bool,
 }
 
 #[cfg(test)]
@@ -400,7 +423,7 @@ mod tests {
             self.seen.lock().unwrap().push(messages.len());
             let events = self.turns.lock().unwrap().pop_front().unwrap_or_else(|| {
                 vec![StreamEvent::TextDelta("(no more scripted turns)".into()),
-                     StreamEvent::Done { stop_reason: crate::providers::StopReason::EndTurn }]
+                     StreamEvent::Done { stop_reason: crate::providers::StopReason::EndTurn, usage: None }]
             });
             stream::iter(events.into_iter().map(Ok)).boxed()
         }
@@ -410,13 +433,13 @@ mod tests {
     fn answer(text: &str) -> Vec<StreamEvent> {
         vec![
             StreamEvent::TextDelta(text.into()),
-            StreamEvent::Done { stop_reason: crate::providers::StopReason::EndTurn },
+            StreamEvent::Done { stop_reason: crate::providers::StopReason::EndTurn, usage: None },
         ]
     }
     fn call_tool(id: &str, name: &str, args: &str) -> Vec<StreamEvent> {
         vec![
             StreamEvent::ToolCallComplete { id: id.into(), name: name.into(), args: args.into() },
-            StreamEvent::Done { stop_reason: crate::providers::StopReason::ToolUse },
+            StreamEvent::Done { stop_reason: crate::providers::StopReason::ToolUse, usage: None },
         ]
     }
 
@@ -475,10 +498,10 @@ mod tests {
         events.iter().any(|e| if let AgentEvent::TextDelta(t) = e { t == want } else { false })
     }
     fn final_text(events: &[AgentEvent]) -> Option<&str> {
-        match events.last() {
-            Some(AgentEvent::Final { text }) => Some(text.as_str()),
+        events.iter().rev().find_map(|e| match e {
+            AgentEvent::Final { text, .. } => Some(text.as_str()),
             _ => None,
-        }
+        })
     }
     fn has_tool_started(events: &[AgentEvent], name: &str) -> bool {
         events.iter().any(|e| if let AgentEvent::ToolCallStarted { name: n, .. } = e { n == name } else { false })

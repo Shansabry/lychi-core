@@ -627,12 +627,12 @@ impl AiProvider for LocalClient {
                         let args = v["args"].as_str().unwrap_or_default().to_string();
                         let _ = tx.blocking_send(Ok(StreamEvent::ToolCallStart { id: id.clone(), name: name.clone() }));
                         let _ = tx.blocking_send(Ok(StreamEvent::ToolCallComplete { id, name, args }));
-                        let _ = tx.blocking_send(Ok(StreamEvent::Done { stop_reason: StopReason::ToolUse }));
+                        let _ = tx.blocking_send(Ok(StreamEvent::Done { stop_reason: StopReason::ToolUse, usage: None }));
                     }
                     Ok(v) => {
                         let answer = v["answer"].as_str().unwrap_or(&raw).to_string();
                         let _ = tx.blocking_send(Ok(StreamEvent::TextDelta(answer)));
-                        let _ = tx.blocking_send(Ok(StreamEvent::Done { stop_reason: StopReason::EndTurn }));
+                        let _ = tx.blocking_send(Ok(StreamEvent::Done { stop_reason: StopReason::EndTurn, usage: None }));
                     }
                     Err(e) => {
                         let _ = tx.blocking_send(Err(LychiError::Ai(format!("local tool JSON parse: {e} (raw: {raw})"))));
@@ -652,7 +652,7 @@ impl AiProvider for LocalClient {
             };
             match generate_inner(&model, &system, &user, max, None, Some(&mut cb)) {
                 Ok(_) => {
-                    let _ = tx.blocking_send(Ok(StreamEvent::Done { stop_reason: StopReason::EndTurn }));
+                    let _ = tx.blocking_send(Ok(StreamEvent::Done { stop_reason: StopReason::EndTurn, usage: None }));
                 }
                 Err(e) => {
                     let _ = tx.blocking_send(Err(e));

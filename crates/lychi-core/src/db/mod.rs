@@ -44,6 +44,12 @@ pub const TIMERS: TableDefinition<&str, &[u8]> = TableDefinition::new("timers");
 /// User-defined saved prompt templates invoked by keyword (Phase 3 AI Commands).
 pub const AI_PRESETS: TableDefinition<&str, &[u8]> = TableDefinition::new("ai_presets");
 
+/// AI conversation history: key = UUID v7 string, value = postcard-serialized
+/// ConversationEntry. Completed agent conversations, recallable via `chat`
+/// (Phase 4). Capped + pruned so the DB doesn't grow unbounded.
+pub const AI_CONVERSATIONS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("ai_conversations");
+
 /// Open (or create) the redb database at the given path.
 /// If the file exists but uses an older format version, back it up and recreate.
 pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
@@ -74,6 +80,7 @@ pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
     txn.open_table(SNIPPETS)?;
     txn.open_table(TIMERS)?;
     txn.open_table(AI_PRESETS)?;
+    txn.open_table(AI_CONVERSATIONS)?;
     txn.commit()?;
 
     Ok(Arc::new(db))

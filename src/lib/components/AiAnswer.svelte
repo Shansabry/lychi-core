@@ -1,7 +1,6 @@
 <script lang="ts">
 import { Globe, Sparkles } from "lucide-svelte";
-import { marked } from "marked";
-import { sanitizeMarkdown } from "$lib/sanitize";
+import { renderMarkdown } from "$lib/markdown";
 
 type ToolStep = {
 	callId: string;
@@ -16,6 +15,8 @@ type Turn = { user: string; text: string; toolSteps: ToolStep[] };
 let {
 	/** Completed prior turns in this conversation (shown above the live answer). */
 	turns = [] as Turn[],
+	/** The current turn's user message — shown as a bubble above the live answer. */
+	lastUser = "",
 	/** The assistant text for the current turn (streams in). */
 	text = "",
 	/** Whether tokens are still arriving (shows a blinking cursor + Stop). */
@@ -40,8 +41,14 @@ let {
 	onwebsearch,
 	/** Fork-card: escalate to the full tool-calling agent. */
 	onfullchat,
+	/** The answer was cut off at the token cap — show a truncation notice. */
+	truncated = false,
+	/** Accumulated token spend for the conversation. */
+	tokensIn = 0,
+	tokensOut = 0,
 }: {
 	turns?: Turn[];
+	lastUser?: string;
 	text?: string;
 	streaming?: boolean;
 	error?: string | null;
@@ -54,16 +61,12 @@ let {
 	quick?: boolean;
 	onwebsearch?: () => void;
 	onfullchat?: () => void;
+	truncated?: boolean;
+	tokensIn?: number;
+	tokensOut?: number;
 } = $props();
 
-function md(t: string): string {
-	if (!t) return "";
-	try {
-		return sanitizeMarkdown(marked.parse(t) as string);
-	} catch {
-		return t.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c] ?? c);
-	}
-}
+const md = renderMarkdown;
 let html = $derived(md(text));
 
 // Auto-scroll: keep the transcript pinned to the bottom as the answer streams
@@ -100,7 +103,15 @@ $effect(() => {
 
 // The reply box only shows when idle (not streaming, no pending approval) and
 // there's an answer to follow up on. Enter sends; the input keeps focus.
+// Focus does NOT auto-shift here — the launcher input stays primary. It's
+// shifted explicitly (via `focusReply`) only when the user acts: clicks
+// "Full chat" or opens a recalled conversation.
 let replyEl: HTMLInputElement | undefined = $state();
+
+/** Move focus to the reply box. Called from the parent on explicit user intent. */
+export function focusReply() {
+	requestAnimationFrame(() => replyEl?.focus());
+}
 function onReplyKeydown(e: KeyboardEvent) {
 	if (e.key === "Enter" && !e.shiftKey) {
 		e.preventDefault();
@@ -108,7 +119,47 @@ function onReplyKeydown(e: KeyboardEvent) {
 		onreply?.();
 	}
 }
+
+// Keyboard shortcuts for the AI answer's action buttons, so they're not
+// mouse-only:
+//   - Approval prompt (Approve/Reject): ⌘/Ctrl+Enter or Y = approve,
+//     Escape or N = reject. This is a decision point, so it takes priority.
+//   - Fork card (Search web / Full chat): ⌘/Ctrl+Enter = search web,
+//     Enter = full chat (mirrors the button kbd hints).
+function onWindowKeydown(e: KeyboardEvent) {
+	if (approval) {
+		const key = e.key.toLowerCase();
+		if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+			e.preventDefault();
+			e.stopPropagation();
+			onapprove?.(true);
+		} else if (key === "y") {
+			e.preventDefault();
+			e.stopPropagation();
+			onapprove?.(true);
+		} else if (key === "n" || e.key === "Escape") {
+			e.preventDefault();
+			e.stopPropagation();
+			onapprove?.(false);
+		}
+		return;
+	}
+	// Fork card is showing (idle quick answer with buttons).
+	if (quick && !streaming) {
+		if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+			e.preventDefault();
+			e.stopPropagation();
+			onwebsearch?.();
+		} else if (e.key === "Enter") {
+			e.preventDefault();
+			e.stopPropagation();
+			onfullchat?.();
+		}
+	}
+}
 </script>
+
+<svelte:window onkeydown={onWindowKeydown} />
 
 {#snippet toolStepsView(steps: ToolStep[])}
 	{#if steps.length > 0}
@@ -136,7 +187,10 @@ function onReplyKeydown(e: KeyboardEvent) {
 			<div class="ai-md turn">{@html md(turn.text)}</div>
 		{/each}
 
-		<!-- The current (streaming) turn's tool steps + answer. -->
+		<!-- The current turn: the user's question, then tool steps + the answer. -->
+		{#if lastUser}
+			<div class="user-turn">{lastUser}</div>
+		{/if}
 		{@render toolStepsView(toolSteps)}
 
 		{#if error}
@@ -148,13 +202,23 @@ function onReplyKeydown(e: KeyboardEvent) {
 			<div class="thinking"><span class="cursor" aria-hidden="true"></span></div>
 		{/if}
 
+		{#if truncated && !streaming}
+			<div class="truncated-note">
+				⚠ Response hit the token limit and was cut off. Raise “Max Tokens” in Settings → AI for longer answers.
+			</div>
+		{/if}
+
 		{#if approval}
 			<div class="approval">
 				<div class="approval-reason">⚠ {approval.reason}</div>
 				<div class="approval-cmd"><code>{approval.toolName} {approval.args}</code></div>
 				<div class="approval-actions">
-					<button class="approve" onclick={() => onapprove?.(true)}>Approve</button>
-					<button class="reject" onclick={() => onapprove?.(false)}>Reject</button>
+					<button class="approve" onclick={() => onapprove?.(true)} title="Approve (⌘↵ or Y)">
+						Approve <kbd>⌘↵</kbd>
+					</button>
+					<button class="reject" onclick={() => onapprove?.(false)} title="Reject (Esc or N)">
+						Reject <kbd>Esc</kbd>
+					</button>
 				</div>
 			</div>
 		{/if}
@@ -196,6 +260,12 @@ function onReplyKeydown(e: KeyboardEvent) {
 			{/if}
 		</div>
 	{/if}
+
+	{#if tokensOut > 0 && !quick}
+		<div class="token-spend" title="Token spend this conversation">
+			{tokensIn.toLocaleString()} in · {tokensOut.toLocaleString()} out · {(tokensIn + tokensOut).toLocaleString()} tokens
+		</div>
+	{/if}
 </div>
 
 <style>
@@ -220,6 +290,25 @@ function onReplyKeydown(e: KeyboardEvent) {
 		color: var(--error);
 		font-size: 13px;
 		font-family: var(--font-mono);
+	}
+
+	.truncated-note {
+		margin-top: 10px;
+		padding: 7px 10px;
+		border-radius: 6px;
+		border: 1px solid color-mix(in srgb, #d0b060 40%, var(--border));
+		background: color-mix(in srgb, #d0b060 10%, transparent);
+		color: #d0b060;
+		font-size: 12px;
+		line-height: 1.45;
+	}
+
+	.token-spend {
+		padding: 4px 14px 8px;
+		font-family: var(--font-mono);
+		font-size: 10.5px;
+		color: var(--fg-muted);
+		text-align: right;
 	}
 
 	/* A prior user turn — a right-aligned pill above its answer. */
@@ -348,13 +437,34 @@ function onReplyKeydown(e: KeyboardEvent) {
 		display: inline;
 	}
 	.ai-md :global(pre) {
+		position: relative;
 		background: var(--bg-secondary);
-		border-radius: 6px;
-		padding: 10px 12px;
+		border: 1px solid var(--border);
+		border-radius: 8px;
+		padding: 11px 13px;
 		overflow-x: auto;
 		font-family: var(--font-mono);
 		font-size: 12.5px;
-		margin: 0.6em 0;
+		line-height: 1.5;
+		margin: 0.7em 0;
+	}
+	/* Language chip in the corner of a code block (from `data-lang`). */
+	.ai-md :global(pre[data-lang])::before {
+		content: attr(data-lang);
+		position: absolute;
+		top: 0;
+		right: 0;
+		padding: 2px 7px;
+		font-size: 9.5px;
+		text-transform: uppercase;
+		letter-spacing: 0.4px;
+		color: var(--fg-muted);
+		background: color-mix(in srgb, var(--fg) 6%, transparent);
+		border-bottom-left-radius: 6px;
+	}
+	.ai-md :global(pre code) {
+		display: block;
+		padding-top: 2px;
 	}
 	.ai-md :global(code) {
 		font-family: var(--font-mono);
@@ -462,6 +572,9 @@ function onReplyKeydown(e: KeyboardEvent) {
 		gap: 8px;
 	}
 	.approval-actions button {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
 		font-family: var(--font-mono);
 		font-size: 12px;
 		padding: 4px 12px;
@@ -470,6 +583,14 @@ function onReplyKeydown(e: KeyboardEvent) {
 		background: var(--bg-secondary);
 		color: var(--fg);
 		cursor: pointer;
+	}
+	.approval-actions kbd {
+		font-family: var(--font-mono);
+		font-size: 9.5px;
+		padding: 1px 4px;
+		border-radius: 3px;
+		background: color-mix(in srgb, var(--fg) 12%, transparent);
+		color: var(--fg-muted);
 	}
 	.approval-actions .approve {
 		border-color: var(--accent);
