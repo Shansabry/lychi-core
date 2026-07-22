@@ -19,13 +19,49 @@ use crate::state::AppState;
 
 const SHORTCUT_ID: &str = "toggle-launcher";
 
+/// How long to keep retrying the portal before concluding the compositor has no
+/// GlobalShortcuts backend. On AUTOSTART, Lychi often launches before
+/// `xdg-desktop-portal` (and its backend) finish coming up, so the first attempts
+/// fail transiently — we back off and retry until the portal appears on the bus.
+/// Bounded so a compositor that genuinely lacks the backend (Sway/wlroots,
+/// GNOME ≤47) eventually gives up and leaves the fallback UX in place.
+const RETRY_SCHEDULE_SECS: &[u64] = &[0, 1, 2, 4, 8, 15, 30, 30, 30];
+
 /// Bind the toggle hotkey through the portal and service its activations.
 /// Runs for the app's lifetime; all failures are non-fatal (fallback UX).
+///
+/// Retries with backoff so an autostart race against `xdg-desktop-portal` (the
+/// backend not yet ready when we boot) self-heals: we keep trying until the
+/// portal is available, then bind + service activations for the process lifetime.
 pub async fn setup(app: tauri::AppHandle, configured_hotkey: String) {
-    if let Err(e) = run(&app, &configured_hotkey).await {
-        tracing::warn!(
-            "[portal] GlobalShortcuts unavailable ({e}) — bind `lychi --toggle` in your desktop's shortcut settings"
-        );
+    for (attempt, &delay) in RETRY_SCHEDULE_SECS.iter().enumerate() {
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+        }
+        // If a prior attempt already bound + is servicing (its `run` returned Ok
+        // only when the session ends), we won't re-enter. `run` blocks for the
+        // app lifetime on success, so reaching here again means it failed.
+        match run(&app, &configured_hotkey).await {
+            Ok(()) => {
+                // The activation stream ended cleanly (session closed) — done.
+                return;
+            }
+            Err(e) => {
+                let last = attempt + 1 == RETRY_SCHEDULE_SECS.len();
+                if last {
+                    tracing::warn!(
+                        "[portal] GlobalShortcuts unavailable after {} attempts ({e}) — bind `lychi --toggle` in your desktop's shortcut settings",
+                        RETRY_SCHEDULE_SECS.len()
+                    );
+                } else {
+                    tracing::debug!(
+                        "[portal] attempt {}/{} failed ({e}) — retrying (portal may still be starting)",
+                        attempt + 1,
+                        RETRY_SCHEDULE_SECS.len()
+                    );
+                }
+            }
+        }
     }
 }
 

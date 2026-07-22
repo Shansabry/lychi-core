@@ -38,8 +38,13 @@ pub enum AgentEvent {
     ReasoningDelta(String),
     /// A tool call is about to run.
     ToolCallStarted { call_id: String, name: String, args: String },
-    /// A tool finished. `output` is what was fed back to the model.
-    ToolCallCompleted { call_id: String, output: String },
+    /// A tool finished. `output` is what was fed back to the model; `artifact`
+    /// is an optional rich result (QR/weather/image) the UI renders inline.
+    ToolCallCompleted {
+        call_id: String,
+        output: String,
+        artifact: Option<super::ToolArtifact>,
+    },
     /// A tool errored (fed back to the model, not fatal).
     ToolCallFailed { call_id: String, error: String },
     /// A tool needs user approval — the loop is suspending.
@@ -311,12 +316,18 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
         });
 
         match self.executor.execute(&call.name, &call.args).await {
-            Ok(ToolOutcome::Ran { output, is_error }) => {
+            Ok(ToolOutcome::Ran { output, is_error, artifact }) => {
+                // Only the text `output` goes into the model's context; the rich
+                // `artifact` (if any) rides the event to the UI for inline render.
                 session.push_tool_result(&call.id, output.clone(), is_error);
                 if is_error {
                     self.emit(AgentEvent::ToolCallFailed { call_id: call.id, error: output });
                 } else {
-                    self.emit(AgentEvent::ToolCallCompleted { call_id: call.id, output });
+                    self.emit(AgentEvent::ToolCallCompleted {
+                        call_id: call.id,
+                        output,
+                        artifact,
+                    });
                 }
                 None
             }
@@ -355,7 +366,14 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                 match self.executor.run_approved(resume).await {
                     Ok(output) => {
                         session.push_tool_result(&call_id, output.clone(), false);
-                        self.emit(AgentEvent::ToolCallCompleted { call_id, output });
+                        // Approval-resume runs run_approved which returns only text;
+                        // no artifact on this path (a rich artifact would need
+                        // run_approved to return one — not needed for current tools).
+                        self.emit(AgentEvent::ToolCallCompleted {
+                            call_id,
+                            output,
+                            artifact: None,
+                        });
                         None
                     }
                     Err(e) => {
@@ -456,7 +474,7 @@ mod tests {
             Self { outcomes: Default::default(), approved_output: "APPROVED-RAN".into(), approved_calls: Mutex::new(0) }
         }
         fn ran(mut self, name: &str, output: &str, is_error: bool) -> Self {
-            self.outcomes.insert(name.into(), ToolOutcome::Ran { output: output.into(), is_error });
+            self.outcomes.insert(name.into(), ToolOutcome::Ran { output: output.into(), is_error, artifact: None });
             self
         }
         fn needs_approval(mut self, name: &str, reason: &str) -> Self {
@@ -471,7 +489,7 @@ mod tests {
     impl ToolExecutor for MockExecutor {
         async fn execute(&self, name: &str, _args: &str) -> Result<ToolOutcome, LychiError> {
             match self.outcomes.get(name) {
-                Some(ToolOutcome::Ran { output, is_error }) => Ok(ToolOutcome::Ran { output: output.clone(), is_error: *is_error }),
+                Some(ToolOutcome::Ran { output, is_error, .. }) => Ok(ToolOutcome::Ran { output: output.clone(), is_error: *is_error, artifact: None }),
                 Some(ToolOutcome::NeedsApproval { reason, resume }) => Ok(ToolOutcome::NeedsApproval { reason: reason.clone(), resume: resume.clone() }),
                 None => Err(LychiError::Ai(format!("mock: unknown tool {name}"))),
             }

@@ -7,13 +7,30 @@ use async_trait::async_trait;
 
 use crate::error::LychiError;
 
+/// A rich, non-text result from a tool (a QR SVG, a weather card, an image) that
+/// the UI renders inline in the chat. The MODEL only ever sees the text `output`
+/// (a short summary), never this — so raw SVG/JSON doesn't pollute its context.
+#[derive(Clone, Debug)]
+pub struct ToolArtifact {
+    /// What kind of content this is, for the UI to render: "svg" | "weather" | …
+    pub kind: String,
+    /// The raw content (SVG markup, weather JSON, a data: URI, …).
+    pub content: String,
+}
+
 /// What running one tool produced. Either it completed (with output), or the
 /// Rules Engine flagged it destructive and it PAUSED awaiting user approval.
 pub enum ToolOutcome {
     /// The tool ran. `output` is the text to feed back to the model (stdout, an
     /// answer, or an error message). `is_error` marks a failure so the model can
     /// react — a tool error is NOT fatal; it's fed back like any result.
-    Ran { output: String, is_error: bool },
+    /// `artifact` carries a rich visual result (QR/weather/image) for the UI to
+    /// render inline — the model never sees it (it gets only `output`).
+    Ran {
+        output: String,
+        is_error: bool,
+        artifact: Option<ToolArtifact>,
+    },
     /// The tool is destructive and needs the user's OK before running. `reason`
     /// explains why (shown in the approval prompt). `resume` is an opaque token
     /// the executor uses to run this exact assessed action on approval (so the

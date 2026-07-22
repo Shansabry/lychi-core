@@ -146,8 +146,8 @@ async function togglePlayPause() {
 				tabindex={-1}
 				aria-label={nowPlaying.status === "playing" ? "Pause" : "Play"}
 			>
-				<!-- Always the waveform: animated while playing, frozen + muted when
-				     paused (animation-play-state: paused + dimmed). -->
+				<!-- The waveform: animated while playing, frozen + muted when paused
+				     (animation-play-state: paused + dimmed). Click toggles playback. -->
 				<span
 					class="viz"
 					class:playing={nowPlaying.status === "playing"}
@@ -404,9 +404,10 @@ async function togglePlayPause() {
 	   animation-play-state. GPU-friendly: only transform animates. */
 	.viz {
 		display: inline-flex;
+		/* Center-anchored: bars scale from the middle (grow both ways). */
 		align-items: center;
-		gap: 2.5px;
-		height: 12px;
+		gap: 2px;
+		height: 10px;
 		flex-shrink: 0;
 		/* Paused (default): frozen mid-height, dimmed + desaturated so it clearly
 		   reads "stopped" — a quiet, muted version of the playing waveform. */
@@ -416,6 +417,8 @@ async function togglePlayPause() {
 	}
 
 	.viz span {
+		/* Whole-pixel width: a fractional (1.5px) width rounds to 1px on some bars
+		   and 2px on others, making them look uneven. 2px renders crisp + uniform. */
 		width: 2px;
 		height: 100%;
 		border-radius: 2px;
@@ -498,9 +501,9 @@ async function togglePlayPause() {
 		transition: opacity 100ms ease, color 100ms ease;
 	}
 
-	/* Hover hint that the waveform is a pause control: dim it slightly. */
+	/* Hover hint that the waveform is a pause control: dim it. */
 	.viz-btn:hover {
-		opacity: 0.7;
+		opacity: 0.6;
 	}
 
 	.now-playing-text {

@@ -374,11 +374,20 @@ impl std::fmt::Display for TerminalSource {
     }
 }
 
-/// Detect session type from XDG_SESSION_TYPE.
+/// Detect a Wayland session. `XDG_SESSION_TYPE` is the primary signal, but it's
+/// frequently ABSENT under autostart (the D-Bus activation environment the
+/// session launches us in may not carry it), which previously misrouted us to
+/// the X11 hotkey path on boot. `WAYLAND_DISPLAY` is the reliable fallback — if
+/// it's set, we're on Wayland regardless of what (if anything) XDG_SESSION_TYPE
+/// says.
 #[cfg(target_os = "linux")]
 pub fn is_wayland() -> bool {
-    std::env::var("XDG_SESSION_TYPE")
-        .map(|v| v == "wayland")
+    if std::env::var("XDG_SESSION_TYPE").map(|v| v == "wayland").unwrap_or(false) {
+        return true;
+    }
+    // Fallback: the Wayland display socket is set on any real Wayland session.
+    std::env::var("WAYLAND_DISPLAY")
+        .map(|v| !v.is_empty())
         .unwrap_or(false)
 }
 

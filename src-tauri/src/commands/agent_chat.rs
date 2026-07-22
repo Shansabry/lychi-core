@@ -19,8 +19,8 @@ use std::sync::atomic::Ordering;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use lychi_core::coordinator::{
-    AgentEvent, ApprovalDecision, Coordinator, Outcome, ResumeToken, Session, ToolExecutor,
-    ToolOutcome,
+    AgentEvent, ApprovalDecision, Coordinator, Outcome, ResumeToken, Session, ToolArtifact,
+    ToolExecutor, ToolOutcome,
 };
 use lychi_core::error::LychiError;
 use lychi_core::executor::{Executor, RunInputs};
@@ -58,6 +58,39 @@ fn result_text(res: &lychi_core::action_registry::ActionResult) -> String {
     }
 }
 
+/// Split a tool result into (model-facing summary text, optional rich artifact).
+/// Rich outputs (a QR SVG, a weather card) are NOT dumped into the model's
+/// context — the model gets a short summary; the raw payload rides an artifact
+/// the UI renders inline. Plain text/status results have no artifact.
+fn result_summary_and_artifact(
+    res: &lychi_core::action_registry::ActionResult,
+) -> (String, Option<ToolArtifact>) {
+    use lychi_core::action_registry::{Output, OutputType};
+    if res.error.is_some() {
+        return (result_text(res), None);
+    }
+    if let Output::Text { body, kind } = &res.output {
+        match kind {
+            OutputType::Svg => {
+                return (
+                    "Generated the requested graphic (shown to the user).".to_string(),
+                    Some(ToolArtifact { kind: "svg".into(), content: body.clone() }),
+                );
+            }
+            OutputType::Weather => {
+                // The model gets the JSON (small, useful for it to summarize);
+                // the UI also renders it as a rich card.
+                return (
+                    body.clone(),
+                    Some(ToolArtifact { kind: "weather".into(), content: body.clone() }),
+                );
+            }
+            _ => {}
+        }
+    }
+    (result_text(res), None)
+}
+
 #[async_trait]
 impl ToolExecutor for ExecutorAdapter {
     async fn execute(&self, name: &str, args: &str) -> Result<ToolOutcome, LychiError> {
@@ -84,9 +117,11 @@ impl ToolExecutor for ExecutorAdapter {
             return Ok(ToolOutcome::NeedsApproval { reason, resume: token });
         }
 
+        let (output, artifact) = result_summary_and_artifact(&res.result);
         Ok(ToolOutcome::Ran {
-            output: result_text(&res.result),
+            output,
             is_error: !res.result.success,
+            artifact,
         })
     }
 
@@ -140,6 +175,12 @@ pub struct AgentEventDto {
     pub input_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u32>,
+    /// A rich tool artifact for inline render (kind = tool_completed):
+    /// artifact_kind = "svg" | "weather" | …, artifact_content = the raw payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_content: Option<String>,
 }
 
 impl AgentEventDto {
@@ -156,6 +197,8 @@ impl AgentEventDto {
             truncated: false,
             input_tokens: None,
             output_tokens: None,
+            artifact_kind: None,
+            artifact_content: None,
         };
         match ev {
             AgentEvent::TurnStarted { step } => {
@@ -176,10 +219,14 @@ impl AgentEventDto {
                 d.tool_name = Some(name);
                 d.tool_args = Some(args);
             }
-            AgentEvent::ToolCallCompleted { call_id, output } => {
+            AgentEvent::ToolCallCompleted { call_id, output, artifact } => {
                 d.kind = "tool_completed".into();
                 d.call_id = Some(call_id);
                 d.text = Some(output);
+                if let Some(a) = artifact {
+                    d.artifact_kind = Some(a.kind);
+                    d.artifact_content = Some(a.content);
+                }
             }
             AgentEvent::ToolCallFailed { call_id, error } => {
                 d.kind = "tool_failed".into();

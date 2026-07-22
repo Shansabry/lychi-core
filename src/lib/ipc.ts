@@ -149,6 +149,9 @@ export interface AgentEventDto {
 	/** usage: token counts for the turn. */
 	input_tokens?: number;
 	output_tokens?: number;
+	/** tool_completed: a rich artifact to render inline (svg | weather | …). */
+	artifact_kind?: string;
+	artifact_content?: string;
 }
 
 export interface BrowserContext {

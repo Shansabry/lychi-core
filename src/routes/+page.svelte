@@ -104,6 +104,9 @@ type ToolStep = {
 	args: string;
 	status: "running" | "done" | "failed";
 	output?: string;
+	/** A rich result to render inline (e.g. a QR svg, a weather card). */
+	artifactKind?: string;
+	artifactContent?: string;
 };
 let aiToolSteps: ToolStep[] = $state([]);
 let aiApproval: { callId: string; toolName: string; args: string; reason: string } | null =
@@ -720,7 +723,15 @@ onMount(() => {
 				case "tool_failed": {
 					const status = ev.kind === "tool_failed" ? "failed" : "done";
 					aiToolSteps = aiToolSteps.map((s) =>
-						s.callId === ev.call_id ? { ...s, status, output: ev.text } : s,
+						s.callId === ev.call_id
+							? {
+									...s,
+									status,
+									output: ev.text,
+									artifactKind: ev.artifact_kind,
+									artifactContent: ev.artifact_content,
+								}
+							: s,
 					);
 					break;
 				}

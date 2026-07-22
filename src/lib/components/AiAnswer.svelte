@@ -1,6 +1,7 @@
 <script lang="ts">
 import { Globe, Sparkles } from "lucide-svelte";
 import { renderMarkdown } from "$lib/markdown";
+import { sanitizeSvg } from "$lib/sanitize";
 
 type ToolStep = {
 	callId: string;
@@ -8,6 +9,8 @@ type ToolStep = {
 	args: string;
 	status: "running" | "done" | "failed";
 	output?: string;
+	artifactKind?: string;
+	artifactContent?: string;
 };
 type Approval = { callId: string; toolName: string; args: string; reason: string };
 type Turn = { user: string; text: string; toolSteps: ToolStep[] };
@@ -172,6 +175,11 @@ function onWindowKeydown(e: KeyboardEvent) {
 					<span class="tool-name">{step.name}</span>
 					<span class="tool-args">{step.args}</span>
 				</div>
+				{#if step.artifactKind === "svg" && step.artifactContent}
+					<!-- Inline rich tool output (e.g. a QR code). Sanitized SVG. -->
+					<!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized -->
+					<div class="tool-artifact svg">{@html sanitizeSvg(step.artifactContent)}</div>
+				{/if}
 			{/each}
 		</div>
 	{/if}
@@ -512,6 +520,21 @@ function onWindowKeydown(e: KeyboardEvent) {
 		flex-direction: column;
 		gap: 4px;
 		margin-bottom: 10px;
+	}
+	/* Inline rich tool output — e.g. a QR code. White plate so a dark-theme
+	   QR stays scannable; capped size, centered. */
+	.tool-artifact.svg {
+		align-self: flex-start;
+		margin: 6px 0 4px;
+		padding: 10px;
+		background: #fff;
+		border-radius: 8px;
+		border: 1px solid var(--border);
+	}
+	.tool-artifact.svg :global(svg) {
+		display: block;
+		width: 160px;
+		height: 160px;
 	}
 	.tool-step {
 		display: flex;
