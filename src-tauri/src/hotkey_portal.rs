@@ -19,6 +19,59 @@ use crate::state::AppState;
 
 const SHORTCUT_ID: &str = "toggle-launcher";
 
+/// Ensure a desktop file NAMED AFTER THE APP-ID (`app.lychi.desktop`) exists in
+/// the user's applications dir. The XDG GlobalShortcuts portal (≥1.21) requires
+/// our app-id registration to be backed by an installed `<app-id>.desktop`;
+/// without it the hotkey fails on Wayland with "An app id is required".
+///
+/// The RPM/deb install this system-wide, but an AppImage installs NOTHING — it's
+/// a portable blob — so the app self-registers here on startup. Idempotent:
+/// writes only if absent, points at the CURRENT executable, refreshes the
+/// desktop DB. Best-effort; any failure just means the portal path may not work
+/// (the fallback UX still applies).
+pub fn ensure_app_desktop_file() {
+    let Some(dir) = dirs::data_dir() else { return };
+    let apps = dir.join("applications");
+    let target = apps.join(format!("{APP_ID}.desktop"));
+    if target.exists() {
+        return;
+    }
+    // Point Exec at our own binary (the AppImage path via $APPIMAGE if set, else
+    // the resolved exe). `%u` lets the deep-link handler reuse it too.
+    let exec = std::env::var("APPIMAGE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::current_exe().ok().map(|p| p.display().to_string()))
+        .unwrap_or_else(|| "lychi-app".to_string());
+
+    let contents = format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=Lychi\n\
+         Comment=Local-first keyboard command launcher\n\
+         Exec={exec} %u\n\
+         Icon=lychi-app\n\
+         Terminal=false\n\
+         Categories=Utility;\n\
+         StartupWMClass=lychi-app\n\
+         MimeType=x-scheme-handler/lychi;\n"
+    );
+
+    if std::fs::create_dir_all(&apps).is_err() {
+        return;
+    }
+    match std::fs::write(&target, contents) {
+        Ok(()) => {
+            tracing::info!("[portal] wrote app-id desktop file: {}", target.display());
+            // Refresh the desktop database so the portal sees it immediately.
+            let _ = std::process::Command::new("update-desktop-database")
+                .arg(&apps)
+                .status();
+        }
+        Err(e) => tracing::debug!("[portal] could not write app-id desktop file ({e})"),
+    }
+}
+
 /// How long to keep retrying the portal before concluding the compositor has no
 /// GlobalShortcuts backend. On AUTOSTART, Lychi often launches before
 /// `xdg-desktop-portal` (and its backend) finish coming up, so the first attempts
@@ -65,7 +118,77 @@ pub async fn setup(app: tauri::AppHandle, configured_hotkey: String) {
     }
 }
 
+/// The reverse-DNS app-id, matching the bundle identifier + the installed
+/// `.desktop`. Required by the host-registry handshake (below).
+const APP_ID: &str = "app.lychi";
+
+/// Announce our app-id to the portal via the host-registry handshake, returning
+/// whether the interface is present (true) or genuinely absent (false).
+///
+/// xdg-desktop-portal ≥1.21 REMOVED the old "derive the app-id from the systemd
+/// scope" path and now HARD-REJECTS GlobalShortcuts `CreateSession` from a
+/// non-sandboxed app that hasn't identified itself — the exact
+/// `NotAllowed: An app id is required` we hit after a reboot. The fix is to call
+/// `org.freedesktop.host.portal.Registry.Register(app_id, {})` on the session
+/// bus BEFORE creating the shortcuts session. ashpd 0.13 doesn't wrap this new
+/// method, so we call it directly over zbus.
+///
+/// CRITICAL for AUTOSTART: on a fresh boot the Registry interface may not be up
+/// yet when we first try. If the *interface* is missing (ServiceUnknown /
+/// UnknownObject) we return an Err so the caller RETRIES — proceeding to
+/// CreateSession without a registered app-id would be a guaranteed reject.
+/// A genuine `UnknownMethod` (older portal that never had Register) returns Ok:
+/// there's nothing to register and the legacy path still works.
+async fn register_host_app_id() -> Result<(), String> {
+    use ashpd::zbus;
+    let attempt = async {
+        let conn = zbus::Connection::session().await?;
+        let proxy = zbus::Proxy::new(
+            &conn,
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.host.portal.Registry",
+        )
+        .await?;
+        // Register(in s app_id, in a{sv} options)
+        let options: std::collections::HashMap<&str, zbus::zvariant::Value> =
+            std::collections::HashMap::new();
+        proxy.call_method("Register", &(APP_ID, options)).await?;
+        Ok::<(), zbus::Error>(())
+    }
+    .await;
+
+    match attempt {
+        Ok(()) => {
+            tracing::info!("[portal] registered host app-id '{APP_ID}'");
+            Ok(())
+        }
+        // The Register METHOD doesn't exist → old portal, nothing to do, proceed.
+        Err(zbus::Error::MethodError(name, _, _))
+            if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod" =>
+        {
+            tracing::info!("[portal] host Registry.Register absent (older portal) — proceeding");
+            Ok(())
+        }
+        // The portal/interface isn't up YET (fresh boot) → tell caller to retry.
+        Err(e) => {
+            tracing::warn!("[portal] host app-id registration failed ({e}) — will retry");
+            Err(e.to_string())
+        }
+    }
+}
+
 async fn run(app: &tauri::AppHandle, configured_hotkey: &str) -> ashpd::Result<()> {
+    // Identify ourselves to the portal FIRST (required on xdg-desktop-portal
+    // ≥1.21, otherwise CreateSession is rejected with "An app id is required").
+    // If this fails (portal not up yet at autostart), bail so the retry loop
+    // tries again — rather than proceeding to a guaranteed CreateSession reject.
+    if let Err(e) = register_host_app_id().await {
+        return Err(ashpd::Error::Portal(ashpd::PortalError::Failed(format!(
+            "host app-id registration not ready: {e}"
+        ))));
+    }
+
     let shortcuts = GlobalShortcuts::new().await?;
     let session = shortcuts.create_session(Default::default()).await?;
 

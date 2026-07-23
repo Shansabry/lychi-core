@@ -408,6 +408,10 @@ pub fn run() {
             //   double-fires alongside portal/DE bindings).
             // - X11: via tauri-plugin-global-shortcut as before.
             if lychi_core::context::is_wayland() {
+                // Self-register the app-id desktop file the portal needs (AppImage
+                // installs nothing; RPM/deb do it at install time — harmless to
+                // re-check). Must exist BEFORE the portal registration below.
+                hotkey_portal::ensure_app_desktop_file();
                 let portal_handle = app.handle().clone();
                 let portal_hotkey = hotkey.clone();
                 tauri::async_runtime::spawn(async move {
