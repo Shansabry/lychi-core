@@ -16,11 +16,7 @@ use std::time::{Duration, Instant};
 /// - `shutdown`: shared flag; when set true the loop exits cleanly.
 /// - `on_change`: invoked (on a spawned thread) after a debounced change — it
 ///   re-scans the dir and re-registers the handler + keywords.
-pub fn start(
-    dir: PathBuf,
-    shutdown: Arc<AtomicBool>,
-    on_change: Arc<dyn Fn() + Send + Sync>,
-) {
+pub fn start(dir: PathBuf, shutdown: Arc<AtomicBool>, on_change: Arc<dyn Fn() + Send + Sync>) {
     std::thread::Builder::new()
         .name("scripts-watcher".into())
         .spawn(move || run_watcher(dir, shutdown, on_change))
@@ -30,7 +26,9 @@ pub fn start(
 fn run_watcher(dir: PathBuf, shutdown: Arc<AtomicBool>, on_change: Arc<dyn Fn() + Send + Sync>) {
     // Ensure the dir exists so the watcher has something to watch and users have
     // a place to drop scripts.
-    if !dir.exists() && let Err(e) = std::fs::create_dir_all(&dir) {
+    if !dir.exists()
+        && let Err(e) = std::fs::create_dir_all(&dir)
+    {
         tracing::warn!("[scripts] could not create {}: {e}", dir.display());
     }
 

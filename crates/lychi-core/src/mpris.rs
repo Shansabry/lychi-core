@@ -13,9 +13,8 @@ const PLAYER_IFACE: &str = "org.mpris.MediaPlayer2.Player";
 /// Web-browser MPRIS bus-name fragments (browsers expose YouTube/web audio as
 /// MPRIS players). Single source of truth — the browser-dedup in `refresh` and
 /// the `Browser`/`yt` targeting in the media handler both key off this.
-const BROWSER_BUS_FRAGMENTS: &[&str] = &[
-    "chromium", "chrome", "firefox", "brave", "vivaldi", "edge",
-];
+const BROWSER_BUS_FRAGMENTS: &[&str] =
+    &["chromium", "chrome", "firefox", "brave", "vivaldi", "edge"];
 
 /// Whether an MPRIS bus name belongs to a web browser.
 pub fn is_browser_bus(bus_name: &str) -> bool {
@@ -433,7 +432,8 @@ impl MprisManager {
     /// the **most recently active** one wins — the MPRIS convention — instead of
     /// an arbitrary alphabetical pick.
     pub fn find_player_by_bus(&self, predicate: impl Fn(&str) -> bool) -> Option<String> {
-        let by_recency = |a: &&String, b: &&String| self.activity.rank(a).cmp(&self.activity.rank(b));
+        let by_recency =
+            |a: &&String, b: &&String| self.activity.rank(a).cmp(&self.activity.rank(b));
         // Prefer the most-recently-active matching player.
         if let Some(name) = self
             .players
@@ -604,7 +604,10 @@ mod tests {
         t.mark("a");
         t.mark("b");
         t.mark("a"); // a is now more recent than b
-        assert!(t.rank("a") > t.rank("b"), "re-marked player should be newer");
+        assert!(
+            t.rank("a") > t.rank("b"),
+            "re-marked player should be newer"
+        );
         // retain drops absent players.
         t.retain(&["a".to_string()]);
         assert_eq!(t.rank("b"), 0, "dropped player resets to 0");

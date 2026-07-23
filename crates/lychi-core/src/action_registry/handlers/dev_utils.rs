@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use base64::Engine;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::error::LychiError;
 
@@ -249,6 +249,9 @@ impl ActionHandler for DevUtilsHandler {
 
     fn description(&self) -> &str {
         "Developer utilities: base64, hash, urlencode/decode, epoch, json, text-case"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Developer
     }
 
     async fn completions(&self, partial: &str) -> Vec<CompletionItem> {

@@ -525,7 +525,11 @@ where
         loop {
             if let Some(pos) = find_event_boundary(&self.buf) {
                 let raw = self.buf[..pos].to_string();
-                let advance = if self.buf[pos..].starts_with("\r\n\r\n") { 4 } else { 2 };
+                let advance = if self.buf[pos..].starts_with("\r\n\r\n") {
+                    4
+                } else {
+                    2
+                };
                 self.buf.drain(..pos + advance);
                 if let Some(data) = parse_sse_data(&raw) {
                     return Ok(Some(data));
@@ -612,8 +616,14 @@ mod tests {
         ];
         let stream = futures_util::stream::iter(chunks);
         let mut sse = SseReader::new(stream);
-        assert_eq!(sse.next_event().await.unwrap().as_deref(), Some("{\"a\":1}"));
-        assert_eq!(sse.next_event().await.unwrap().as_deref(), Some("{\"b\":2}"));
+        assert_eq!(
+            sse.next_event().await.unwrap().as_deref(),
+            Some("{\"a\":1}")
+        );
+        assert_eq!(
+            sse.next_event().await.unwrap().as_deref(),
+            Some("{\"b\":2}")
+        );
         assert_eq!(sse.next_event().await.unwrap().as_deref(), Some("[DONE]"));
         assert_eq!(sse.next_event().await.unwrap(), None);
     }
@@ -642,11 +652,21 @@ mod tests {
         let events = collect(stream).await;
         // MessageStart, TextDelta(Hel), TextDelta(lo), Done{EndTurn}
         assert!(matches!(events[0], StreamEvent::MessageStart { .. }));
-        let text: String = events.iter().filter_map(|e| match e {
-            StreamEvent::TextDelta(t) => Some(t.clone()), _ => None,
-        }).collect();
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(text, "Hello");
-        assert!(matches!(events.last(), Some(StreamEvent::Done { stop_reason: StopReason::EndTurn, .. })));
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                ..
+            })
+        ));
     }
 
     // message_delta carries the authoritative stop_reason (max_tokens) + usage.
@@ -690,13 +710,25 @@ mod tests {
             futures_util::stream::iter(chunks),
             "m".into(),
             CancellationToken::new(),
-        )).await;
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::ToolCallStart { name, .. } if name == "open")));
+        ))
+        .await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ToolCallStart { name, .. } if name == "open"))
+        );
         let complete = events.iter().find_map(|e| match e {
-            StreamEvent::ToolCallComplete { name, args, .. } => Some((name.clone(), args.clone())), _ => None,
+            StreamEvent::ToolCallComplete { name, args, .. } => Some((name.clone(), args.clone())),
+            _ => None,
         });
         assert_eq!(complete, Some(("open".into(), "firefox".into())));
-        assert!(matches!(events.last(), Some(StreamEvent::Done { stop_reason: StopReason::ToolUse, .. })));
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Done {
+                stop_reason: StopReason::ToolUse,
+                ..
+            })
+        ));
     }
 
     // Canned OpenAI SSE with fragmented tool-call args (id/name on first chunk).
@@ -713,13 +745,19 @@ mod tests {
             futures_util::stream::iter(chunks),
             "m".into(),
             CancellationToken::new(),
-        )).await;
-        let text: String = events.iter().filter_map(|e| match e {
-            StreamEvent::TextDelta(t) => Some(t.clone()), _ => None,
-        }).collect();
+        ))
+        .await;
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(text, "hi");
         let complete = events.iter().find_map(|e| match e {
-            StreamEvent::ToolCallComplete { name, args, .. } => Some((name.clone(), args.clone())), _ => None,
+            StreamEvent::ToolCallComplete { name, args, .. } => Some((name.clone(), args.clone())),
+            _ => None,
         });
         assert_eq!(complete, Some(("web".into(), "rust".into())));
     }
@@ -735,9 +773,14 @@ mod tests {
             futures_util::stream::iter(chunks),
             "m".into(),
             cancel,
-        )).await;
+        ))
+        .await;
         // Should stop early — no text delta emitted (cancel checked before first read).
-        assert!(!events.iter().any(|e| matches!(e, StreamEvent::TextDelta(_))));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta(_)))
+        );
     }
 
     #[test]
@@ -756,7 +799,11 @@ mod tests {
                 role: Role::Assistant,
                 content: "I'll open it".into(),
                 tool_call_id: None,
-                tool_calls: vec![ToolCall { id: "t1".into(), name: "open".into(), args: "firefox".into() }],
+                tool_calls: vec![ToolCall {
+                    id: "t1".into(),
+                    name: "open".into(),
+                    args: "firefox".into(),
+                }],
                 is_error: false,
             },
             ChatMessage::tool_result("t1", "opened", false),
@@ -778,7 +825,11 @@ mod tests {
                 role: Role::Assistant,
                 content: String::new(),
                 tool_call_id: None,
-                tool_calls: vec![ToolCall { id: "t1".into(), name: "open".into(), args: "firefox".into() }],
+                tool_calls: vec![ToolCall {
+                    id: "t1".into(),
+                    name: "open".into(),
+                    args: "firefox".into(),
+                }],
                 is_error: false,
             },
             ChatMessage::tool_result("t1", "opened", false),
@@ -787,7 +838,9 @@ mod tests {
         assert_eq!(wire.len(), 3);
         assert_eq!(wire[1]["tool_calls"][0]["function"]["name"], "open");
         assert_eq!(
-            wire[1]["tool_calls"][0]["function"]["arguments"].as_str().unwrap(),
+            wire[1]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
             "{\"args\":\"firefox\"}"
         );
         assert_eq!(wire[2]["role"], "tool");
@@ -796,8 +849,14 @@ mod tests {
 
     #[test]
     fn tool_schemas_use_uniform_args_shape() {
-        let tools = vec![ToolDef { name: "open".into(), description: "Open an app".into() }];
-        assert_eq!(anthropic_tools(&tools)[0]["input_schema"]["required"][0], "args");
+        let tools = vec![ToolDef {
+            name: "open".into(),
+            description: "Open an app".into(),
+        }];
+        assert_eq!(
+            anthropic_tools(&tools)[0]["input_schema"]["required"][0],
+            "args"
+        );
         assert_eq!(
             openai_tools(&tools)[0]["function"]["parameters"]["properties"]["args"]["type"],
             "string"
@@ -807,7 +866,10 @@ mod tests {
     #[test]
     fn build_body_shapes_per_dialect() {
         let msgs = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
-        let tools = vec![ToolDef { name: "open".into(), description: "d".into() }];
+        let tools = vec![ToolDef {
+            name: "open".into(),
+            description: "d".into(),
+        }];
 
         // Anthropic: system out-of-band, tools present, stream:true.
         let a = build_body(Dialect::Anthropic, "claude", 100, &msgs, &tools);

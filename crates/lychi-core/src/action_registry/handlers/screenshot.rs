@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::error::LychiError;
 
@@ -490,13 +490,8 @@ fn portal_screenshot_blocking(interactive: bool) -> Result<Option<String>, Strin
     // where SENDER is our unique bus name with dots→underscores and the leading
     // ':' stripped. (Portal spec, org.freedesktop.portal.Request.)
     let token = format!("lychi_{}", std::process::id());
-    let sender = conn
-        .unique_name()
-        .trim_start_matches(':')
-        .replace('.', "_");
-    let request_path = format!(
-        "/org/freedesktop/portal/desktop/request/{sender}/{token}"
-    );
+    let sender = conn.unique_name().trim_start_matches(':').replace('.', "_");
+    let request_path = format!("/org/freedesktop/portal/desktop/request/{sender}/{token}");
 
     let (tx, rx) = mpsc::channel::<(u32, Option<String>)>();
     let tx = Arc::new(Mutex::new(tx));
@@ -608,6 +603,9 @@ impl ActionHandler for ScreenshotHandler {
     fn description(&self) -> &str {
         "Capture a screenshot (full screen, region, or window)"
     }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::System
+    }
 
     async fn completions(&self, partial: &str) -> Vec<CompletionItem> {
         let p = partial.trim().to_ascii_lowercase();
@@ -660,9 +658,7 @@ impl ActionHandler for ScreenshotHandler {
         //   needs nothing installed), tool as fallback.
         let native_first = !matches!(mode, Mode::Full);
 
-        if native_first
-            && let Some(plan) = plan(mode, &path_str)
-        {
+        if native_first && let Some(plan) = plan(mode, &path_str) {
             match capture(plan, &path_str) {
                 Ok(()) if std::path::Path::new(&path_str).exists() => {
                     notify_saved(&path_str, mode);

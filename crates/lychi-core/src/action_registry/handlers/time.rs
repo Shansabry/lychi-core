@@ -3,7 +3,8 @@ use chrono::{Datelike, Local, NaiveTime, Offset, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType, RiskLevel,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
+    RiskLevel,
 };
 use crate::error::LychiError;
 
@@ -442,6 +443,9 @@ impl ActionHandler for TimeHandler {
 
     fn description(&self) -> &str {
         "World clock & timezone conversion"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Utilities
     }
 
     fn default_risk(&self) -> RiskLevel {

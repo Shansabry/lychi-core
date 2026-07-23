@@ -47,8 +47,7 @@ pub const AI_PRESETS: TableDefinition<&str, &[u8]> = TableDefinition::new("ai_pr
 /// AI conversation history: key = UUID v7 string, value = postcard-serialized
 /// ConversationEntry. Completed agent conversations, recallable via `chat`
 /// (Phase 4). Capped + pruned so the DB doesn't grow unbounded.
-pub const AI_CONVERSATIONS: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("ai_conversations");
+pub const AI_CONVERSATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("ai_conversations");
 
 /// Open (or create) the redb database at the given path.
 /// If the file exists but uses an older format version, back it up and recreate.

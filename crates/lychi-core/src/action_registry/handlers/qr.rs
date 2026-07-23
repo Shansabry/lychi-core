@@ -12,7 +12,7 @@ use qrcode::render::svg;
 use qrcode::{EcLevel, QrCode};
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::error::LychiError;
 
@@ -66,6 +66,9 @@ impl ActionHandler for QrHandler {
 
     fn description(&self) -> &str {
         "Generate a QR code from text or a URL"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Utilities
     }
 
     async fn completions(&self, partial: &str) -> Vec<CompletionItem> {

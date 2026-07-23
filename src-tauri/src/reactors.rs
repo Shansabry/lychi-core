@@ -125,6 +125,10 @@ struct AiReactor {
     /// same pass that rebuilds the executor's AI handlers, so a mode switch
     /// updates both paths atomically-enough (the command reads it per request).
     ai_provider: Arc<RwLock<Option<Arc<dyn lychi_core::providers::AiProvider>>>>,
+    /// App handle used to push AI availability to the frontend. The FE mirrors
+    /// this into its `aiEnabled` flag so submit-routing (NL/`ask` → agent vs.
+    /// web) stays in sync with the live provider, event-driven, no polling.
+    app: tauri::AppHandle,
 }
 
 impl EventHandler for AiReactor {
@@ -153,6 +157,7 @@ impl EventHandler for AiReactor {
         let mut executor = self.executor.blocking_write();
 
         // Swap (or clear) the intent router.
+        let available = provider.is_some();
         match provider {
             Some(p) => {
                 let router =
@@ -165,6 +170,13 @@ impl EventHandler for AiReactor {
                 tracing::info!("[reactor] ai config applied (AI off)");
             }
         }
+        drop(executor);
+
+        // Push the new availability to the frontend so its `aiEnabled` flag —
+        // the single gate for routing NL/`ask` to the agent vs. web — updates
+        // the instant AI is enabled/disabled in Settings, with no polling.
+        use tauri::Emitter;
+        let _ = self.app.emit("lychi://ai-status-changed", available);
     }
 }
 
@@ -174,6 +186,7 @@ pub fn register_config_reactors(
     executor: Arc<RwLock<Executor>>,
     config: Arc<RwLock<Config>>,
     ai_provider: Arc<RwLock<Option<Arc<dyn lychi_core::providers::AiProvider>>>>,
+    app: tauri::AppHandle,
 ) {
     bus.subscribe(Arc::new(CommandsReactor {
         executor: executor.clone(),
@@ -187,5 +200,6 @@ pub fn register_config_reactors(
         executor,
         config,
         ai_provider,
+        app,
     }));
 }

@@ -7,7 +7,7 @@ use redb::{ReadableDatabase, ReadableTable};
 use serde::Serialize;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::error::LychiError;
 
@@ -73,7 +73,8 @@ impl Timer {
             None
         } else {
             let this_run_secs = self.started_at.elapsed().as_secs_f64();
-            let started_ms = crate::db::now_millis().saturating_sub((this_run_secs * 1000.0) as u64);
+            let started_ms =
+                crate::db::now_millis().saturating_sub((this_run_secs * 1000.0) as u64);
             Some(started_ms)
         };
         // When paused, fold the paused run's elapsed into elapsed_before so the
@@ -332,6 +333,9 @@ impl ActionHandler for TimerHandler {
 
     fn description(&self) -> &str {
         "Timer — countdown timers with desktop notification. Usage: timer 25m, timer start workout 5m, timer stop, timer status"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Utilities
     }
 
     async fn execute(&self, ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

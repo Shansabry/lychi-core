@@ -488,7 +488,10 @@ mod tests {
             known,
             "test",
         );
-        assert!(r.is_ok(), "trailing text after the JSON object must be tolerated");
+        assert!(
+            r.is_ok(),
+            "trailing text after the JSON object must be tolerated"
+        );
     }
 
     #[test]
@@ -499,7 +502,10 @@ mod tests {
             known,
             "test",
         );
-        assert!(r.is_ok(), "leading prose before the JSON object must be tolerated");
+        assert!(
+            r.is_ok(),
+            "leading prose before the JSON object must be tolerated"
+        );
     }
 
     #[test]

@@ -3,12 +3,12 @@ pub mod cloud;
 pub mod factory;
 #[cfg(feature = "local-ai")]
 pub mod local;
-/// The curated local-model registry (plain metadata — NOT feature-gated, so the
-/// download command + settings UI work without the `local-ai` engine feature).
-pub mod local_models;
 /// Streamed model downloader (NOT feature-gated — a user can download a model
 /// independent of whether this build has the inference engine).
 pub mod local_download;
+/// The curated local-model registry (plain metadata — NOT feature-gated, so the
+/// download command + settings UI work without the `local-ai` engine feature).
+pub mod local_models;
 pub mod ollama;
 /// Shared wire-format encoding + SSE streaming machinery for the `chat` primitive.
 mod wire;
@@ -70,7 +70,11 @@ impl ChatMessage {
         Self::plain(Role::Assistant, content)
     }
     /// A tool-result turn answering `tool_call_id`.
-    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>, is_error: bool) -> Self {
+    pub fn tool_result(
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
         Self {
             role: Role::Tool,
             content: content.into(),
@@ -138,10 +142,17 @@ pub enum StreamEvent {
     ToolCallArgsDelta { id: String, delta: String },
     /// A tool call is fully assembled. `args` is the single Lychi argument string
     /// (the provider has already unwrapped its `{"args": …}` wire object).
-    ToolCallComplete { id: String, name: String, args: String },
+    ToolCallComplete {
+        id: String,
+        name: String,
+        args: String,
+    },
     /// The turn ended. `usage` carries token counts when the provider reports them
     /// (Anthropic/OpenAI SSE); `None` for providers that don't (e.g. local).
-    Done { stop_reason: StopReason, usage: Option<Usage> },
+    Done {
+        stop_reason: StopReason,
+        usage: Option<Usage>,
+    },
 }
 
 /// Token usage for one model turn, when the provider reports it.

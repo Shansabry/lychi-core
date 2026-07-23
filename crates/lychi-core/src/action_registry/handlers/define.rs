@@ -14,7 +14,7 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::error::LychiError;
 
@@ -219,6 +219,9 @@ impl ActionHandler for DefineHandler {
 
     fn description(&self) -> &str {
         "Define a word (dictionary lookup)"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Web
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

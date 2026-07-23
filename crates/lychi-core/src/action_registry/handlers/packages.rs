@@ -23,7 +23,8 @@ use std::process::Command;
 use async_trait::async_trait;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType, RiskAssessment, RiskLevel,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
+    RiskAssessment, RiskLevel,
 };
 use crate::error::LychiError;
 
@@ -364,7 +365,10 @@ fn run_pkg_op(op: PkgOp, pkg: &str) -> Result<String, String> {
         return if status.success() {
             Ok(format!("{} {app} via flatpak ✓", op.past()))
         } else {
-            Err(format!("flatpak failed: {} {app}", op.present().to_lowercase()))
+            Err(format!(
+                "flatpak failed: {} {app}",
+                op.present().to_lowercase()
+            ))
         };
     }
 
@@ -422,6 +426,9 @@ impl ActionHandler for PackagesHandler {
     fn description(&self) -> &str {
         "Search, install, remove & upgrade system packages (dnf/apt/pacman/zypper/flatpak)"
     }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::System
+    }
 
     fn assess_risk(
         &self,
@@ -443,7 +450,11 @@ impl ActionHandler for PackagesHandler {
             ("search", "search <query>", "Search available packages"),
             ("install", "install <package>", "Install a package"),
             ("remove", "remove <package>", "Remove a package"),
-            ("upgrade", "upgrade [package]", "Upgrade a package or the system"),
+            (
+                "upgrade",
+                "upgrade [package]",
+                "Upgrade a package or the system",
+            ),
         ];
         hints
             .iter()
@@ -503,8 +514,14 @@ mod tests {
     #[test]
     fn assess_risk_confirms_install_not_search() {
         let h = PackagesHandler::new();
-        assert_eq!(h.assess_risk("install neovim", &Default::default()).level, RiskLevel::Medium);
-        assert_eq!(h.assess_risk("search ripgrep", &Default::default()).level, RiskLevel::Low);
+        assert_eq!(
+            h.assess_risk("install neovim", &Default::default()).level,
+            RiskLevel::Medium
+        );
+        assert_eq!(
+            h.assess_risk("search ripgrep", &Default::default()).level,
+            RiskLevel::Low
+        );
     }
 
     #[test]
@@ -578,9 +595,20 @@ mod tests {
     #[test]
     fn upgrade_args_full_vs_single() {
         // apt: single-package upgrade uses install --only-upgrade; full uses upgrade.
-        assert!(Manager::Apt.upgrade_args("vim").contains(&"--only-upgrade".to_string()));
-        assert!(Manager::Apt.upgrade_args("").contains(&"upgrade".to_string()));
+        assert!(
+            Manager::Apt
+                .upgrade_args("vim")
+                .contains(&"--only-upgrade".to_string())
+        );
+        assert!(
+            Manager::Apt
+                .upgrade_args("")
+                .contains(&"upgrade".to_string())
+        );
         // pacman always full sync-upgrade.
-        assert_eq!(Manager::Pacman.upgrade_args("vim"), vec!["-Syu", "--noconfirm"]);
+        assert_eq!(
+            Manager::Pacman.upgrade_args("vim"),
+            vec!["-Syu", "--noconfirm"]
+        );
     }
 }

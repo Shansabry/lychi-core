@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use redb::Database;
 
-use crate::action_registry::{ActionHandler, ActionResult, ExecContext, OutputType};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CommandCategory, ExecContext, OutputType,
+};
 use crate::db::frecency;
 use crate::error::LychiError;
 
@@ -43,6 +45,9 @@ impl ActionHandler for FileOpen {
 
     fn description(&self) -> &str {
         "Open a file or folder in the default application"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Files
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

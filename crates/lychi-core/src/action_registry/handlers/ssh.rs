@@ -7,7 +7,7 @@ use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher};
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::error::LychiError;
 
@@ -359,6 +359,9 @@ impl ActionHandler for SshHandler {
 
     fn description(&self) -> &str {
         "Connect to SSH hosts from ~/.ssh/config"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Developer
     }
 
     async fn execute(&self, ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::error::LychiError;
 
@@ -160,6 +160,9 @@ impl ActionHandler for ResizeImageHandler {
 
     fn description(&self) -> &str {
         "Resize an image: resize <path> to <800x600 | 800 | x600 | 50%>"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Files
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

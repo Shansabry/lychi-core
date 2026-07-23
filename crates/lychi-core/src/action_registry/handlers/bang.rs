@@ -14,7 +14,9 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, ExecContext};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext,
+};
 use crate::error::LychiError;
 
 pub struct BangHandler {
@@ -58,6 +60,9 @@ impl ActionHandler for BangHandler {
 
     fn description(&self) -> &str {
         "Custom search-engine shortcuts (gh, npm, mdn, …)"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Web
     }
 
     async fn completions(&self, partial: &str) -> Vec<CompletionItem> {

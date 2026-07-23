@@ -31,8 +31,10 @@ let {
 	ontogglechathistory = () => {},
 	onshowresult,
 	onshowplan,
+	onshowai = () => {},
 	notesOpen = false,
 	hasPlan = false,
+	aiParked = false,
 	contextStale = false,
 	contextStaleHint = "",
 	contextRefreshing = false,
@@ -56,8 +58,10 @@ let {
 	ontogglechathistory?: () => void;
 	onshowresult: () => void;
 	onshowplan: () => void;
+	onshowai?: () => void;
 	notesOpen?: boolean;
 	hasPlan?: boolean;
+	aiParked?: boolean;
 	contextStale?: boolean;
 	contextStaleHint?: string;
 	contextRefreshing?: boolean;
@@ -181,6 +185,20 @@ async function togglePlayPause() {
 				<kbd>{getComboString("action_panel")}</kbd>
 			</button>
 		{/if}
+		{#if aiParked}
+			<!-- An AI answer/chat exists but is parked off-stage (behind a panel or
+			     hidden via Esc). This icon recalls it — nothing is lost. Only shown
+			     while the answer is off-screen. -->
+			<button
+				class="bar-icon ai-parked"
+				onmousedown={(e) => e.preventDefault()}
+				onclick={onshowai}
+				title="Show AI answer"
+				tabindex={-1}
+			>
+				<Sparkles size={14} strokeWidth={1.5} />
+			</button>
+		{/if}
 		{#if result && (result.output || result.error)}
 			<button
 				class="bar-icon"
@@ -205,7 +223,7 @@ async function togglePlayPause() {
 				<Sparkles size={14} strokeWidth={1.5} />
 			</button>
 		{/if}
-		{#if (result && (result.output || result.error)) || hasPlan}
+		{#if (result && (result.output || result.error)) || hasPlan || aiParked}
 			<span class="toolbar-sep"></span>
 		{/if}
 		<button
@@ -344,6 +362,23 @@ async function togglePlayPause() {
 
 	.bar-icon.active {
 		color: var(--accent);
+	}
+
+	/* Parked AI answer: tinted with the AI hue + a soft pulse so it reads as
+	   "answer waiting" rather than an inert toggle. */
+	.bar-icon.ai-parked {
+		color: var(--ai);
+		animation: ai-park-pulse 2s ease-in-out infinite;
+	}
+
+	.bar-icon.ai-parked:hover {
+		opacity: 1;
+		animation: none;
+	}
+
+	@keyframes ai-park-pulse {
+		0%, 100% { opacity: 0.7; }
+		50% { opacity: 1; }
 	}
 
 	.status-info {

@@ -7,7 +7,7 @@ use nucleo_matcher::{Config, Matcher};
 use redb::Database;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::db::frecency;
 use crate::error::LychiError;
@@ -135,6 +135,9 @@ impl ActionHandler for WindowSwitcherHandler {
 
     fn description(&self) -> &str {
         "Switch between open windows (focus or close)"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::System
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

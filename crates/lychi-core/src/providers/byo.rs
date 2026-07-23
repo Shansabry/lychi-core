@@ -172,7 +172,10 @@ impl BYOClient {
     /// BYO config (wire format + key) onto it.
     fn wire_client(&self) -> WireClient {
         let (dialect, auth) = match self.wire {
-            WireFormat::Anthropic => (Dialect::Anthropic, AuthStyle::AnthropicKey(self.api_key.clone())),
+            WireFormat::Anthropic => (
+                Dialect::Anthropic,
+                AuthStyle::AnthropicKey(self.api_key.clone()),
+            ),
             WireFormat::OpenAi => (Dialect::OpenAi, AuthStyle::Bearer(self.api_key.clone())),
         };
         WireClient::new(
@@ -356,5 +359,4 @@ mod tests {
         );
         assert_eq!(c.name(), "grok");
     }
-
 }

@@ -5,7 +5,9 @@ use std::time::Instant;
 use redb::Database;
 
 use crate::action_registry::handlers::icons::resolve_icon_cached;
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, ExecContext};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext,
+};
 use crate::db::frecency;
 use crate::desktop_apps::{AUTO_LAUNCH_THRESHOLD, app_index};
 use crate::error::LychiError;
@@ -68,6 +70,9 @@ impl ActionHandler for AppLauncher {
 
     fn description(&self) -> &str {
         "Launch a desktop application"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::System
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

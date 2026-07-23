@@ -1,0 +1,330 @@
+/**
+ * ChatSession — all AI-conversation state + the agent-event application logic.
+ *
+ * Extracted from +page.svelte (Phase 2 of the FE re-architecture). Owns the ~15
+ * `ai*` fields, the streamed-answer transcript, tool-step lifecycle, the pending
+ * destructive-tool approval, and the token/truncation bookkeeping. The launcher
+ * page keeps only thin orchestration wrappers (the parts that also touch page
+ * state like `lastResult` or call `runCommand`).
+ *
+ * CRITICAL: `gen` is a plain NON-reactive field (never `$state`). It's the async
+ * staleness guard — bumped on every new run so late `lychi://agent-event`s from a
+ * superseded run are dropped in `applyEvent`. Making it reactive would re-trigger
+ * effects on every bump and (worse) is unnecessary churn; it's deliberately opaque
+ * to reactivity. Do not add `$state` to it.
+ *
+ * Arrays that are replaced wholesale (`turns`, `toolSteps`) use `$state.raw` — a
+ * perf win (no deep proxying) that matches the WebKit paint sensitivity.
+ *
+ * Svelte 5 note: methods are arrow-function fields so `this` stays bound when they
+ * are passed as component callback props.
+ */
+
+import { type AgentEventDto, agentApprove, agentChatStart, cancelAiChat } from "$lib/ipc";
+import { ui } from "./ui.svelte";
+
+export type ToolStep = {
+	callId: string;
+	name: string;
+	args: string;
+	status: "running" | "done" | "failed";
+	output?: string;
+	/** A rich result to render inline (e.g. a QR svg, a weather card). */
+	artifactKind?: string;
+	artifactContent?: string;
+};
+
+/** A completed prior turn in the conversation (shown above the streaming answer). */
+export type AiTurn = { user: string; text: string; toolSteps: ToolStep[] };
+
+// --- System prompts (moved here with the chat logic that uses them) ---
+
+/** The system prompt for the agent — a launcher assistant that can act via tools. */
+export const AGENT_SYSTEM =
+	"You are Lychi, a helpful assistant inside a Linux launcher. Answer concisely in markdown. You can call tools to act on the user's system when helpful; otherwise just answer.";
+
+/**
+ * The quick-AI fork-card system prompt. The agent CAN act (it has the tool
+ * catalog): if the query is an action Lychi can perform (weather, open an app,
+ * media control, system info…), DO it via a tool rather than describing how.
+ * Otherwise answer directly and concisely.
+ */
+export const QUICK_AI_SYSTEM =
+	"You are Lychi, a smart assistant inside a Linux launcher. You can ACT on the user's system by calling tools. If the request is something a tool can do (check the weather, open/launch an app, control media, read system info, search, etc.), call the tool and give the result — never tell the user to run a command themselves when you have a tool for it. Otherwise, answer the question directly and concisely in 2-3 sentences with minimal markdown.";
+
+/** System prompt for AI presets (text transforms) — do the task, nothing else. */
+export const PRESET_SYSTEM =
+	"You are Lychi's AI command runner. Perform the task in the user's message directly and return only the result — no preamble, no explanation, no tool use. Use minimal markdown.";
+
+class ChatSession {
+	// Streamed answer + status.
+	text = $state("");
+	streaming = $state(false);
+	error = $state<string | null>(null);
+
+	// Fork-card mode (a short answer with Search-web / Full-chat buttons).
+	quick = $state(false);
+	quickPrompt = $state("");
+
+	// Transcript + live turn. Replaced wholesale → $state.raw.
+	turns = $state.raw<AiTurn[]>([]);
+	toolSteps = $state.raw<ToolStep[]>([]);
+	lastUser = $state("");
+
+	// Pending destructive-tool approval (loop suspended until decided).
+	approval = $state<{ callId: string; toolName: string; args: string; reason: string } | null>(
+		null,
+	);
+
+	// In-panel follow-up reply box.
+	reply = $state("");
+
+	// Token spend + truncation notice.
+	truncated = $state(false);
+	tokensIn = $state(0);
+	tokensOut = $state(0);
+
+	/** NON-reactive staleness guard (see file header). Bumped per run. */
+	gen = 0;
+
+	/** Reset the fields shared by every run start (not the transcript). */
+	#beginRun(user: string): number {
+		this.lastUser = user;
+		this.text = "";
+		this.toolSteps = [];
+		this.error = null;
+		this.approval = null;
+		this.truncated = false;
+		this.streaming = true;
+		ui.showAi();
+		return ++this.gen;
+	}
+
+	#fail(gen: number, e: unknown): void {
+		if (gen === this.gen) {
+			this.streaming = false;
+			this.error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	/** Clear the active conversation entirely (fresh start / summon). */
+	reset = (): void => {
+		this.gen++; // supersede any in-flight run
+		this.text = "";
+		this.error = null;
+		this.streaming = false;
+		ui.clearAi();
+		this.toolSteps = [];
+		this.approval = null;
+		this.turns = [];
+		this.lastUser = "";
+		this.reply = "";
+		this.quick = false;
+		this.quickPrompt = "";
+		this.truncated = false;
+		this.tokensIn = 0;
+		this.tokensOut = 0;
+	};
+
+	/**
+	 * Start (fresh) or continue (follow-up) a tool-calling agent run. `fresh` = new
+	 * conversation; else the backend appends this as a follow-up. Progress arrives
+	 * via `lychi://agent-event` → `applyEvent`.
+	 */
+	start = async (prompt: string, fresh = true): Promise<void> => {
+		const text = prompt.trim();
+		if (!text) return;
+		if (fresh) {
+			this.turns = [];
+		} else if (this.text) {
+			// Snapshot the completed answer into the transcript before the new turn.
+			this.turns = [
+				...this.turns,
+				{ user: this.lastUser, text: this.text, toolSteps: this.toolSteps },
+			];
+		}
+		const gen = this.#beginRun(text);
+		this.quick = false; // full agent chat, not the fork card
+		try {
+			await agentChatStart(AGENT_SYSTEM, text, fresh, /* withTools */ true, gen);
+		} catch (e) {
+			this.#fail(gen, e);
+		}
+	};
+
+	/** Send the in-panel reply (continues the conversation). */
+	sendReply = async (): Promise<void> => {
+		const text = this.reply.trim();
+		if (!text || this.streaming) return;
+		this.reply = "";
+		await this.start(text, /* fresh */ false);
+	};
+
+	/** Run a tool-FREE preset (text transform) — streams into the full surface. */
+	startPreset = async (prompt: string): Promise<void> => {
+		const text = prompt.trim();
+		if (!text) return;
+		this.turns = [];
+		const gen = this.#beginRun(text);
+		this.quick = false;
+		try {
+			await agentChatStart(PRESET_SYSTEM, text, /* fresh */ true, /* withTools */ false, gen);
+		} catch (e) {
+			this.#fail(gen, e);
+		}
+	};
+
+	/** The fork card: stream a short answer with Search-web / Full-chat buttons. */
+	startQuick = async (prompt: string): Promise<void> => {
+		const text = prompt.trim();
+		if (!text) return;
+		this.turns = [];
+		this.quickPrompt = text;
+		const gen = this.#beginRun(text);
+		this.quick = true; // the fork card
+		try {
+			await agentChatStart(QUICK_AI_SYSTEM, text, /* fresh */ true, /* withTools */ true, gen);
+		} catch (e) {
+			this.#fail(gen, e);
+		}
+	};
+
+	/**
+	 * Escalate the fork-card answer into full chat WITHOUT re-asking. Returns the
+	 * prompt to re-run when nothing streamed yet (caller decides), else null.
+	 */
+	escalate = (): string | null => {
+		if (!this.text) {
+			// Nothing streamed yet — signal the caller to run a fresh full-agent turn.
+			const prompt = this.quickPrompt;
+			this.quick = false;
+			return prompt || null;
+		}
+		// Snapshot the quick answer as a completed turn, then switch to full chat.
+		// Clear the live-turn fields so the snapshot doesn't ALSO render as the bubble.
+		this.turns = [
+			...this.turns,
+			{ user: this.lastUser, text: this.text, toolSteps: this.toolSteps },
+		];
+		this.lastUser = "";
+		this.text = "";
+		this.toolSteps = [];
+		this.quick = false;
+		this.streaming = false;
+		return null;
+	};
+
+	/** Resolve a pending destructive-tool approval and resume the agent. */
+	approve = async (ok: boolean): Promise<void> => {
+		if (!this.approval) return;
+		this.approval = null;
+		this.truncated = false;
+		this.streaming = true;
+		const gen = this.gen; // same run continues
+		try {
+			await agentApprove(ok, gen);
+		} catch (e) {
+			this.#fail(gen, e);
+		}
+	};
+
+	/** Cancel an in-flight agent run (Esc while streaming). */
+	cancel = (): void => {
+		this.gen++; // drop late events on the frontend
+		this.streaming = false;
+		cancelAiChat().catch(() => {});
+	};
+
+	/**
+	 * Load a recalled conversation's turns onto the surface (no new request). The
+	 * caller supplies the paired turns + the last (live) turn.
+	 */
+	loadRecalled = (priorTurns: AiTurn[], liveUser: string, liveText: string): void => {
+		this.turns = priorTurns;
+		this.lastUser = liveUser;
+		this.text = liveText;
+		this.toolSteps = [];
+		this.error = null;
+		this.approval = null;
+		this.streaming = false;
+		ui.showAi();
+		this.quick = false;
+		this.gen++; // fresh generation for any follow-up
+	};
+
+	/**
+	 * Apply one `lychi://agent-event`. Pure w.r.t. Tauri (feed it a DTO), so the
+	 * whole streaming lifecycle is unit-testable. Drops stale-generation events.
+	 */
+	applyEvent = (ev: AgentEventDto): void => {
+		if (ev.gen !== this.gen) return; // stale run — ignore
+		switch (ev.kind) {
+			case "text":
+				this.text += ev.text ?? "";
+				break;
+			case "tool_started":
+				this.toolSteps = [
+					...this.toolSteps,
+					{
+						callId: ev.call_id ?? "",
+						name: ev.tool_name ?? "",
+						args: ev.tool_args ?? "",
+						status: "running",
+					},
+				];
+				break;
+			case "tool_completed":
+			case "tool_failed": {
+				const status = ev.kind === "tool_failed" ? "failed" : "done";
+				this.toolSteps = this.toolSteps.map((s) =>
+					s.callId === ev.call_id
+						? {
+								...s,
+								status,
+								output: ev.text,
+								artifactKind: ev.artifact_kind,
+								artifactContent: ev.artifact_content,
+							}
+						: s,
+				);
+				break;
+			}
+			case "awaiting_approval":
+				this.streaming = false;
+				this.approval = {
+					callId: ev.call_id ?? "",
+					toolName: ev.tool_name ?? "",
+					args: ev.tool_args ?? "",
+					reason: ev.reason ?? "This action needs your approval.",
+				};
+				break;
+			case "final":
+				this.streaming = false;
+				if (ev.text) this.text = ev.text;
+				this.truncated = ev.truncated ?? false;
+				// Empty answer with nothing streamed and no tool output — the model
+				// returned no content (a known small-model/Groq quirk on some inputs).
+				// Never leave a blank card: surface it so the user can retry/rephrase.
+				if (!this.text.trim() && this.toolSteps.length === 0) {
+					this.error = "The model returned an empty response. Try rephrasing.";
+				}
+				break;
+			case "usage":
+				this.tokensIn += ev.input_tokens ?? 0;
+				this.tokensOut += ev.output_tokens ?? 0;
+				break;
+			case "stopped":
+				this.streaming = false;
+				this.error = ev.text ?? "Stopped.";
+				break;
+			case "error":
+				this.streaming = false;
+				this.error = ev.text ?? "The agent failed.";
+				break;
+			// turn_started / reasoning: no UI change for now.
+		}
+	};
+}
+
+/** The single app-wide chat session. */
+export const chat = new ChatSession();

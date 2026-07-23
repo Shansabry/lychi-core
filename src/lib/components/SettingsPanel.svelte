@@ -11,7 +11,7 @@ import type {
 import { KEYBINDINGS_DEFAULTS } from "$lib/ipc";
 import { preloadSettings } from "$lib/preloadCache";
 import AboutTab from "./settings/AboutTab.svelte";
-import AiTab from "./settings/AiTab.svelte";
+import AiTab from "./settings/ai/AiTab.svelte";
 import GeneralTab from "./settings/GeneralTab.svelte";
 import GuideTab from "./settings/GuideTab.svelte";
 import ProjectsTab from "./settings/ProjectsTab.svelte";

@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType, RiskLevel,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
+    RiskLevel,
 };
 use crate::error::LychiError;
 
@@ -425,6 +426,9 @@ impl ActionHandler for WeatherHandler {
     fn description(&self) -> &str {
         "Get current weather for a location"
     }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Utilities
+    }
 
     fn default_risk(&self) -> RiskLevel {
         RiskLevel::Low
@@ -498,6 +502,9 @@ impl ActionHandler for Arc<WeatherHandler> {
     }
     fn description(&self) -> &str {
         self.as_ref().description()
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Utilities
     }
     fn default_risk(&self) -> RiskLevel {
         self.as_ref().default_risk()
@@ -586,9 +593,24 @@ mod tests {
 
     #[test]
     fn local_qualifiers_resolve_to_autodetect() {
-        for q in ["here", "now", "today", "right now", "current", "currently",
-                  "my location", "local", "NOW", " Here ", ""] {
-            assert_eq!(normalize_weather_location(q), "", "{q:?} should auto-detect");
+        for q in [
+            "here",
+            "now",
+            "today",
+            "right now",
+            "current",
+            "currently",
+            "my location",
+            "local",
+            "NOW",
+            " Here ",
+            "",
+        ] {
+            assert_eq!(
+                normalize_weather_location(q),
+                "",
+                "{q:?} should auto-detect"
+            );
         }
     }
 

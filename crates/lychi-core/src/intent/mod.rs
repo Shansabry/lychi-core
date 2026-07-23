@@ -1,4 +1,5 @@
 pub mod ai_router;
+pub mod classify;
 pub mod patterns;
 pub mod prompt;
 pub mod typo_suggest;
@@ -7,7 +8,6 @@ use crate::action_registry::registry::ActionRegistry;
 use crate::providers::{AgentPlan, AiResponse};
 use ai_router::AiRouter;
 use patterns::{Confidence, PatternResult};
-
 
 /// How the intent was resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,4 +207,3 @@ impl IntentResolver {
         }
     }
 }
-

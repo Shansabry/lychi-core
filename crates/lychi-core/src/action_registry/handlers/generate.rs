@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::error::LychiError;
 
@@ -167,6 +167,9 @@ impl ActionHandler for GenerateHandler {
 
     fn description(&self) -> &str {
         "Generate passwords, UUIDs, tokens, and random numbers"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Utilities
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

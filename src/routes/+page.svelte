@@ -1,5 +1,4 @@
 <script lang="ts">
-import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { onMount } from "svelte";
@@ -16,30 +15,18 @@ import NotesPanel from "$lib/components/NotesPanel.svelte";
 import ResultPanel from "$lib/components/ResultPanel.svelte";
 import SettingsPanel from "$lib/components/SettingsPanel.svelte";
 import StatusBar from "$lib/components/StatusBar.svelte";
-import type {
-	AgentEventDto,
-	AgentPlan,
-	CommandResult,
-	CompletionItem,
-	EnvironmentContext,
-	FileSearchBatch,
-	MountPoint,
-	StepEvent,
-	TrackInfo,
-} from "$lib/ipc";
+import { attachTauriEvents } from "$lib/events/bridge.svelte";
+import type { AgentPlan, CommandResult, CompletionItem } from "$lib/ipc";
 import {
-	agentApprove,
-	agentChatStart,
-	cancelAiChat,
 	cancelFileSearch,
 	clearConversations,
 	confirmExecution,
+	classifyInput,
 	deleteConversation,
 	executeCommand,
 	fuzzyPathCompletions,
 	getActiveWindowStrategy,
 	getAgentPlan,
-	getAiPresets,
 	getAiStatus,
 	getCompletions,
 	getContext,
@@ -53,7 +40,6 @@ import {
 	hideWindow,
 	listPathCompletions,
 	loadConversation,
-	mediaGetStatus,
 	openPath,
 	openUri,
 	readSelection,
@@ -61,11 +47,15 @@ import {
 	saveGeneralConfig,
 	saveWindowPosition,
 	startFileSearch,
-	suggestCorrection,
 } from "$lib/ipc";
-import { loadKeybindings, matchesAction } from "$lib/keybindings";
+import { loadKeybindings } from "$lib/keybindings";
 import { preloadAll } from "$lib/preloadCache";
-import { decideSubmit, renderPreset } from "$lib/submit-router";
+import { type AiTurn, chat } from "$lib/stores/chat.svelte";
+import { completions } from "$lib/stores/completions.svelte";
+import { context } from "$lib/stores/context.svelte";
+import { media } from "$lib/stores/media.svelte";
+import { ui } from "$lib/stores/ui.svelte";
+import { decideSubmit, type RouteDecision, renderPreset } from "$lib/submit-router";
 
 let inputValue = $state("");
 let isExecuting = $state(false);
@@ -74,113 +64,55 @@ let isExecuting = $state(false);
 // clobbering fresh state.
 let executeGeneration = 0;
 let isRouting = $state(false);
-// Local-AI model warmup indicator (only fires for mode=local — BYOK/Ollama/Cloud
-// have no local model to load).
-let aiLoading = $state(false);
+// Local-AI model warmup indicator now lives in the `ui` store (`ui.aiLoading`);
+// only fires for mode=local (BYOK/Ollama/Cloud have no local model to load).
 let backendReady = $state(false);
 let lastResult: CommandResult | null = $state(null);
 let lastCommand = $state("");
 
 // --- AI agent (streaming, tool-calling) state ---
-// `aiText` is the assistant answer streaming in; `aiStreaming` gates the cursor;
-// `aiError` shows a failure. `aiGen` is the generation id — bumped per query so
-// stale-stream events (a superseded answer) are dropped. `aiToolSteps` records
-// the tool calls the agent runs; `aiApproval` holds a pending destructive-tool
-// approval prompt (the loop is suspended until the user decides).
-let aiText = $state("");
-let aiStreaming = $state(false);
-let aiError: string | null = $state(null);
-let aiGen = 0;
-// Whether the AI answer view is the active surface (vs. a command result).
-let aiActive = $state(false);
-// Quick-AI "fork card" mode: a short streamed answer for an unknown query,
-// with [Search web] / [Full chat] buttons. Distinct from the full agent chat
-// (aiActive without aiQuick). `aiQuickPrompt` is what the buttons act on.
-let aiQuick = $state(false);
-let aiQuickPrompt = $state("");
-type ToolStep = {
-	callId: string;
-	name: string;
-	args: string;
-	status: "running" | "done" | "failed";
-	output?: string;
-	/** A rich result to render inline (e.g. a QR svg, a weather card). */
-	artifactKind?: string;
-	artifactContent?: string;
-};
-let aiToolSteps: ToolStep[] = $state([]);
-let aiApproval: { callId: string; toolName: string; args: string; reason: string } | null =
-	$state(null);
-// Completed prior turns in this conversation (shown above the streaming answer).
-type AiTurn = { user: string; text: string; toolSteps: ToolStep[] };
-let aiTurns: AiTurn[] = $state([]);
-let aiLastUser = $state("");
-// The in-panel follow-up reply box text.
-let aiReply = $state("");
+// All conversation state now lives in the `chat` store singleton
+// ($lib/stores/chat.svelte) — the streamed answer, tool-step lifecycle, pending
+// approval, transcript, token/truncation bookkeeping, and the `gen` staleness
+// guard. This page keeps only thin orchestration wrappers (the parts that also
+// touch page state like `lastResult` or call `runCommand`).
+// AI-answer visibility lives in the `ui` surface machine: `ui.aiVisible`
+// (on stage), `ui.aiParked` (exists but off-stage), `ui.aiExists` (either).
 // Ref to the AiAnswer component, so explicit actions (Full chat / recall) can
 // shift focus to its reply box. The launcher input stays primary otherwise.
 let aiAnswerRef: AiAnswer | undefined = $state();
-// The current answer was cut off at the token cap (shows a truncation notice).
-let aiTruncated = $state(false);
-// Accumulated token spend for the conversation (input + output).
-let aiTokensIn = $state(0);
-let aiTokensOut = $state(0);
 
 let historyEntries: string[] = $state([]);
-let historyOpen = $state(false);
-// Chat-history recall panel (the `chat` keyword) + its loaded conversation list.
-let chatHistoryOpen = $state(false);
+// Panel visibility (history / chat-history / notes / media / settings) now lives
+// in the `ui` surface machine — read via `ui.panelVisible("…")`, mutate via
+// `ui.togglePanel/openPanel/closePanel`. Chat-history recall = the `chat` keyword.
 let conversations: import("$lib/ipc").ConversationSummary[] = $state([]);
 
-let completions: CompletionItem[] = $state([]);
-let completionIndex = $state(-1);
-let debounceTimer: ReturnType<typeof setTimeout> | undefined;
-let completionGen = 0;
-// True while a completions query is in flight. Drives a subtle skeleton in the
-// results area for the narrow window where the first query (cold start) hasn't
-// returned yet — non-blocking, vanishes the instant results arrive. The launcher
-// stays fully typeable throughout; this is a hint, not a loading gate.
-let completionsPending = $state(false);
-
-// @ file reference mode (browse — point to a file in a command)
-let atMode = $state(false);
-let atStart = $state(-1);
-let atNoResults = $state(false);
-
-// / file search mode (find and open a file, like Spotlight)
-let searchMode = $state(false);
-let fileSearchId = $state(0);
-let searchDone = $state(false);
-let mountPoints: MountPoint[] = $state([]);
-let scopeIndex = $state(0);
-let activeScope = $derived(mountPoints[scopeIndex]?.path ?? "");
-let searchScopePath = $state(""); // absolute path when drilled into a folder
-let filePathMap: Map<string, string> = $state(new Map()); // label → full_path for preview
-let fileMetaMap: Map<string, { size_bytes?: number | null; modified_secs?: number | null }> =
-	$state(new Map());
-let ignoreActive = $state(false);
+// The completion list, `@`-browse, and `/`-file-search state now live in the
+// `completions` store singleton ($lib/stores/completions.svelte). Read/mutate via
+// completions.items / .index / .pending / .atMode / .searchMode / etc. The two
+// breadcrumb `$derived.by` below stay here — they read the page's `inputValue`.
 
 // Derive breadcrumb path context for / search mode (when drilled into a folder)
 let searchPathContext = $derived.by(() => {
-	if (!searchMode || !searchScopePath) return "";
-	const home = mountPoints[0]?.path ?? "";
-	if (home && searchScopePath.startsWith(home)) {
-		return `~${searchScopePath.slice(home.length)}/`;
+	if (!completions.searchMode || !completions.searchScopePath) return "";
+	const home = completions.mountPoints[0]?.path ?? "";
+	if (home && completions.searchScopePath.startsWith(home)) {
+		return `~${completions.searchScopePath.slice(home.length)}/`;
 	}
-	return `${searchScopePath}/`;
+	return `${completions.searchScopePath}/`;
 });
 
 // Derive breadcrumb path context for @ mode
 let atPathContext = $derived.by(() => {
-	if (!atMode || atStart < 0) return "";
-	const partial = inputValue.slice(atStart + 1);
+	if (!completions.atMode || completions.atStart < 0) return "";
+	const partial = inputValue.slice(completions.atStart + 1);
 	const lastSlash = partial.lastIndexOf("/");
 	if (lastSlash === -1) return "~/";
 	const raw = partial.slice(0, lastSlash + 1);
 	return raw.startsWith("/") ? raw : `~/${raw}`;
 });
 
-let settingsOpen = $state(false);
 let hideOnBlur = $state(true);
 let windowStrategy = $state("x11"); // "layer-shell" or "x11" — drives layout mode
 // Non-composited X11 (xfwm4/Marco with compositing off): the window is a
@@ -253,27 +185,9 @@ async function copyToggleCommand() {
 // first compositor frame is always a clean empty launcher.
 let launcherReady = $state(false);
 
-// Context-staleness indicator (shown as a dim glyph in the status bar, not a
-// warning row). Set from a `__context_stale__` sentinel in the completions.
-let contextStale = $state(false);
-let contextStaleHint = $state("");
-// True only while a background context re-gather is actually in flight (between
-// the `context-stale` and `context-ready` events) — drives the "updating
-// context…" spinner, distinct from the idle "context outdated" bulb.
-let contextRefreshing = $state(false);
-
-/**
- * Pull a `__context_stale__` sentinel out of zero-state completions: sets the
- * status-bar indicator and returns the list WITHOUT it, so staleness shows as a
- * quiet glyph instead of an invasive warning row. Returns results unchanged
- * when the sentinel is absent (and clears the indicator).
- */
-function extractContextStale(results: CompletionItem[]): CompletionItem[] {
-	const stale = results.find((c) => c.icon_path === "__context_stale__");
-	contextStale = !!stale;
-	contextStaleHint = stale?.description ?? "";
-	return stale ? results.filter((c) => c.icon_path !== "__context_stale__") : results;
-}
+// Environment context (active window / cwd / git) + its freshness now live in the
+// `context` store: `context.env`, `context.stale`/`context.staleHint`,
+// `context.refreshing`, `context.loading`, `context.pill`, `context.extractStale()`.
 
 /**
  * Load the empty-input suggestions (recents / context rows) into the completions
@@ -288,13 +202,13 @@ const CHAT_RUN_PREFIX = "__chat__:";
 
 function loadEmptySuggestions() {
 	if (inputValue.trim().length > 0) return;
-	const gen = ++completionGen;
+	const gen = ++completions.completionGen;
 	// Fetch command recents + a few recent AI chats in parallel, then merge:
 	// chats first (with an AI icon), then the command/context recents.
 	Promise.all([getCompletions(""), getConversations().catch(() => [])])
 		.then(([rawResults, convs]) => {
-			if (gen !== completionGen || inputValue.trim().length > 0) return;
-			const recents = extractContextStale(rawResults);
+			if (gen !== completions.completionGen || inputValue.trim().length > 0) return;
+			const recents = context.extractStale(rawResults);
 			const chatRows: CompletionItem[] = convs.slice(0, 4).map((c) => ({
 				label: c.title,
 				icon_path: "__ai_chat__",
@@ -302,10 +216,10 @@ function loadEmptySuggestions() {
 				description: `${c.turn_count} turn${c.turn_count === 1 ? "" : "s"} · AI chat`,
 				run: `${CHAT_RUN_PREFIX}${c.id}`,
 			}));
-			completions = [...chatRows, ...recents];
+			completions.items = [...chatRows, ...recents];
 			// Do NOT preselect: on an empty box these are recents, not a query
 			// result. Selection happens only on mouse press or arrow key.
-			completionIndex = -1;
+			completions.index = -1;
 		})
 		.catch(() => {});
 }
@@ -326,76 +240,25 @@ let planPanelRef: AgentPlanPanel | undefined = $state(undefined);
 let resultPanelRef: ResultPanel | undefined = $state(undefined);
 // C1/C15: generation counter for AI routing — ESC increments to cancel stale responses
 let routingGeneration = 0;
-let mediaOpen = $state(false);
-let notesOpen = $state(false);
 let pendingNoteText: string | null = $state(null);
 let initialNotesTab: "notes" | "todos" | "reminders" | "timers" | "snippets" | undefined =
 	$state(undefined);
-let mediaPlayers: TrackInfo[] = $state([]);
+// MPRIS players + now-playing live in the `media` store (`media.players`,
+// `media.nowPlaying`, `media.multiplePlayers`); its poll loop is started in onMount.
 // Whether an AI provider is actually configured — gates the natural-language
 // placeholder suggestions so we never advertise AI-only actions to a user who
 // has no key (they'd silently web-search instead).
 let aiEnabled = $state(false);
-// AI presets (keyword → template). Loaded on mount; typing `<keyword> <text>`
-// renders the template and sends it to the agent. See submit-router.
-let aiPresets: { keyword: string; template: string }[] = $state([]);
-let envContext: EnvironmentContext | null = $state(null);
-let contextLoading = $state(false);
-let contextLoadingTimer: ReturnType<typeof setTimeout> | undefined;
-let contextPill = $derived.by(() => {
-	// Only show context pill for terminal/IDE — not browsers or random apps
-	const w = envContext?.active_window;
-	if (!w?.is_terminal && !w?.is_ide) return "";
-	const ideIsFocused = w?.is_ide ?? false;
-	const cwd = ideIsFocused
-		? (envContext?.cwd ?? envContext?.terminal_cwd)
-		: (envContext?.terminal_cwd ?? envContext?.cwd);
-	const folder = cwd?.split("/").pop();
-	if (!folder) return "";
-	const branch = envContext?.git?.branch;
-	if (branch) return `${folder} · ${branch}`;
-	return folder;
-});
-let mediaPollTimer: ReturnType<typeof setTimeout> | undefined;
-
-// Derive the "now playing" track — first playing, or first in list
-let nowPlaying = $derived.by(() => {
-	const playing = mediaPlayers.find((p) => p.status === "playing");
-	return playing ?? mediaPlayers[0] ?? null;
-});
-
-let multiplePlayers = $derived(mediaPlayers.length > 1);
 
 // File preview — show for files and folders in search or browse mode
 let previewPath = $derived.by(() => {
-	if (!searchMode && !atMode) return "";
-	if (completions.length === 0 || completionIndex < 0) return "";
-	const item = completions[completionIndex];
+	if (!completions.searchMode && !completions.atMode) return "";
+	if (completions.items.length === 0 || completions.index < 0) return "";
+	const item = completions.items[completions.index];
 	if (!item) return "";
 	return resolveFullPath(item.label);
 });
 let showPreview = $derived(previewPath.length > 0);
-
-// Poll media player status — 5s when playing/paused, 30s when idle
-$effect(() => {
-	function scheduleNext() {
-		const hasActive = mediaPlayers.some((p) => p.status === "playing" || p.status === "paused");
-		mediaPollTimer = setTimeout(poll, hasActive ? 5000 : 30000);
-	}
-
-	async function poll() {
-		try {
-			const players = await mediaGetStatus();
-			mediaPlayers = players.filter((p) => p.title || p.status !== "stopped");
-		} catch {
-			mediaPlayers = [];
-		}
-		scheduleNext();
-	}
-
-	poll();
-	return () => clearTimeout(mediaPollTimer);
-});
 
 // A partial is "path-like" (spelling out a path → drill/browse) vs a bare name
 // (fuzzy jump-to-file anywhere, Claude-Code style). Path-like = contains a
@@ -414,29 +277,29 @@ async function fetchAtCompletions(partial: string) {
 				: await listPathCompletions(partial);
 		// Defer state update to next frame so it never blocks a keystroke paint
 		requestAnimationFrame(() => {
-			completions = results;
-			completionIndex = results.length > 0 ? 0 : -1;
-			atNoResults = results.length === 0 && partial.length > 0;
+			completions.items = results;
+			completions.index = results.length > 0 ? 0 : -1;
+			completions.atNoResults = results.length === 0 && partial.length > 0;
 		});
 		// Stay in @ mode even when empty — user can backspace to navigate up
 	} catch (err) {
 		console.error("[@completions] error:", err);
 		// Stay in @ mode on error too — don't kick the user out
 		requestAnimationFrame(() => {
-			completions = [];
-			completionIndex = -1;
-			atNoResults = true;
+			completions.items = [];
+			completions.index = -1;
+			completions.atNoResults = true;
 		});
 	}
 }
 
 // Resolve the absolute path for a completion label (for preview)
 function resolveFullPath(label: string): string {
-	const mapped = filePathMap.get(label);
+	const mapped = completions.filePathMap.get(label);
 	if (mapped) return mapped;
 	// Browse mode: labels like "~/foo/bar.txt"
 	if (label.startsWith("~/")) {
-		const home = mountPoints[0]?.path ?? "";
+		const home = completions.mountPoints[0]?.path ?? "";
 		return `${home}/${label.slice(2)}`;
 	}
 	return label.endsWith("/") ? label.slice(0, -1) : label;
@@ -446,21 +309,15 @@ function resolveFullPath(label: string): string {
 function handleInput(val: string) {
 	// Skip completions until backend is ready — input still updates visually via bind:value
 	if (!backendReady) return;
-	// Close any open panel so CompletionsList renders
-	if (settingsOpen || notesOpen || mediaOpen) {
-		settingsOpen = false;
-		notesOpen = false;
-		mediaOpen = false;
-	}
-	historyOpen = false;
-	chatHistoryOpen = false;
+	// Close any open panel so CompletionsList renders, and force the results surface.
+	ui.showLauncher();
 	// Typing a new query dismisses an on-screen AI answer so completions show.
 	// (The conversation is already persisted; recall it via `chat` if needed.)
-	if (aiActive && val.trim().length > 0) {
-		resetChat();
+	if (ui.aiExists && val.trim().length > 0) {
+		chat.reset();
 	}
-	clearTimeout(debounceTimer);
-	atNoResults = false;
+	clearTimeout(completions.debounceTimer);
+	completions.atNoResults = false;
 
 	// Detect / file search mode — must be at the start of input
 	if (val.startsWith("/")) {
@@ -473,46 +330,46 @@ function handleInput(val: string) {
 		// Only reject if the search term (part after last /) has a space — folder paths can have spaces
 		if (!searchTermCandidate.includes(" ")) {
 			// Exit @ mode if active
-			atMode = false;
-			atStart = -1;
+			completions.atMode = false;
+			completions.atStart = -1;
 
 			// Refresh mount points on entering search mode (detects new USB drives etc.)
-			if (!searchMode) {
+			if (!completions.searchMode) {
 				getMountPoints().then((mounts) => {
-					mountPoints = mounts;
+					completions.mountPoints = mounts;
 				});
 			}
 
-			searchMode = true;
-			searchDone = false;
-			fileSearchId++;
-			const id = fileSearchId;
+			completions.searchMode = true;
+			completions.searchDone = false;
+			completions.fileSearchId++;
+			const id = completions.fileSearchId;
 
 			let searchScope: string;
 			let searchTerm: string;
 			if (lastSlash >= 0) {
 				const folderPart = raw.slice(0, lastSlash); // e.g. "Documents/Agent agnes"
 				searchTerm = searchTermCandidate; // e.g. "q1" or ""
-				const baseScope = activeScope || (mountPoints[0]?.path ?? "");
+				const baseScope = completions.activeScope || (completions.mountPoints[0]?.path ?? "");
 				searchScope = folderPart ? `${baseScope}/${folderPart}` : baseScope;
-				searchScopePath = searchScope;
+				completions.searchScopePath = searchScope;
 			} else {
 				searchTerm = raw;
-				searchScope = activeScope || (mountPoints[0]?.path ?? "");
-				searchScopePath = "";
+				searchScope = completions.activeScope || (completions.mountPoints[0]?.path ?? "");
+				completions.searchScopePath = "";
 			}
 
 			// Don't clear completions — keep showing old results until new ones arrive
 			if (raw.length > 0 || lastSlash >= 0) {
-				debounceTimer = setTimeout(() => {
-					completions = [];
-					completionIndex = -1;
+				completions.debounceTimer = setTimeout(() => {
+					completions.items = [];
+					completions.index = -1;
 					if (searchScope) startFileSearch(searchTerm, searchScope, id);
 				}, 150);
 			} else {
 				// Just "/" typed — list the active scope immediately (home dir by default)
-				completions = [];
-				completionIndex = -1;
+				completions.items = [];
+				completions.index = -1;
 				if (searchScope) startFileSearch("", searchScope, id);
 			}
 			return;
@@ -520,13 +377,9 @@ function handleInput(val: string) {
 	}
 
 	// Exiting search mode
-	if (searchMode) {
+	if (completions.searchMode) {
 		cancelFileSearch();
-		searchScopePath = "";
-		searchMode = false;
-		filePathMap = new Map();
-		fileMetaMap = new Map();
-		ignoreActive = false;
+		completions.exitSearch();
 	}
 
 	// Detect @ file reference — find the last @ in the input
@@ -537,30 +390,30 @@ function handleInput(val: string) {
 		const beforeAt = val.slice(0, atIdx);
 		const isEmail = beforeAt.length > 0 && !beforeAt.endsWith(" ");
 		if (!partial.includes(" ") && !isEmail) {
-			atMode = true;
-			atStart = atIdx;
+			completions.atMode = true;
+			completions.atStart = atIdx;
 			cancelFileSearch();
-			const gen = ++completionGen;
+			const gen = ++completions.completionGen;
 			const fetchAt =
 				partial.length > 0 && !isPathLikeAt(partial)
 					? fuzzyPathCompletions(partial)
 					: listPathCompletions(partial);
 			fetchAt
 				.then((results) => {
-					if (gen !== completionGen) return;
+					if (gen !== completions.completionGen) return;
 					requestAnimationFrame(() => {
-						completions = results;
-						completionIndex = results.length > 0 ? 0 : -1;
-						atNoResults = results.length === 0 && partial.length > 0;
+						completions.items = results;
+						completions.index = results.length > 0 ? 0 : -1;
+						completions.atNoResults = results.length === 0 && partial.length > 0;
 					});
 				})
 				.catch((err) => {
 					console.error("[@completions] error:", err);
-					if (gen !== completionGen) return;
+					if (gen !== completions.completionGen) return;
 					requestAnimationFrame(() => {
-						completions = [];
-						completionIndex = -1;
-						atNoResults = true;
+						completions.items = [];
+						completions.index = -1;
+						completions.atNoResults = true;
 					});
 				});
 			return;
@@ -568,60 +421,58 @@ function handleInput(val: string) {
 	}
 
 	// Not in @ or / mode — normal completions
-	atMode = false;
-	atStart = -1;
+	completions.atMode = false;
+	completions.atStart = -1;
 
 	const trimmed = val.trim();
-	if (trimmed.length < 1 && !envContext) {
-		completionGen++;
-		completionsPending = false;
-		completions = [];
-		completionIndex = -1;
+	if (trimmed.length < 1 && !context.env) {
+		completions.completionGen++;
+		completions.pending = false;
+		completions.items = [];
+		completions.index = -1;
 		return;
 	}
 
-	const gen = ++completionGen;
-	completionsPending = true;
+	const gen = ++completions.completionGen;
+	completions.pending = true;
 	getCompletions(trimmed)
 		.then((rawResults) => {
-			if (gen !== completionGen) return;
-			completionsPending = false;
-			const results = extractContextStale(rawResults);
-			completions = results;
-			// Omnibox rule (Chromium `allowed_to_be_default_match`): only
-			// auto-select a suggestion whose text is a prefix-extension of what
-			// the user literally typed. Otherwise select nothing, so plain Enter
-			// runs the typed input — never a non-prefix match. e.g. "run top"
-			// must NOT auto-run the history entry "run htop".
-			completionIndex = defaultMatchIndex(results, trimmed);
+			if (gen !== completions.completionGen) return;
+			completions.pending = false;
+			const results = context.extractStale(rawResults);
+			completions.items = results;
+			// Raycast/Alfred single-list model: the top real result is always
+			// auto-selected, so plain Enter runs it. Results are already
+			// frecency-ranked by the backend, and inline history was removed —
+			// recall lives in the History panel — so there's no non-actionable
+			// row to guard Enter against beyond separators/flags/info.
+			completions.index = defaultMatchIndex(results, trimmed);
 		})
 		.catch((err) => {
-			if (gen === completionGen) completionsPending = false;
+			if (gen === completions.completionGen) completions.pending = false;
 			console.error("[completions] error:", err);
 		});
 }
 
 /**
- * Index of the completion eligible to be Enter's default, or -1 if none.
- * A candidate qualifies only when it forward-completes the typed input —
- * its command (`run`/`fill`) or label starts with the input, case-insensitively.
- * Separators and info rows are never eligible. This is the browser-omnibox
- * model: with no explicit arrow-selection, Enter runs the typed input unless a
- * true prefix-completion exists.
+ * Index of the row that Enter selects by default — the first ACTIONABLE result,
+ * or -1 if none. Raycast/Alfred model: results are frecency-ranked, so the top
+ * real row is what the user means; auto-select it and let plain Enter run it.
+ *
+ * Non-actionable rows are skipped: separators, info rows, and the sentinel flag
+ * rows the backend injects (a stale-context indicator, a dirty-git warning).
+ * These render but must never become Enter's target. Empty input still selects
+ * nothing — those are zero-state recents, not a query result the user chose.
  */
+const NON_ACTIONABLE_ICONS = new Set([
+	"__separator__",
+	"__info__",
+	"__context_stale__",
+	"__warning__",
+]);
 function defaultMatchIndex(results: CompletionItem[], input: string): number {
-	const q = input.trim().toLowerCase();
-	// Empty input → recents/suggestions, NOT a query result: never preselect, so
-	// Enter doesn't run a row the user didn't choose. Selection is mouse/arrow only.
-	if (!q) return -1;
-	for (let i = 0; i < results.length; i++) {
-		const c = results[i];
-		if (c.icon_path === "__separator__" || c.icon_path === "__info__") continue;
-		// The text this row would act on — prefer the exact command it carries.
-		const candidate = (c.run ?? c.fill ?? c.label).toLowerCase();
-		if (candidate.startsWith(q)) return i;
-	}
-	return -1;
+	if (!input.trim()) return -1;
+	return results.findIndex((c) => !c.icon_path || !NON_ACTIONABLE_ICONS.has(c.icon_path));
 }
 
 onMount(() => {
@@ -634,11 +485,8 @@ onMount(() => {
 	getAiStatus().then((s) => {
 		aiEnabled = s.has_ai_router;
 	});
-	getAiPresets().then((ps) => {
-		aiPresets = ps.map((p) => ({ keyword: p.keyword, template: p.template }));
-	});
 	getMountPoints().then((mounts) => {
-		mountPoints = mounts;
+		completions.mountPoints = mounts;
 	});
 	getHistory().then((entries) => {
 		historyEntries = entries;
@@ -671,462 +519,117 @@ onMount(() => {
 	// Guard: only attach Tauri listeners if running inside Tauri
 	if (!("__TAURI_INTERNALS__" in window)) return;
 
-	let unlisteners: (() => void)[] = [];
+	// Start the MPRIS status poll (5s active / 30s idle); dispose on teardown.
+	const stopMediaPoll = media.start();
 
-	(async () => {
-		const win = getCurrentWindow();
-
-		// Self-heal: if the window was mapped before these listeners attached
-		// (cold start — the summon/shown events fired into the void), become
-		// visible/clickable now instead of staying an invisible click-blocker.
-		win
-			.isVisible()
-			.then((visible) => {
-				if (visible) launcherReady = true;
-			})
-			.catch(() => {});
-
-		// Listen for agent step events
-		const unlistenStep = await win.listen<StepEvent>("lychi://agent-step", (e) => {
-			planPanelRef?.handleStepEvent(e.payload);
-			// When the final step completes, expose its result to the StatusBar
-			// so the AI sparkle indicator shows for AI-routed plans.
-			const { result, status } = e.payload;
+	// All lychi:// event wiring lives in the bridge (transport); store-only events
+	// route through the pure router, the page-coupled ones come back through these
+	// handlers. onMount stays a thin composition root.
+	let detachEvents: (() => void) | undefined;
+	attachTauriEvents({
+		ready: () => {
+			launcherReady = true;
+		},
+		agentStep: (payload) => {
+			planPanelRef?.handleStepEvent(payload);
+			// When the final step completes, expose its result to the StatusBar so
+			// the AI sparkle indicator shows for AI-routed plans.
+			const { result, status } = payload;
 			if (result && (status === "done" || status === "failed")) {
 				lastResult = { ...result, routed_by: "ai" };
 			}
-		});
-		unlisteners.push(unlistenStep);
-
-		// Listen for agent events (the tool-calling coordinator). Drops events
-		// from a superseded run (`gen` mismatch). Multiplexes prose, tool-call
-		// lifecycle, approval prompts, and the final answer into the AI surface.
-		const unlistenAgent = await win.listen<AgentEventDto>("lychi://agent-event", (e) => {
-			const ev = e.payload;
-			if (ev.gen !== aiGen) return; // stale run — ignore
-			switch (ev.kind) {
-				case "text":
-					aiText += ev.text ?? "";
-					break;
-				case "tool_started":
-					aiToolSteps = [
-						...aiToolSteps,
-						{
-							callId: ev.call_id ?? "",
-							name: ev.tool_name ?? "",
-							args: ev.tool_args ?? "",
-							status: "running",
-						},
-					];
-					break;
-				case "tool_completed":
-				case "tool_failed": {
-					const status = ev.kind === "tool_failed" ? "failed" : "done";
-					aiToolSteps = aiToolSteps.map((s) =>
-						s.callId === ev.call_id
-							? {
-									...s,
-									status,
-									output: ev.text,
-									artifactKind: ev.artifact_kind,
-									artifactContent: ev.artifact_content,
-								}
-							: s,
-					);
-					break;
-				}
-				case "awaiting_approval":
-					aiStreaming = false;
-					aiApproval = {
-						callId: ev.call_id ?? "",
-						toolName: ev.tool_name ?? "",
-						args: ev.tool_args ?? "",
-						reason: ev.reason ?? "This action needs your approval.",
-					};
-					break;
-				case "final":
-					aiStreaming = false;
-					if (ev.text) aiText = ev.text;
-					aiTruncated = ev.truncated ?? false;
-					break;
-				case "usage":
-					aiTokensIn += ev.input_tokens ?? 0;
-					aiTokensOut += ev.output_tokens ?? 0;
-					break;
-				case "stopped":
-					aiStreaming = false;
-					aiError = ev.text ?? "Stopped.";
-					break;
-				case "error":
-					aiStreaming = false;
-					aiError = ev.text ?? "The agent failed.";
-					break;
-				// turn_started / reasoning: no UI change for now.
-			}
-		});
-		unlisteners.push(unlistenAgent);
-
-		// Ready signal — emitted post-map (with a 150ms watchdog re-emit).
-		// Idempotent: only flips visibility readiness. Without it, a lost
-		// summon leaves an invisible surface that blocks all desktop clicks.
-		const unlistenShown = await win.listen("lychi://shown", () => {
-			launcherReady = true;
-		});
-		unlisteners.push(unlistenShown);
-
-		// Listen for summon event from Rust (global shortcut / IPC toggle)
-		const unlistenSummon = await win.listen("lychi://summon", () => {
-			launcherReady = true;
-			inputValue = "";
-			lastResult = null;
-			historyOpen = false;
-			chatHistoryOpen = false;
-			settingsOpen = false;
-			pendingPlan = null;
-			mediaOpen = false;
-			notesOpen = false;
-			// Fresh AI conversation each summon (decision: reset-every-summon).
-			resetChat();
-			// Keep AI presets fresh (cheap) — guarantees they're loaded before the
-			// user types a preset keyword, and picks up any Settings edits.
-			getAiPresets().then((ps) => {
-				aiPresets = ps.map((p) => ({ keyword: p.keyword, template: p.template }));
-			});
-			// Clear stale context immediately — fast path re-populates if same window,
-			// fresh gather populates for changed windows. Prevents flash of wrong context.
-			envContext = null;
-			// Delayed spinner: only show skeleton if context takes >120ms
-			clearTimeout(contextLoadingTimer);
-			contextLoading = false;
-			contextLoadingTimer = setTimeout(() => {
-				contextLoading = true;
-			}, 120);
-
-			completionIndex = -1;
-			atMode = false;
-			atStart = -1;
-			searchMode = false;
-			// C15: Cancel any in-flight AI routing on summon reset
-			routingGeneration++;
-			isRouting = false;
-			cancelFileSearch();
-			// Load recents/suggestions IMMEDIATELY (don't wait for context-ready) so
-			// they're present as the window appears — no post-paint pop-in. Fresh
-			// context (below) re-fetches to enrich in place. We keep the old
-			// completions until the new ones arrive (no empty→populated flash).
-			loadEmptySuggestions();
-			// Force focus the input (layer shell may not auto-focus DOM elements).
-			// Double-tap: rAF for immediate attempt, setTimeout for delayed retry
-			// in case the compositor grants surface focus slightly late.
-			requestAnimationFrame(() => {
-				document.querySelector<HTMLInputElement>(".input-container input")?.focus();
-			});
-			setTimeout(() => {
-				document.querySelector<HTMLInputElement>(".input-container input")?.focus();
-			}, 50);
-		});
-		unlisteners.push(unlistenSummon);
-
-		// A background context re-gather has STARTED (fired by execute_command
-		// when it runs against stale context) — show "updating context…".
-		const unlistenContextStale = await win.listen("lychi://context-stale", () => {
-			contextRefreshing = true;
-		});
-		unlisteners.push(unlistenContextStale);
-
-		// Listen for context-ready event from async context gathering
-		const unlistenContext = await win.listen<EnvironmentContext>("lychi://context-ready", (e) => {
-			envContext = e.payload;
-			contextRefreshing = false;
-			clearTimeout(contextLoadingTimer);
-			contextLoading = false;
+		},
+		summon: handleSummon,
+		afterContextReady: () => {
 			// Fresh context arrived — re-fetch suggestions to enrich them in place
-			// (same helper as summon; guarded, empty-input-only). The fixed-pool
-			// CompletionsList updates without DOM churn, so this never causes a jump.
+			// (guarded, empty-input-only). The fixed-pool CompletionsList updates
+			// without DOM churn, so this never causes a jump.
 			loadEmptySuggestions();
-		});
-		unlisteners.push(unlistenContext);
-
-		// Listen for media track updates from background D-Bus listener
-		const unlistenMedia = await win.listen<TrackInfo>("lychi://media-track", (e) => {
-			const incoming = e.payload;
-			const idx = mediaPlayers.findIndex((p) => p.bus_name === incoming.bus_name);
-			if (idx >= 0) {
-				mediaPlayers[idx] = incoming;
-				mediaPlayers = [...mediaPlayers];
-			} else {
-				mediaPlayers = [...mediaPlayers, incoming];
-			}
-		});
-		unlisteners.push(unlistenMedia);
-
-		// Local-AI model load state → status-bar "Loading AI model…" indicator.
-		const unlistenAiLoad = await win.listen<string>("lychi://ai-load-state", (e) => {
-			aiLoading = e.payload === "loading";
-		});
-		unlisteners.push(unlistenAiLoad);
-
-		// Listen for streaming file search results
-		const unlistenFileSearch = await win.listen<FileSearchBatch>(
-			"lychi://file-search-results",
-			(e) => {
-				const batch = e.payload;
-				if (batch.search_id !== fileSearchId) return;
-
-				// Populate path map for preview and metadata map for display
-				const pathUpdates = new Map(filePathMap);
-				const metaUpdates = new Map(fileMetaMap);
-				for (const r of batch.results) {
-					pathUpdates.set(r.label, r.full_path);
-					metaUpdates.set(r.label, { size_bytes: r.size_bytes, modified_secs: r.modified_secs });
-				}
-
-				// A section-header row (backend tags it with description "__separator__").
-				// Rendered by CompletionsList as a centered label between lines; not
-				// selectable. Everything else is a normal file/folder result.
-				const newItems: CompletionItem[] = batch.results.map((r) => {
-					const isSep = r.description === "__separator__";
-					return {
-						label: r.label,
-						icon_path: isSep ? "__separator__" : r.is_dir ? "__folder__" : null,
-						score: r.score,
-						description: isSep ? null : (r.description ?? null),
-					};
-				});
-
-				const isDone = batch.done;
-
-				// Defer state update to next frame so it never blocks a keystroke paint
-				requestAnimationFrame(() => {
-					filePathMap = pathUpdates;
-					fileMetaMap = metaUpdates;
-					if (batch.has_ignore_rules) ignoreActive = true;
-
-					// Each batch carries the FULL ranked snapshot for this search (the
-					// index re-emits the whole top-N as it fills), already ordered by
-					// the backend — fzf/Raycast standard: the backend owns ranking, the
-					// UI just renders. REPLACE, don't append (appending re-adds the
-					// same paths every emit → duplicates). Dedup by full_path as a
-					// guard; preserve the backend's order (no re-sort). Section headers
-					// (empty full_path) are kept verbatim — never deduped away.
-					const seen = new Set<string>();
-					completions = newItems
-						.filter((item) => {
-							if (item.icon_path === "__separator__") return true;
-							const key = pathUpdates.get(item.label) ?? item.label;
-							if (seen.has(key)) return false;
-							seen.add(key);
-							return true;
-						})
-						.slice(0, 20);
-
-					// Auto-select the first SELECTABLE row (skip a leading section header).
-					if (completionIndex < 0) {
-						const first = completions.findIndex((c) => c.icon_path !== "__separator__");
-						if (first >= 0) completionIndex = first;
-					}
-
-					if (isDone) {
-						searchDone = true;
-						atNoResults = completions.length === 0;
-					}
-				});
-			},
-		);
-		unlisteners.push(unlistenFileSearch);
-
-		// Window-level key handling (capture phase) — needed for actions that
-		// must work even when DOM focus has left the input (e.g. after a
-		// command runs and the result panel is showing).
-		window.addEventListener(
-			"keydown",
-			(e) => {
-				// Prevent WebKitGTK from stealing tab_back for native focus nav
-				if (matchesAction(e, "tab_back")) {
-					e.preventDefault();
-					return;
-				}
-				// Browse the current result's inline URL via the user-assigned
-				// open_inline_url binding — focus-independent so it fires from
-				// the result panel too.
-				if (lastResult?.open_url && matchesAction(e, "open_inline_url")) {
-					e.preventDefault();
-					openInlineUrl();
-				}
-				// Copy a shown QR image with the copy_path shortcut (Ctrl+Shift+C).
-				// Only when a QR result is visible and not in file-search mode
-				// (there the same binding copies the selected path — no conflict).
-				if (!searchMode && lastResult?.output_type === "svg" && matchesAction(e, "copy_path")) {
-					e.preventDefault();
-					resultPanelRef?.copyQr();
-				}
-				// Quick screenshot (Ctrl+Shift+P): hide Lychi so it's not in the
-				// shot, then capture a region. Fires from anywhere in the window.
-				if (matchesAction(e, "screenshot")) {
-					e.preventDefault();
-					quickScreenshot();
-				}
-			},
-			true,
-		);
-
-		// Dismiss on blur — Rust emits lychi://dismiss when GTK focus is lost
-		// and dismiss is armed. Single signal, no grace periods, no race conditions.
-		const unlistenDismiss = await win.listen("lychi://dismiss", () => {
-			if (!hideOnBlur) return;
-			if (settingsOpen || notesOpen) {
-				settingsOpen = false;
-				notesOpen = false;
-				return;
-			}
-			invoke("hide_launcher").then(() => {
-				if (searchMode) {
-					cancelFileSearch();
-					searchMode = false;
-				}
-				completions = [];
-				completionIndex = -1;
-				atMode = false;
-				atStart = -1;
-			});
-		});
-		unlisteners.push(unlistenDismiss);
-
-		// GTK-level Escape — catches Escape even when WebView input lacks DOM focus
-		const unlistenGtkEscape = await win.listen("lychi://gtk-escape", () => {
-			handleDismiss();
-		});
-		unlisteners.push(unlistenGtkEscape);
-
-		// Persist window position on move (debounced).
-		// Skip (0,0) — Wayland doesn't report real positions.
-		let moveTimer: ReturnType<typeof setTimeout> | undefined;
-		const unlistenMoved = await win.onMoved(({ payload: pos }) => {
-			if (pos.x === 0 && pos.y === 0) return;
-			clearTimeout(moveTimer);
-			moveTimer = setTimeout(() => {
-				saveWindowPosition(pos.x, pos.y);
-			}, 500);
-		});
-		unlisteners.push(unlistenMoved);
-	})();
+		},
+		dismiss: handleBlurDismiss,
+		escape: handleDismiss,
+		aiStatusChanged: (available) => {
+			aiEnabled = available;
+		},
+		windowMoved: (x, y) => saveWindowPosition(x, y),
+		keyEffects: {
+			hasInlineUrl: () => !!lastResult?.open_url,
+			isSvgResult: () => lastResult?.output_type === "svg",
+			openInlineUrl,
+			copyQr: () => resultPanelRef?.copyQr(),
+			screenshot: quickScreenshot,
+		},
+	}).then((off) => {
+		detachEvents = off;
+	});
 
 	return () => {
-		for (const fn of unlisteners) fn();
+		stopMediaPoll();
+		detachEvents?.();
 	};
 });
 
-/** The system prompt for the agent — a launcher assistant that can act via tools. */
-const AGENT_SYSTEM =
-	"You are Lychi, a helpful assistant inside a Linux launcher. Answer concisely in markdown. You can call tools to act on the user's system when helpful; otherwise just answer.";
-
-/** Clear the active AI conversation (fresh start). */
-function resetChat() {
-	aiGen++; // supersede any in-flight run
-	aiText = "";
-	aiError = null;
-	aiStreaming = false;
-	aiActive = false;
-	aiToolSteps = [];
-	aiApproval = null;
-	aiTurns = [];
-	aiLastUser = "";
-	aiReply = "";
-	aiQuick = false;
-	aiQuickPrompt = "";
-	aiTruncated = false;
-	aiTokensIn = 0;
-	aiTokensOut = 0;
-}
-
-/** Send a follow-up from the in-panel reply box (continues the conversation). */
-async function sendReply() {
-	const text = aiReply.trim();
-	if (!text || aiStreaming) return;
-	aiReply = "";
-	await startChat(text, /* fresh */ false);
-}
-
-/**
- * Start (fresh) or continue (follow-up) a tool-calling agent run for `prompt`.
- * `fresh` = new conversation; else the backend appends this as a follow-up to the
- * running session (history + tool results as context). Progress (prose, tool
- * steps, approval prompts, final answer) arrives via the `lychi://agent-event`
- * listener. For a follow-up, previous turns stay on screen above the new answer.
- */
-async function startChat(prompt: string, fresh = true) {
-	const text = prompt.trim();
-	if (!text) return;
-	if (fresh) {
-		aiTurns = [];
-	} else if (aiText) {
-		// Snapshot the completed answer into the transcript before the new turn.
-		aiTurns = [...aiTurns, { user: aiLastUser, text: aiText, toolSteps: aiToolSteps }];
-	}
-	aiLastUser = text;
-	aiText = "";
-	aiToolSteps = [];
-	aiError = null;
-	aiApproval = null;
-	aiTruncated = false;
-	aiStreaming = true;
-	aiActive = true;
-	aiQuick = false; // full agent chat, not the fork card
-	lastResult = null; // AI answer takes over the result area
-	const gen = ++aiGen;
-	try {
-		await agentChatStart(AGENT_SYSTEM, text, fresh, /* withTools */ true, gen);
-	} catch (e) {
-		if (gen === aiGen) {
-			aiStreaming = false;
-			aiError = e instanceof Error ? e.message : String(e);
-		}
-	}
-}
-
-/**
- * The system prompt for the quick-AI fork card. The agent CAN act (it has the
- * tool catalog): if the query is an action Lychi can perform (weather, open an
- * app, media control, system info…), DO it via a tool rather than describing how.
- * Otherwise answer the question directly and concisely.
- */
-const QUICK_AI_SYSTEM =
-	"You are Lychi, a smart assistant inside a Linux launcher. You can ACT on the user's system by calling tools. If the request is something a tool can do (check the weather, open/launch an app, control media, read system info, search, etc.), call the tool and give the result — never tell the user to run a command themselves when you have a tool for it. Otherwise, answer the question directly and concisely in 2-3 sentences with minimal markdown.";
-
-/** System prompt for AI presets (text transforms) — do the task, nothing else. */
-const PRESET_SYSTEM =
-	"You are Lychi's AI command runner. Perform the task in the user's message directly and return only the result — no preamble, no explanation, no tool use. Use minimal markdown.";
-
-/**
- * Run an AI preset (a text transform like translate/summarize). Tool-FREE and
- * streaming — presets never need to call tools, so we skip the ~40-tool catalog
- * entirely (smaller request, no tool-choice reasoning = noticeably faster). The
- * answer streams into the full chat surface (not the fork card — the user
- * explicitly invoked a command), and follow-ups continue the session.
- */
-async function startPreset(prompt: string) {
-	const text = prompt.trim();
-	if (!text) return;
-	aiTurns = [];
-	aiLastUser = text;
-	aiText = "";
-	aiToolSteps = [];
-	aiError = null;
-	aiApproval = null;
-	aiTruncated = false;
-	aiStreaming = true;
-	aiActive = true;
-	aiQuick = false; // full answer surface, not the fork card
+/** Full summon reset: pristine launcher, fresh chat/context, focus the input. */
+function handleSummon() {
+	launcherReady = true;
+	inputValue = "";
 	lastResult = null;
-	const gen = ++aiGen;
-	try {
-		await agentChatStart(PRESET_SYSTEM, text, /* fresh */ true, /* withTools */ false, gen);
-	} catch (e) {
-		if (gen === aiGen) {
-			aiStreaming = false;
-			aiError = e instanceof Error ? e.message : String(e);
-		}
+	pendingPlan = null;
+	// Pristine launcher surface: no panel, nothing parked.
+	ui.summonReset();
+	// Fresh AI conversation each summon (decision: reset-every-summon).
+	chat.reset();
+	// NOTE: preset keyword matching now lives in the backend classifier, so the
+	// FE no longer caches presets for routing. `aiEnabled` is NOT re-fetched here
+	// either — it's kept live by the
+	// `lychi://ai-status-changed` event (see onMount), which the AiReactor emits
+	// whenever the provider is (re)built. Event-driven, not polled.
+	// Clear stale context immediately — fast path re-populates if same window,
+	// fresh gather populates for changed windows. Prevents flash of wrong context.
+	// (context.reset also arms the >120ms delayed-skeleton timer.)
+	context.reset();
+
+	completions.index = -1;
+	completions.atMode = false;
+	completions.atStart = -1;
+	completions.searchMode = false;
+	// C15: Cancel any in-flight AI routing on summon reset
+	routingGeneration++;
+	isRouting = false;
+	cancelFileSearch();
+	// Load recents/suggestions IMMEDIATELY (don't wait for context-ready) so they're
+	// present as the window appears — no post-paint pop-in. Fresh context re-fetches
+	// to enrich in place. We keep the old completions until the new ones arrive.
+	loadEmptySuggestions();
+	// Force focus the input (layer shell may not auto-focus DOM elements). Double-tap:
+	// rAF for immediate attempt, setTimeout for a delayed retry in case the
+	// compositor grants surface focus slightly late.
+	requestAnimationFrame(() => {
+		document.querySelector<HTMLInputElement>(".input-container input")?.focus();
+	});
+	setTimeout(() => {
+		document.querySelector<HTMLInputElement>(".input-container input")?.focus();
+	}, 50);
+}
+
+/** Blur-dismiss (lychi://dismiss): respect hide-on-blur; an open Settings/Notes
+ *  panel just closes instead of hiding the window. */
+function handleBlurDismiss() {
+	if (!hideOnBlur) return;
+	if (ui.panelVisible("settings") || ui.panelVisible("notes")) {
+		ui.closePanel();
+		return;
 	}
+	hideWindow().then(() => {
+		if (completions.searchMode) {
+			cancelFileSearch();
+			completions.searchMode = false;
+		}
+		completions.items = [];
+		completions.index = -1;
+		completions.atMode = false;
+		completions.atStart = -1;
+	});
 }
 
 /**
@@ -1138,7 +641,7 @@ async function startPreset(prompt: string) {
 async function openConversation(id: string) {
 	const conv = await loadConversation(id).catch(() => null);
 	if (!conv) return;
-	chatHistoryOpen = false;
+	// ui.showAi() below closes the chat-history panel as it takes the surface.
 	// Pair the stored messages into user→assistant turns for the transcript.
 	// Tool/system messages are skipped in this view (the raw session still has
 	// them for the model's context).
@@ -1152,18 +655,12 @@ async function openConversation(id: string) {
 			pendingUser = "";
 		}
 	}
-	aiTurns = turns.slice(0, -1); // last pair goes into the live slot
+	const prior = turns.slice(0, -1); // last pair goes into the live slot
 	const last = turns[turns.length - 1];
-	aiLastUser = last?.user ?? pendingUser;
-	aiText = last?.text ?? "";
-	aiToolSteps = [];
-	aiError = null;
-	aiApproval = null;
-	aiStreaming = false;
-	aiActive = true;
-	aiQuick = false;
+	// loadRecalled sets the transcript + live slot, shows the AI surface, and bumps
+	// the generation for any follow-up.
+	chat.loadRecalled(prior, last?.user ?? pendingUser, last?.text ?? "");
 	lastResult = null;
-	aiGen++; // fresh generation for any follow-up
 	// Opening a recalled conversation is an explicit action → focus the reply box.
 	aiAnswerRef?.focusReply();
 }
@@ -1181,99 +678,27 @@ async function clearAllConversations() {
 }
 
 /**
- * The fork card: stream a short answer for an unknown query, with [Search web] /
- * [Full chat] buttons the user picks from. The agent HAS tools (with_tools=true)
- * so it can act on action-queries ("weather now" → calls the weather tool)
- * instead of just describing what to run.
- */
-async function startQuickAi(prompt: string) {
-	const text = prompt.trim();
-	if (!text) return;
-	aiTurns = [];
-	aiLastUser = text;
-	aiQuickPrompt = text;
-	aiText = "";
-	aiToolSteps = [];
-	aiError = null;
-	aiApproval = null;
-	aiTruncated = false;
-	aiStreaming = true;
-	aiActive = true;
-	aiQuick = true; // the fork card
-	lastResult = null;
-	const gen = ++aiGen;
-	try {
-		await agentChatStart(QUICK_AI_SYSTEM, text, /* fresh */ true, /* withTools */ true, gen);
-	} catch (e) {
-		if (gen === aiGen) {
-			aiStreaming = false;
-			aiError = e instanceof Error ? e.message : String(e);
-		}
-	}
-}
-
-/** Fork-card button: escalate the quick answer into the full tool-calling agent. */
-/**
  * Fork-card button: continue the quick answer in the full agent — WITHOUT
- * re-asking. The short Q→A is already on screen and its session is stashed in
- * the backend (with_tools=false). Escalating just flips the UI to full-chat
- * mode: the answer becomes the first transcript turn and the reply box drives
- * the next question, which continues the stashed session (fresh=false). No
- * duplicate request; the model keeps the context it already produced.
+ * re-asking. `chat.escalate()` snapshots the on-screen answer into the transcript
+ * and switches to full-chat mode; if nothing streamed yet it returns the prompt
+ * to run a fresh full-agent turn instead. Either way we then focus the reply box.
  */
 function escalateToChat() {
-	if (!aiText) {
-		// Nothing streamed yet (still thinking / errored) — fall back to a fresh
-		// full-agent run so the button always does something useful.
-		const prompt = aiQuickPrompt;
-		aiQuick = false;
-		if (prompt) startChat(prompt, /* fresh */ true);
+	const rerun = chat.escalate();
+	if (rerun) {
+		lastResult = null; // AI answer takes over the result area
+		chat.start(rerun, /* fresh */ true);
 		return;
 	}
-	// Snapshot the quick answer as a completed turn, then switch to full chat.
-	// Clear the live-turn fields (user + text) so the snapshotted turn doesn't
-	// ALSO render as the current bubble (that was the duplicate-question bug).
-	aiTurns = [...aiTurns, { user: aiLastUser, text: aiText, toolSteps: aiToolSteps }];
-	aiLastUser = "";
-	aiText = "";
-	aiToolSteps = [];
-	aiQuick = false;
-	aiStreaming = false;
-	// The reply box is now shown (quick=false, not streaming); the user's
-	// follow-up continues the existing session via sendReply → startChat(fresh=false).
-	// Explicit action → shift focus to the reply box.
+	// The reply box is now shown; explicit action → shift focus to it.
 	aiAnswerRef?.focusReply();
 }
 
 /** Fork-card button: bail out to a plain web search for the query. */
 async function quickWebSearch() {
-	const prompt = aiQuickPrompt;
-	resetChat();
+	const prompt = chat.quickPrompt;
+	chat.reset();
 	if (prompt) await runCommand(`web ${prompt}`);
-}
-
-/** Resolve a pending destructive-tool approval and resume the agent. */
-async function approveTool(approve: boolean) {
-	if (!aiApproval) return;
-	aiApproval = null;
-	aiTruncated = false;
-	aiStreaming = true;
-	const gen = aiGen; // same run continues
-	try {
-		await agentApprove(approve, gen);
-	} catch (e) {
-		if (gen === aiGen) {
-			aiStreaming = false;
-			aiError = e instanceof Error ? e.message : String(e);
-		}
-	}
-}
-
-/** Cancel an in-flight agent run (Esc while streaming). */
-function cancelChat() {
-	aiGen++; // drop late events on the frontend
-	aiStreaming = false;
-	cancelAiChat().catch(() => {});
 }
 
 async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
@@ -1283,29 +708,52 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 	//   Enter        → escalate to full chat
 	//   ⌘/Ctrl+Enter → bail out to a web search
 	// The input box is empty during the card, so these would otherwise no-op.
-	if (aiQuick && !aiStreaming && !inputValue.trim()) {
+	if (chat.quick && !chat.streaming && !inputValue.trim()) {
 		if (opts?.ctrlKey) await quickWebSearch();
 		else await escalateToChat();
 		return;
 	}
 
-	// ALL routing lives in one pure decider (src/lib/submit-router.ts). This
-	// function is a thin dispatcher: build the context, ask where to go, do it.
-	// One place decides command-vs-agent-vs-panel — no scattered `runCommand`
-	// branches. Natural language always ends at the agent (the single AI path);
-	// it never errors out to "unknown command".
+	// String CLASSIFICATION is the backend's job (the single source of truth):
+	// `classifyInput` returns a typed RouteDecision the FE reducer actuates. The
+	// FE never re-derives command-vs-AI from its own keyword list. We fetch the
+	// decision for the raw input, plus the selected row's `run` when it differs
+	// (so a replayed history/context command routes exactly as if typed fresh).
+	// KEYBOARD/MODE outcomes (Ctrl/Shift, /-search, @-browse) need no decision, so
+	// skip the round-trip when a modifier or search/@ mode already determines it.
 	const trimmed = inputValue.trim();
+	const needsDecision =
+		!opts?.ctrlKey && !opts?.runInline && !completions.searchMode && !completions.atMode;
+	const selected =
+		completions.index >= 0 ? completions.items[completions.index] : undefined;
+	const selectedRun = selected?.run ?? undefined;
+
+	let inputDecision: RouteDecision | undefined;
+	let runDecision: RouteDecision | undefined;
+	if (needsDecision) {
+		// ~2-3ms warm; gated by backendReady above. Errors → undefined (reducer
+		// no-ops rather than misroute).
+		[inputDecision, runDecision] = await Promise.all([
+			trimmed ? classifyInput(trimmed).catch(() => undefined) : Promise.resolve(undefined),
+			selectedRun && selectedRun !== trimmed
+				? classifyInput(selectedRun).catch(() => undefined)
+				: Promise.resolve(undefined),
+		]);
+	}
+
+	// The FE reducer folds the backend decision with keyboard/mode/selection
+	// state (src/lib/submit-router.ts) into exactly one SubmitAction.
 	const action = decideSubmit({
 		trimmed,
 		ctrlKey: opts?.ctrlKey ?? false,
 		runInline: opts?.runInline ?? false,
-		searchMode,
-		atMode,
+		searchMode: completions.searchMode,
+		atMode: completions.atMode,
 		pendingPlan: !!pendingPlan,
-		completions,
-		completionIndex,
-		aiEnabled,
-		presets: aiPresets,
+		completions: completions.items,
+		completionIndex: completions.index,
+		inputDecision,
+		runDecision,
 	});
 
 	switch (action.kind) {
@@ -1314,16 +762,12 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 
 		case "panel": {
 			inputValue = "";
-			completions = [];
-			completionIndex = -1;
-			settingsOpen = action.panel === "settings";
-			historyOpen = action.panel === "history";
-			mediaOpen = action.panel === "media";
-			notesOpen = action.panel === "notes";
-			chatHistoryOpen = action.panel === "chat-history";
+			completions.items = [];
+			completions.index = -1;
+			// One call opens exactly one panel; any on-screen AI answer auto-parks.
+			ui.openPanel(action.panel);
 			if (action.panel === "notes") initialNotesTab = action.notesTab;
 			if (action.panel === "chat-history") {
-				aiActive = false; // hide any on-screen AI answer behind the recall list
 				getConversations().then((cs) => {
 					conversations = cs;
 				});
@@ -1342,8 +786,8 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 		case "fill":
 		case "correct":
 			inputValue = action.value;
-			completions = [];
-			completionIndex = -1;
+			completions.items = [];
+			completions.index = -1;
 			handleInput(inputValue);
 			return;
 
@@ -1356,16 +800,16 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 				auto_open: false,
 			};
 			inputValue = "";
-			completions = [];
-			completionIndex = -1;
+			completions.items = [];
+			completions.index = -1;
 			return;
 
 		case "open-path": {
 			const opened = await openPath(action.path);
 			if (opened) {
 				inputValue = "";
-				completions = [];
-				completionIndex = -1;
+				completions.items = [];
+				completions.index = -1;
 				cancelFileSearch();
 				await hide();
 			}
@@ -1376,8 +820,8 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 			// An AI-chat recall row (from the empty-box recents) → open the chat,
 			// not the executor.
 			if (action.command.startsWith(CHAT_RUN_PREFIX)) {
-				completions = [];
-				completionIndex = -1;
+				completions.items = [];
+				completions.index = -1;
 				await openConversation(action.command.slice(CHAT_RUN_PREFIX.length));
 				return;
 			}
@@ -1385,58 +829,51 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 			return;
 
 		case "quick-ai": {
-			// A single unknown word (no spaces) might be an app-name typo — check
-			// for a "Did you mean" correction BEFORE going to AI. Instant local
-			// fuzzy match; multi-word / real questions skip this and go to AI.
-			if (aiEnabled && !action.prompt.includes(" ")) {
-				const corrected = await suggestCorrection(action.prompt).catch(() => null);
-				if (corrected) {
-					// Fill the input with the correction so the user confirms with a
-					// second Enter (or edits it) — never auto-runs the wrong app.
-					inputValue = corrected;
-					completions = [];
-					completionIndex = -1;
-					handleInput(inputValue);
-					return;
-				}
-			}
+			// Ambiguous natural language → the fork card. Typo correction is handled
+			// upstream by the backend classifier (a near-miss returns a `correct`
+			// decision), uniformly for single- AND multi-word input — so there's no
+			// special-case correction check here anymore.
 			inputValue = "";
-			completions = [];
-			completionIndex = -1;
-			await startQuickAi(action.prompt);
+			completions.items = [];
+			completions.index = -1;
+			lastResult = null; // AI answer takes over the result area
+			await chat.startQuick(action.prompt);
 			return;
 		}
 
 		case "agent":
 			inputValue = "";
-			completions = [];
-			completionIndex = -1;
-			await startChat(action.prompt, /* fresh */ true);
+			completions.items = [];
+			completions.index = -1;
+			lastResult = null; // AI answer takes over the result area
+			await chat.start(action.prompt, /* fresh */ true);
 			return;
 
 		case "preset": {
 			// An AI preset. If the user typed no text after the keyword, fall back
 			// to the PRIMARY selection (highlighted text in the focused window) —
 			// so `summarize` alone acts on what you've selected in VSCode/browser.
-			// Runs tool-free (startPreset) — a text transform needs no tools.
+			// Runs tool-free (chat.startPreset) — a text transform needs no tools.
 			inputValue = "";
-			completions = [];
-			completionIndex = -1;
+			completions.items = [];
+			completions.index = -1;
 			let input = action.input;
 			if (!input) {
 				const sel = await readSelection().catch(() => null);
 				if (sel) input = sel;
 			}
-			await startPreset(renderPreset(action.template, input));
+			lastResult = null; // AI answer takes over the result area
+			await chat.startPreset(renderPreset(action.template, input));
 			return;
 		}
 
 		case "ai-disabled": {
 			// The user made an AI request but no provider is configured. Warn
-			// (more prominently for an explicit `ask`), then fall to a web search.
+			// (more prominently for an explicit `ask`), then run the backend's
+			// chosen web-search fallback (`action.command`).
 			inputValue = "";
-			completions = [];
-			completionIndex = -1;
+			completions.items = [];
+			completions.index = -1;
 			const note = action.explicit
 				? "AI is disabled — enable it in Settings. Searching the web instead."
 				: "AI is disabled — searching the web instead.";
@@ -1447,7 +884,7 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 				duration_ms: 0,
 				auto_open: false,
 			};
-			await runCommand(`web ${action.prompt}`);
+			await runCommand(action.command);
 			return;
 		}
 	}
@@ -1457,12 +894,9 @@ async function runCommand(command: string, opts?: { runInline?: boolean }) {
 	if (isExecuting) return;
 	isExecuting = true;
 	const generation = ++executeGeneration;
-	completions = [];
-	completionIndex = -1;
-	historyOpen = false;
-	settingsOpen = false;
-	mediaOpen = false;
-	notesOpen = false;
+	completions.items = [];
+	completions.index = -1;
+	ui.showLauncher();
 	try {
 		lastCommand = command;
 		// Screenshot commands open a region/window selector — Lychi must leave
@@ -1489,55 +923,32 @@ async function runCommand(command: string, opts?: { runInline?: boolean }) {
 			await hide();
 			await openUri(lastResult.open_url);
 		} else if (lastResult.output === "__media_panel__") {
-			mediaOpen = true;
-			historyOpen = false;
-			settingsOpen = false;
-			notesOpen = false;
-
+			ui.openPanel("media");
 			lastResult = null;
 		} else if (lastResult.output === "__notes_panel__") {
-			notesOpen = true;
-			historyOpen = false;
-			settingsOpen = false;
-			mediaOpen = false;
-
+			ui.openPanel("notes");
 			lastResult = null;
 		} else if (lastResult.output === "__timer_panel__") {
-			notesOpen = true;
+			ui.openPanel("notes");
 			initialNotesTab = "timers";
-			historyOpen = false;
-			settingsOpen = false;
-			mediaOpen = false;
 			lastResult = null;
 		} else if (lastResult.output === "__reminders_panel__") {
-			notesOpen = true;
+			ui.openPanel("notes");
 			initialNotesTab = "reminders";
-			historyOpen = false;
-			settingsOpen = false;
-			mediaOpen = false;
-
 			lastResult = null;
 		} else if (lastResult.output === "__snippets_panel__") {
-			notesOpen = true;
+			ui.openPanel("notes");
 			initialNotesTab = "snippets";
-			historyOpen = false;
-			settingsOpen = false;
-			mediaOpen = false;
-
 			lastResult = null;
 		} else if (lastResult.output?.startsWith("__notes_limit__:")) {
 			pendingNoteText = lastResult.output.slice("__notes_limit__:".length);
-			notesOpen = true;
-			historyOpen = false;
-			settingsOpen = false;
-			mediaOpen = false;
-
+			ui.openPanel("notes");
 			lastResult = null;
 		} else if (lastResult.output?.startsWith("__browse_panel__:")) {
 			const dir = lastResult.output.slice("__browse_panel__:".length);
 			inputValue = `@${dir}`;
-			atMode = true;
-			atStart = 0;
+			completions.atMode = true;
+			completions.atStart = 0;
 			lastResult = null;
 			fetchAtCompletions(dir);
 		} else if (lastResult.success && !lastResult.output) {
@@ -1600,11 +1011,11 @@ function handleConfirmDismiss() {
 }
 
 async function openFileByLabel(label: string) {
-	searchMode = false;
-	atMode = false;
-	atStart = -1;
-	completions = [];
-	completionIndex = -1;
+	completions.searchMode = false;
+	completions.atMode = false;
+	completions.atStart = -1;
+	completions.items = [];
+	completions.index = -1;
 	cancelFileSearch();
 	inputValue = "";
 	await hide();
@@ -1616,8 +1027,8 @@ function drillIntoFolder(item: CompletionItem) {
 	let path = item.label;
 	if (path.startsWith("~/")) {
 		path = path.slice(2); // ~/Downloads/ → Downloads/
-	} else if (activeScope && path.startsWith(activeScope)) {
-		path = path.slice(activeScope.length); // /mnt/DevSSD/Colris/ → Colris/
+	} else if (completions.activeScope && path.startsWith(completions.activeScope)) {
+		path = path.slice(completions.activeScope.length); // /mnt/DevSSD/Colris/ → Colris/
 		if (path.startsWith("/")) path = path.slice(1);
 	}
 	// Prepend a single leading slash for scope-relative paths, but never double
@@ -1629,7 +1040,7 @@ function drillIntoFolder(item: CompletionItem) {
 
 /** Reveal the selected search result in the file manager (Ctrl+Enter). */
 async function revealSelected() {
-	const item = completions[completionIndex];
+	const item = completions.items[completions.index];
 	if (!item) return;
 	const full = resolveFullPath(item.label);
 	if (!full) return;
@@ -1639,7 +1050,7 @@ async function revealSelected() {
 
 /** Copy the selected search result's full path, flashing a confirmation. */
 async function copySelectedPath() {
-	const item = completions[completionIndex];
+	const item = completions.items[completions.index];
 	if (!item) return;
 	const full = resolveFullPath(item.label);
 	if (!full) return;
@@ -1661,7 +1072,7 @@ type PanelAction = { id: string; label: string; hint?: string };
 
 /** The selected completion, or undefined (skips separators just in case). */
 let selectedCompletion = $derived.by(() => {
-	const item = completions[completionIndex];
+	const item = completions.items[completions.index];
 	if (!item || item.icon_path === "__separator__") return undefined;
 	return item;
 });
@@ -1672,7 +1083,8 @@ let panelActions = $derived.by((): PanelAction[] => {
 	if (!item) return [];
 	const acts: PanelAction[] = [];
 	const isFolder = item.icon_path === "__folder__";
-	const hasPath = searchMode || atMode || filePathMap.has(item.label);
+	const hasPath =
+		completions.searchMode || completions.atMode || completions.filePathMap.has(item.label);
 	const isApp = item.run?.startsWith("appctl") || item.run?.startsWith("open ");
 	const isCalc = item.label.startsWith("= ");
 	const isAiChat = item.run?.startsWith(CHAT_RUN_PREFIX);
@@ -1785,9 +1197,10 @@ function runPanelAction(id: string) {
 			// Seed a fresh agent chat with the row's label.
 			closeActionPanel();
 			inputValue = "";
-			completions = [];
-			completionIndex = -1;
-			startChat(item.label, /* fresh */ true);
+			completions.items = [];
+			completions.index = -1;
+			lastResult = null; // AI answer takes over the result area
+			chat.start(item.label, /* fresh */ true);
 			break;
 		case "ai_delete_chat":
 			// Delete a recalled conversation (AI-chat recent row).
@@ -1803,16 +1216,16 @@ function runPanelAction(id: string) {
 
 function handleCompletionSelect(label: string, forceOpen?: boolean) {
 	// An AI-chat recall row (empty-box recents) → open the conversation.
-	const clicked = completions.find((c) => c.label === label);
+	const clicked = completions.items.find((c) => c.label === label);
 	if (clicked?.run?.startsWith(CHAT_RUN_PREFIX)) {
-		completions = [];
-		completionIndex = -1;
+		completions.items = [];
+		completions.index = -1;
 		openConversation(clicked.run.slice(CHAT_RUN_PREFIX.length));
 		return;
 	}
 	// / search mode — Enter opens the folder/file; Ctrl+Enter (forceOpen) reveals
 	// it in the file manager. Drilling into a folder is Tab / → (see drillIntoFolder).
-	if (searchMode) {
+	if (completions.searchMode) {
 		if (forceOpen) {
 			revealSelected();
 		} else {
@@ -1822,37 +1235,38 @@ function handleCompletionSelect(label: string, forceOpen?: boolean) {
 	}
 
 	// @ browse mode — reference a file in the command line
-	if (atMode) {
+	if (completions.atMode) {
 		if (label.endsWith("/")) {
-			const before = inputValue.slice(0, atStart);
-			const afterAt = inputValue.slice(atStart);
+			const before = inputValue.slice(0, completions.atStart);
+			const afterAt = inputValue.slice(completions.atStart);
 			const spaceIdx = afterAt.indexOf(" ", 1); // skip the @ itself
 			const after = spaceIdx === -1 ? "" : afterAt.slice(spaceIdx);
 			// Set input and immediately fetch — handleInput will also fire but
 			// debounce means our direct call wins
 			inputValue = `${before}@${label}${after}`;
-			clearTimeout(debounceTimer);
+			clearTimeout(completions.debounceTimer);
 			fetchAtCompletions(label);
 			requestAnimationFrame(() => {
 				document.querySelector<HTMLInputElement>(".input-container input")?.focus();
 			});
 		} else {
 			// Insert the file path into the command, replacing the @partial
-			const before = inputValue.slice(0, atStart);
-			const afterAt = inputValue.slice(atStart);
+			const before = inputValue.slice(0, completions.atStart);
+			const afterAt = inputValue.slice(completions.atStart);
 			const spaceIdx = afterAt.indexOf(" ", 1);
 			const after = spaceIdx === -1 ? "" : afterAt.slice(spaceIdx);
 			inputValue = `${before}@${label}${after}`;
-			atMode = false;
-			atStart = -1;
-			completions = [];
-			completionIndex = -1;
+			completions.atMode = false;
+			completions.atStart = -1;
+			completions.items = [];
+			completions.index = -1;
 		}
 		return;
 	}
 
-	// Find the item by label (click passes label directly, may not match completionIndex)
-	const item = completions.find((c) => c.label === label) ?? completions[completionIndex];
+	// Find the item by label (click passes label directly, may not match completions.index)
+	const item =
+		completions.items.find((c) => c.label === label) ?? completions.items[completions.index];
 
 	// "Did you mean: X?" typo suggestion — fill input with corrected text
 	if (item?.description && label.startsWith("Did you mean:")) {
@@ -1886,19 +1300,19 @@ function handleCompletionSelect(label: string, forceOpen?: boolean) {
 }
 
 function handleScopeChange(index: number) {
-	scopeIndex = index;
-	if (searchMode && inputValue.startsWith("/")) {
+	completions.scopeIndex = index;
+	if (completions.searchMode && inputValue.startsWith("/")) {
 		// Re-trigger search with new scope
-		searchDone = false;
-		fileSearchId++;
-		const id = fileSearchId;
-		completions = [];
-		completionIndex = -1;
-		searchScopePath = "";
+		completions.searchDone = false;
+		completions.fileSearchId++;
+		const id = completions.fileSearchId;
+		completions.items = [];
+		completions.index = -1;
+		completions.searchScopePath = "";
 
 		const raw = inputValue.slice(1);
 		const lastSlash = raw.lastIndexOf("/");
-		const baseScope = mountPoints[index]?.path ?? "";
+		const baseScope = completions.mountPoints[index]?.path ?? "";
 
 		let searchScope: string;
 		let searchTerm: string;
@@ -1906,7 +1320,7 @@ function handleScopeChange(index: number) {
 			const folderPart = raw.slice(0, lastSlash);
 			searchTerm = raw.slice(lastSlash + 1);
 			searchScope = folderPart ? `${baseScope}/${folderPart}` : baseScope;
-			searchScopePath = searchScope;
+			completions.searchScopePath = searchScope;
 		} else {
 			searchTerm = raw;
 			searchScope = baseScope;
@@ -1918,18 +1332,14 @@ function handleScopeChange(index: number) {
 
 function handleHistorySelect(entry: string) {
 	inputValue = entry;
-	historyOpen = false;
+	ui.closePanel();
 }
 
 function handleToggleHistory() {
-	historyOpen = !historyOpen;
-	settingsOpen = false;
-	mediaOpen = false;
-	notesOpen = false;
-	chatHistoryOpen = false;
-	if (historyOpen) {
-		completions = [];
-		completionIndex = -1;
+	ui.togglePanel("history");
+	if (ui.panelVisible("history")) {
+		completions.items = [];
+		completions.index = -1;
 	} else {
 		// Re-fetch completions for current input
 		handleInput(inputValue);
@@ -1937,15 +1347,11 @@ function handleToggleHistory() {
 }
 
 function handleToggleChatHistory() {
-	chatHistoryOpen = !chatHistoryOpen;
-	historyOpen = false;
-	settingsOpen = false;
-	mediaOpen = false;
-	notesOpen = false;
-	if (chatHistoryOpen) {
-		aiActive = false; // hide any on-screen AI answer behind the recall list
-		completions = [];
-		completionIndex = -1;
+	ui.togglePanel("chat-history");
+	if (ui.panelVisible("chat-history")) {
+		// Opening the recall list auto-parks any on-screen AI answer (ui machine).
+		completions.items = [];
+		completions.index = -1;
 		getConversations().then((cs) => {
 			conversations = cs;
 		});
@@ -1955,57 +1361,40 @@ function handleToggleChatHistory() {
 }
 
 function handleToggleSettings() {
-	settingsOpen = !settingsOpen;
-	if (settingsOpen) {
-		historyOpen = false;
-		mediaOpen = false;
-		notesOpen = false;
-
-		completions = [];
-		completionIndex = -1;
+	ui.togglePanel("settings");
+	if (ui.panelVisible("settings")) {
+		completions.items = [];
+		completions.index = -1;
 	}
 }
 
 function handleToggleMedia() {
-	mediaOpen = !mediaOpen;
-	if (mediaOpen) {
-		historyOpen = false;
-		settingsOpen = false;
-		notesOpen = false;
-
-		completions = [];
-		completionIndex = -1;
+	ui.togglePanel("media");
+	if (ui.panelVisible("media")) {
+		completions.items = [];
+		completions.index = -1;
 	}
 }
 
 function handleToggleNotes() {
-	notesOpen = !notesOpen;
-	if (notesOpen) {
-		historyOpen = false;
-		settingsOpen = false;
-		mediaOpen = false;
-
-		completions = [];
-		completionIndex = -1;
+	ui.togglePanel("notes");
+	if (ui.panelVisible("notes")) {
+		completions.items = [];
+		completions.index = -1;
 	}
 }
 
 function handleShowResult() {
-	settingsOpen = false;
-	mediaOpen = false;
-	historyOpen = false;
-	notesOpen = false;
-	completions = [];
-	completionIndex = -1;
+	// Close any panel back to the results surface (parked AI stays parked).
+	ui.showLauncher();
+	completions.items = [];
+	completions.index = -1;
 }
 
 function handleShowPlan() {
-	settingsOpen = false;
-	mediaOpen = false;
-	historyOpen = false;
-	notesOpen = false;
-	completions = [];
-	completionIndex = -1;
+	ui.showPlan();
+	completions.items = [];
+	completions.index = -1;
 }
 
 /**
@@ -2016,8 +1405,8 @@ function handleShowPlan() {
  * Search/@-browse modes are left alone (the input there is a path, not a query).
  */
 function fillFromSelection() {
-	if (atMode || searchMode) return;
-	const sel = completions[completionIndex];
+	if (completions.atMode || completions.searchMode) return;
+	const sel = completions.items[completions.index];
 	if (!sel || sel.icon_path === "__separator__" || sel.icon_path === "__info__") return;
 	// A calc row ("= 42") or a "Did you mean" row isn't a runnable command — don't
 	// clobber the input with their display text.
@@ -2027,24 +1416,28 @@ function fillFromSelection() {
 }
 
 function handleArrowUp() {
-	if (completions.length > 0) {
-		let next = completionIndex - 1;
+	if (completions.items.length > 0) {
+		let next = completions.index - 1;
 		// Skip separator items
-		while (next >= 0 && completions[next]?.icon_path === "__separator__") next--;
+		while (next >= 0 && completions.items[next]?.icon_path === "__separator__") next--;
 		// If we ran off the top onto (or past) a leading header, stay put rather
 		// than landing on a non-selectable separator.
-		if (next < 0 || completions[next]?.icon_path === "__separator__") return;
-		completionIndex = next;
+		if (next < 0 || completions.items[next]?.icon_path === "__separator__") return;
+		completions.index = next;
 		fillFromSelection();
 	}
 }
 
 function handleArrowDown() {
-	if (completions.length > 0) {
-		let next = completionIndex + 1;
+	if (completions.items.length > 0) {
+		let next = completions.index + 1;
 		// Skip separator items
-		while (next < completions.length && completions[next]?.icon_path === "__separator__") next++;
-		completionIndex = Math.min(completions.length - 1, next);
+		while (
+			next < completions.items.length &&
+			completions.items[next]?.icon_path === "__separator__"
+		)
+			next++;
+		completions.index = Math.min(completions.items.length - 1, next);
 		fillFromSelection();
 	}
 }
@@ -2061,8 +1454,8 @@ async function hide() {
 // runCommand) because the window is already hidden — no panel/history churn.
 async function quickScreenshot() {
 	inputValue = "";
-	completions = [];
-	completionIndex = -1;
+	completions.items = [];
+	completions.index = -1;
 	await hide();
 	// Give the compositor a moment to remove the window before capturing.
 	await new Promise((r) => setTimeout(r, 180));
@@ -2083,16 +1476,18 @@ async function openInlineUrl() {
 }
 
 async function handleDismiss() {
-	// AI chat Esc: first Esc cancels a live stream (keeps the answer + launcher);
-	// a second Esc (answer showing, not streaming) clears it back to the launcher.
-	// Only a third Esc hides. This keeps the fast-and-forget feel without losing
-	// an answer to an accidental keypress.
-	if (aiStreaming) {
-		cancelChat();
+	// AI chat Esc ladder: (1) a live stream → cancel it (keep the answer);
+	// (2) an on-screen answer → PARK it (hide to the status-bar recall icon and
+	// return to the launcher — nothing is lost; click the icon or run a new query
+	// to bring it back). The answer is only truly cleared by a new query or a
+	// re-summon (chat.reset). This keeps the fast-and-forget feel without losing an
+	// answer to an accidental keypress.
+	if (chat.streaming) {
+		chat.cancel();
 		return;
 	}
-	if (aiActive) {
-		resetChat();
+	if (ui.aiVisible) {
+		ui.parkAi();
 		inputValue = "";
 		return;
 	}
@@ -2156,20 +1551,20 @@ async function handleDismiss() {
 			disabled={isExecuting || isRouting}
 			routing={isRouting}
 			executing={isExecuting}
-			{contextPill}
-			{contextLoading}
-			{atMode}
-			{atStart}
-			{searchMode}
+			contextPill={context.pill}
+			contextLoading={context.loading}
+			atMode={completions.atMode}
+			atStart={completions.atStart}
+			searchMode={completions.searchMode}
 			{aiEnabled}
-			scopeCount={mountPoints.length}
-			ontabscope={() => handleScopeChange((scopeIndex + 1) % mountPoints.length)}
+			scopeCount={completions.mountPoints.length}
+			ontabscope={() => handleScopeChange((completions.scopeIndex + 1) % completions.mountPoints.length)}
 			ontabcomplete={() => {
-				if (completions.length > 0 && completionIndex >= 0) {
-					const item = completions[completionIndex];
-					if (searchMode && item.icon_path === "__folder__") {
+				if (completions.items.length > 0 && completions.index >= 0) {
+					const item = completions.items[completions.index];
+					if (completions.searchMode && item.icon_path === "__folder__") {
 						drillIntoFolder(item);
-					} else if (searchMode) {
+					} else if (completions.searchMode) {
 						// File in search mode — open it
 						openFileByLabel(item.label);
 					} else {
@@ -2180,18 +1575,18 @@ async function handleDismiss() {
 			}}
 			ondrillinto={() => {
 				// Arrow-right → drill into the selected folder (search mode only).
-				if (searchMode && completions.length > 0 && completionIndex >= 0) {
-					const item = completions[completionIndex];
+				if (completions.searchMode && completions.items.length > 0 && completions.index >= 0) {
+					const item = completions.items[completions.index];
 					if (item?.icon_path === "__folder__") drillIntoFolder(item);
 				}
 			}}
 			oncopypath={() => {
-				if (searchMode && completions.length > 0 && completionIndex >= 0) {
+				if (completions.searchMode && completions.items.length > 0 && completions.index >= 0) {
 					copySelectedPath();
 				}
 			}}
 			onshifttabback={() => {
-				if (searchMode && inputValue.startsWith("/")) {
+				if (completions.searchMode && inputValue.startsWith("/")) {
 					const raw = inputValue.slice(1);
 					// Find last slash, then the one before it to go up
 					const trimmed = raw.endsWith("/") ? raw.slice(0, -1) : raw;
@@ -2202,12 +1597,12 @@ async function handleDismiss() {
 						inputValue = "/";
 					}
 					handleInput(inputValue);
-				} else if (atMode && atStart >= 0) {
-					const partial = inputValue.slice(atStart + 1);
-					const afterAt = inputValue.slice(atStart);
+				} else if (completions.atMode && completions.atStart >= 0) {
+					const partial = inputValue.slice(completions.atStart + 1);
+					const afterAt = inputValue.slice(completions.atStart);
 					const spaceIdx = afterAt.indexOf(" ", 1);
 					const after = spaceIdx === -1 ? "" : afterAt.slice(spaceIdx);
-					const before = inputValue.slice(0, atStart);
+					const before = inputValue.slice(0, completions.atStart);
 
 					// Strip trailing slash, find parent
 					const trimmed = partial.endsWith("/") ? partial.slice(0, -1) : partial;
@@ -2215,17 +1610,17 @@ async function handleDismiss() {
 					if (lastSlash > 0) {
 						const parent = trimmed.slice(0, lastSlash + 1);
 						inputValue = `${before}@${parent}${after}`;
-						clearTimeout(debounceTimer);
+						clearTimeout(completions.debounceTimer);
 						fetchAtCompletions(parent);
 					} else {
 						inputValue = `${before}@${after}`;
-						clearTimeout(debounceTimer);
+						clearTimeout(completions.debounceTimer);
 						fetchAtCompletions("");
 					}
 				}
 			}}
-			searchGhost={searchMode && completions.length > 0 && completionIndex >= 0 ? completions[completionIndex].label : ""}
-			browseGhost={atMode && completions.length > 0 && completionIndex >= 0 ? completions[completionIndex].label : ""}
+			searchGhost={completions.searchMode && completions.items.length > 0 && completions.index >= 0 ? completions.items[completions.index].label : ""}
+			browseGhost={completions.atMode && completions.items.length > 0 && completions.index >= 0 ? completions.items[completions.index].label : ""}
 			history={historyEntries}
 			onactionpanel={openActionPanel}
 		/>
@@ -2237,54 +1632,49 @@ async function handleDismiss() {
 			/>
 		{/if}
 		<!-- Panels: always mounted, hidden via CSS (visibility:hidden) for instant toggle -->
+		<!-- Visibility derives from the `ui` surface machine — exactly one panel can
+		     be open, and it always wins the stage (overlap is unrepresentable). -->
 		<!-- Order matches shortcuts: Ctrl+1 History, Ctrl+2 Notes, Ctrl+3 Media, Ctrl+4 Settings -->
-		<div class:panel-hidden={!historyOpen}>
+		<div class:panel-hidden={!ui.panelVisible("history")}>
 			<HistoryPanel entries={historyEntries} onselect={handleHistorySelect} />
 		</div>
-		<div class:panel-hidden={!chatHistoryOpen}>
+		<div class:panel-hidden={!ui.panelVisible("chat-history")}>
 			<ChatHistoryPanel
 				{conversations}
-				visible={chatHistoryOpen}
+				visible={ui.panelVisible("chat-history")}
 				onselect={openConversation}
 				ondelete={deleteConversationEntry}
 				onclear={clearAllConversations}
-				ondismiss={() => { chatHistoryOpen = false; }}
+				ondismiss={ui.closePanel}
 			/>
 		</div>
-		<div class:panel-hidden={!notesOpen}>
-			<NotesPanel ondismiss={() => { notesOpen = false; pendingNoteText = null; initialNotesTab = undefined; }} {pendingNoteText} onpendingcleared={() => { pendingNoteText = null; }} {initialNotesTab} visible={notesOpen} />
+		<div class:panel-hidden={!ui.panelVisible("notes")}>
+			<NotesPanel ondismiss={() => { ui.closePanel(); pendingNoteText = null; initialNotesTab = undefined; }} {pendingNoteText} onpendingcleared={() => { pendingNoteText = null; }} {initialNotesTab} visible={ui.panelVisible("notes")} />
 		</div>
-		<div class:panel-hidden={!mediaOpen}>
-			<MediaPanel visible={mediaOpen} ondismiss={() => { mediaOpen = false; }} players={mediaPlayers} />
+		<div class:panel-hidden={!ui.panelVisible("media")}>
+			<MediaPanel visible={ui.panelVisible("media")} ondismiss={ui.closePanel} players={media.players} />
 		</div>
-		<div class="settings-wrapper" class:panel-hidden={!settingsOpen}>
-			<SettingsPanel
-				ondismiss={() => { settingsOpen = false; }}
-				onpresetchange={() => {
-					getAiPresets().then((ps) => {
-						aiPresets = ps.map((p) => ({ keyword: p.keyword, template: p.template }));
-					});
-				}}
-			/>
+		<div class="settings-wrapper" class:panel-hidden={!ui.panelVisible("settings")}>
+			<SettingsPanel ondismiss={ui.closePanel} />
 		</div>
-		{#if aiActive}
+		{#if ui.aiVisible}
 			<AiAnswer
 				bind:this={aiAnswerRef}
-				turns={aiTurns}
-				lastUser={aiLastUser}
-				text={aiText}
-				truncated={aiTruncated}
-				tokensIn={aiTokensIn}
-				tokensOut={aiTokensOut}
-				streaming={aiStreaming}
-				error={aiError}
-				toolSteps={aiToolSteps}
-				approval={aiApproval}
-				onapprove={approveTool}
-				bind:reply={aiReply}
-				onreply={sendReply}
-				onstop={cancelChat}
-				quick={aiQuick}
+				turns={chat.turns}
+				lastUser={chat.lastUser}
+				text={chat.text}
+				truncated={chat.truncated}
+				tokensIn={chat.tokensIn}
+				tokensOut={chat.tokensOut}
+				streaming={chat.streaming}
+				error={chat.error}
+				toolSteps={chat.toolSteps}
+				approval={chat.approval}
+				onapprove={chat.approve}
+				bind:reply={chat.reply}
+				onreply={chat.sendReply}
+				onstop={chat.cancel}
+				quick={chat.quick}
 				onwebsearch={quickWebSearch}
 				onfullchat={escalateToChat}
 			/>
@@ -2298,27 +1688,27 @@ async function handleDismiss() {
 				}}
 				ondismiss={() => { pendingPlan = null; }}
 			/>
-		{:else if !settingsOpen && !notesOpen && !mediaOpen && !historyOpen && !chatHistoryOpen}
+		{:else if !ui.anyPanelOpen}
 			<CompletionsList
-				items={completions}
-				selectedIndex={completionIndex}
+				items={completions.items}
+				selectedIndex={completions.index}
 				onselect={handleCompletionSelect}
-				pathContext={searchMode ? searchPathContext : (atMode ? atPathContext : "")}
-				scopeTabs={searchMode && mountPoints.length > 1 ? mountPoints : []}
-				activeScopeIndex={scopeIndex}
+				pathContext={completions.searchMode ? searchPathContext : (completions.atMode ? atPathContext : "")}
+				scopeTabs={completions.searchMode && completions.mountPoints.length > 1 ? completions.mountPoints : []}
+				activeScopeIndex={completions.scopeIndex}
 				onscopechange={handleScopeChange}
-				searching={searchMode && !searchDone}
-				browseMode={atMode}
-				searchMode={searchMode}
-				metaMap={searchMode ? fileMetaMap : undefined}
-				ignoreActive={searchMode && ignoreActive}
+				searching={completions.searchMode && !completions.searchDone}
+				browseMode={completions.atMode}
+				searchMode={completions.searchMode}
+				metaMap={completions.searchMode ? completions.fileMetaMap : undefined}
+				ignoreActive={completions.searchMode && completions.ignoreActive}
 				{flashMessage}
 			/>
-			{#if completions.length === 0 && atMode && atNoResults}
+			{#if completions.items.length === 0 && completions.atMode && completions.atNoResults}
 				<div class="empty-state">Empty folder</div>
-			{:else if completions.length === 0 && searchMode && !searchDone}
+			{:else if completions.items.length === 0 && completions.searchMode && !completions.searchDone}
 				<div class="empty-state">Searching...</div>
-			{:else if completions.length === 0 && completionsPending && !atMode && !searchMode && inputValue.trim().length > 0}
+			{:else if completions.items.length === 0 && completions.pending && !completions.atMode && !completions.searchMode && inputValue.trim().length > 0}
 				<!-- Cold-start hint: the first query hasn't returned yet. Subtle,
 				     non-blocking skeleton that vanishes the instant results arrive.
 				     Input stays fully usable. -->
@@ -2342,26 +1732,28 @@ async function handleDismiss() {
 			result={lastResult}
 			executing={isExecuting}
 			routing={isRouting}
-			{historyOpen}
-			{settingsOpen}
-			mediaOpen={mediaOpen}
-			{chatHistoryOpen}
-			{nowPlaying}
-			{multiplePlayers}
+			historyOpen={ui.panelVisible("history")}
+			settingsOpen={ui.panelVisible("settings")}
+			mediaOpen={ui.panelVisible("media")}
+			chatHistoryOpen={ui.panelVisible("chat-history")}
+			notesOpen={ui.panelVisible("notes")}
+			aiParked={ui.aiParked}
+			nowPlaying={media.nowPlaying}
+			multiplePlayers={media.multiplePlayers}
 			ontogglehistory={handleToggleHistory}
 			ontogglesettings={handleToggleSettings}
 			ontogglemedia={handleToggleMedia}
 			ontogglenotes={handleToggleNotes}
 			ontogglechathistory={handleToggleChatHistory}
-			{notesOpen}
 		onshowresult={handleShowResult}
 		onshowplan={handleShowPlan}
+		onshowai={ui.restoreAi}
 		hasPlan={!!pendingPlan}
-		{contextStale}
-		{contextStaleHint}
-		{contextRefreshing}
-		{aiLoading}
-		actionsAvailable={!settingsOpen && !notesOpen && !mediaOpen && !historyOpen && !chatHistoryOpen && panelActions.length > 0}
+		contextStale={context.stale}
+		contextStaleHint={context.staleHint}
+		contextRefreshing={context.refreshing}
+		aiLoading={ui.aiLoading}
+		actionsAvailable={!ui.anyPanelOpen && panelActions.length > 0}
 		onactionpanel={openActionPanel}
 		/>
 	</main>

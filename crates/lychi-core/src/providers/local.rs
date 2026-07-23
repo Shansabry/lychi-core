@@ -382,7 +382,10 @@ impl LocalClient {
     /// happens lazily on first inference, so app start / provider rebuild stays
     /// fast); `path` is the resolved GGUF file.
     pub fn load(path: PathBuf, max_tokens: u32) -> Result<Self, LychiError> {
-        let id = path.file_stem().and_then(|n| n.to_str()).unwrap_or_default();
+        let id = path
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         let spec = local_models::find(id).ok_or_else(|| {
             LychiError::Ai(format!("unknown local model id '{id}' (not in registry)"))
         })?;
@@ -414,7 +417,6 @@ impl LocalClient {
         .await
         .map_err(|e| LychiError::Ai(format!("inference task panicked: {e}")))?
     }
-
 }
 
 /// How to constrain the model's output for a given call.
@@ -562,7 +564,8 @@ impl AiProvider for LocalClient {
         question: &str,
     ) -> Result<String, LychiError> {
         // Free-form answer → no grammar constraint.
-        self.generate(system_prompt, question, GrammarMode::Free).await
+        self.generate(system_prompt, question, GrammarMode::Free)
+            .await
     }
 
     /// Streaming, grammar-constrained tool-calling chat as a normalized event
@@ -606,36 +609,57 @@ impl AiProvider for LocalClient {
                     return;
                 }
             };
-            let _ = tx.blocking_send(Ok(StreamEvent::MessageStart { model: model_id.clone() }));
+            let _ = tx.blocking_send(Ok(StreamEvent::MessageStart {
+                model: model_id.clone(),
+            }));
 
             if has_tools {
                 // Tool mode: grammar-constrain to a tool call OR an answer (one
                 // shot — grammar JSON isn't meaningful to stream token-by-token).
                 let grammar = match tool_grammar(&tool_names) {
                     Ok(g) => Some(g),
-                    Err(e) => { let _ = tx.blocking_send(Err(e)); return; }
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(e));
+                        return;
+                    }
                 };
-                let raw = match generate_inner(&model, &system, &user, max, grammar.as_deref(), None) {
-                    Ok((out, _)) => out,
-                    Err(e) => { let _ = tx.blocking_send(Err(e)); return; }
-                };
+                let raw =
+                    match generate_inner(&model, &system, &user, max, grammar.as_deref(), None) {
+                        Ok((out, _)) => out,
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(e));
+                            return;
+                        }
+                    };
                 tracing::debug!(provider = "local", model = %model_id, "[ai] tool response: {raw}");
                 match serde_json::from_str::<serde_json::Value>(&raw) {
                     Ok(v) if v["tool"].is_string() => {
                         let id = format!("local-{model_id}");
                         let name = v["tool"].as_str().unwrap_or_default().to_string();
                         let args = v["args"].as_str().unwrap_or_default().to_string();
-                        let _ = tx.blocking_send(Ok(StreamEvent::ToolCallStart { id: id.clone(), name: name.clone() }));
-                        let _ = tx.blocking_send(Ok(StreamEvent::ToolCallComplete { id, name, args }));
-                        let _ = tx.blocking_send(Ok(StreamEvent::Done { stop_reason: StopReason::ToolUse, usage: None }));
+                        let _ = tx.blocking_send(Ok(StreamEvent::ToolCallStart {
+                            id: id.clone(),
+                            name: name.clone(),
+                        }));
+                        let _ =
+                            tx.blocking_send(Ok(StreamEvent::ToolCallComplete { id, name, args }));
+                        let _ = tx.blocking_send(Ok(StreamEvent::Done {
+                            stop_reason: StopReason::ToolUse,
+                            usage: None,
+                        }));
                     }
                     Ok(v) => {
                         let answer = v["answer"].as_str().unwrap_or(&raw).to_string();
                         let _ = tx.blocking_send(Ok(StreamEvent::TextDelta(answer)));
-                        let _ = tx.blocking_send(Ok(StreamEvent::Done { stop_reason: StopReason::EndTurn, usage: None }));
+                        let _ = tx.blocking_send(Ok(StreamEvent::Done {
+                            stop_reason: StopReason::EndTurn,
+                            usage: None,
+                        }));
                     }
                     Err(e) => {
-                        let _ = tx.blocking_send(Err(LychiError::Ai(format!("local tool JSON parse: {e} (raw: {raw})"))));
+                        let _ = tx.blocking_send(Err(LychiError::Ai(format!(
+                            "local tool JSON parse: {e} (raw: {raw})"
+                        ))));
                     }
                 }
                 return;
@@ -648,11 +672,15 @@ impl AiProvider for LocalClient {
                     return false;
                 }
                 // blocking_send Err ⇒ ReceiverStream dropped ⇒ stop generating.
-                tx.blocking_send(Ok(StreamEvent::TextDelta(delta.to_string()))).is_ok()
+                tx.blocking_send(Ok(StreamEvent::TextDelta(delta.to_string())))
+                    .is_ok()
             };
             match generate_inner(&model, &system, &user, max, None, Some(&mut cb)) {
                 Ok(_) => {
-                    let _ = tx.blocking_send(Ok(StreamEvent::Done { stop_reason: StopReason::EndTurn, usage: None }));
+                    let _ = tx.blocking_send(Ok(StreamEvent::Done {
+                        stop_reason: StopReason::EndTurn,
+                        usage: None,
+                    }));
                 }
                 Err(e) => {
                     let _ = tx.blocking_send(Err(e));
@@ -680,18 +708,24 @@ fn flatten_conversation(messages: &[ChatMessage]) -> (String, String) {
                     transcript.push(format!("Assistant: {}", m.content));
                 }
                 for tc in &m.tool_calls {
-                    transcript.push(format!("Assistant called tool `{}` with: {}", tc.name, tc.args));
+                    transcript.push(format!(
+                        "Assistant called tool `{}` with: {}",
+                        tc.name, tc.args
+                    ));
                 }
             }
             Role::Tool => {
-                let tag = if m.is_error { "Tool error" } else { "Tool result" };
+                let tag = if m.is_error {
+                    "Tool error"
+                } else {
+                    "Tool result"
+                };
                 transcript.push(format!("{tag}: {}", m.content));
             }
         }
     }
     (system.join("\n\n"), transcript.join("\n"))
 }
-
 
 #[cfg(test)]
 mod bench {
@@ -747,7 +781,10 @@ mod bench {
             ran += 1;
         }
         println!();
-        assert!(ran > 0, "no models downloaded — download at least one first");
+        assert!(
+            ran > 0,
+            "no models downloaded — download at least one first"
+        );
     }
 
     /// Regression for the GGML_ASSERT(n_tokens_all <= n_batch) process-abort:
@@ -778,8 +815,8 @@ mod bench {
             .expect("large prompt must not abort");
         println!("route-grammar output: {out:?}");
         // The grammar guarantees a parseable object with a KNOWN action_id.
-        let v: serde_json::Value = serde_json::from_str(out.trim())
-            .expect("grammar output must be valid JSON");
+        let v: serde_json::Value =
+            serde_json::from_str(out.trim()).expect("grammar output must be valid JSON");
         assert!(v.is_object(), "output must be a JSON object");
         let action = v["action_id"].as_str().unwrap_or("");
         assert!(
@@ -792,7 +829,10 @@ mod bench {
     fn route_grammar_builds_and_constrains() {
         // Pure (no model needed): the schema→grammar conversion must succeed and
         // the grammar must mention the action literals.
-        let actions: Vec<String> = ["open", "ask", "web"].iter().map(|s| s.to_string()).collect();
+        let actions: Vec<String> = ["open", "ask", "web"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let g = route_grammar(&actions).expect("route grammar builds");
         assert!(g.contains("open") && g.contains("ask") && g.contains("web"));
     }
@@ -803,7 +843,10 @@ mod bench {
         // an answer branch. Empty tool set → answer-only.
         let tools: Vec<String> = ["weather", "open"].iter().map(|s| s.to_string()).collect();
         let g = tool_grammar(&tools).expect("tool grammar builds");
-        assert!(g.contains("weather") && g.contains("open"), "tool names constrained");
+        assert!(
+            g.contains("weather") && g.contains("open"),
+            "tool names constrained"
+        );
         assert!(g.contains("answer"), "answer branch present");
 
         let empty: Vec<String> = vec![];
@@ -821,7 +864,11 @@ mod bench {
                 role: Role::Assistant,
                 content: "Opening it".into(),
                 tool_call_id: None,
-                tool_calls: vec![ToolCall { id: "t1".into(), name: "open".into(), args: "firefox".into() }],
+                tool_calls: vec![ToolCall {
+                    id: "t1".into(),
+                    name: "open".into(),
+                    args: "firefox".into(),
+                }],
                 is_error: false,
             },
             ChatMessage::tool_result("t1", "opened", false),

@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::context::EnvironmentContext;
 use crate::error::LychiError;
@@ -51,6 +51,9 @@ impl ActionHandler for ContextDebugHandler {
 
     fn description(&self) -> &str {
         "Show current environment context (debug)"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Developer
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

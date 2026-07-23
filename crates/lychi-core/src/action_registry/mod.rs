@@ -303,6 +303,61 @@ impl CommandResultDto {
     }
 }
 
+/// The family a command belongs to, for grouping in the Guide. Each handler
+/// declares its own via `ActionHandler::category` (default `General`), so the
+/// grouping is generated from the live registry and never hardcoded frontend-side.
+/// Serialized as a lowercase string (`"files"`, `"ai"`, …) for the TS bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "lowercase")]
+pub enum CommandCategory {
+    /// Files, folders, search, browse, reveal.
+    Files,
+    /// AI chat, presets, text transforms.
+    Ai,
+    /// Web search, YouTube, definitions, bangs, bookmarks.
+    Web,
+    /// Processes, windows, services, power, system info.
+    System,
+    /// Shell, ssh, terminal, dev encoders/utilities.
+    Developer,
+    /// Media / MPRIS control.
+    Media,
+    /// Calculators, converters, generators, notes, timers, and other tools.
+    Utilities,
+    /// Uncategorised (the default).
+    General,
+}
+
+impl CommandCategory {
+    /// Human-readable section title shown in the Guide.
+    pub fn title(self) -> &'static str {
+        match self {
+            CommandCategory::Files => "Files & Folders",
+            CommandCategory::Ai => "AI",
+            CommandCategory::Web => "Web & Search",
+            CommandCategory::System => "System & Windows",
+            CommandCategory::Developer => "Developer",
+            CommandCategory::Media => "Media",
+            CommandCategory::Utilities => "Utilities",
+            CommandCategory::General => "General",
+        }
+    }
+
+    /// Display order in the Guide (lower = earlier).
+    pub fn order(self) -> u8 {
+        match self {
+            CommandCategory::Files => 0,
+            CommandCategory::Ai => 1,
+            CommandCategory::Web => 2,
+            CommandCategory::Developer => 3,
+            CommandCategory::System => 4,
+            CommandCategory::Media => 5,
+            CommandCategory::Utilities => 6,
+            CommandCategory::General => 7,
+        }
+    }
+}
+
 /// One row in the dynamic command catalog (Guide/help). Generated from the live
 /// registry so it never goes stale. See `ActionRegistry::command_catalog`.
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
@@ -313,6 +368,12 @@ pub struct CommandInfo {
     pub keyword: String,
     /// One-line human description from the handler.
     pub description: String,
+    /// The family this command belongs to (for Guide grouping).
+    pub category: CommandCategory,
+    /// The category's human-readable section title (so the frontend needn't map).
+    pub category_title: String,
+    /// The category's display order (lower sorts earlier).
+    pub category_order: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, specta::Type)]
@@ -453,6 +514,13 @@ pub trait ActionHandler: Send + Sync {
 
     /// Human-readable description for help/discovery.
     fn description(&self) -> &str;
+
+    /// The family this handler belongs to, for grouping in the Guide. Override to
+    /// place a handler in a category; the default `General` keeps unclassified
+    /// handlers visible. Purely presentational — never affects routing or risk.
+    fn category(&self) -> CommandCategory {
+        CommandCategory::General
+    }
 
     /// Default risk level for this handler. Override for risky handlers.
     ///

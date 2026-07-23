@@ -549,7 +549,8 @@ impl Executor {
         privacy: &PrivacyConfig,
         inputs: &RunInputs,
     ) -> Result<ExecuteResult, LychiError> {
-        self.run_inner(input, None, confirmed, privacy, inputs).await
+        self.run_inner(input, None, confirmed, privacy, inputs)
+            .await
     }
 
     /// Execute a PRE-RESOLVED intent, re-checking policy but skipping resolution.
@@ -567,7 +568,8 @@ impl Executor {
         inputs: &RunInputs,
     ) -> Result<ExecuteResult, LychiError> {
         // `input` is only used for logging here; the intent is authoritative.
-        self.run_inner("", Some(intent), true, privacy, inputs).await
+        self.run_inner("", Some(intent), true, privacy, inputs)
+            .await
     }
 
     async fn run_inner(
@@ -748,9 +750,7 @@ impl Executor {
                         self.context.clone(),
                     );
                 }
-                let (result, was_busy) = self
-                    .gate.run(handler, &exec_ctx, &intent.args)
-                    .await?;
+                let (result, was_busy) = self.gate.run(handler, &exec_ctx, &intent.args).await?;
                 busy = was_busy;
                 if intent.routing == RoutingMethod::Ai {
                     envelope.routed_by = Some("ai".to_string());
@@ -917,73 +917,24 @@ impl Executor {
         }
 
         // For no-match queries (a bare question / phrase), offer explicit
-        // escape hatches that survive truncation. When AI is configured, show
-        // BOTH "Ask AI: …" and "Search web: …" so the user chooses — no AI
-        // guessing, no auto-behavior, two clear deterministic options. When AI
-        // is off, only the web option (Sab's rule: no AI → keywords/web).
-        //
-        // Fallbacks are a FLOOR, not a competitor (Alfred/Raycast standard):
-        // when the deterministic layer already found a CONFIDENT match — e.g. an
-        // app resolved out of "can you open spotify" via token-set matching —
-        // the fallbacks are suppressed so they never crowd a real intent. They
-        // appear only when nothing confident matched, always ranked at the end.
-        const CONFIDENT_RESULT_SCORE: u16 = 500; // ≈ app_score 0.71 blended
-        let has_confident_match = handler_results
-            .iter()
-            .any(|r| r.score >= CONFIDENT_RESULT_SCORE);
-        let web_fallback: Vec<CompletionItem> = if let PatternResult::NoMatch { input } = &route
-            && !input.trim().is_empty()
-            && !has_confident_match
-            && !handler_results.iter().any(|r| {
-                r.icon_path.as_deref() == Some("__web__") || r.label.starts_with("Search web:")
-            })
-            && let Some(web) = self.registry.get("web")
-        {
-            let q = input.trim();
-            let ask_row = self.has_ai().then(|| {
-                CompletionItem::new(format!("Ask AI: {q}"), Some("__none__".into()), 101)
-                    .with_run(format!("ask {q}"))
-                    .with_description("Enter to get an AI answer")
-            });
-            let web_rows = web.completions(input).await;
+        // NOTE: inline "Ask AI: …" / "Search web: …" fallback rows were REMOVED
+        // for routing consistency (Raycast/Alfred standard: fallbacks are never
+        // auto-selectable competitors). They used to be injected here for a
+        // no-match query and auto-selected, so Enter on a question ran whichever
+        // fallback frecency floated up — competing with the single input
+        // classifier and producing inconsistent/no responses. Routing for a
+        // natural-language query is now decided in ONE place (`intent::classify`
+        // → agent vs. the fork card), and the fork card itself already offers
+        // Search-web / Full-chat. So these rows were pure redundancy.
 
-            // Order the two escape hatches by LEARNED preference: whichever the
-            // user picks more (frecency, `fallback:ask` vs `fallback:web`) leads.
-            // Default when unlearned keeps Ask AI first (the richer answer). This
-            // is the frecency principle applied to the fallback choice itself — if
-            // you keep choosing Search web, it starts appearing first.
-            let ask_score = crate::db::frecency::get_fallback_score(&self.db, "ask");
-            let web_score = crate::db::frecency::get_fallback_score(&self.db, "web");
-            let web_preferred = web_score > ask_score;
-
-            let mut out = Vec::new();
-            if web_preferred {
-                out.extend(web_rows);
-                out.extend(ask_row);
-            } else {
-                out.extend(ask_row);
-                out.extend(web_rows);
-            }
-            // Re-stamp scores so the frontend's score-sort preserves this order
-            // (higher = earlier), regardless of the rows' intrinsic scores.
-            for (i, row) in out.iter_mut().enumerate() {
-                row.score = (200 - i.min(199)) as u16;
-            }
-            out
-        } else {
-            Vec::new()
-        };
-
-        // Get history completions (deduplicated against handler results)
+        // Inline history recall was removed for UX consistency: past raw command
+        // strings no longer appear as a separate typed-suggestion section. Recall
+        // lives in ONE place — the dedicated History panel (plus zero-state recents
+        // on an empty box). Typed suggestions now show real, frecency-ranked
+        // results only, matching the Raycast/Alfred single-list model. See the
+        // `submit-router` decider + `defaultMatchIndex` on the frontend, which now
+        // always auto-select the top real row.
         let trimmed = raw.trim();
-        let mut history_results = Vec::new();
-        if !trimmed.is_empty() {
-            for hist in self.history.fuzzy_search(&self.db, trimmed) {
-                if !handler_results.iter().any(|r| r.label == hist.label) {
-                    history_results.push(hist);
-                }
-            }
-        }
 
         // Omnibox-style blend: learned/contextual commands matching the typed
         // input rank alongside handler completions (capped at 2 by the engine).
@@ -998,18 +949,13 @@ impl Executor {
                 .collect();
             if !context_matches.is_empty() {
                 self.note_suggestions(&context_matches);
-                history_results.retain(|h| !context_matches.iter().any(|c| c.label == h.label));
             }
         }
 
-        // Build sectioned output: handler results first, then separator, then history
-        if !handler_results.is_empty()
-            || !history_results.is_empty()
-            || !web_fallback.is_empty()
-            || !context_matches.is_empty()
-        {
+        // Build output: context matches lead, then handler results.
+        // (Inline history + fallback rows were removed — see the notes above.)
+        if !handler_results.is_empty() || !context_matches.is_empty() {
             handler_results.truncate(5);
-            history_results.truncate(3);
             // Context matches lead the handler section — they carry learned
             // per-context ranking that generic completions can't.
             handler_results.splice(0..0, context_matches);
@@ -1050,24 +996,7 @@ impl Executor {
                 }
             }
 
-            let mut out = handler_results;
-
-            if !history_results.is_empty() && !out.is_empty() {
-                // Insert separator between sections
-                out.push(CompletionItem {
-                    label: "history".to_string(),
-                    icon_path: Some("__separator__".to_string()),
-                    score: 0,
-                    description: None,
-                    reason: None,
-                    thumb_b64: None,
-                    ..Default::default()
-                });
-            }
-
-            out.extend(history_results);
-            out.extend(web_fallback);
-            return out;
+            return handler_results;
         }
 
         // Fallback: if a matched handler (not "open" or "web") returned nothing, try app search.
@@ -1104,6 +1033,45 @@ impl Executor {
     /// Whether AI is available.
     pub fn has_ai(&self) -> bool {
         self.resolver.has_ai()
+    }
+
+    /// Classify a raw input string into a [`RouteDecision`] — the SINGLE source of
+    /// truth the frontend actuates on Enter. Folds the executor-owned side-channels
+    /// (user Script Commands, bang shortcuts) BEFORE the general classifier, in the
+    /// same priority order `run_inner` dispatches them, so a script/bang keyword
+    /// classifies as a `Command` the frontend runs verbatim. Everything else
+    /// delegates to [`crate::intent::classify::classify_string`] (the one place
+    /// command/NL/preset/panel/typo grading lives).
+    pub fn classify(&self, raw: &str) -> crate::intent::classify::RouteDecision {
+        use crate::intent::classify::{RouteDecision, classify_string};
+
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return RouteDecision::Nl {
+                prompt: String::new(),
+                confident: false,
+            };
+        }
+
+        // User Script Commands and bang shortcuts win over the general router
+        // (highest intent), exactly as in `run_inner`. Both run verbatim.
+        if self.script_route(trimmed).is_some() || self.bang_route(trimmed).is_some() {
+            return RouteDecision::Command {
+                command: trimmed.to_string(),
+            };
+        }
+
+        // Preset keyword lookup, injected so the classifier stays IO-free.
+        let db = self.db.clone();
+        let preset_for = |keyword: &str| {
+            crate::ai_presets::store::AiPresetsStore::new()
+                .get_preset_by_keyword(&db, keyword)
+                .ok()
+                .flatten()
+                .map(|p| (p.template, p.name))
+        };
+
+        classify_string(trimmed, &self.registry, preset_for, self.has_ai())
     }
 
     /// Refresh environment context (call on summon).
@@ -1421,19 +1389,13 @@ mod tests {
 
     #[test]
     fn expand_at_strips_reference_on_absolute_path() {
-        assert_eq!(
-            expand_at_references("open @/tmp/a.png"),
-            "open /tmp/a.png"
-        );
+        assert_eq!(expand_at_references("open @/tmp/a.png"), "open /tmp/a.png");
     }
 
     #[test]
     fn expand_at_leaves_email_and_bare_at_untouched() {
         // `@` mid-token (email) is not a token-leading reference.
-        assert_eq!(
-            expand_at_references("mail foo@bar.com"),
-            "mail foo@bar.com"
-        );
+        assert_eq!(expand_at_references("mail foo@bar.com"), "mail foo@bar.com");
         // A leading `@` not followed by a path-like char is left as-is.
         assert_eq!(expand_at_references("say @ hi"), "say @ hi");
     }
@@ -1637,7 +1599,10 @@ mod tests {
             first.envelope.needs_confirmation.is_some(),
             "should require confirmation"
         );
-        assert!(!executed.load(Ordering::SeqCst), "must not run before confirm");
+        assert!(
+            !executed.load(Ordering::SeqCst),
+            "must not run before confirm"
+        );
         let pending = first.pending_intent.expect("captured pending intent");
         assert_eq!(pending.action_id, "danger");
 
@@ -1744,7 +1709,10 @@ mod tests {
 
         let privacy = PrivacyConfig::default();
         let inputs = RunInputs::default();
-        let res = ex.run("ctxrisk go", false, &privacy, &inputs).await.unwrap();
+        let res = ex
+            .run("ctxrisk go", false, &privacy, &inputs)
+            .await
+            .unwrap();
 
         assert!(
             saw_tmp.load(Ordering::SeqCst),
@@ -1791,13 +1759,10 @@ mod tests {
 
         let h1 = SlowExclusive;
         let h2 = SlowExclusive;
-        let (r1, r2) = tokio::join!(
-            async { ex.gate.run(&h1, &ctx, "a").await },
-            async {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                ex.gate.run(&h2, &ctx, "b").await
-            },
-        );
+        let (r1, r2) = tokio::join!(async { ex.gate.run(&h1, &ctx, "a").await }, async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            ex.gate.run(&h2, &ctx, "b").await
+        },);
         let (res1, busy1) = r1.unwrap();
         let (res2, busy2) = r2.unwrap();
         assert!(!busy1 && res1.success, "first exclusive runs");
@@ -1854,7 +1819,10 @@ mod tests {
             },
         );
         assert!(!r1.unwrap().busy, "first run not busy");
-        assert!(r2.unwrap().busy, "second run surfaces busy on ExecuteResult");
+        assert!(
+            r2.unwrap().busy,
+            "second run surfaces busy on ExecuteResult"
+        );
     }
 
     /// Always returns success: false — simulates app-not-found soft failure
@@ -2002,9 +1970,13 @@ mod tests {
         assert!(!(routing != RoutingMethod::Ai)); // i.e. guard is false → no fallback
     }
 
-    /// 6. Completions: "Search web: …" item is always present for a NoMatch input
+    /// 6. Completions: a NoMatch natural-language query surfaces NO inline
+    /// "Ask AI:" / "Search web:" fallback rows. Those were removed for routing
+    /// consistency (Raycast/Alfred standard) — NL routing is decided by the
+    /// single classifier (`intent::classify`) and the fork card, not by an
+    /// auto-selectable completion row that competes with it.
     #[tokio::test]
-    async fn completions_web_always_visible_for_no_match() {
+    async fn completions_no_inline_fallback_rows_for_no_match() {
         let ex = make_executor(registry_open_fails());
         let completions = ex
             .completions(
@@ -2012,12 +1984,12 @@ mod tests {
                 &crate::config::schema::SuggestionsConfig::default(),
             )
             .await;
-        let has_web = completions
+        let has_fallback = completions
             .iter()
-            .any(|c| c.label.starts_with("Search web:"));
+            .any(|c| c.label.starts_with("Search web:") || c.label.starts_with("Ask AI:"));
         assert!(
-            has_web,
-            "expected a 'Search web:' completion item, got: {completions:?}"
+            !has_fallback,
+            "expected NO inline fallback rows for a no-match query, got: {completions:?}"
         );
     }
 

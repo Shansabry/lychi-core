@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, ExecContext};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext,
+};
 use crate::error::LychiError;
 
 const YOUTUBE_SEARCH_URL: &str = "https://www.youtube.com/results?search_query=";
@@ -33,6 +35,9 @@ impl ActionHandler for YouTube {
 
     fn description(&self) -> &str {
         "Search YouTube in your default browser"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Web
     }
 
     async fn completions(&self, partial: &str) -> Vec<CompletionItem> {

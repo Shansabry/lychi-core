@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use std::sync::RwLock;
 use std::time::Instant;
 
-use crate::action_registry::{ActionHandler, ActionResult, OutputType, RiskLevel};
+use crate::action_registry::{ActionHandler, ActionResult, CommandCategory, OutputType, RiskLevel};
 use crate::error::LychiError;
 
 /// Captured environment from the user's interactive login shell. A pure lazy
@@ -44,7 +44,7 @@ pub(crate) enum Clearance {
 /// Returns `Err` (surfaced as a failed `ActionResult`) when execution is not
 /// authorized.
 fn check_shell_authorization(cmd: &str, clearance: Clearance) -> Result<(), LychiError> {
-    use crate::rules::shell::{authorize, ShellDecision};
+    use crate::rules::shell::{ShellDecision, authorize};
     match authorize(cmd) {
         ShellDecision::Allow => Ok(()),
         ShellDecision::Confirm { reason } if clearance == Clearance::UserConfirmed => {
@@ -762,6 +762,9 @@ impl ActionHandler for ShellExec {
 
     fn description(&self) -> &str {
         "Execute a shell command"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Developer
     }
 
     fn default_risk(&self) -> RiskLevel {

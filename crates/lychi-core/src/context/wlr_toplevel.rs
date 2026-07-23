@@ -219,9 +219,7 @@ mod imp {
         let target = state
             .toplevels
             .iter()
-            .find(|(_, e)| {
-                !e.closed && e.app_id.eq_ignore_ascii_case(app_id) && e.title == title
-            })
+            .find(|(_, e)| !e.closed && e.app_id.eq_ignore_ascii_case(app_id) && e.title == title)
             .map(|(id, _)| id.clone())
             .ok_or("Window no longer exists")?;
 

@@ -382,7 +382,10 @@ impl std::fmt::Display for TerminalSource {
 /// says.
 #[cfg(target_os = "linux")]
 pub fn is_wayland() -> bool {
-    if std::env::var("XDG_SESSION_TYPE").map(|v| v == "wayland").unwrap_or(false) {
+    if std::env::var("XDG_SESSION_TYPE")
+        .map(|v| v == "wayland")
+        .unwrap_or(false)
+    {
         return true;
     }
     // Fallback: the Wayland display socket is set on any real Wayland session.

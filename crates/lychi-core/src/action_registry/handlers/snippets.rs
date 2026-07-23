@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use redb::Database;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::error::LychiError;
 use crate::snippets::store::SnippetsStore;
@@ -61,6 +61,9 @@ impl ActionHandler for SnippetsHandler {
 
     fn description(&self) -> &str {
         "Snippets — save and paste text blocks. Usage: snip <name> to paste, snip add <name> <body>, snip list, snip delete <name>, snip edit <name> <body>"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Utilities
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

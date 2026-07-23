@@ -36,6 +36,7 @@ import type {
 	PrivacyConfig,
 	ProjectsConfig,
 	ReminderItem,
+	RouteDecision,
 	ScratchItem,
 	SnippetItem,
 	TimerStatus,
@@ -88,6 +89,7 @@ export type {
 	ProjectsConfig,
 	ReminderItem,
 	RiskLevel,
+	RouteDecision,
 	ScratchItem,
 	SnippetItem,
 	TimerStatus,
@@ -229,6 +231,17 @@ export async function getHideOnBlur(): Promise<boolean> {
 export async function getCompletions(input: string): Promise<CompletionItem[]> {
 	if (!isTauri()) return [];
 	return unwrap(await commands.getCompletions(input));
+}
+
+/**
+ * Classify a raw input string into a typed routing decision — the SINGLE source
+ * of truth for "what does Enter do?". The frontend actuates the result verbatim
+ * (run a command, open a panel, go to the agent/fork card, fill a correction),
+ * never re-deriving command-vs-AI from its own keyword list.
+ */
+export async function classifyInput(input: string): Promise<RouteDecision | undefined> {
+	if (!isTauri()) return undefined;
+	return unwrap(await commands.classifyInput(input));
 }
 
 /**

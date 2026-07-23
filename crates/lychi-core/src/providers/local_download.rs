@@ -49,8 +49,7 @@ pub async fn download(
     on_progress: impl Fn(DownloadProgress),
 ) -> Result<(), LychiError> {
     let dir = paths::models_dir();
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| LychiError::Ai(format!("create models dir: {e}")))?;
+    std::fs::create_dir_all(&dir).map_err(|e| LychiError::Ai(format!("create models dir: {e}")))?;
 
     download_file(
         spec,
@@ -140,8 +139,7 @@ async fn download_file(
         tracing::warn!("[local-ai] {label} downloaded WITHOUT integrity check (hash not pinned)");
     }
 
-    std::fs::rename(&part, dest)
-        .map_err(|e| LychiError::Ai(format!("install {label}: {e}")))?;
+    std::fs::rename(&part, dest).map_err(|e| LychiError::Ai(format!("install {label}: {e}")))?;
 
     on_progress(DownloadProgress {
         model_id: spec.id.to_string(),
@@ -157,8 +155,7 @@ fn file_sha256(path: &Path) -> Result<String, LychiError> {
     let mut file =
         std::fs::File::open(path).map_err(|e| LychiError::Ai(format!("open for hash: {e}")))?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)
-        .map_err(|e| LychiError::Ai(format!("hash read: {e}")))?;
+    std::io::copy(&mut file, &mut hasher).map_err(|e| LychiError::Ai(format!("hash read: {e}")))?;
     Ok(format!("{:x}", hasher.finalize()))
 }
 

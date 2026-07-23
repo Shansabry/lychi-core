@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::error::LychiError;
 use crate::mpris::{MprisManager, PlaybackStatus, TrackInfo};
@@ -163,8 +163,15 @@ fn find_target(players: &[TrackInfo], target: Target) -> Option<&TrackInfo> {
     }
 }
 
-const MEDIA_SUBCOMMANDS: &[&str] =
-    &["play", "pause", "stop", "next", "prev", "toggle", "pause all"];
+const MEDIA_SUBCOMMANDS: &[&str] = &[
+    "play",
+    "pause",
+    "stop",
+    "next",
+    "prev",
+    "toggle",
+    "pause all",
+];
 
 fn media_completions(partial: &str) -> Vec<CompletionItem> {
     let lower = partial.to_lowercase();
@@ -344,6 +351,9 @@ impl ActionHandler for MediaHandler {
 
     fn description(&self) -> &str {
         "Media controls — play, pause, next, prev. Prefix with provider (spotify, yt) to target a specific player."
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Media
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

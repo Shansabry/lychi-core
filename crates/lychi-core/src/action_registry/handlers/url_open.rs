@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::action_registry::{ActionHandler, ActionResult, ExecContext};
+use crate::action_registry::{ActionHandler, ActionResult, CommandCategory, ExecContext};
 use crate::error::LychiError;
 
 pub struct UrlOpen;
@@ -40,6 +40,9 @@ impl ActionHandler for UrlOpen {
 
     fn description(&self) -> &str {
         "Open a URL in the default browser"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Web
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 
-use crate::action_registry::{ActionHandler, ActionResult, ExecContext, OutputType};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CommandCategory, ExecContext, OutputType,
+};
 use crate::error::LychiError;
 
 #[derive(Default)]
@@ -40,6 +42,9 @@ impl ActionHandler for BrowseHandler {
 
     fn description(&self) -> &str {
         "Browse files in a directory interactively"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Files
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

@@ -134,7 +134,10 @@ mod tests {
             authorize_path(Path::new("/home/\0/x")),
             PathDecision::Deny { .. }
         ));
-        assert!(matches!(authorize_path(Path::new("")), PathDecision::Deny { .. }));
+        assert!(matches!(
+            authorize_path(Path::new("")),
+            PathDecision::Deny { .. }
+        ));
     }
 
     #[test]

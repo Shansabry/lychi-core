@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use redb::Database;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::clipboard::store::ClipboardStore;
 use crate::error::LychiError;
@@ -64,6 +64,9 @@ impl ActionHandler for ClipboardHandler {
 
     fn description(&self) -> &str {
         "Browse and paste from clipboard history"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Utilities
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

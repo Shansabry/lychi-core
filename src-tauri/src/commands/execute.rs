@@ -361,6 +361,21 @@ pub async fn get_completions(
     Ok(results)
 }
 
+/// Classify a raw input string into a typed routing decision — the SINGLE source
+/// of truth for "what does Enter do?". The frontend actuates the result verbatim
+/// (run a command, open a panel, go to the agent/fork card, fill a correction),
+/// never re-deriving command-vs-AI from its own keyword list. Local + instant
+/// (reuses the pattern router, prefix index, presets, and typo suggester).
+#[tauri::command]
+#[specta::specta]
+pub async fn classify_input(
+    input: String,
+    state: State<'_, AppState>,
+) -> Result<lychi_core::intent::classify::RouteDecision, LychiError> {
+    let executor = state.executor.read().await;
+    Ok(executor.classify(&input))
+}
+
 /// A "Did you mean: X?" correction for a near-miss input (e.g. an app-name typo
 /// "spoti" → "open Spotify"), or `None`. Called on Enter for a single unknown
 /// word BEFORE falling to the AI, so a fat-fingered app name is corrected

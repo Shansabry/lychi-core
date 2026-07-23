@@ -57,6 +57,7 @@ pub fn run() {
             commands::execute::execute_command,
             commands::execute::confirm_execution,
             commands::execute::get_completions,
+            commands::execute::classify_input,
             commands::execute::suggest_correction,
             commands::execute::get_command_catalog,
             commands::execute::get_trigger_catalog,
@@ -309,7 +310,7 @@ pub fn run() {
             });
 
             // Subscribe config reactors to the event bus (state-change fan-out).
-            app.state::<state::AppState>().wire_reactors();
+            app.state::<state::AppState>().wire_reactors(app.handle().clone());
 
             // Warm alias cache for transparent alias resolution in router
             let alias_db = app.state::<state::AppState>().db.clone();

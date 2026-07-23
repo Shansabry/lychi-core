@@ -438,8 +438,8 @@ fn detect_stack_wlr() -> Vec<WindowContext> {
                 is_ide: false, // stack scan only cares about terminals
                 title: w.title,
                 wm_class,
-                pid: 0,            // foreign-toplevel exposes no pid
-                window_id: None,   // no stable cross-connection id
+                pid: 0,          // foreign-toplevel exposes no pid
+                window_id: None, // no stable cross-connection id
             }
         })
         .collect()

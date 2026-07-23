@@ -5,7 +5,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::error::LychiError;
 
@@ -72,6 +72,9 @@ impl ActionHandler for SysInfoHandler {
 
     fn description(&self) -> &str {
         "System info — ip, cpu, mem, disk, temp, gpu, battery, net, audio, display, os"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::System
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
@@ -1065,7 +1068,10 @@ mod tests {
         assert_eq!(format_uptime(3600), "up 1 hour");
         assert_eq!(format_uptime(3660), "up 1 hour, 1 minute");
         assert_eq!(format_uptime(90000), "up 1 day, 1 hour");
-        assert_eq!(format_uptime(2 * 86400 + 3 * 3600 + 12 * 60), "up 2 days, 3 hours, 12 minutes");
+        assert_eq!(
+            format_uptime(2 * 86400 + 3 * 3600 + 12 * 60),
+            "up 2 days, 3 hours, 12 minutes"
+        );
     }
 
     #[test]

@@ -24,8 +24,9 @@ impl Config {
         let mut base = toml::Value::try_from(Config::default())
             .map_err(|e| LychiError::Config(format!("serializing default config: {e}")))?;
         merge_toml(&mut base, user);
-        let mut config: Config =
-            base.try_into().map_err(|e| LychiError::Config(e.to_string()))?;
+        let mut config: Config = base
+            .try_into()
+            .map_err(|e| LychiError::Config(e.to_string()))?;
 
         // Drop any search-engine keyword that collides with a reserved command
         // (e.g. a hand-edited `open = "..."`) so it can't shadow a real command.

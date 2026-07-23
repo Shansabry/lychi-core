@@ -30,10 +30,7 @@ impl Session {
     /// A fresh session seeded with a system prompt + the first user message.
     pub fn new(system: impl Into<String>, first_user: impl Into<String>) -> Self {
         Self {
-            messages: vec![
-                ChatMessage::system(system),
-                ChatMessage::user(first_user),
-            ],
+            messages: vec![ChatMessage::system(system), ChatMessage::user(first_user)],
             pending: Vec::new(),
         }
     }
@@ -136,7 +133,10 @@ mod tests {
 
     #[test]
     fn set_system_inserts_when_no_leading_system() {
-        let mut s = Session { messages: vec![ChatMessage::user("hi")], pending: Vec::new() };
+        let mut s = Session {
+            messages: vec![ChatMessage::user("hi")],
+            pending: Vec::new(),
+        };
         s.set_system("sys");
         assert_eq!(s.messages[0].role, Role::System);
         assert_eq!(s.messages[0].content, "sys");

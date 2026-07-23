@@ -12,7 +12,8 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, RiskAssessment, RiskLevel,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, RiskAssessment,
+    RiskLevel,
 };
 use crate::error::LychiError;
 use crate::script_commands::{ScriptCommand, ScriptMode};
@@ -34,7 +35,10 @@ pub struct ScriptCommandsHandler {
 
 impl ScriptCommandsHandler {
     pub fn new(scripts: Vec<ScriptCommand>, shell: String) -> Self {
-        let scripts = scripts.into_iter().map(|s| (s.keyword.clone(), s)).collect();
+        let scripts = scripts
+            .into_iter()
+            .map(|s| (s.keyword.clone(), s))
+            .collect();
         Self { scripts, shell }
     }
 
@@ -78,11 +82,18 @@ impl ActionHandler for ScriptCommandsHandler {
     fn description(&self) -> &str {
         "Run a Script Command from ~/.config/lychi/scripts/"
     }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Developer
+    }
 
     // User-authored scripts in the user's own scripts dir auto-run by default
     // (an authored-intent boundary like a shell alias). A script can opt into a
     // confirmation with `# @lychi.risk medium`.
-    fn assess_risk(&self, args: &str, _ctx: &crate::action_registry::RiskContext<'_>) -> RiskAssessment {
+    fn assess_risk(
+        &self,
+        args: &str,
+        _ctx: &crate::action_registry::RiskContext<'_>,
+    ) -> RiskAssessment {
         match self.resolve(args) {
             Some((cmd, _)) if cmd.confirm => RiskAssessment {
                 level: RiskLevel::Medium,
@@ -150,7 +161,9 @@ impl ActionHandler for ScriptCommandsHandler {
         let mut items: Vec<CompletionItem> = self
             .scripts
             .values()
-            .filter(|s| p.is_empty() || s.keyword.starts_with(&p) || s.title.to_lowercase().contains(&p))
+            .filter(|s| {
+                p.is_empty() || s.keyword.starts_with(&p) || s.title.to_lowercase().contains(&p)
+            })
             .map(|s| CompletionItem {
                 label: s.keyword.clone(),
                 icon_path: Some("__custom__".into()),
@@ -189,7 +202,8 @@ mod tests {
 
     #[test]
     fn resolve_splits_keyword_and_args() {
-        let h = ScriptCommandsHandler::new(vec![cmd("deploy", ScriptMode::Inline)], "/bin/sh".into());
+        let h =
+            ScriptCommandsHandler::new(vec![cmd("deploy", ScriptMode::Inline)], "/bin/sh".into());
         let (c, args) = h.resolve("deploy prod --force").unwrap();
         assert_eq!(c.keyword, "deploy");
         assert_eq!(args, "prod --force");
@@ -197,7 +211,8 @@ mod tests {
 
     #[test]
     fn resolve_bare_keyword_no_args() {
-        let h = ScriptCommandsHandler::new(vec![cmd("backup", ScriptMode::Inline)], "/bin/sh".into());
+        let h =
+            ScriptCommandsHandler::new(vec![cmd("backup", ScriptMode::Inline)], "/bin/sh".into());
         let (c, args) = h.resolve("backup").unwrap();
         assert_eq!(c.keyword, "backup");
         assert_eq!(args, "");
@@ -229,15 +244,18 @@ mod tests {
     #[test]
     fn no_confirm_is_low_risk() {
         let h = ScriptCommandsHandler::new(vec![cmd("safe", ScriptMode::Inline)], "/bin/sh".into());
-        assert_eq!(h.assess_risk("safe", &Default::default()).level, RiskLevel::Low);
+        assert_eq!(
+            h.assess_risk("safe", &Default::default()).level,
+            RiskLevel::Low
+        );
     }
 
     // Build a real script file on disk and a handler wrapping it, so `execute`
     // resolves + assembles a genuine command line. Returns (handler, cleanup).
     fn script_on_disk(keyword: &str, confirm: bool) -> (ScriptCommandsHandler, PathBuf) {
         use std::io::Write;
-        let dir = std::env::temp_dir()
-            .join(format!("lychi-scripttest-{}-{keyword}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("lychi-scripttest-{}-{keyword}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join(format!("{keyword}.sh"));

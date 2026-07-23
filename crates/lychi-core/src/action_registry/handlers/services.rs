@@ -27,7 +27,8 @@ use std::process::Command;
 use async_trait::async_trait;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType, RiskAssessment, RiskLevel,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
+    RiskAssessment, RiskLevel,
 };
 use crate::error::LychiError;
 
@@ -252,6 +253,9 @@ impl ActionHandler for ServicesHandler {
     fn description(&self) -> &str {
         "Control systemd services: list, status, start/stop/restart"
     }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::System
+    }
 
     fn assess_risk(
         &self,
@@ -366,6 +370,9 @@ impl ActionHandler for ServicesListHandler {
     fn description(&self) -> &str {
         "List running systemd services"
     }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::System
+    }
 
     async fn execute(&self, _ctx: &ExecContext, _args: &str) -> Result<ActionResult, LychiError> {
         if !have("systemctl") {
@@ -396,11 +403,23 @@ mod tests {
     #[test]
     fn assess_risk_confirms_mutating_verbs_only() {
         let h = ServicesHandler::new();
-        assert_eq!(h.assess_risk("nginx restart", &Default::default()).level, RiskLevel::Medium);
-        assert_eq!(h.assess_risk("stop nginx", &Default::default()).level, RiskLevel::Medium);
+        assert_eq!(
+            h.assess_risk("nginx restart", &Default::default()).level,
+            RiskLevel::Medium
+        );
+        assert_eq!(
+            h.assess_risk("stop nginx", &Default::default()).level,
+            RiskLevel::Medium
+        );
         // read-only → auto-execute
-        assert_eq!(h.assess_risk("nginx", &Default::default()).level, RiskLevel::Low);
-        assert_eq!(h.assess_risk("nginx status", &Default::default()).level, RiskLevel::Low);
+        assert_eq!(
+            h.assess_risk("nginx", &Default::default()).level,
+            RiskLevel::Low
+        );
+        assert_eq!(
+            h.assess_risk("nginx status", &Default::default()).level,
+            RiskLevel::Low
+        );
     }
 
     #[test]

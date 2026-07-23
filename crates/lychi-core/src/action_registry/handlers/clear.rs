@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use redb::Database;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::clipboard::store::ClipboardStore;
 use crate::db::frecency;
@@ -61,6 +61,9 @@ impl ActionHandler for ClearHandler {
 
     fn description(&self) -> &str {
         "Clear history, clipboard, or learned suggestions"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Utilities
     }
 
     /// Every clear is irreversible, so the Rules Engine asks for confirmation

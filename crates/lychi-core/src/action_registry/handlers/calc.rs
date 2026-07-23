@@ -8,7 +8,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::error::LychiError;
 
@@ -90,6 +90,9 @@ impl ActionHandler for CalcHandler {
 
     fn description(&self) -> &str {
         "Evaluate math expressions, unit conversions, and currency conversions"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Utilities
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

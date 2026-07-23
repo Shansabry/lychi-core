@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use redb::Database;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::error::LychiError;
 use crate::notes::store::{MAX_NOTES, NotesStore};
@@ -57,6 +57,9 @@ impl ActionHandler for NotesHandler {
 
     fn description(&self) -> &str {
         "Notes — add, list, or delete notes. Usage: note <text> to add, note read to list, note delete <id> to remove"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Utilities
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
@@ -188,6 +191,9 @@ impl ActionHandler for TodoHandler {
 
     fn description(&self) -> &str {
         "Todo list — add, list, check off, or delete items. Usage: todo add <text>, todo list, todo done <id>, todo delete <id>"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Utilities
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

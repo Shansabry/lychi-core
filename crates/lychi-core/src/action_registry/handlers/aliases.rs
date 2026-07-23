@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use redb::Database;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::aliases::store::{AliasesStore, MAX_ALIASES};
 use crate::error::LychiError;
@@ -36,6 +36,9 @@ impl ActionHandler for AliasHandler {
 
     fn description(&self) -> &str {
         "Aliases — save command shortcuts. Usage: alias add <name> <command>, alias list, alias delete <name>"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Utilities
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

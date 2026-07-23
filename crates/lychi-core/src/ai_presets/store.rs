@@ -100,7 +100,9 @@ impl AiPresetsStore {
             )));
         }
         if template.is_empty() {
-            return Err(LychiError::AiPreset("Preset template cannot be empty".into()));
+            return Err(LychiError::AiPreset(
+                "Preset template cannot be empty".into(),
+            ));
         }
         if template.len() > MAX_TEMPLATE {
             return Err(LychiError::AiPreset(format!(
@@ -170,7 +172,9 @@ impl AiPresetsStore {
             )));
         }
         if template.is_empty() {
-            return Err(LychiError::AiPreset("Preset template cannot be empty".into()));
+            return Err(LychiError::AiPreset(
+                "Preset template cannot be empty".into(),
+            ));
         }
         if template.len() > MAX_TEMPLATE {
             return Err(LychiError::AiPreset(format!(
@@ -270,7 +274,9 @@ impl AiPresetsStore {
 fn normalize_keyword(keyword: &str) -> Result<String, LychiError> {
     let k = keyword.trim().to_lowercase();
     if k.is_empty() {
-        return Err(LychiError::AiPreset("Preset keyword cannot be empty".into()));
+        return Err(LychiError::AiPreset(
+            "Preset keyword cannot be empty".into(),
+        ));
     }
     if k.split_whitespace().count() != 1 {
         return Err(LychiError::AiPreset(
@@ -308,7 +314,9 @@ mod tests {
     fn keyword_normalized_lowercase() {
         let db = open_test_database();
         let store = AiPresetsStore::new();
-        store.add_preset(&db, "  TRans  ", "T", "x {input}").unwrap();
+        store
+            .add_preset(&db, "  TRans  ", "T", "x {input}")
+            .unwrap();
         assert!(store.get_preset_by_keyword(&db, "trans").unwrap().is_some());
         // Duplicate (case-insensitive) rejected.
         let err = store.add_preset(&db, "TRANS", "T2", "y").unwrap_err();

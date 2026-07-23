@@ -10,7 +10,7 @@ use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::error::LychiError;
 
@@ -391,6 +391,9 @@ impl ActionHandler for ProjectOpen {
 
     fn description(&self) -> &str {
         "Open a project folder in the code editor"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Files
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

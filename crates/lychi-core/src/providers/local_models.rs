@@ -72,8 +72,7 @@ pub const MODELS: &[ModelSpec] = &[
         description: "Fast, accurate router. Apache-2.0. The best all-round default.",
         size_label: "~1 GB",
         ram_label: "~2 GB RAM",
-        gguf_url:
-            "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+        gguf_url: "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
         gguf_sha256: "1adf0b11065d8ad2e8123ea110d1ec956dab4ab038eab665614adba04b6c3370",
         format: ChatFormat::ChatMl,
     },
@@ -84,8 +83,7 @@ pub const MODELS: &[ModelSpec] = &[
         description: "Top instruction-following at this size. Apache-2.0.",
         size_label: "~1.1 GB",
         ram_label: "~2 GB RAM",
-        gguf_url:
-            "https://huggingface.co/bartowski/SmolLM2-1.7B-Instruct-GGUF/resolve/main/SmolLM2-1.7B-Instruct-Q4_K_M.gguf",
+        gguf_url: "https://huggingface.co/bartowski/SmolLM2-1.7B-Instruct-GGUF/resolve/main/SmolLM2-1.7B-Instruct-Q4_K_M.gguf",
         gguf_sha256: "77665ea4815999596525c636fbeb56ba8b080b46ae85efef4f0d986a139834d7",
         format: ChatFormat::ChatMl,
     },
@@ -96,8 +94,7 @@ pub const MODELS: &[ModelSpec] = &[
         description: "Best reasoning here; needs a stronger CPU. ~2 GB download.",
         size_label: "~2 GB",
         ram_label: "~4 GB RAM",
-        gguf_url:
-            "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+        gguf_url: "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
         gguf_sha256: "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff",
         format: ChatFormat::Llama3,
     },
@@ -117,9 +114,9 @@ pub fn format_prompt(format: ChatFormat, system: &str, user: &str) -> String {
              <|start_header_id|>user<|end_header_id|>\n\n{user}<|eot_id|>\
              <|start_header_id|>assistant<|end_header_id|>\n\n"
         ),
-        ChatFormat::Phi => format!(
-            "<|system|>\n{system}<|end|>\n<|user|>\n{user}<|end|>\n<|assistant|>\n"
-        ),
+        ChatFormat::Phi => {
+            format!("<|system|>\n{system}<|end|>\n<|user|>\n{user}<|end|>\n<|assistant|>\n")
+        }
         ChatFormat::ChatMl => format!(
             "<|im_start|>system\n{system}<|im_end|>\n\
              <|im_start|>user\n{user}<|im_end|>\n\

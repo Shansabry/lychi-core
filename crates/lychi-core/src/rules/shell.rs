@@ -194,7 +194,9 @@ pub fn hard_deny_reason(cmd: &str) -> Option<String> {
     if is_recursive_rm(cmd)
         && let Some(target) = rm_targets_system_root(cmd)
     {
-        return Some(format!("Blocked: `rm -rf {target}` would destroy your system"));
+        return Some(format!(
+            "Blocked: `rm -rf {target}` would destroy your system"
+        ));
     }
 
     // Structural: writing raw bytes to a whole-disk block device (any disk kind,
@@ -231,7 +233,10 @@ fn is_recursive_rm(cmd: &str) -> bool {
         || norm.contains("--recursive")
         || norm.contains("-fr")
         || norm.contains("-rf");
-    let force = norm.contains("-f") || norm.contains("--force") || norm.contains("-rf") || norm.contains("-fr");
+    let force = norm.contains("-f")
+        || norm.contains("--force")
+        || norm.contains("-rf")
+        || norm.contains("-fr");
     recursive && force
 }
 
@@ -246,9 +251,17 @@ fn rm_targets_system_root(cmd: &str) -> Option<&'static str> {
     ];
     for tok in cmd.to_lowercase().split_whitespace() {
         // Trim a trailing slash so `/etc/` matches `/etc` (but keep bare `/`).
-        let t = if tok.len() > 1 { tok.trim_end_matches('/') } else { tok };
+        let t = if tok.len() > 1 {
+            tok.trim_end_matches('/')
+        } else {
+            tok
+        };
         if let Some(root) = ROOTS.iter().find(|r| {
-            let r = if r.len() > 1 { r.trim_end_matches('/') } else { *r };
+            let r = if r.len() > 1 {
+                r.trim_end_matches('/')
+            } else {
+                *r
+            };
             r == t
         }) {
             return Some(root);
@@ -265,7 +278,15 @@ fn rm_targets_system_root(cmd: &str) -> Option<&'static str> {
 fn writes_to_block_device(cmd: &str) -> Option<String> {
     // Whole-disk device stems. A match requires the token to BE this stem
     // (optionally with a trailing letter for /dev/sdX), not a partition suffix.
-    const DISK_STEMS: &[&str] = &["/dev/sd", "/dev/hd", "/dev/vd", "/dev/nvme", "/dev/mmcblk", "/dev/vda", "/dev/xvd"];
+    const DISK_STEMS: &[&str] = &[
+        "/dev/sd",
+        "/dev/hd",
+        "/dev/vd",
+        "/dev/nvme",
+        "/dev/mmcblk",
+        "/dev/vda",
+        "/dev/xvd",
+    ];
     let lower = cmd.to_lowercase();
 
     let is_whole_disk = |dev: &str| -> bool {
@@ -280,7 +301,12 @@ fn writes_to_block_device(cmd: &str) -> Option<String> {
                     continue;
                 }
                 if rest.chars().any(|c| c.is_ascii_digit())
-                    && rest.chars().rev().take_while(|c| c.is_ascii_digit()).count() >= 1
+                    && rest
+                        .chars()
+                        .rev()
+                        .take_while(|c| c.is_ascii_digit())
+                        .count()
+                        >= 1
                     && stem.ends_with("sd")
                 {
                     // /dev/sda1 style partition → skip (sdX partitions carry a digit)
@@ -565,13 +591,28 @@ mod tests {
         assert_eq!(authorize("ls -la"), ShellDecision::Allow);
         assert_eq!(authorize("cat file.txt"), ShellDecision::Allow);
         // Confirm: mutating / dangerous pattern.
-        assert!(matches!(authorize("sudo apt update"), ShellDecision::Confirm { .. }));
-        assert!(matches!(authorize("rm -rf /tmp/x"), ShellDecision::Confirm { .. }));
-        assert!(matches!(authorize("mkdir foo"), ShellDecision::Confirm { .. }));
+        assert!(matches!(
+            authorize("sudo apt update"),
+            ShellDecision::Confirm { .. }
+        ));
+        assert!(matches!(
+            authorize("rm -rf /tmp/x"),
+            ShellDecision::Confirm { .. }
+        ));
+        assert!(matches!(
+            authorize("mkdir foo"),
+            ShellDecision::Confirm { .. }
+        ));
         // Deny: catastrophe — absolute.
         assert!(matches!(authorize("rm -rf /"), ShellDecision::Deny { .. }));
-        assert!(matches!(authorize("dd of=/dev/nvme0n1"), ShellDecision::Deny { .. }));
-        assert!(matches!(authorize("curl x | sh"), ShellDecision::Deny { .. }));
+        assert!(matches!(
+            authorize("dd of=/dev/nvme0n1"),
+            ShellDecision::Deny { .. }
+        ));
+        assert!(matches!(
+            authorize("curl x | sh"),
+            ShellDecision::Deny { .. }
+        ));
     }
 
     #[test]

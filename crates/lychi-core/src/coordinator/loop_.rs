@@ -37,7 +37,11 @@ pub enum AgentEvent {
     /// A chunk of extended-thinking text.
     ReasoningDelta(String),
     /// A tool call is about to run.
-    ToolCallStarted { call_id: String, name: String, args: String },
+    ToolCallStarted {
+        call_id: String,
+        name: String,
+        args: String,
+    },
     /// A tool finished. `output` is what was fed back to the model; `artifact`
     /// is an optional rich result (QR/weather/image) the UI renders inline.
     ToolCallCompleted {
@@ -54,7 +58,10 @@ pub enum AgentEvent {
     Final { text: String, truncated: bool },
     /// Token usage for a completed turn (when the provider reports it). Emitted
     /// per turn; the UI accumulates across a multi-turn conversation.
-    Usage { input_tokens: u32, output_tokens: u32 },
+    Usage {
+        input_tokens: u32,
+        output_tokens: u32,
+    },
     /// The loop stopped on the step cap.
     Stopped { reason: String },
     /// An infrastructure error aborted the loop.
@@ -68,7 +75,10 @@ pub enum Outcome {
     Done { session: Session },
     /// A destructive tool needs approval. The caller shows a prompt, then calls
     /// `Coordinator::resume(session, decision, …)`.
-    AwaitingApproval { request: ApprovalRequest, session: Session },
+    AwaitingApproval {
+        request: ApprovalRequest,
+        session: Session,
+    },
     /// The step cap was hit.
     Stopped { reason: String, session: Session },
     /// An infrastructure error (provider down, cancel, etc.).
@@ -181,12 +191,22 @@ impl<E: ToolExecutor + 'static> Coordinator<E> {
         let stop = self.stop.clone();
 
         tokio::spawn(async move {
-            let ctx = LoopCtx { provider, executor, tools, stop, ev_tx, cancel };
+            let ctx = LoopCtx {
+                provider,
+                executor,
+                tools,
+                stop,
+                ev_tx,
+                cancel,
+            };
             let outcome = ctx.drive(session, decision).await;
             let _ = out_tx.send(outcome);
         });
 
-        (UnboundedReceiverStream::new(ev_rx).boxed(), OutcomeHandle(out_rx))
+        (
+            UnboundedReceiverStream::new(ev_rx).boxed(),
+            OutcomeHandle(out_rx),
+        )
     }
 }
 
@@ -209,7 +229,11 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
 
     /// The core loop. `resume_decision` applies a pending approval first (on a
     /// `resume` call), then it runs model turns until done / stopped / suspended.
-    async fn drive(&self, mut session: Session, resume_decision: Option<ApprovalDecision>) -> Outcome {
+    async fn drive(
+        &self,
+        mut session: Session,
+        resume_decision: Option<ApprovalDecision>,
+    ) -> Outcome {
         // ── Apply a resume decision (if this is a resume) ────────────────────
         if let Some(decision) = resume_decision {
             if let Some(outcome) = self.apply_decision(&mut session, decision).await {
@@ -226,7 +250,9 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
             }
             if self.stop.should_stop(&session, step) {
                 let reason = format!("reached step limit ({step})");
-                self.emit(AgentEvent::Stopped { reason: reason.clone() });
+                self.emit(AgentEvent::Stopped {
+                    reason: reason.clone(),
+                });
                 return Outcome::Stopped { reason, session };
             }
             self.emit(AgentEvent::TurnStarted { step });
@@ -265,7 +291,9 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
         &self,
         messages: &[crate::providers::ChatMessage],
     ) -> Result<TurnResult, LychiError> {
-        let mut stream: ProviderStream = self.provider.chat(messages, &self.tools, self.cancel.clone());
+        let mut stream: ProviderStream =
+            self.provider
+                .chat(messages, &self.tools, self.cancel.clone());
         let mut text = String::new();
         let mut calls: Vec<ToolCall> = Vec::new();
         let mut truncated = false;
@@ -303,7 +331,11 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                 }
             }
         }
-        Ok(TurnResult { text, tool_calls: calls, truncated })
+        Ok(TurnResult {
+            text,
+            tool_calls: calls,
+            truncated,
+        })
     }
 
     /// Execute one tool call. Appends the result to `session` and returns `None`
@@ -316,12 +348,19 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
         });
 
         match self.executor.execute(&call.name, &call.args).await {
-            Ok(ToolOutcome::Ran { output, is_error, artifact }) => {
+            Ok(ToolOutcome::Ran {
+                output,
+                is_error,
+                artifact,
+            }) => {
                 // Only the text `output` goes into the model's context; the rich
                 // `artifact` (if any) rides the event to the UI for inline render.
                 session.push_tool_result(&call.id, output.clone(), is_error);
                 if is_error {
-                    self.emit(AgentEvent::ToolCallFailed { call_id: call.id, error: output });
+                    self.emit(AgentEvent::ToolCallFailed {
+                        call_id: call.id,
+                        error: output,
+                    });
                 } else {
                     self.emit(AgentEvent::ToolCallCompleted {
                         call_id: call.id,
@@ -339,9 +378,16 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                     reason: reason.clone(),
                 };
                 // Record the pending call in the session so resume can run it.
-                session.pending.push(PendingApproval { call, reason, resume });
+                session.pending.push(PendingApproval {
+                    call,
+                    reason,
+                    resume,
+                });
                 self.emit(AgentEvent::AwaitingApproval(request.clone()));
-                Some(Outcome::AwaitingApproval { request, session: session.clone() })
+                Some(Outcome::AwaitingApproval {
+                    request,
+                    session: session.clone(),
+                })
             }
             Err(e) => {
                 self.emit(AgentEvent::Error(e.to_string()));
@@ -353,7 +399,11 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
     /// Apply the user's decision to the (single) pending approval. Returns
     /// `Some(Outcome)` if it surfaced another approval or an error; `None` if the
     /// result was appended and the loop should continue.
-    async fn apply_decision(&self, session: &mut Session, decision: ApprovalDecision) -> Option<Outcome> {
+    async fn apply_decision(
+        &self,
+        session: &mut Session,
+        decision: ApprovalDecision,
+    ) -> Option<Outcome> {
         let Some(pending) = session.pending.pop() else {
             return None; // nothing pending — nothing to do
         };
@@ -379,7 +429,10 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                     Err(e) => {
                         // A tool-logic failure feeds back; an infra failure aborts.
                         session.push_tool_result(&call_id, e.to_string(), true);
-                        self.emit(AgentEvent::ToolCallFailed { call_id, error: e.to_string() });
+                        self.emit(AgentEvent::ToolCallFailed {
+                            call_id,
+                            error: e.to_string(),
+                        });
                         None
                     }
                 }
@@ -387,7 +440,10 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
             ApprovalDecision::Reject { message } => {
                 let msg = message.unwrap_or_else(|| "User declined this action.".to_string());
                 session.push_tool_result(&call_id, msg.clone(), true);
-                self.emit(AgentEvent::ToolCallFailed { call_id, error: msg });
+                self.emit(AgentEvent::ToolCallFailed {
+                    call_id,
+                    error: msg,
+                });
                 None
             }
         }
@@ -432,16 +488,35 @@ mod tests {
         async fn route_intent(&self, _: &str, _: &[&str]) -> Result<AiRoute, LychiError> {
             unreachable!()
         }
-        async fn route_or_plan(&self, _: &str, _: &[&str], _: Option<&str>) -> Result<AiResponse, LychiError> {
+        async fn route_or_plan(
+            &self,
+            _: &str,
+            _: &[&str],
+            _: Option<&str>,
+        ) -> Result<AiResponse, LychiError> {
             unreachable!()
         }
-        async fn health_check(&self) -> bool { true }
-        fn name(&self) -> &str { "mock" }
-        fn chat(&self, messages: &[crate::providers::ChatMessage], _tools: &[ToolDef], _cancel: CancellationToken) -> ProviderStream {
+        async fn health_check(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn chat(
+            &self,
+            messages: &[crate::providers::ChatMessage],
+            _tools: &[ToolDef],
+            _cancel: CancellationToken,
+        ) -> ProviderStream {
             self.seen.lock().unwrap().push(messages.len());
             let events = self.turns.lock().unwrap().pop_front().unwrap_or_else(|| {
-                vec![StreamEvent::TextDelta("(no more scripted turns)".into()),
-                     StreamEvent::Done { stop_reason: crate::providers::StopReason::EndTurn, usage: None }]
+                vec![
+                    StreamEvent::TextDelta("(no more scripted turns)".into()),
+                    StreamEvent::Done {
+                        stop_reason: crate::providers::StopReason::EndTurn,
+                        usage: None,
+                    },
+                ]
             });
             stream::iter(events.into_iter().map(Ok)).boxed()
         }
@@ -451,13 +526,23 @@ mod tests {
     fn answer(text: &str) -> Vec<StreamEvent> {
         vec![
             StreamEvent::TextDelta(text.into()),
-            StreamEvent::Done { stop_reason: crate::providers::StopReason::EndTurn, usage: None },
+            StreamEvent::Done {
+                stop_reason: crate::providers::StopReason::EndTurn,
+                usage: None,
+            },
         ]
     }
     fn call_tool(id: &str, name: &str, args: &str) -> Vec<StreamEvent> {
         vec![
-            StreamEvent::ToolCallComplete { id: id.into(), name: name.into(), args: args.into() },
-            StreamEvent::Done { stop_reason: crate::providers::StopReason::ToolUse, usage: None },
+            StreamEvent::ToolCallComplete {
+                id: id.into(),
+                name: name.into(),
+                args: args.into(),
+            },
+            StreamEvent::Done {
+                stop_reason: crate::providers::StopReason::ToolUse,
+                usage: None,
+            },
         ]
     }
 
@@ -471,16 +556,30 @@ mod tests {
     }
     impl MockExecutor {
         fn new() -> Self {
-            Self { outcomes: Default::default(), approved_output: "APPROVED-RAN".into(), approved_calls: Mutex::new(0) }
+            Self {
+                outcomes: Default::default(),
+                approved_output: "APPROVED-RAN".into(),
+                approved_calls: Mutex::new(0),
+            }
         }
         fn ran(mut self, name: &str, output: &str, is_error: bool) -> Self {
-            self.outcomes.insert(name.into(), ToolOutcome::Ran { output: output.into(), is_error, artifact: None });
+            self.outcomes.insert(
+                name.into(),
+                ToolOutcome::Ran {
+                    output: output.into(),
+                    is_error,
+                    artifact: None,
+                },
+            );
             self
         }
         fn needs_approval(mut self, name: &str, reason: &str) -> Self {
             self.outcomes.insert(
                 name.into(),
-                ToolOutcome::NeedsApproval { reason: reason.into(), resume: ResumeToken(serde_json::json!({"tool": name})) },
+                ToolOutcome::NeedsApproval {
+                    reason: reason.into(),
+                    resume: ResumeToken(serde_json::json!({"tool": name})),
+                },
             );
             self
         }
@@ -489,8 +588,19 @@ mod tests {
     impl ToolExecutor for MockExecutor {
         async fn execute(&self, name: &str, _args: &str) -> Result<ToolOutcome, LychiError> {
             match self.outcomes.get(name) {
-                Some(ToolOutcome::Ran { output, is_error, .. }) => Ok(ToolOutcome::Ran { output: output.clone(), is_error: *is_error, artifact: None }),
-                Some(ToolOutcome::NeedsApproval { reason, resume }) => Ok(ToolOutcome::NeedsApproval { reason: reason.clone(), resume: resume.clone() }),
+                Some(ToolOutcome::Ran {
+                    output, is_error, ..
+                }) => Ok(ToolOutcome::Ran {
+                    output: output.clone(),
+                    is_error: *is_error,
+                    artifact: None,
+                }),
+                Some(ToolOutcome::NeedsApproval { reason, resume }) => {
+                    Ok(ToolOutcome::NeedsApproval {
+                        reason: reason.clone(),
+                        resume: resume.clone(),
+                    })
+                }
                 None => Err(LychiError::Ai(format!("mock: unknown tool {name}"))),
             }
         }
@@ -500,20 +610,38 @@ mod tests {
         }
     }
 
-    fn coordinator(provider: Arc<MockProvider>, executor: Arc<MockExecutor>) -> Coordinator<MockExecutor> {
-        Coordinator::new(provider, executor, vec![ToolDef { name: "weather".into(), description: "get weather".into() }])
+    fn coordinator(
+        provider: Arc<MockProvider>,
+        executor: Arc<MockExecutor>,
+    ) -> Coordinator<MockExecutor> {
+        Coordinator::new(
+            provider,
+            executor,
+            vec![ToolDef {
+                name: "weather".into(),
+                description: "get weather".into(),
+            }],
+        )
     }
 
     // Drain the event stream into a Vec (for assertions).
     async fn drain(mut s: AgentEventStream) -> Vec<AgentEvent> {
         let mut out = Vec::new();
-        while let Some(e) = s.next().await { out.push(e); }
+        while let Some(e) = s.next().await {
+            out.push(e);
+        }
         out
     }
 
     // Predicate helpers (avoids guard-in-`matches!`, unstable in this edition).
     fn has_text(events: &[AgentEvent], want: &str) -> bool {
-        events.iter().any(|e| if let AgentEvent::TextDelta(t) = e { t == want } else { false })
+        events.iter().any(|e| {
+            if let AgentEvent::TextDelta(t) = e {
+                t == want
+            } else {
+                false
+            }
+        })
     }
     fn final_text(events: &[AgentEvent]) -> Option<&str> {
         events.iter().rev().find_map(|e| match e {
@@ -522,26 +650,54 @@ mod tests {
         })
     }
     fn has_tool_started(events: &[AgentEvent], name: &str) -> bool {
-        events.iter().any(|e| if let AgentEvent::ToolCallStarted { name: n, .. } = e { n == name } else { false })
+        events.iter().any(|e| {
+            if let AgentEvent::ToolCallStarted { name: n, .. } = e {
+                n == name
+            } else {
+                false
+            }
+        })
     }
     fn tool_completed_output(events: &[AgentEvent]) -> Option<&str> {
-        events.iter().find_map(|e| if let AgentEvent::ToolCallCompleted { output, .. } = e { Some(output.as_str()) } else { None })
+        events.iter().find_map(|e| {
+            if let AgentEvent::ToolCallCompleted { output, .. } = e {
+                Some(output.as_str())
+            } else {
+                None
+            }
+        })
     }
     fn tool_failed_error(events: &[AgentEvent]) -> Option<&str> {
-        events.iter().find_map(|e| if let AgentEvent::ToolCallFailed { error, .. } = e { Some(error.as_str()) } else { None })
+        events.iter().find_map(|e| {
+            if let AgentEvent::ToolCallFailed { error, .. } = e {
+                Some(error.as_str())
+            } else {
+                None
+            }
+        })
     }
     fn awaiting_tool(events: &[AgentEvent]) -> Option<&str> {
-        events.iter().find_map(|e| if let AgentEvent::AwaitingApproval(r) = e { Some(r.tool_name.as_str()) } else { None })
+        events.iter().find_map(|e| {
+            if let AgentEvent::AwaitingApproval(r) = e {
+                Some(r.tool_name.as_str())
+            } else {
+                None
+            }
+        })
     }
 
     #[tokio::test]
     async fn plain_answer_no_tools() {
         let provider = MockProvider::new(vec![answer("Hello there")]);
         let exec = Arc::new(MockExecutor::new());
-        let (stream, handle) = coordinator(provider, exec).run(Session::new("sys", "hi"), CancellationToken::new());
+        let (stream, handle) =
+            coordinator(provider, exec).run(Session::new("sys", "hi"), CancellationToken::new());
         let events = drain(stream).await;
         // TurnStarted, TextDelta, Final
-        assert!(matches!(events.first(), Some(AgentEvent::TurnStarted { step: 0 })));
+        assert!(matches!(
+            events.first(),
+            Some(AgentEvent::TurnStarted { step: 0 })
+        ));
         assert!(has_text(&events, "Hello there"));
         assert_eq!(final_text(&events), Some("Hello there"));
         match handle.wait().await {
@@ -562,7 +718,8 @@ mod tests {
         ]);
         let exec = Arc::new(MockExecutor::new().ran("weather", "18C sunny", false));
         let p = provider.clone();
-        let (stream, handle) = coordinator(provider, exec).run(Session::new("sys", "weather?"), CancellationToken::new());
+        let (stream, handle) = coordinator(provider, exec)
+            .run(Session::new("sys", "weather?"), CancellationToken::new());
         let events = drain(stream).await;
 
         assert!(has_tool_started(&events, "weather"));
@@ -573,7 +730,10 @@ mod tests {
         // result + assistant turn were fed back).
         let seen = p.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 2, "provider called twice (two turns)");
-        assert!(seen[1] > seen[0], "second turn sees the appended tool result");
+        assert!(
+            seen[1] > seen[0],
+            "second turn sees the appended tool result"
+        );
 
         match handle.wait().await {
             Outcome::Done { session } => {
@@ -591,7 +751,8 @@ mod tests {
             answer("Sorry, that failed."),
         ]);
         let exec = Arc::new(MockExecutor::new().ran("weather", "network down", true));
-        let (stream, handle) = coordinator(provider, exec).run(Session::new("sys", "weather?"), CancellationToken::new());
+        let (stream, handle) = coordinator(provider, exec)
+            .run(Session::new("sys", "weather?"), CancellationToken::new());
         let events = drain(stream).await;
         assert_eq!(tool_failed_error(&events), Some("network down"));
         // The loop CONTINUED (didn't abort) — a Final answer arrived.
@@ -602,15 +763,28 @@ mod tests {
     #[tokio::test]
     async fn destructive_tool_suspends_for_approval() {
         let provider = MockProvider::new(vec![call_tool("t1", "delete", "all")]);
-        let exec = Arc::new(MockExecutor::new().needs_approval("delete", "This deletes everything"));
-        let coord = Coordinator::new(provider, exec, vec![ToolDef { name: "delete".into(), description: "delete".into() }]);
-        let (stream, handle) = coord.run(Session::new("sys", "delete all"), CancellationToken::new());
+        let exec =
+            Arc::new(MockExecutor::new().needs_approval("delete", "This deletes everything"));
+        let coord = Coordinator::new(
+            provider,
+            exec,
+            vec![ToolDef {
+                name: "delete".into(),
+                description: "delete".into(),
+            }],
+        );
+        let (stream, handle) =
+            coord.run(Session::new("sys", "delete all"), CancellationToken::new());
         let events = drain(stream).await;
         assert_eq!(awaiting_tool(&events), Some("delete"));
         match handle.wait().await {
             Outcome::AwaitingApproval { request, session } => {
                 assert_eq!(request.reason, "This deletes everything");
-                assert_eq!(session.pending.len(), 1, "the paused call is recorded for resume");
+                assert_eq!(
+                    session.pending.len(),
+                    1,
+                    "the paused call is recorded for resume"
+                );
             }
             _ => panic!("expected AwaitingApproval"),
         }
@@ -621,7 +795,14 @@ mod tests {
         // Set up a suspended session by running to the approval point.
         let provider = MockProvider::new(vec![call_tool("t1", "delete", "all")]);
         let exec = Arc::new(MockExecutor::new().needs_approval("delete", "confirm?"));
-        let coord = Coordinator::new(provider, exec.clone(), vec![ToolDef { name: "delete".into(), description: "delete".into() }]);
+        let coord = Coordinator::new(
+            provider,
+            exec.clone(),
+            vec![ToolDef {
+                name: "delete".into(),
+                description: "delete".into(),
+            }],
+        );
         let (s1, h1) = coord.run(Session::new("sys", "delete all"), CancellationToken::new());
         drain(s1).await;
         let session = match h1.wait().await {
@@ -631,7 +812,14 @@ mod tests {
 
         // Resume with Approve — a NEW provider that answers after the approved tool.
         let provider2 = MockProvider::new(vec![answer("Deleted, done.")]);
-        let coord2 = Coordinator::new(provider2, exec.clone(), vec![ToolDef { name: "delete".into(), description: "delete".into() }]);
+        let coord2 = Coordinator::new(
+            provider2,
+            exec.clone(),
+            vec![ToolDef {
+                name: "delete".into(),
+                description: "delete".into(),
+            }],
+        );
         let (s2, h2) = coord2.resume(session, ApprovalDecision::Approve, CancellationToken::new());
         let events = drain(s2).await;
         assert_eq!(tool_completed_output(&events), Some("APPROVED-RAN"));
@@ -645,14 +833,37 @@ mod tests {
     async fn reject_feeds_denial_back_to_model() {
         let provider = MockProvider::new(vec![call_tool("t1", "delete", "all")]);
         let exec = Arc::new(MockExecutor::new().needs_approval("delete", "confirm?"));
-        let coord = Coordinator::new(provider, exec.clone(), vec![ToolDef { name: "delete".into(), description: "delete".into() }]);
+        let coord = Coordinator::new(
+            provider,
+            exec.clone(),
+            vec![ToolDef {
+                name: "delete".into(),
+                description: "delete".into(),
+            }],
+        );
         let (s1, h1) = coord.run(Session::new("sys", "delete all"), CancellationToken::new());
         drain(s1).await;
-        let session = match h1.wait().await { Outcome::AwaitingApproval { session, .. } => session, _ => panic!() };
+        let session = match h1.wait().await {
+            Outcome::AwaitingApproval { session, .. } => session,
+            _ => panic!(),
+        };
 
         let provider2 = MockProvider::new(vec![answer("Okay, I won't.")]);
-        let coord2 = Coordinator::new(provider2, exec.clone(), vec![ToolDef { name: "delete".into(), description: "delete".into() }]);
-        let (s2, h2) = coord2.resume(session, ApprovalDecision::Reject { message: Some("User said no".into()) }, CancellationToken::new());
+        let coord2 = Coordinator::new(
+            provider2,
+            exec.clone(),
+            vec![ToolDef {
+                name: "delete".into(),
+                description: "delete".into(),
+            }],
+        );
+        let (s2, h2) = coord2.resume(
+            session,
+            ApprovalDecision::Reject {
+                message: Some("User said no".into()),
+            },
+            CancellationToken::new(),
+        );
         let events = drain(s2).await;
         assert_eq!(tool_failed_error(&events), Some("User said no"));
         // run_approved NOT called (rejected).
@@ -660,7 +871,12 @@ mod tests {
         // A denial tool-result was appended, and the model got another turn.
         match h2.wait().await {
             Outcome::Done { session } => {
-                assert!(session.messages.iter().any(|m| m.is_error && m.content == "User said no"));
+                assert!(
+                    session
+                        .messages
+                        .iter()
+                        .any(|m| m.is_error && m.content == "User said no")
+                );
             }
             _ => panic!("expected Done"),
         }
@@ -669,13 +885,18 @@ mod tests {
     #[tokio::test]
     async fn step_cap_stops_a_runaway_loop() {
         // A provider that ALWAYS calls a tool → would loop forever without the cap.
-        let turns: Vec<Vec<StreamEvent>> = (0..20).map(|_| call_tool("t", "weather", "x")).collect();
+        let turns: Vec<Vec<StreamEvent>> =
+            (0..20).map(|_| call_tool("t", "weather", "x")).collect();
         let provider = MockProvider::new(turns);
         let exec = Arc::new(MockExecutor::new().ran("weather", "ok", false));
         let coord = coordinator(provider, exec).with_stop(Arc::new(MaxSteps(3)));
         let (stream, handle) = coord.run(Session::new("sys", "go"), CancellationToken::new());
         let events = drain(stream).await;
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::Stopped { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Stopped { .. }))
+        );
         assert!(matches!(handle.wait().await, Outcome::Stopped { .. }));
     }
 

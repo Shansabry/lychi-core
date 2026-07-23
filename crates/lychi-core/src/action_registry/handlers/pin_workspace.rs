@@ -9,7 +9,8 @@ use std::path::Path;
 use async_trait::async_trait;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType, RiskLevel,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
+    RiskLevel,
 };
 use crate::context::pin;
 use crate::error::LychiError;
@@ -33,6 +34,9 @@ impl ActionHandler for PinWorkspaceHandler {
 
     fn description(&self) -> &str {
         "Pin a workspace directory for context detection"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Utilities
     }
 
     fn default_risk(&self) -> RiskLevel {

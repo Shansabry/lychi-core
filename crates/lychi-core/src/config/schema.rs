@@ -442,16 +442,16 @@ impl AiConfig {
         let is_https = url.starts_with("https://");
         let is_http = url.starts_with("http://");
         if !is_https && !is_http {
-            return Err(format!(
-                "AI endpoint must start with https:// (got: {url})"
-            ));
+            return Err(format!("AI endpoint must start with https:// (got: {url})"));
         }
 
         if is_http {
             // Cleartext is only acceptable to a loopback host.
             let host = host_of(url);
-            let loopback = matches!(host.as_deref(), Some("localhost") | Some("127.0.0.1") | Some("[::1]") | Some("::1"))
-                || host.as_deref().is_some_and(|h| h.starts_with("127."));
+            let loopback = matches!(
+                host.as_deref(),
+                Some("localhost") | Some("127.0.0.1") | Some("[::1]") | Some("::1")
+            ) || host.as_deref().is_some_and(|h| h.starts_with("127."));
             if !loopback {
                 return Err(format!(
                     "Refusing to send your API key over cleartext http:// to a non-local host \
@@ -472,7 +472,10 @@ fn host_of(url: &str) -> Option<String> {
         .next()
         .unwrap_or(after_scheme);
     // Strip userinfo if present, then split off the port (but keep [::1] intact).
-    let authority = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
     let host = if let Some(rest) = authority.strip_prefix('[') {
         // IPv6 literal: keep the brackets for matching `[::1]`.
         format!("[{}]", rest.split(']').next().unwrap_or(rest))
@@ -605,10 +608,22 @@ mod tests {
     #[test]
     fn base_url_requires_https_for_remote() {
         // https is fine.
-        assert!(byo("https://api.example.com/v1").validate_base_url().is_ok());
+        assert!(
+            byo("https://api.example.com/v1")
+                .validate_base_url()
+                .is_ok()
+        );
         // cleartext http to a remote host is rejected (key exfiltration risk).
-        assert!(byo("http://api.example.com/v1").validate_base_url().is_err());
-        assert!(byo("http://attacker.example/v1/messages").validate_base_url().is_err());
+        assert!(
+            byo("http://api.example.com/v1")
+                .validate_base_url()
+                .is_err()
+        );
+        assert!(
+            byo("http://attacker.example/v1/messages")
+                .validate_base_url()
+                .is_err()
+        );
         // a non-URL / typo is rejected.
         assert!(byo("api.example.com").validate_base_url().is_err());
         assert!(byo("ftp://x").validate_base_url().is_err());
@@ -623,7 +638,11 @@ mod tests {
         assert!(byo("http://127.0.0.53/v1").validate_base_url().is_ok());
         assert!(byo("http://[::1]:1234/v1").validate_base_url().is_ok());
         // but a host merely CONTAINING "localhost" is not loopback.
-        assert!(byo("http://localhost.attacker.com/v1").validate_base_url().is_err());
+        assert!(
+            byo("http://localhost.attacker.com/v1")
+                .validate_base_url()
+                .is_err()
+        );
     }
 
     #[test]
@@ -638,9 +657,18 @@ mod tests {
 
     #[test]
     fn host_of_extracts_host() {
-        assert_eq!(host_of("https://api.example.com/v1").as_deref(), Some("api.example.com"));
-        assert_eq!(host_of("http://localhost:11434/v1").as_deref(), Some("localhost"));
-        assert_eq!(host_of("http://user:pass@host.com/x").as_deref(), Some("host.com"));
+        assert_eq!(
+            host_of("https://api.example.com/v1").as_deref(),
+            Some("api.example.com")
+        );
+        assert_eq!(
+            host_of("http://localhost:11434/v1").as_deref(),
+            Some("localhost")
+        );
+        assert_eq!(
+            host_of("http://user:pass@host.com/x").as_deref(),
+            Some("host.com")
+        );
         assert_eq!(host_of("http://[::1]:1234/v1").as_deref(), Some("[::1]"));
     }
 
@@ -693,5 +721,4 @@ mod tests {
         assert!(cfg.search_engines.contains_key("gh"));
         assert!(!cfg.search_engines.contains_key("open"));
     }
-
 }

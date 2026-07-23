@@ -5,7 +5,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::action_registry::handlers::clipboard::write_to_clipboard;
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::error::LychiError;
 
@@ -137,6 +137,9 @@ impl ActionHandler for UnicodeHandler {
 
     fn description(&self) -> &str {
         "Search Unicode characters by name (u:arrow or unicode arrow)"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Utilities
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

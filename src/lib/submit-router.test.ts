@@ -1,13 +1,17 @@
 import { describe, expect, it } from "vitest";
-import {
-	decideSubmit,
-	isDeterministicCommand,
-	type RouterCompletion,
-	renderPreset,
-	type SubmitContext,
-} from "./submit-router";
+import type { RouteDecision } from "./bindings";
+import { decideSubmit, renderPreset, type RouterCompletion, type SubmitContext } from "./submit-router";
 
-/** A default context: idle box, no completions, no modifiers. */
+/**
+ * These tests cover the FRONTEND reducer only: how keyboard/mode/selection state
+ * composes with the BACKEND's `RouteDecision`. String classification itself
+ * (command-vs-agent, colon triggers, preset/panel keywords, NL confidence, typo
+ * correction) is the backend's job and is tested in Rust
+ * (`crates/lychi-core/src/intent/classify.rs`). Here we feed a mock decision in
+ * via `inputDecision`/`runDecision` and assert the reducer actuates it correctly.
+ */
+
+/** A default context: idle box, no completions, no modifiers, no decision. */
 function ctx(overrides: Partial<SubmitContext> = {}): SubmitContext {
 	return {
 		trimmed: "",
@@ -18,7 +22,6 @@ function ctx(overrides: Partial<SubmitContext> = {}): SubmitContext {
 		pendingPlan: false,
 		completions: [],
 		completionIndex: -1,
-		aiEnabled: true,
 		...overrides,
 	};
 }
@@ -28,6 +31,9 @@ function comp(over: Partial<RouterCompletion> = {}): RouterCompletion {
 	return { label: "x", ...over };
 }
 
+const CMD = (command: string): RouteDecision => ({ kind: "command", command });
+const NL = (prompt: string, confident: boolean): RouteDecision => ({ kind: "nl", prompt, confident });
+
 describe("decideSubmit — guards", () => {
 	it("empty input with no selection is a noop", () => {
 		expect(decideSubmit(ctx()).kind).toBe("noop");
@@ -36,9 +42,13 @@ describe("decideSubmit — guards", () => {
 	it("a showing plan swallows Enter", () => {
 		expect(decideSubmit(ctx({ trimmed: "hi", pendingPlan: true })).kind).toBe("noop");
 	});
+
+	it("input with no decision yet is a noop (caller awaits classifyInput)", () => {
+		expect(decideSubmit(ctx({ trimmed: "firefox" })).kind).toBe("noop");
+	});
 });
 
-describe("decideSubmit — keyboard modifiers", () => {
+describe("decideSubmit — keyboard modifiers (FE-only, no classification)", () => {
 	it("Ctrl+Enter forces a web search", () => {
 		expect(decideSubmit(ctx({ trimmed: "rust", ctrlKey: true }))).toEqual({
 			kind: "command",
@@ -66,109 +76,155 @@ describe("decideSubmit — keyboard modifiers", () => {
 	});
 });
 
-describe("decideSubmit — panels & colon triggers", () => {
-	it("bare 'settings' opens the settings panel", () => {
-		expect(decideSubmit(ctx({ trimmed: "settings" }))).toEqual({
-			kind: "panel",
-			panel: "settings",
+describe("decideSubmit — actuating the backend decision", () => {
+	it("a command decision runs verbatim", () => {
+		expect(decideSubmit(ctx({ trimmed: "open spotify", inputDecision: CMD("open spotify") }))).toEqual({
+			kind: "command",
+			command: "open spotify",
 		});
 	});
 
-	it("bare 'chat' opens the chat-history recall panel", () => {
-		expect(decideSubmit(ctx({ trimmed: "chat" }))).toEqual({
-			kind: "panel",
-			panel: "chat-history",
+	it("a confident NL decision goes straight to the full agent", () => {
+		expect(
+			decideSubmit(ctx({ trimmed: "what is rust?", inputDecision: NL("what is rust?", true) })),
+		).toEqual({ kind: "agent", prompt: "what is rust?" });
+	});
+
+	it("an ambiguous NL decision shows the fork card (quick-ai)", () => {
+		expect(
+			decideSubmit(ctx({ trimmed: "pasta recipe", inputDecision: NL("pasta recipe", false) })),
+		).toEqual({ kind: "quick-ai", prompt: "pasta recipe" });
+	});
+
+	it("a preset decision renders through", () => {
+		const d: RouteDecision = { kind: "preset", template: "Translate: {input}", input: "hola" };
+		expect(decideSubmit(ctx({ trimmed: "translate hola", inputDecision: d }))).toEqual({
+			kind: "preset",
+			template: "Translate: {input}",
+			input: "hola",
 		});
 	});
 
-	it("bare 'todos' opens notes on the todos tab", () => {
-		expect(decideSubmit(ctx({ trimmed: "todos" }))).toEqual({
+	it("a panel decision maps to the FE panel + notes sub-tab", () => {
+		const d: RouteDecision = { kind: "panel", name: "notes", sub_tab: "todos" };
+		expect(decideSubmit(ctx({ trimmed: "todos", inputDecision: d }))).toEqual({
 			kind: "panel",
 			panel: "notes",
 			notesTab: "todos",
 		});
 	});
 
-	it("a colon trigger goes straight to the backend", () => {
-		expect(decideSubmit(ctx({ trimmed: "tz:tokyo" }))).toEqual({
-			kind: "command",
-			command: "tz:tokyo",
+	it("a panel decision with no sub-tab omits notesTab", () => {
+		const d: RouteDecision = { kind: "panel", name: "settings", sub_tab: null };
+		expect(decideSubmit(ctx({ trimmed: "settings", inputDecision: d }))).toEqual({
+			kind: "panel",
+			panel: "settings",
 		});
 	});
 
-	it("an http url is NOT treated as a colon trigger", () => {
-		// falls through to the agent (no completions) rather than colon-routing
-		expect(decideSubmit(ctx({ trimmed: "http://x" })).kind).toBe("quick-ai");
+	it("a correct decision fills the correction for confirm", () => {
+		const d: RouteDecision = { kind: "correct", corrected: "open Spotify" };
+		expect(decideSubmit(ctx({ trimmed: "spoti", inputDecision: d }))).toEqual({
+			kind: "correct",
+			value: "open Spotify",
+		});
+	});
+
+	it("an ai-disabled decision carries the web-fallback command", () => {
+		const d: RouteDecision = { kind: "ai-disabled", command: "web what is rust?", explicit: true };
+		expect(decideSubmit(ctx({ trimmed: "what is rust?", inputDecision: d }))).toEqual({
+			kind: "ai-disabled",
+			command: "web what is rust?",
+			explicit: true,
+		});
 	});
 });
 
-describe("decideSubmit — the single AI path (the dual-path bug)", () => {
-	it("a bare question with NO completions goes to the agent", () => {
-		expect(decideSubmit(ctx({ trimmed: "what is rust?" }))).toEqual({
-			kind: "quick-ai",
-			prompt: "what is rust?",
+describe("decideSubmit — selected completion actuation", () => {
+	it("a calc row displays, does not execute", () => {
+		const c = ctx({
+			trimmed: "= 6*7",
+			completions: [comp({ label: "= 42" })],
+			completionIndex: 0,
+			inputDecision: CMD("= 6*7"),
 		});
+		expect(decideSubmit(c)).toEqual({ kind: "calc-display", text: "42" });
 	});
 
-	it("a bare question WITH an auto-selected history completion still goes to the agent", () => {
-		// This is the exact regression: a history/context row echoing the typed
-		// query used to route raw text back through the old command router.
+	it("a 'Did you mean' row fills the correction", () => {
 		const c = ctx({
-			trimmed: "what is rust?",
-			completions: [comp({ label: "what is rust?", icon_path: "__context__" })],
+			trimmed: "spoti",
+			completions: [comp({ label: "Did you mean: open Spotify?", description: "open Spotify" })],
 			completionIndex: 0,
 		});
-		expect(decideSubmit(c)).toEqual({ kind: "quick-ai", prompt: "what is rust?" });
+		expect(decideSubmit(c)).toEqual({ kind: "correct", value: "open Spotify" });
 	});
 
-	it("a __history__ completion whose `run` echoes the typed question goes to the agent (THE bug)", () => {
-		// The real leak: history rows carry `run = <the raw thing you typed>`.
-		// A prior "what is rust?" comes back with run="what is rust?", which used
-		// to be replayed verbatim through the executor. It must go to the agent.
+	it("a tab-complete hint fills the input", () => {
 		const c = ctx({
-			trimmed: "what is rust?",
-			completions: [
-				comp({ label: "what is rust?", icon_path: "__history__", run: "what is rust?" }),
-			],
+			trimmed: "tz",
+			completions: [comp({ label: "tz tokyo", fill: "tz " })],
 			completionIndex: 0,
 		});
-		expect(decideSubmit(c)).toEqual({ kind: "quick-ai", prompt: "what is rust?" });
+		expect(decideSubmit(c)).toEqual({ kind: "fill", value: "tz " });
 	});
 
-	it("a __history__ completion whose `run` IS a real command still runs", () => {
+	it("@-browse selection drills into the row", () => {
+		const c = ctx({
+			trimmed: "@src",
+			atMode: true,
+			completions: [comp({ label: "~/src/" })],
+			completionIndex: 0,
+		});
+		expect(decideSubmit(c)).toEqual({ kind: "completion-select", label: "~/src/", ctrlKey: false });
+	});
+});
+
+describe("decideSubmit — a selected row's run is classified by the backend (dual-path fix)", () => {
+	it("a history row whose run is a real command runs verbatim", () => {
 		const c = ctx({
 			trimmed: "open spot",
 			completions: [comp({ label: "open spotify", icon_path: "__history__", run: "open spotify" })],
 			completionIndex: 0,
+			inputDecision: NL("open spot", false),
+			runDecision: CMD("open spotify"),
 		});
 		expect(decideSubmit(c)).toEqual({ kind: "command", command: "open spotify" });
 	});
 
-	it("a multi-word query whose selected label equals it goes to the agent, not a command", () => {
+	it("a history row whose run echoes a past question goes to the agent", () => {
 		const c = ctx({
 			trimmed: "what is rust?",
-			completions: [comp({ label: "what is rust?" })],
+			completions: [comp({ label: "what is rust?", icon_path: "__history__", run: "what is rust?" })],
 			completionIndex: 0,
+			inputDecision: NL("what is rust?", true),
+			runDecision: NL("what is rust?", true),
 		});
-		expect(decideSubmit(c).kind).toBe("quick-ai");
+		expect(decideSubmit(c)).toEqual({ kind: "agent", prompt: "what is rust?" });
 	});
 
-	it("natural language never yields a command/noop dead-end", () => {
-		for (const q of ["explain closures", "summarize this", "why is the sky blue"]) {
-			expect(decideSubmit(ctx({ trimmed: q })).kind).toBe("quick-ai");
-		}
-	});
-
-	it("explicit `ask <q>` skips the fork card → full agent chat", () => {
-		expect(decideSubmit(ctx({ trimmed: "ask what is rust?" }))).toEqual({
-			kind: "agent",
-			prompt: "what is rust?",
+	it("an NL question whose selected row echoes the query (run is NL) goes to the agent", () => {
+		// A history/context row echoing an NL query — both input and run classify
+		// as NL, so the question owns Enter (not a raw replay). This is the
+		// no-response fix: the input's classification wins over the row.
+		const c = ctx({
+			trimmed: "what is rust?",
+			completions: [comp({ label: "what is rust?", icon_path: "__history__", run: "what is rust?" })],
+			completionIndex: 0,
+			inputDecision: NL("what is rust?", true),
+			runDecision: NL("what is rust?", true),
 		});
+		expect(decideSubmit(c)).toEqual({ kind: "agent", prompt: "what is rust?" });
 	});
 
-	it("bare `ask` with no query does not become an agent call", () => {
-		// no query after "ask" → falls through (quick-ai on the bare word)
-		expect(decideSubmit(ctx({ trimmed: "ask" })).kind).not.toBe("agent");
+	it("an ambiguous NL query (no runnable row selected) shows the fork card", () => {
+		// Inline fallback rows were removed backend-side, so a bare NL query has no
+		// competing row — the input decision drives Enter.
+		const c = ctx({
+			trimmed: "pasta recipe",
+			inputDecision: NL("pasta recipe", false),
+		});
+		expect(decideSubmit(c)).toEqual({ kind: "quick-ai", prompt: "pasta recipe" });
 	});
 });
 
@@ -184,181 +240,5 @@ describe("renderPreset", () => {
 	});
 	it("returns template as-is when no placeholder and no input", () => {
 		expect(renderPreset("Say hi", "")).toBe("Say hi");
-	});
-});
-
-describe("decideSubmit — AI presets", () => {
-	const presets = [
-		{ keyword: "translate", template: "Translate to English: {input}" },
-		{ keyword: "email", template: "Write a professional email about: {input}" },
-	];
-
-	it("`translate hola` renders the template → full agent", () => {
-		expect(decideSubmit(ctx({ trimmed: "translate hola", presets }))).toEqual({
-			kind: "preset",
-			template: "Translate to English: {input}",
-			input: "hola",
-		});
-	});
-
-	it("a custom user preset works the same way", () => {
-		expect(decideSubmit(ctx({ trimmed: "email quarterly results", presets }))).toEqual({
-			kind: "preset",
-			template: "Write a professional email about: {input}",
-			input: "quarterly results",
-		});
-	});
-
-	it("a bare preset keyword with no input still renders (empty {input})", () => {
-		expect(decideSubmit(ctx({ trimmed: "translate", presets }))).toEqual({
-			kind: "preset",
-			template: "Translate to English: {input}",
-			input: "",
-		});
-	});
-
-	it("a non-preset query is unaffected", () => {
-		expect(decideSubmit(ctx({ trimmed: "what is rust?", presets })).kind).toBe("quick-ai");
-	});
-
-	it("preset matching is case-insensitive on the keyword", () => {
-		expect(decideSubmit(ctx({ trimmed: "TRANSLATE hola", presets })).kind).toBe("preset");
-	});
-});
-
-describe("decideSubmit — AI disabled warns then falls to web", () => {
-	it("an unknown query → ai-disabled (implicit), carrying the prompt", () => {
-		expect(decideSubmit(ctx({ trimmed: "what is rust?", aiEnabled: false }))).toEqual({
-			kind: "ai-disabled",
-			prompt: "what is rust?",
-			explicit: false,
-		});
-	});
-
-	it("explicit `ask <q>` → ai-disabled (explicit) when AI is off", () => {
-		expect(decideSubmit(ctx({ trimmed: "ask what is rust?", aiEnabled: false }))).toEqual({
-			kind: "ai-disabled",
-			prompt: "what is rust?",
-			explicit: true,
-		});
-	});
-
-	it("deterministic commands are unaffected by AI being off", () => {
-		expect(decideSubmit(ctx({ trimmed: "settings", aiEnabled: false }))).toEqual({
-			kind: "panel",
-			panel: "settings",
-		});
-	});
-});
-
-describe("isDeterministicCommand", () => {
-	it("known-prefix multi-word is a command", () => {
-		expect(isDeterministicCommand("open spotify")).toBe(true);
-		expect(isDeterministicCommand("run ls -la")).toBe(true);
-		expect(isDeterministicCommand("web cats")).toBe(true);
-	});
-	it("single token is a command (bare app/keyword)", () => {
-		expect(isDeterministicCommand("firefox")).toBe(true);
-		expect(isDeterministicCommand("settings")).toBe(true);
-	});
-	it("colon triggers and paths are commands", () => {
-		expect(isDeterministicCommand("tz:tokyo")).toBe(true);
-		expect(isDeterministicCommand("/home/sab")).toBe(true);
-	});
-	it("multi-word starting with a non-prefix word is natural language", () => {
-		expect(isDeterministicCommand("what is rust?")).toBe(false);
-		expect(isDeterministicCommand("explain closures to me")).toBe(false);
-		expect(isDeterministicCommand("why is the sky blue")).toBe(false);
-	});
-});
-
-describe("decideSubmit — deterministic commands stay instant", () => {
-	it("a known-prefix query with a selected app completion runs the command", () => {
-		const c = ctx({
-			trimmed: "open spot",
-			completions: [comp({ label: "Spotify" })],
-			completionIndex: 0,
-		});
-		expect(decideSubmit(c)).toEqual({ kind: "command", command: "open Spotify" });
-	});
-
-	it("does not double a prefix already on the label", () => {
-		const c = ctx({
-			trimmed: "run htop",
-			completions: [comp({ label: "run htop" })],
-			completionIndex: 0,
-		});
-		expect(decideSubmit(c)).toEqual({ kind: "command", command: "run htop" });
-	});
-
-	it("a completion carrying an explicit `run` runs it verbatim", () => {
-		const c = ctx({
-			trimmed: "wea",
-			completions: [comp({ label: "Search web: wea", run: "web wea" })],
-			completionIndex: 0,
-		});
-		expect(decideSubmit(c)).toEqual({ kind: "command", command: "web wea" });
-	});
-
-	it("a completion carrying `fill` fills the box (tab-to-complete)", () => {
-		const c = ctx({
-			trimmed: "vol",
-			completions: [comp({ label: "volume <n>", fill: "system volume " })],
-			completionIndex: 0,
-		});
-		expect(decideSubmit(c)).toEqual({ kind: "fill", value: "system volume " });
-	});
-});
-
-describe("decideSubmit — completions & search mode", () => {
-	it("a calc result displays without executing", () => {
-		const c = ctx({
-			trimmed: "2+2",
-			completions: [comp({ label: "= 4" })],
-			completionIndex: 0,
-		});
-		expect(decideSubmit(c)).toEqual({ kind: "calc-display", text: "4" });
-	});
-
-	it("a 'Did you mean' row fills the correction from its description", () => {
-		const c = ctx({
-			trimmed: "opne firefox",
-			completions: [comp({ label: "Did you mean: open firefox?", description: "open firefox" })],
-			completionIndex: 0,
-		});
-		expect(decideSubmit(c)).toEqual({ kind: "correct", value: "open firefox" });
-	});
-
-	it("search mode drills into the selected row", () => {
-		const c = ctx({
-			trimmed: "/home",
-			searchMode: true,
-			completions: [comp({ label: "Documents" })],
-			completionIndex: 0,
-		});
-		expect(decideSubmit(c)).toEqual({
-			kind: "completion-select",
-			label: "Documents",
-			ctrlKey: false,
-		});
-	});
-
-	it("search mode with no selectable row tries to open the literal path", () => {
-		const c = ctx({ trimmed: "/home/sab/x", searchMode: true });
-		expect(decideSubmit(c)).toEqual({ kind: "open-path", path: "/home/sab/x" });
-	});
-
-	it("search mode auto-selects the first non-separator row", () => {
-		const c = ctx({
-			trimmed: "/h",
-			searchMode: true,
-			completionIndex: -1,
-			completions: [comp({ label: "sep", icon_path: "__separator__" }), comp({ label: "home" })],
-		});
-		expect(decideSubmit(c)).toEqual({
-			kind: "completion-select",
-			label: "home",
-			ctrlKey: false,
-		});
 	});
 });

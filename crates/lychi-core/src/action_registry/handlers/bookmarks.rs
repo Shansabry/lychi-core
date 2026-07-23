@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::action_registry::{ActionHandler, ActionResult, CompletionItem, ExecContext};
+use crate::action_registry::{
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext,
+};
 use crate::error::LychiError;
 
 /// Cached nucleo matcher.
@@ -225,6 +227,9 @@ impl ActionHandler for BookmarkHandler {
 
     fn description(&self) -> &str {
         "Search and open browser bookmarks (bm <query>)"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Web
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

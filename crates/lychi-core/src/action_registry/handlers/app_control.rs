@@ -4,7 +4,8 @@ use std::time::Instant;
 use async_trait::async_trait;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType, RiskLevel,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
+    RiskLevel,
 };
 use crate::error::LychiError;
 
@@ -268,6 +269,9 @@ impl ActionHandler for AppControlHandler {
 
     fn description(&self) -> &str {
         "Focus, quit, or kill running applications"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::System
     }
 
     fn default_risk(&self) -> RiskLevel {

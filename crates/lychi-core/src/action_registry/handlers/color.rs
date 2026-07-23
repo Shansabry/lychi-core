@@ -3,7 +3,7 @@ use std::process::{Command, Stdio};
 use async_trait::async_trait;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::error::LychiError;
 
@@ -555,6 +555,9 @@ impl ActionHandler for ColorHandler {
 
     fn description(&self) -> &str {
         "Convert colors between hex, RGB, HSL and find nearest Tailwind match"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Utilities
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

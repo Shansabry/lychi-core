@@ -408,12 +408,13 @@ impl AppState {
     /// is set up. Each reactor owns exactly the state it manages (via `Arc`
     /// clones), so a `ConfigChanged` emit fans out to whoever cares without the
     /// emitting command knowing they exist.
-    pub fn wire_reactors(&self) {
+    pub fn wire_reactors(&self, app: tauri::AppHandle) {
         crate::reactors::register_config_reactors(
             &self.event_bus,
             self.executor.clone(),
             self.config.clone(),
             self.ai_provider.clone(),
+            app,
         );
     }
 

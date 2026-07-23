@@ -104,9 +104,15 @@ mod tests {
     #[test]
     fn allows_web_and_local_schemes() {
         assert_eq!(authorize_uri("https://example.com"), UriDecision::Allow);
-        assert_eq!(authorize_uri("http://example.com/x?y=1"), UriDecision::Allow);
+        assert_eq!(
+            authorize_uri("http://example.com/x?y=1"),
+            UriDecision::Allow
+        );
         assert_eq!(authorize_uri("mailto:a@b.com"), UriDecision::Allow);
-        assert_eq!(authorize_uri("file:///home/sab/notes.txt"), UriDecision::Allow);
+        assert_eq!(
+            authorize_uri("file:///home/sab/notes.txt"),
+            UriDecision::Allow
+        );
         // Case-insensitive scheme.
         assert_eq!(authorize_uri("HTTPS://EXAMPLE.COM"), UriDecision::Allow);
     }
@@ -129,11 +135,23 @@ mod tests {
 
     #[test]
     fn denies_unknown_and_schemeless() {
-        assert!(matches!(authorize_uri("chrome://settings"), UriDecision::Deny { .. }));
-        assert!(matches!(authorize_uri("steam://run/1"), UriDecision::Deny { .. }));
+        assert!(matches!(
+            authorize_uri("chrome://settings"),
+            UriDecision::Deny { .. }
+        ));
+        assert!(matches!(
+            authorize_uri("steam://run/1"),
+            UriDecision::Deny { .. }
+        ));
         // No scheme → fail closed (callers must normalise bare hosts first).
-        assert!(matches!(authorize_uri("example.com/path"), UriDecision::Deny { .. }));
-        assert!(matches!(authorize_uri("/just/a/path"), UriDecision::Deny { .. }));
+        assert!(matches!(
+            authorize_uri("example.com/path"),
+            UriDecision::Deny { .. }
+        ));
+        assert!(matches!(
+            authorize_uri("/just/a/path"),
+            UriDecision::Deny { .. }
+        ));
         assert!(matches!(authorize_uri(""), UriDecision::Deny { .. }));
     }
 

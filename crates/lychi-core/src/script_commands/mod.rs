@@ -221,7 +221,11 @@ mod tests {
         write(&dir, "alpha.py", "print(1)"); // duplicate keyword "alpha"
         let cmds = discover(&dir);
         let keywords: Vec<_> = cmds.iter().map(|c| c.keyword.as_str()).collect();
-        assert_eq!(keywords, vec!["alpha"], "hidden/noise skipped, dedup by keyword");
+        assert_eq!(
+            keywords,
+            vec!["alpha"],
+            "hidden/noise skipped, dedup by keyword"
+        );
     }
 
     #[test]

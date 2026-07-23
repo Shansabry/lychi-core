@@ -220,7 +220,9 @@ mod tests {
         let db = open_test_database();
         let store = AiHistoryStore::new();
         // Only a system prompt → no real turns → not saved.
-        let res = store.upsert(&db, "c1", &[ChatMessage::system("sys")]).unwrap();
+        let res = store
+            .upsert(&db, "c1", &[ChatMessage::system("sys")])
+            .unwrap();
         assert!(res.is_none());
         assert!(store.list(&db).unwrap().is_empty());
     }
@@ -244,7 +246,9 @@ mod tests {
         // Save a recent one, then hand-write an ancient one directly into the
         // table (updated_at older than the retention window). A subsequent upsert
         // triggers prune, which should drop the ancient one.
-        store.upsert(&db, "recent", &conv_messages("q", "a")).unwrap();
+        store
+            .upsert(&db, "recent", &conv_messages("q", "a"))
+            .unwrap();
 
         let ancient = Conversation {
             id: "ancient".into(),
@@ -263,7 +267,9 @@ mod tests {
         assert_eq!(store.list(&db).unwrap().len(), 2);
 
         // Any upsert runs prune → the ancient one is dropped.
-        store.upsert(&db, "recent2", &conv_messages("q2", "a2")).unwrap();
+        store
+            .upsert(&db, "recent2", &conv_messages("q2", "a2"))
+            .unwrap();
         let ids: Vec<String> = store.list(&db).unwrap().into_iter().map(|s| s.id).collect();
         assert!(!ids.contains(&"ancient".to_string()));
         assert!(ids.contains(&"recent".to_string()));

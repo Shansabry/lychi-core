@@ -3,7 +3,8 @@ use std::process::Command;
 use std::time::Instant;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType, RiskAssessment, RiskLevel,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
+    RiskAssessment, RiskLevel,
 };
 use crate::error::LychiError;
 
@@ -65,21 +66,13 @@ fn simple_actions() -> &'static [SimpleAction] {
         SimpleAction {
             name: "suspend",
             description: "Suspend (sleep) the system",
-            run: || {
-                run_first_available(&[
-                    ("systemctl", &["suspend"]),
-                    ("loginctl", &["suspend"]),
-                ])
-            },
+            run: || run_first_available(&[("systemctl", &["suspend"]), ("loginctl", &["suspend"])]),
         },
         SimpleAction {
             name: "hibernate",
             description: "Hibernate the system",
             run: || {
-                run_first_available(&[
-                    ("systemctl", &["hibernate"]),
-                    ("loginctl", &["hibernate"]),
-                ])
+                run_first_available(&[("systemctl", &["hibernate"]), ("loginctl", &["hibernate"])])
             },
         },
         SimpleAction {
@@ -555,11 +548,7 @@ fn logout_session() -> Result<(), String> {
         // qdbus argument list; 1,-1,-1 = logout, no confirm, default shutdown mode.
         Some((
             "qdbus",
-            &[
-                "org.kde.Shutdown",
-                "/Shutdown",
-                "org.kde.Shutdown.logout",
-            ],
+            &["org.kde.Shutdown", "/Shutdown", "org.kde.Shutdown.logout"],
         ))
     } else if desktop.contains("gnome") {
         Some(("gnome-session-quit", &["--logout", "--no-prompt"]))
@@ -644,6 +633,9 @@ impl ActionHandler for SystemCommand {
 
     fn description(&self) -> &str {
         "System controls (power, audio, brightness, wifi, bluetooth)"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::System
     }
 
     fn assess_risk(

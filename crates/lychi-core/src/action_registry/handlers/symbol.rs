@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use crate::action_registry::handlers::clipboard::write_to_clipboard;
 use crate::action_registry::{
-    ActionHandler, ActionResult, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::error::LychiError;
 
@@ -1305,6 +1305,9 @@ impl ActionHandler for SymbolHandler {
 
     fn description(&self) -> &str {
         "Search and copy symbols by name (sym:arrow or sym arrow)"
+    }
+    fn category(&self) -> CommandCategory {
+        CommandCategory::Utilities
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {

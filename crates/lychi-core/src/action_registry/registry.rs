@@ -1,7 +1,25 @@
 use std::collections::HashMap;
 
 use crate::action_registry::trigger::ArgTransform;
-use crate::action_registry::{ActionHandler, CommandInfo, CompletionItem};
+use crate::action_registry::{ActionHandler, CommandCategory, CommandInfo, CompletionItem};
+
+/// Build a `CommandInfo`, denormalising the category's title + order so the
+/// frontend groups without needing its own category table.
+fn command_info(
+    id: &str,
+    keyword: &str,
+    description: &str,
+    category: CommandCategory,
+) -> CommandInfo {
+    CommandInfo {
+        id: id.to_string(),
+        keyword: keyword.to_string(),
+        description: description.to_string(),
+        category,
+        category_title: category.title().to_string(),
+        category_order: category.order(),
+    }
+}
 
 /// A resolved routing entry: which handler a keyword prefix maps to, and how to
 /// shape the remaining text into that handler's args.
@@ -107,14 +125,15 @@ impl ActionRegistry {
                     .iter()
                     .flat_map(|t| t.prefixes.iter().copied())
                     .next()?;
-                Some(CommandInfo {
-                    id: h.id().to_string(),
-                    keyword: keyword.to_string(),
-                    description: h.description().to_string(),
-                })
+                Some(command_info(h.id(), keyword, h.description(), h.category()))
             })
             .collect();
-        items.sort_by(|a, b| a.keyword.cmp(&b.keyword));
+        // Group by category order, then alphabetise within each group.
+        items.sort_by(|a, b| {
+            a.category_order
+                .cmp(&b.category_order)
+                .then_with(|| a.keyword.cmp(&b.keyword))
+        });
         items
     }
 
@@ -130,23 +149,20 @@ impl ActionRegistry {
 
         // Structural sigils first (in declared order — most common at top).
         for &(sigil, desc) in SIGIL_TRIGGERS {
-            items.push(CommandInfo {
-                id: String::new(),
-                keyword: sigil.to_string(),
-                description: desc.to_string(),
-            });
+            items.push(command_info("", sigil, desc, CommandCategory::General));
         }
 
-        // Colon shorthands, description sourced from the live handler.
+        // Colon shorthands, description + category sourced from the live handler.
         let mut colon: Vec<CommandInfo> = COLON_TRIGGERS
             .iter()
             .filter_map(|&(prefix, handler_id)| {
                 let h = self.handlers.get(handler_id)?;
-                Some(CommandInfo {
-                    id: handler_id.to_string(),
-                    keyword: prefix.to_string(),
-                    description: h.description().to_string(),
-                })
+                Some(command_info(
+                    handler_id,
+                    prefix,
+                    h.description(),
+                    h.category(),
+                ))
             })
             .collect();
         colon.sort_by(|a, b| a.keyword.cmp(&b.keyword));
