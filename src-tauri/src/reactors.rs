@@ -160,10 +160,13 @@ impl EventHandler for AiReactor {
         let available = provider.is_some();
         match provider {
             Some(p) => {
-                let router =
-                    AiRouter::new_shared(p, crate::state::AppState::ask_timeout(&ai));
+                let router = AiRouter::new_shared(p, crate::state::AppState::ask_timeout(&ai));
                 executor.resolver.set_ai_router(router);
-                tracing::info!("[reactor] ai config applied (provider: {}/{})", ai.mode, ai.provider);
+                tracing::info!(
+                    "[reactor] ai config applied (provider: {}/{})",
+                    ai.mode,
+                    ai.provider
+                );
             }
             None => {
                 executor.resolver.clear_ai_router();

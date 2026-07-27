@@ -47,6 +47,11 @@ pub struct BYOClient {
     api_key: String,
     max_tokens: u32,
     http: Client,
+    /// Optional store for LEARNED model capabilities. When present, a rejection
+    /// that proves this model can't read images is recorded so the next attach
+    /// is warned before a request is wasted (see `providers::capability`).
+    /// `None` keeps the client usable in tests and anywhere without a DB.
+    caps_db: Option<std::sync::Arc<redb::Database>>,
 }
 
 impl BYOClient {
@@ -72,7 +77,14 @@ impl BYOClient {
             api_key,
             max_tokens,
             http: Client::new(),
+            caps_db: None,
         }
+    }
+
+    /// Attach the capability store so failures teach us about this model.
+    pub fn with_capability_store(mut self, db: std::sync::Arc<redb::Database>) -> Self {
+        self.caps_db = Some(db);
+        self
     }
 
     async fn call_openai_compatible(
@@ -103,7 +115,10 @@ impl BYOClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(LychiError::Ai(format!("API returned {status}: {body}")));
+            // Same classifier as the streaming path — one place turns provider
+            // errors into user-facing text. These calls never carry images.
+            let err = super::errors::classify(Some(status.as_u16()), &body, false);
+            return Err(LychiError::Ai(err.message));
         }
 
         let json: Value = resp
@@ -146,7 +161,10 @@ impl BYOClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(LychiError::Ai(format!("API returned {status}: {body}")));
+            // Same classifier as the streaming path — one place turns provider
+            // errors into user-facing text. These calls never carry images.
+            let err = super::errors::classify(Some(status.as_u16()), &body, false);
+            return Err(LychiError::Ai(err.message));
         }
 
         let json: Value = resp
@@ -178,6 +196,25 @@ impl BYOClient {
             ),
             WireFormat::OpenAi => (Dialect::OpenAi, AuthStyle::Bearer(self.api_key.clone())),
         };
+        // When a store is attached, a failure that proves this model can't read
+        // images is recorded against `<provider>/<model>` — so the NEXT attach
+        // is warned up-front instead of spending another rejected request.
+        let observer = self.caps_db.clone().map(|db| {
+            let provider = self.provider_id.clone();
+            let model = self.model.clone();
+            let obs: super::wire::ErrorObserver = std::sync::Arc::new(move |err| {
+                if err.kind == super::errors::AiErrorKind::VisionUnsupported {
+                    let _ = super::capability::record(
+                        &db,
+                        &provider,
+                        &model,
+                        super::capability::Vision::Unsupported,
+                        /* from_metadata */ false,
+                    );
+                }
+            });
+            obs
+        });
         WireClient::new(
             self.http.clone(),
             dialect,
@@ -186,6 +223,7 @@ impl BYOClient {
             self.max_tokens,
             auth,
         )
+        .with_error_observer(observer)
     }
 }
 

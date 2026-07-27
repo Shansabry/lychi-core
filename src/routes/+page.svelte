@@ -5,6 +5,7 @@ import { onMount } from "svelte";
 import ActionPanel from "$lib/components/ActionPanel.svelte";
 import AgentPlanPanel from "$lib/components/AgentPlanPanel.svelte";
 import AiAnswer from "$lib/components/AiAnswer.svelte";
+import AttachmentTray from "$lib/components/AttachmentTray.svelte";
 import ChatHistoryPanel from "$lib/components/ChatHistoryPanel.svelte";
 import CommandInput from "$lib/components/CommandInput.svelte";
 import CompletionsList from "$lib/components/CompletionsList.svelte";
@@ -22,6 +23,7 @@ import {
 	clearConversations,
 	confirmExecution,
 	classifyInput,
+	contentText,
 	deleteConversation,
 	executeCommand,
 	fuzzyPathCompletions,
@@ -50,12 +52,13 @@ import {
 } from "$lib/ipc";
 import { loadKeybindings } from "$lib/keybindings";
 import { preloadAll } from "$lib/preloadCache";
-import { type AiTurn, chat } from "$lib/stores/chat.svelte";
+import { attachments } from "$lib/stores/attachments.svelte";
+import { type AiTurn, type UserAttachment, chat } from "$lib/stores/chat.svelte";
 import { completions } from "$lib/stores/completions.svelte";
 import { context } from "$lib/stores/context.svelte";
 import { media } from "$lib/stores/media.svelte";
 import { ui } from "$lib/stores/ui.svelte";
-import { decideSubmit, type RouteDecision, renderPreset } from "$lib/submit-router";
+import { decideSubmit, presetDisplay, type RouteDecision, renderPreset } from "$lib/submit-router";
 
 let inputValue = $state("");
 let isExecuting = $state(false);
@@ -646,20 +649,44 @@ async function openConversation(id: string) {
 	// Tool/system messages are skipped in this view (the raw session still has
 	// them for the model's context).
 	const turns: AiTurn[] = [];
-	let pendingUser = "";
+	let pendingUser = { instruction: "", attachment: undefined as UserAttachment | undefined };
 	for (const m of conv.messages) {
+		// `content` is a block list since vision landed (text interleaved with
+		// images) — flatten to the prose for display. Mirrors the Rust
+		// `ChatMessage::content_text()`; images are shown via the turn's own
+		// file chips, not re-rendered from history.
+		const text = contentText(m.content);
 		if (m.role === "user") {
-			pendingUser = m.content;
-		} else if (m.role === "assistant" && m.content) {
-			turns.push({ user: pendingUser, text: m.content, toolSteps: [] });
-			pendingUser = "";
+			// A folded turn carries its own display split (`presetDisplay` computed
+			// it when the message was SENT and it was persisted with the message),
+			// so recall replays that verdict rather than re-deriving the boundary
+			// from flat text — one decider, no drift. Unfolded turns render as-is.
+			pendingUser = m.display
+				? {
+						instruction: m.display.instruction,
+						attachment: { label: m.display.label, body: m.display.body },
+					}
+				: { instruction: text, attachment: undefined };
+		} else if (m.role === "assistant" && text) {
+			turns.push({
+				user: pendingUser.instruction,
+				text,
+				toolSteps: [],
+				attachment: pendingUser.attachment,
+			});
+			pendingUser = { instruction: "", attachment: undefined };
 		}
 	}
 	const prior = turns.slice(0, -1); // last pair goes into the live slot
 	const last = turns[turns.length - 1];
 	// loadRecalled sets the transcript + live slot, shows the AI surface, and bumps
 	// the generation for any follow-up.
-	chat.loadRecalled(prior, last?.user ?? pendingUser, last?.text ?? "");
+	chat.loadRecalled(
+		prior,
+		last?.user ?? pendingUser.instruction,
+		last?.text ?? "",
+		last ? last.attachment : pendingUser.attachment,
+	);
 	lastResult = null;
 	// Opening a recalled conversation is an explicit action → focus the reply box.
 	aiAnswerRef?.focusReply();
@@ -754,6 +781,7 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 		completionIndex: completions.index,
 		inputDecision,
 		runDecision,
+		hasAttachments: attachments.any,
 	});
 
 	switch (action.kind) {
@@ -863,7 +891,12 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 				if (sel) input = sel;
 			}
 			lastResult = null; // AI answer takes over the result area
-			await chat.startPreset(renderPreset(action.template, input));
+			// Model gets the full rendered prompt; the bubble folds a big selection
+			// into a collapsed attachment chip instead of dumping it inline.
+			await chat.startPreset(
+				renderPreset(action.template, input),
+				presetDisplay(action.template, input),
+			);
 			return;
 		}
 
@@ -1020,6 +1053,29 @@ async function openFileByLabel(label: string) {
 	inputValue = "";
 	await hide();
 	await openUri(`file://${label}`);
+}
+
+/**
+ * Stage the highlighted file-search / `@` result as an AI attachment (Ctrl+Shift+A).
+ * The backend classifies it — this only forwards the path and clears the picker
+ * so the user is left at an empty prompt with a chip, ready to type the ask.
+ */
+async function attachSelectedFile() {
+	if (!(completions.searchMode || completions.atMode)) return;
+	if (completions.items.length === 0 || completions.index < 0) return;
+	const item = completions.items[completions.index];
+	// Folders aren't attachable (the backend refuses them too) — drilling in is
+	// the useful gesture there, so leave the picker alone.
+	if (item.icon_path === "__folder__") return;
+
+	completions.searchMode = false;
+	completions.atMode = false;
+	completions.atStart = -1;
+	completions.items = [];
+	completions.index = -1;
+	cancelFileSearch();
+	inputValue = "";
+	await attachments.add([item.label]);
 }
 
 /** Drill into a folder result — browse its contents inside Lychi (Tab / →). */
@@ -1623,7 +1679,12 @@ async function handleDismiss() {
 			browseGhost={completions.atMode && completions.items.length > 0 && completions.index >= 0 ? completions.items[completions.index].label : ""}
 			history={historyEntries}
 			onactionpanel={openActionPanel}
+			onattachfile={attachSelectedFile}
+			onpastefiles={attachments.addFromClipboard}
+			onremovelastattachment={attachments.removeLast}
+			hasAttachments={attachments.any}
 		/>
+		<AttachmentTray />
 		{#if actionPanelOpen}
 			<ActionPanel
 				actions={panelActions}
@@ -1662,6 +1723,8 @@ async function handleDismiss() {
 				bind:this={aiAnswerRef}
 				turns={chat.turns}
 				lastUser={chat.lastUser}
+				lastAttachment={chat.lastAttachment}
+				lastFiles={chat.lastFiles}
 				text={chat.text}
 				truncated={chat.truncated}
 				tokensIn={chat.tokensIn}

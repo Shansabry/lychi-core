@@ -9,13 +9,18 @@
 //! model discovery, name) stays in each provider; only the wire *mechanism* is
 //! shared. (The local llama.cpp engine is not a wire client — it has its own.)
 
+use std::sync::Arc;
+
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
 
 use crate::error::LychiError;
 
-use super::{CancellationToken, ChatMessage, EventStream, Role, StopReason, StreamEvent, ToolDef};
+use super::{
+    CancellationToken, ChatMessage, ContentPart, EventStream, Role, StopReason, StreamEvent,
+    ToolDef,
+};
 
 // ── WireClient: the one HTTP→SSE→event flow, per dialect ──────────────────────
 
@@ -42,6 +47,13 @@ pub(crate) enum AuthStyle {
 
 /// A configured client for one HTTP endpoint + dialect. Owns the complete
 /// streaming-chat mechanism so providers don't duplicate it.
+/// Notified when a request fails, so callers can LEARN from it (see
+/// `providers::capability`). Kept as a callback rather than a DB handle so the
+/// wire layer stays free of storage concerns and remains testable in isolation.
+pub(crate) type ErrorObserver = Arc<dyn Fn(&super::errors::AiError) + Send + Sync>;
+
+/// A configured client for one HTTP endpoint + dialect. Owns the complete
+/// streaming-chat mechanism so providers don't duplicate it.
 pub(crate) struct WireClient {
     http: Client,
     dialect: Dialect,
@@ -50,6 +62,9 @@ pub(crate) struct WireClient {
     model: String,
     max_tokens: u32,
     auth: AuthStyle,
+    /// Optional hook fired on a classified failure. `None` in tests and for
+    /// providers that have nothing to learn.
+    on_error: Option<ErrorObserver>,
 }
 
 impl WireClient {
@@ -68,7 +83,15 @@ impl WireClient {
             model: model.into(),
             max_tokens,
             auth,
+            on_error: None,
         }
+    }
+
+    /// Attach a failure observer (builder-style). Used to record learned model
+    /// capabilities without giving the wire layer a database.
+    pub(crate) fn with_error_observer(mut self, obs: Option<ErrorObserver>) -> Self {
+        self.on_error = obs;
+        self
     }
 
     /// Stream a chat turn as normalized [`super::StreamEvent`]s. Builds the
@@ -85,9 +108,14 @@ impl WireClient {
         let url = self.url.clone();
         let model = self.model.clone();
         let auth = self.auth.clone();
+        let on_error = self.on_error.clone();
 
         // Build the wire body up-front (pure, no IO).
         let body = build_body(dialect, &model, self.max_tokens, messages, tools);
+        // Whether this request carried images decides how a 400 is explained: a
+        // shape complaint about `content` means "text-only model" only when we
+        // actually sent image blocks. Captured here, before `messages` is dropped.
+        let had_images = messages.iter().any(|m| m.has_images());
 
         async_stream::try_stream! {
             let mut req = http.post(&url).header("Content-Type", "application/json");
@@ -98,16 +126,26 @@ impl WireClient {
                     .header("anthropic-version", "2023-06-01"),
                 AuthStyle::None => req,
             };
+            // Provider failures are classified into one actionable sentence
+            // (`providers::errors`) rather than surfaced as raw JSON — the user
+            // needs to know what to DO, not what the endpoint's validator said.
             let resp = req
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| LychiError::Ai(format!("HTTP request failed: {e}")))?;
+                .map_err(|e| {
+                    // No status = transport failure.
+                    let err = super::errors::classify(None, &e.to_string(), had_images);
+                    if let Some(obs) = &on_error { obs(&err); }
+                    LychiError::Ai(err.message)
+                })?;
             let status = resp.status();
             if !status.is_success() {
                 // Error path consumes `resp` (reads the body) and diverges.
                 let text = resp.text().await.unwrap_or_default();
-                Err(LychiError::Ai(format!("API returned {status}: {text}")))?;
+                let err = super::errors::classify(Some(status.as_u16()), &text, had_images);
+                if let Some(obs) = &on_error { obs(&err); }
+                Err(LychiError::Ai(err.message))?;
                 return; // unreachable after `?`, but makes the divergence explicit
             }
             let byte_stream = resp.bytes_stream();
@@ -172,14 +210,23 @@ pub(crate) fn anthropic_messages(messages: &[ChatMessage]) -> Vec<Value> {
     for m in messages {
         match m.role {
             Role::System => {} // handled out-of-band
-            Role::User => out.push(json!({ "role": "user", "content": m.content })),
+            Role::User => {
+                // A text-only user turn can go as a bare string; anything with an
+                // image attachment must use the content-block array form.
+                if m.has_images() {
+                    out.push(json!({ "role": "user", "content": anthropic_content_blocks(m) }));
+                } else {
+                    out.push(json!({ "role": "user", "content": m.content_text() }));
+                }
+            }
             Role::Assistant => {
+                let text = m.content_text();
                 if m.tool_calls.is_empty() {
-                    out.push(json!({ "role": "assistant", "content": m.content }));
+                    out.push(json!({ "role": "assistant", "content": text }));
                 } else {
                     let mut blocks: Vec<Value> = Vec::new();
-                    if !m.content.is_empty() {
-                        blocks.push(json!({ "type": "text", "text": m.content }));
+                    if !text.is_empty() {
+                        blocks.push(json!({ "type": "text", "text": text }));
                     }
                     for tc in &m.tool_calls {
                         blocks.push(json!({
@@ -196,7 +243,7 @@ pub(crate) fn anthropic_messages(messages: &[ChatMessage]) -> Vec<Value> {
                 let block = json!({
                     "type": "tool_result",
                     "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
-                    "content": m.content,
+                    "content": m.content_text(),
                     "is_error": m.is_error,
                 });
                 // Coalesce consecutive tool results into the previous user
@@ -221,9 +268,28 @@ pub(crate) fn anthropic_system(messages: &[ChatMessage]) -> String {
     messages
         .iter()
         .filter(|m| m.role == Role::System)
-        .map(|m| m.content.as_str())
+        .map(|m| m.content_text())
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// Encode a user message's content parts as Anthropic content blocks: `text`
+/// blocks and `image` blocks (`source:{type:"base64", media_type, data}`).
+fn anthropic_content_blocks(m: &ChatMessage) -> Vec<Value> {
+    m.content
+        .iter()
+        .map(|part| match part {
+            ContentPart::Text { text } => json!({ "type": "text", "text": text }),
+            ContentPart::Image { source } => json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": source.media_type,
+                    "data": source.data,
+                },
+            }),
+        })
+        .collect()
 }
 
 /// Serialize the message history to OpenAI wire format. Tool results are separate
@@ -232,11 +298,19 @@ pub(crate) fn openai_messages(messages: &[ChatMessage]) -> Vec<Value> {
     let mut out = Vec::new();
     for m in messages {
         match m.role {
-            Role::System => out.push(json!({ "role": "system", "content": m.content })),
-            Role::User => out.push(json!({ "role": "user", "content": m.content })),
+            Role::System => out.push(json!({ "role": "system", "content": m.content_text() })),
+            Role::User => {
+                // Text-only → bare string; with images → the content-parts array.
+                if m.has_images() {
+                    out.push(json!({ "role": "user", "content": openai_content_parts(m) }));
+                } else {
+                    out.push(json!({ "role": "user", "content": m.content_text() }));
+                }
+            }
             Role::Assistant => {
+                let text = m.content_text();
                 if m.tool_calls.is_empty() {
-                    out.push(json!({ "role": "assistant", "content": m.content }));
+                    out.push(json!({ "role": "assistant", "content": text }));
                 } else {
                     let calls: Vec<Value> = m
                         .tool_calls
@@ -254,7 +328,7 @@ pub(crate) fn openai_messages(messages: &[ChatMessage]) -> Vec<Value> {
                         .collect();
                     out.push(json!({
                         "role": "assistant",
-                        "content": if m.content.is_empty() { Value::Null } else { json!(m.content) },
+                        "content": if text.is_empty() { Value::Null } else { json!(text) },
                         "tool_calls": calls,
                     }));
                 }
@@ -262,11 +336,28 @@ pub(crate) fn openai_messages(messages: &[ChatMessage]) -> Vec<Value> {
             Role::Tool => out.push(json!({
                 "role": "tool",
                 "tool_call_id": m.tool_call_id.clone().unwrap_or_default(),
-                "content": m.content,
+                "content": m.content_text(),
             })),
         }
     }
     out
+}
+
+/// Encode a user message's content parts as OpenAI content parts: `text` parts
+/// and `image_url` parts whose URL is a `data:<mime>;base64,<data>` URI.
+fn openai_content_parts(m: &ChatMessage) -> Vec<Value> {
+    m.content
+        .iter()
+        .map(|part| match part {
+            ContentPart::Text { text } => json!({ "type": "text", "text": text }),
+            ContentPart::Image { source } => json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{};base64,{}", source.media_type, source.data),
+                },
+            }),
+        })
+        .collect()
 }
 
 /// Anthropic tool schema — uniform `{ args: string }` input for every Lychi tool.
@@ -585,7 +676,7 @@ fn parse_sse_data(block: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{CancellationToken, StopReason, StreamEvent, ToolCall};
+    use crate::providers::{CancellationToken, ContentPart, StopReason, StreamEvent, ToolCall};
 
     #[test]
     fn sse_parse_data_joins_multiline_and_strips_prefix() {
@@ -791,13 +882,77 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_encodes_user_image_as_base64_source_block() {
+        let msg = ChatMessage::user_with_images(
+            "what is this?",
+            vec![super::super::ImageSource {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+            }],
+        );
+        let wire = anthropic_messages(&[msg]);
+        assert_eq!(wire.len(), 1);
+        let content = &wire[0]["content"];
+        assert!(content.is_array());
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "what is this?");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "QUJD");
+    }
+
+    #[test]
+    fn openai_encodes_user_image_as_data_uri() {
+        let msg = ChatMessage::user_with_images(
+            "describe",
+            vec![super::super::ImageSource {
+                media_type: "image/jpeg".into(),
+                data: "QUJD".into(),
+            }],
+        );
+        let wire = openai_messages(&[msg]);
+        assert_eq!(wire.len(), 1);
+        let content = &wire[0]["content"];
+        assert!(content.is_array());
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/jpeg;base64,QUJD"
+        );
+    }
+
+    #[test]
+    fn text_only_user_still_encodes_as_bare_string() {
+        // No images → the compact string form on BOTH dialects (no needless array).
+        let msg = ChatMessage::user("hello");
+        assert_eq!(anthropic_messages(&[msg.clone()])[0]["content"], "hello");
+        assert_eq!(openai_messages(&[msg])[0]["content"], "hello");
+    }
+
+    #[test]
+    fn legacy_string_content_deserializes() {
+        // History persisted BEFORE the multimodal migration stored `content` as a
+        // bare JSON string. It must still load into a single Text part.
+        let json = r#"{"role":"user","content":"old message"}"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.content, vec![ContentPart::text("old message")]);
+        assert_eq!(msg.content_text(), "old message");
+        assert!(!msg.has_images());
+        // New serialization is the block-array form.
+        let out = serde_json::to_string(&msg).unwrap();
+        assert!(out.contains(r#""type":"text""#));
+    }
+
+    #[test]
     fn anthropic_messages_round_trip_tool_calls() {
         let msgs = vec![
             ChatMessage::system("sys"),
             ChatMessage::user("open firefox"),
             ChatMessage {
                 role: Role::Assistant,
-                content: "I'll open it".into(),
+                content: vec![ContentPart::text("I'll open it")],
                 tool_call_id: None,
                 tool_calls: vec![ToolCall {
                     id: "t1".into(),
@@ -805,6 +960,7 @@ mod tests {
                     args: "firefox".into(),
                 }],
                 is_error: false,
+                display: None,
             },
             ChatMessage::tool_result("t1", "opened", false),
         ];
@@ -823,7 +979,7 @@ mod tests {
             ChatMessage::user("open firefox"),
             ChatMessage {
                 role: Role::Assistant,
-                content: String::new(),
+                content: vec![],
                 tool_call_id: None,
                 tool_calls: vec![ToolCall {
                     id: "t1".into(),
@@ -831,6 +987,7 @@ mod tests {
                     args: "firefox".into(),
                 }],
                 is_error: false,
+                display: None,
             },
             ChatMessage::tool_result("t1", "opened", false),
         ];

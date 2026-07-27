@@ -26,9 +26,7 @@ pub async fn save_ai_config(
     // would leak it. Requires https:// (loopback http:// allowed for local
     // proxies). Fails the save with a clear message rather than silently
     // exfiltrating the key on the next request.
-    ai_config
-        .validate_base_url()
-        .map_err(LychiError::Config)?;
+    ai_config.validate_base_url().map_err(LychiError::Config)?;
 
     // Persist, then release the write lock BEFORE emitting — the AiReactor
     // acquires the config/executor locks with blocking_*, so this command must
@@ -105,6 +103,40 @@ pub async fn get_ai_status(state: State<'_, AppState>) -> Result<AiStatus, Lychi
         model: config.ai.model.clone(),
         has_ai_router: executor.has_ai(),
     })
+}
+
+/// Whether the CURRENTLY SELECTED model is known to accept image input.
+///
+/// `"supported"` / `"unsupported"` / `"unknown"`. Unknown means no evidence
+/// either way and the caller should ALLOW the attempt — refusing on absent
+/// evidence would make a newly released vision model unusable. Verdicts come
+/// from provider metadata where the endpoint reports it, and otherwise from a
+/// previously observed rejection (see `providers::capability`).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_model_vision(state: State<'_, AppState>) -> Result<String, LychiError> {
+    let config = state.config.read().await;
+    // Only BYO has a user-chosen remote model to reason about; the other modes
+    // (local/ollama) are answered as unknown, i.e. "just try it".
+    if config.ai.mode != "byo" {
+        return Ok("unknown".to_string());
+    }
+    let (provider, model) = (config.ai.provider.clone(), config.ai.model.clone());
+    drop(config);
+
+    let db = state.db.clone();
+    let vision = tauri::async_runtime::spawn_blocking(move || {
+        lychi_core::providers::capability::get_vision(&db, &provider, &model)
+    })
+    .await
+    .map_err(|e| LychiError::ExecutionFailed(format!("vision lookup task panicked: {e}")))?;
+
+    Ok(match vision {
+        lychi_core::providers::capability::Vision::Supported => "supported",
+        lychi_core::providers::capability::Vision::Unsupported => "unsupported",
+        lychi_core::providers::capability::Vision::Unknown => "unknown",
+    }
+    .to_string())
 }
 
 #[tauri::command]
@@ -345,8 +377,7 @@ pub async fn delete_local_model(model_id: String) -> Result<(), LychiError> {
     let f = spec.gguf_filename();
     let path = dir.join(&f);
     if path.exists() {
-        std::fs::remove_file(&path)
-            .map_err(|e| LychiError::Config(format!("delete {f}: {e}")))?;
+        std::fs::remove_file(&path).map_err(|e| LychiError::Config(format!("delete {f}: {e}")))?;
     }
     Ok(())
 }

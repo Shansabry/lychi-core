@@ -252,10 +252,19 @@ mod tests {
 
     // Build a real script file on disk and a handler wrapping it, so `execute`
     // resolves + assembles a genuine command line. Returns (handler, cleanup).
+    //
+    // The dir is made unique per call with an atomic counter (not just pid+keyword)
+    // so tests reusing the same keyword don't share a directory and race on
+    // `remove_dir_all` when run in parallel (CLAUDE.md temp-path rule).
     fn script_on_disk(keyword: &str, confirm: bool) -> (ScriptCommandsHandler, PathBuf) {
         use std::io::Write;
-        let dir =
-            std::env::temp_dir().join(format!("lychi-scripttest-{}-{keyword}", std::process::id()));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "lychi-scripttest-{}-{keyword}-{n}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join(format!("{keyword}.sh"));

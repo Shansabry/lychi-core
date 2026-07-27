@@ -15,9 +15,11 @@ use lychi_core::action_registry::handlers::clear::ClearHandler;
 use lychi_core::action_registry::handlers::clipboard::ClipboardHandler;
 use lychi_core::action_registry::handlers::color::ColorHandler;
 use lychi_core::action_registry::handlers::context_debug::ContextDebugHandler;
+use lychi_core::action_registry::handlers::convert_image::ConvertImageHandler;
 use lychi_core::action_registry::handlers::define::DefineHandler;
 use lychi_core::action_registry::handlers::dev_utils::DevUtilsHandler;
 use lychi_core::action_registry::handlers::emoji::EmojiHandler;
+use lychi_core::action_registry::handlers::extract::ExtractHandler;
 use lychi_core::action_registry::handlers::file_open::FileOpen;
 use lychi_core::action_registry::handlers::generate::GenerateHandler;
 #[cfg(feature = "mpris")]
@@ -45,6 +47,7 @@ use lychi_core::action_registry::handlers::weather::WeatherHandler;
 use lychi_core::action_registry::handlers::web_search::WebSearch;
 use lychi_core::action_registry::handlers::window_switcher::WindowSwitcherHandler;
 use lychi_core::action_registry::handlers::youtube::YouTube;
+use lychi_core::action_registry::handlers::zip::ZipHandler;
 use lychi_core::action_registry::registry::ActionRegistry;
 use lychi_core::config::Config;
 use lychi_core::executor::Executor;
@@ -191,6 +194,10 @@ impl AppState {
             db_size as f64 / 1024.0
         );
 
+        // Register the learned-model-capability store before any provider is
+        // built, so the factory can wire failure-learning into BYO clients.
+        lychi_core::providers::capability::init_store(db.clone());
+
         // Seed settings from TOML on first launch (if settings table is empty)
         if let Err(e) = lychi_core::config::db::seed_from_config(&db, &config) {
             tracing::error!("Failed to seed settings: {e}");
@@ -290,6 +297,9 @@ impl AppState {
         registry.register(Box::new(DevUtilsHandler::new()));
         registry.register(Box::new(QrHandler::new()));
         registry.register(Box::new(ResizeImageHandler::new()));
+        registry.register(Box::new(ConvertImageHandler::new()));
+        registry.register(Box::new(ZipHandler::new()));
+        registry.register(Box::new(ExtractHandler::new()));
         registry.register(Box::new(ScreenshotHandler::new()));
         registry.register(Box::new(ServicesHandler::new()));
         registry.register(Box::new(ServicesListHandler::new()));
@@ -347,8 +357,7 @@ impl AppState {
 
         // Script Commands — files in ~/.config/lychi/scripts/ become named
         // commands. Discovered at startup; hot-reloaded by the scripts watcher.
-        let scripts =
-            lychi_core::script_commands::discover(&lychi_core::paths::scripts_dir());
+        let scripts = lychi_core::script_commands::discover(&lychi_core::paths::scripts_dir());
         let script_keywords: Vec<String> = scripts.iter().map(|s| s.keyword.clone()).collect();
         registry.register(Box::new(
             lychi_core::action_registry::handlers::script_commands::ScriptCommandsHandler::new(
@@ -359,9 +368,9 @@ impl AppState {
 
         // Clone for the router; the original `ai_provider` is stored on AppState
         // (below) as the handle the streaming-chat command reads.
-        let ai_router = ai_provider.clone().map(|p| {
-            AiRouter::new_shared(p, Self::ask_timeout(&config.ai))
-        });
+        let ai_router = ai_provider
+            .clone()
+            .map(|p| AiRouter::new_shared(p, Self::ask_timeout(&config.ai)));
 
         let history = HistoryStore::new(config.history.max_entries, config.history.deduplicate);
 

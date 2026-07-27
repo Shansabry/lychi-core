@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { RouteDecision } from "./bindings";
-import { decideSubmit, renderPreset, type RouterCompletion, type SubmitContext } from "./submit-router";
+import {
+	decideSubmit,
+	type RouterCompletion,
+	renderPreset,
+	type SubmitContext,
+} from "./submit-router";
 
 /**
  * These tests cover the FRONTEND reducer only: how keyboard/mode/selection state
@@ -32,7 +37,11 @@ function comp(over: Partial<RouterCompletion> = {}): RouterCompletion {
 }
 
 const CMD = (command: string): RouteDecision => ({ kind: "command", command });
-const NL = (prompt: string, confident: boolean): RouteDecision => ({ kind: "nl", prompt, confident });
+const NL = (prompt: string, confident: boolean): RouteDecision => ({
+	kind: "nl",
+	prompt,
+	confident,
+});
 
 describe("decideSubmit — guards", () => {
 	it("empty input with no selection is a noop", () => {
@@ -45,6 +54,35 @@ describe("decideSubmit — guards", () => {
 
 	it("input with no decision yet is a noop (caller awaits classifyInput)", () => {
 		expect(decideSubmit(ctx({ trimmed: "firefox" })).kind).toBe("noop");
+	});
+});
+
+describe("decideSubmit — staged attachments (FE-only UI state)", () => {
+	it("attachments alone make an empty submit a full-agent turn", () => {
+		const a = decideSubmit(ctx({ hasAttachments: true }));
+		expect(a.kind).toBe("agent");
+		if (a.kind === "agent") expect(a.prompt.length).toBeGreaterThan(0);
+	});
+
+	it("an empty submit with no attachments is still a noop", () => {
+		expect(decideSubmit(ctx({ hasAttachments: false })).kind).toBe("noop");
+	});
+
+	it("attachments promote an ambiguous question past the fork card", () => {
+		const base = { trimmed: "what is this", inputDecision: NL("what is this", false) };
+		expect(decideSubmit(ctx(base)).kind).toBe("quick-ai");
+		expect(decideSubmit(ctx({ ...base, hasAttachments: true })).kind).toBe("agent");
+	});
+
+	it("attachments do not hijack a deterministic command", () => {
+		const a = decideSubmit(
+			ctx({ trimmed: "firefox", inputDecision: CMD("open firefox"), hasAttachments: true }),
+		);
+		expect(a.kind).toBe("command");
+	});
+
+	it("a showing plan still swallows Enter even with attachments", () => {
+		expect(decideSubmit(ctx({ pendingPlan: true, hasAttachments: true })).kind).toBe("noop");
 	});
 });
 
@@ -78,7 +116,9 @@ describe("decideSubmit — keyboard modifiers (FE-only, no classification)", () 
 
 describe("decideSubmit — actuating the backend decision", () => {
 	it("a command decision runs verbatim", () => {
-		expect(decideSubmit(ctx({ trimmed: "open spotify", inputDecision: CMD("open spotify") }))).toEqual({
+		expect(
+			decideSubmit(ctx({ trimmed: "open spotify", inputDecision: CMD("open spotify") })),
+		).toEqual({
 			kind: "command",
 			command: "open spotify",
 		});
@@ -195,7 +235,9 @@ describe("decideSubmit — a selected row's run is classified by the backend (du
 	it("a history row whose run echoes a past question goes to the agent", () => {
 		const c = ctx({
 			trimmed: "what is rust?",
-			completions: [comp({ label: "what is rust?", icon_path: "__history__", run: "what is rust?" })],
+			completions: [
+				comp({ label: "what is rust?", icon_path: "__history__", run: "what is rust?" }),
+			],
 			completionIndex: 0,
 			inputDecision: NL("what is rust?", true),
 			runDecision: NL("what is rust?", true),
@@ -209,7 +251,9 @@ describe("decideSubmit — a selected row's run is classified by the backend (du
 		// no-response fix: the input's classification wins over the row.
 		const c = ctx({
 			trimmed: "what is rust?",
-			completions: [comp({ label: "what is rust?", icon_path: "__history__", run: "what is rust?" })],
+			completions: [
+				comp({ label: "what is rust?", icon_path: "__history__", run: "what is rust?" }),
+			],
 			completionIndex: 0,
 			inputDecision: NL("what is rust?", true),
 			runDecision: NL("what is rust?", true),

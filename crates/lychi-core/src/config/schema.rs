@@ -563,6 +563,9 @@ pub struct KeybindingsConfig {
     pub screenshot: String,
     /// Open the secondary-actions panel for the selected result. Ctrl+K.
     pub action_panel: String,
+    /// Stage the selected file as an attachment for the next AI turn (image →
+    /// vision, document → inlined text). Ctrl+Shift+A.
+    pub attach_file: String,
 }
 
 impl Default for KeybindingsConfig {
@@ -583,6 +586,7 @@ impl Default for KeybindingsConfig {
             copy_path: "Ctrl+Shift+C".to_string(),
             screenshot: "Ctrl+Shift+S".to_string(),
             action_panel: "Ctrl+K".to_string(),
+            attach_file: "Ctrl+Shift+A".to_string(),
         }
     }
 }

@@ -134,7 +134,7 @@ fn build_byo(
         .ok_or_else(|| ProviderError::MissingApiKey(cfg.provider.clone()))?;
 
     let wire = WireFormat::parse(&cfg.resolved_wire_format());
-    let client = BYOClient::new(
+    let mut client = BYOClient::new(
         cfg.provider.clone(),
         wire,
         base_url,
@@ -142,6 +142,11 @@ fn build_byo(
         api_key,
         cfg.max_tokens,
     );
+    // Learn from failures when a capability store is registered (it is, in the
+    // app; not in tests). Wired here so no caller has to remember to.
+    if let Some(db) = super::capability::store() {
+        client = client.with_capability_store(db.clone());
+    }
     Ok(Arc::new(client))
 }
 

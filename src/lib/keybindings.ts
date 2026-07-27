@@ -22,7 +22,8 @@ export type ActionId =
 	| "run_inline"
 	| "copy_path"
 	| "screenshot"
-	| "action_panel";
+	| "action_panel"
+	| "attach_file";
 
 export const ACTION_LABELS: Record<ActionId, string> = {
 	toggle_history: "Toggle history",
@@ -40,6 +41,7 @@ export const ACTION_LABELS: Record<ActionId, string> = {
 	copy_path: "Copy result path",
 	screenshot: "Quick screenshot",
 	action_panel: "Show actions for result",
+	attach_file: "Attach file to AI chat",
 };
 
 export const ALL_ACTIONS: ActionId[] = Object.keys(ACTION_LABELS) as ActionId[];

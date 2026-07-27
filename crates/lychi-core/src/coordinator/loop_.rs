@@ -875,7 +875,7 @@ mod tests {
                     session
                         .messages
                         .iter()
-                        .any(|m| m.is_error && m.content == "User said no")
+                        .any(|m| m.is_error && m.content_text() == "User said no")
                 );
             }
             _ => panic!("expected Done"),

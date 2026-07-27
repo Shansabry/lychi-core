@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::providers::{ChatMessage, ToolCall};
+use crate::providers::{ChatMessage, ImageSource, ToolCall};
 
 use super::tool_executor::ResumeToken;
 
@@ -35,9 +35,51 @@ impl Session {
         }
     }
 
+    /// A fresh session seeded with a system prompt + a first user message that
+    /// carries image attachments (vision). Equivalent to `new` when `images` is
+    /// empty.
+    pub fn new_with_images(
+        system: impl Into<String>,
+        first_user: impl Into<String>,
+        images: Vec<ImageSource>,
+    ) -> Self {
+        Self {
+            messages: vec![
+                ChatMessage::system(system),
+                ChatMessage::user_with_images(first_user, images),
+            ],
+            pending: Vec::new(),
+        }
+    }
+
     /// Append a user turn (a follow-up or a resumed conversation).
     pub fn push_user(&mut self, content: impl Into<String>) {
         self.messages.push(ChatMessage::user(content));
+    }
+
+    /// Append a user turn carrying image attachments. Equivalent to `push_user`
+    /// when `images` is empty.
+    pub fn push_user_with_images(&mut self, content: impl Into<String>, images: Vec<ImageSource>) {
+        self.messages
+            .push(ChatMessage::user_with_images(content, images));
+    }
+
+    /// Stamp the presentational split onto the most recent user turn.
+    ///
+    /// The sender already computed how the bubble folds (instruction + chip);
+    /// recording it here is what lets a recalled conversation render identically
+    /// without a second decider re-deriving the boundary from flat text. No-op
+    /// when there is no user turn or no split to record.
+    pub fn set_last_user_display(&mut self, display: Option<crate::providers::MessageDisplay>) {
+        let Some(display) = display else { return };
+        if let Some(m) = self
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.role == crate::providers::Role::User)
+        {
+            m.display = Some(display);
+        }
     }
 
     /// Replace the system prompt (messages[0]) in place, keeping all history.
@@ -49,7 +91,7 @@ impl Session {
         if let Some(first) = self.messages.first_mut()
             && first.role == crate::providers::Role::System
         {
-            first.content = system.into();
+            first.set_text(system);
         } else {
             self.messages.insert(0, ChatMessage::system(system));
         }
@@ -61,10 +103,11 @@ impl Session {
     pub fn push_assistant(&mut self, text: String, tool_calls: Vec<ToolCall>) {
         self.messages.push(ChatMessage {
             role: crate::providers::Role::Assistant,
-            content: text,
+            content: vec![crate::providers::ContentPart::text(text)],
             tool_call_id: None,
             tool_calls,
             is_error: false,
+            display: None,
         });
     }
 
@@ -118,15 +161,54 @@ mod tests {
     use crate::providers::Role;
 
     #[test]
+    fn display_split_is_stamped_on_the_last_user_turn_and_survives_a_roundtrip() {
+        use crate::providers::MessageDisplay;
+
+        let mut s = Session::new("sys", "Summarize the following: <a very long blob>");
+        s.set_last_user_display(Some(MessageDisplay {
+            instruction: "Summarize the following: …".into(),
+            label: "Selected text · 1.2k".into(),
+            body: "<a very long blob>".into(),
+        }));
+
+        let user = &s.messages[1];
+        assert_eq!(user.role, Role::User);
+        let d = user.display.as_ref().expect("display should be stamped");
+        assert_eq!(d.instruction, "Summarize the following: …");
+        assert_eq!(d.body, "<a very long blob>");
+        // The model still receives the FULL content — the split is presentational.
+        assert!(user.content_text().contains("<a very long blob>"));
+
+        // Persisted history must carry it back, otherwise recall has to guess.
+        let json = serde_json::to_string(&s.messages).unwrap();
+        let back: Vec<crate::providers::ChatMessage> = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back[1].display.as_ref().unwrap().label,
+            "Selected text · 1.2k"
+        );
+    }
+
+    #[test]
+    fn messages_without_a_display_split_stay_none() {
+        let mut s = Session::new("sys", "hello");
+        s.set_last_user_display(None);
+        assert!(s.messages[1].display.is_none());
+        // A legacy message (no `display` key at all) still deserializes.
+        let legacy = r#"[{"role":"user","content":"hi"}]"#;
+        let back: Vec<crate::providers::ChatMessage> = serde_json::from_str(legacy).unwrap();
+        assert!(back[0].display.is_none());
+    }
+
+    #[test]
     fn set_system_replaces_leading_prompt_keeping_history() {
         let mut s = Session::new("terse prompt", "what is rust?");
         s.push_assistant("Rust is a systems language.".into(), Vec::new());
         s.set_system("full agent prompt");
         // System swapped, history (user + assistant) intact and in order.
         assert_eq!(s.messages[0].role, Role::System);
-        assert_eq!(s.messages[0].content, "full agent prompt");
+        assert_eq!(s.messages[0].content_text(), "full agent prompt");
         assert_eq!(s.messages[1].role, Role::User);
-        assert_eq!(s.messages[1].content, "what is rust?");
+        assert_eq!(s.messages[1].content_text(), "what is rust?");
         assert_eq!(s.messages[2].role, Role::Assistant);
         assert_eq!(s.messages.len(), 3);
     }
@@ -139,7 +221,7 @@ mod tests {
         };
         s.set_system("sys");
         assert_eq!(s.messages[0].role, Role::System);
-        assert_eq!(s.messages[0].content, "sys");
+        assert_eq!(s.messages[0].content_text(), "sys");
         assert_eq!(s.messages[1].role, Role::User);
     }
 }

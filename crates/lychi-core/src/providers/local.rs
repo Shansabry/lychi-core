@@ -700,12 +700,22 @@ fn flatten_conversation(messages: &[ChatMessage]) -> (String, String) {
     let mut system = Vec::new();
     let mut transcript = Vec::new();
     for m in messages {
+        let text = m.content_text();
         match m.role {
-            Role::System => system.push(m.content.clone()),
-            Role::User => transcript.push(format!("User: {}", m.content)),
+            Role::System => system.push(text),
+            Role::User => {
+                // The local engine is text-only; note any dropped image attachments
+                // so the model knows an image was provided even though it can't see it.
+                let note = if m.has_images() {
+                    " [image attached]"
+                } else {
+                    ""
+                };
+                transcript.push(format!("User: {text}{note}"));
+            }
             Role::Assistant => {
-                if !m.content.is_empty() {
-                    transcript.push(format!("Assistant: {}", m.content));
+                if !text.is_empty() {
+                    transcript.push(format!("Assistant: {text}"));
                 }
                 for tc in &m.tool_calls {
                     transcript.push(format!(
@@ -720,7 +730,7 @@ fn flatten_conversation(messages: &[ChatMessage]) -> (String, String) {
                 } else {
                     "Tool result"
                 };
-                transcript.push(format!("{tag}: {}", m.content));
+                transcript.push(format!("{tag}: {text}"));
             }
         }
     }

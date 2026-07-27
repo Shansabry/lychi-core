@@ -83,9 +83,32 @@ fn panel_for(keyword: &str) -> Option<(PanelKind, Option<&'static str>)> {
 /// keystroke or app-name typo never silently spins up an AI turn. (Moved here
 /// from the frontend `QUESTION_WORDS`.)
 const QUESTION_WORDS: &[&str] = &[
-    "what", "whats", "why", "how", "who", "when", "where", "which", "is", "are", "can", "could",
-    "should", "would", "do", "does", "did", "will", "explain", "tell", "write", "give",
-    "summarize", "translate", "define", "compare",
+    "what",
+    "whats",
+    "why",
+    "how",
+    "who",
+    "when",
+    "where",
+    "which",
+    "is",
+    "are",
+    "can",
+    "could",
+    "should",
+    "would",
+    "do",
+    "does",
+    "did",
+    "will",
+    "explain",
+    "tell",
+    "write",
+    "give",
+    "summarize",
+    "translate",
+    "define",
+    "compare",
 ];
 
 /// Does `text` read as a clear natural-language question/request (high-confidence
@@ -137,7 +160,9 @@ pub fn classify_string(
     if lower == "ask" || lower.starts_with("ask ") {
         let q = trimmed[3..].trim();
         if !q.is_empty() {
-            return nl_or_disabled(q, /* confident */ true, /* explicit */ true, has_ai);
+            return nl_or_disabled(
+                q, /* confident */ true, /* explicit */ true, has_ai,
+            );
         }
         // bare "ask" falls through to normal handling
     }
@@ -248,7 +273,11 @@ mod tests {
         fn triggers(&self) -> &'static [Trigger] {
             self.triggers
         }
-        async fn execute(&self, _ctx: &ExecContext, _args: &str) -> Result<ActionResult, LychiError> {
+        async fn execute(
+            &self,
+            _ctx: &ExecContext,
+            _args: &str,
+        ) -> Result<ActionResult, LychiError> {
             Ok(ActionResult::default())
         }
     }
@@ -259,6 +288,10 @@ mod tests {
         static WEB: &[Trigger] = &[Trigger::keywords(&["web"])];
         static RUN: &[Trigger] = &[Trigger::keywords(&["run"])];
         static OPEN: &[Trigger] = &[Trigger::keywords(&["open"])];
+        // File-utility verbs (Phase 1) — routed purely by their triggers.
+        static CONVERT: &[Trigger] = &[Trigger::keywords(&["convert"])];
+        static ZIP: &[Trigger] = &[Trigger::keywords(&["zip", "compress"])];
+        static EXTRACT: &[Trigger] = &[Trigger::keywords(&["extract", "unzip"])];
         let mut r = ActionRegistry::new();
         r.register(Box::new(TestHandler {
             id: "web",
@@ -271,6 +304,18 @@ mod tests {
         r.register(Box::new(TestHandler {
             id: "open",
             triggers: OPEN,
+        }));
+        r.register(Box::new(TestHandler {
+            id: "convert",
+            triggers: CONVERT,
+        }));
+        r.register(Box::new(TestHandler {
+            id: "zip",
+            triggers: ZIP,
+        }));
+        r.register(Box::new(TestHandler {
+            id: "extract",
+            triggers: EXTRACT,
         }));
         r
     }
@@ -320,6 +365,23 @@ mod tests {
                 sub_tab: Some("todos".into())
             }
         );
+    }
+
+    #[test]
+    fn file_verbs_route_to_command() {
+        let r = test_registry();
+        for input in [
+            "convert ~/a/img.png to webp",
+            "zip a.txt b.txt to out.zip",
+            "compress a.txt",
+            "extract bundle.tar.gz",
+            "unzip archive.zip",
+        ] {
+            match classify_string(input, &r, no_presets, true) {
+                RouteDecision::Command { command } => assert_eq!(command, input),
+                other => panic!("{input:?} should route to Command, got {other:?}"),
+            }
+        }
     }
 
     #[test]

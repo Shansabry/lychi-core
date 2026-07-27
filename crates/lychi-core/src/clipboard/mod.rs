@@ -1,3 +1,4 @@
+pub mod files;
 pub mod image_utils;
 pub mod selection;
 pub mod store;

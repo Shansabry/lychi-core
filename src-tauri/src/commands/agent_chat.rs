@@ -24,10 +24,10 @@ use lychi_core::coordinator::{
 };
 use lychi_core::error::LychiError;
 use lychi_core::executor::{Executor, RunInputs};
-use lychi_core::providers::{CancellationToken, ToolDef};
+use lychi_core::providers::{CancellationToken, ImageSource, ToolDef};
 use serde::Serialize;
-use tokio::sync::RwLock;
 use tauri::{AppHandle, Emitter, State};
+use tokio::sync::RwLock;
 
 use crate::state::AppState;
 
@@ -53,7 +53,11 @@ fn result_text(res: &lychi_core::action_registry::ActionResult) -> String {
         Output::LaunchDesktop { path } => format!("Launched: {path}"),
         Output::FocusApp { wm_class } => format!("Focused: {wm_class}"),
         Output::None => {
-            if res.success { "Done.".to_string() } else { "Failed.".to_string() }
+            if res.success {
+                "Done.".to_string()
+            } else {
+                "Failed.".to_string()
+            }
         }
     }
 }
@@ -74,7 +78,10 @@ fn result_summary_and_artifact(
             OutputType::Svg => {
                 return (
                     "Generated the requested graphic (shown to the user).".to_string(),
-                    Some(ToolArtifact { kind: "svg".into(), content: body.clone() }),
+                    Some(ToolArtifact {
+                        kind: "svg".into(),
+                        content: body.clone(),
+                    }),
                 );
             }
             OutputType::Weather => {
@@ -82,7 +89,10 @@ fn result_summary_and_artifact(
                 // the UI also renders it as a rich card.
                 return (
                     body.clone(),
-                    Some(ToolArtifact { kind: "weather".into(), content: body.clone() }),
+                    Some(ToolArtifact {
+                        kind: "weather".into(),
+                        content: body.clone(),
+                    }),
                 );
             }
             _ => {}
@@ -114,7 +124,10 @@ impl ToolExecutor for ExecutorAdapter {
                 "action_id": intent.action_id,
                 "args": intent.args,
             }));
-            return Ok(ToolOutcome::NeedsApproval { reason, resume: token });
+            return Ok(ToolOutcome::NeedsApproval {
+                reason,
+                resume: token,
+            });
         }
 
         let (output, artifact) = result_summary_and_artifact(&res.result);
@@ -128,7 +141,10 @@ impl ToolExecutor for ExecutorAdapter {
     async fn run_approved(&self, resume: ResumeToken) -> Result<String, LychiError> {
         // Reconstruct the assessed intent from the token and run it confirmed —
         // the exact action the Rules Engine gated, not a re-resolution.
-        let action_id = resume.0["action_id"].as_str().unwrap_or_default().to_string();
+        let action_id = resume.0["action_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         let args = resume.0["args"].as_str().unwrap_or_default().to_string();
         let intent = lychi_core::intent::ResolvedIntent {
             action_id,
@@ -213,13 +229,21 @@ impl AgentEventDto {
                 d.kind = "reasoning".into();
                 d.text = Some(t);
             }
-            AgentEvent::ToolCallStarted { call_id, name, args } => {
+            AgentEvent::ToolCallStarted {
+                call_id,
+                name,
+                args,
+            } => {
                 d.kind = "tool_started".into();
                 d.call_id = Some(call_id);
                 d.tool_name = Some(name);
                 d.tool_args = Some(args);
             }
-            AgentEvent::ToolCallCompleted { call_id, output, artifact } => {
+            AgentEvent::ToolCallCompleted {
+                call_id,
+                output,
+                artifact,
+            } => {
                 d.kind = "tool_completed".into();
                 d.call_id = Some(call_id);
                 d.text = Some(output);
@@ -245,7 +269,10 @@ impl AgentEventDto {
                 d.text = Some(text);
                 d.truncated = truncated;
             }
-            AgentEvent::Usage { input_tokens, output_tokens } => {
+            AgentEvent::Usage {
+                input_tokens,
+                output_tokens,
+            } => {
                 d.kind = "usage".into();
                 d.input_tokens = Some(input_tokens);
                 d.output_tokens = Some(output_tokens);
@@ -287,7 +314,10 @@ async fn build_coordinator(
         exec.registry
             .command_catalog()
             .into_iter()
-            .map(|c| ToolDef { name: c.id, description: c.description })
+            .map(|c| ToolDef {
+                name: c.id,
+                description: c.description,
+            })
             .collect()
     } else {
         Vec::new()
@@ -371,18 +401,63 @@ async fn persist_conversation(
 /// — with prior tool results + history as context). `with_tools = false` is the
 /// quick-AI fork card (answer only, no acting). Streams `lychi://agent-event`s;
 /// may end in an approval the frontend resolves via `agent_approve`.
+/// Encode a list of image file paths into vision `ImageSource`s off the async
+/// runtime (decode/resize/base64 is CPU-bound). A path that fails to encode is
+/// skipped with a warning rather than failing the whole turn.
+async fn encode_images(paths: Vec<String>) -> Vec<ImageSource> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .filter_map(|p| {
+                match lychi_core::files::image_ops::encode_image_for_vision(std::path::Path::new(
+                    &p,
+                )) {
+                    Ok((media_type, data)) => Some(ImageSource { media_type, data }),
+                    Err(e) => {
+                        tracing::warn!("[agent] skipping image {p}: {e}");
+                        None
+                    }
+                }
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
 #[tauri::command]
 #[specta::specta]
+// `display` carries how the turn renders when that differs from its content (a
+// preset that folded a large payload into a chip). It is persisted with the
+// message so a RECALLED conversation renders identically, keeping the sender the
+// only decider of that split. Never sent to a provider.
 pub async fn agent_chat_start(
     system: String,
     user: String,
     fresh: bool,
     with_tools: bool,
     generation: u64,
+    images: Vec<String>,
+    display: Option<lychi_core::providers::MessageDisplay>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), LychiError> {
     state.ai_generation.store(generation, Ordering::Relaxed);
+    let images = encode_images(images).await;
+    // Inline any `@`-referenced documents (pdf/docx/…) as extracted text so the
+    // model sees content, not a path. Off-runtime: extraction reads + parses files.
+    // On any failure, fall back to the user's original text (never drop it).
+    let user = {
+        let raw = user.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            lychi_core::files::text_extract::expand_doc_refs(&raw)
+        })
+        .await
+        .unwrap_or(user)
+    };
     let cancel = CancellationToken::new();
     {
         let mut slot = state.ai_cancel.write().await;
@@ -397,7 +472,7 @@ pub async fn agent_chat_start(
     let session = if fresh {
         state.agent_session.write().await.take(); // drop any prior conversation
         *state.agent_conversation_id.write().await = Some(lychi_core::db::new_id());
-        Session::new(system, user)
+        Session::new_with_images(system, user, images)
     } else {
         {
             let mut id = state.agent_conversation_id.write().await;
@@ -412,12 +487,15 @@ pub async fn agent_chat_start(
                 // tools) is promoted to the full agent prompt while retaining the
                 // answer it already produced.
                 s.set_system(system);
-                s.push_user(user);
+                s.push_user_with_images(user, images);
                 s
             }
-            None => Session::new(system, user),
+            None => Session::new_with_images(system, user, images),
         }
     };
+
+    let mut session = session;
+    session.set_last_user_display(display);
 
     let (coord, ()) = build_coordinator(&state, with_tools).await?;
     let (stream, handle) = coord.run(session, cancel);

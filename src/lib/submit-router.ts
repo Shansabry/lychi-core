@@ -69,6 +69,12 @@ export interface SubmitContext {
 	 * command). Lets a replayed `run` route exactly as if typed fresh.
 	 */
 	runDecision?: RouteDecision;
+	/**
+	 * Files are staged in the attachment tray. Pure UI state (the backend can't
+	 * see the tray), so it lives here: it makes an otherwise-empty submit
+	 * meaningful — "here's an image, look at it" is a complete ask.
+	 */
+	hasAttachments?: boolean;
 }
 
 /** Render a preset template, substituting `{input}` (mirrors the Rust `render`). */
@@ -76,6 +82,52 @@ export function renderPreset(template: string, input: string): string {
 	if (template.includes("{input}")) return template.replaceAll("{input}", input);
 	if (!input) return template;
 	return `${template}\n\n${input}`;
+}
+
+/**
+ * A user message longer than this (chars) is folded into a collapsed attachment
+ * chip in the chat bubble instead of shown inline. Keep in sync with the store's
+ * intent; the store re-checks so callers can't accidentally inline a huge blob.
+ */
+export const PRESET_ATTACH_THRESHOLD = 240;
+
+/**
+ * Split a preset into what the CHAT BUBBLE shows: the instruction line (the
+ * template minus the payload) and, when the payload is large, a collapsed
+ * attachment chip. The MODEL still gets the full rendered prompt separately
+ * (`renderPreset`) — this only shapes the on-screen bubble.
+ *
+ * - `Summarize the following: {input}` + big blob → instruction `Summarize the
+ *   following:`, attachment `{label: "Selected text · 1.2k", body: blob}`.
+ * - `translate {input} to spanish` + big blob → instruction `translate … to
+ *   spanish`, attachment as above.
+ * - Small input, or a template with no `{input}` → instruction is the rendered
+ *   prompt, no attachment (behaves like before).
+ */
+export function presetDisplay(
+	template: string,
+	input: string,
+): { instruction: string; attachment?: { label: string; body: string } } {
+	const payload = input.trim();
+	const large = payload.length >= PRESET_ATTACH_THRESHOLD;
+
+	if (!large || !template.includes("{input}")) {
+		// Nothing worth folding out — show the rendered prompt as-is.
+		return { instruction: renderPreset(template, input) };
+	}
+
+	// Replace the `{input}` slot with an ellipsis so the instruction reads
+	// naturally ("translate … to spanish", "Summarize the following: …").
+	const instruction = template.replaceAll("{input}", "…").replace(/\s+/g, " ").trim();
+	const label = `Selected text · ${formatCharCount(payload.length)}`;
+	return { instruction, attachment: { label, body: payload } };
+}
+
+/** Compact char count for the attachment chip: 812, 1.2k, 34k. */
+function formatCharCount(n: number): string {
+	if (n < 1000) return `${n}`;
+	if (n < 10_000) return `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k`;
+	return `${Math.round(n / 1000)}k`;
 }
 
 /**
@@ -175,8 +227,15 @@ export function decideSubmit(ctx: SubmitContext): SubmitAction {
 	const hasSelected = completions.length > 0 && completionIndex >= 0;
 
 	// 1. Guards.
-	if (!trimmed && !hasSelected) return { kind: "noop" };
 	if (ctx.pendingPlan) return { kind: "noop" };
+	if (!trimmed && !hasSelected) {
+		// Attachments alone are a complete ask ("here's a screenshot — what is
+		// this?"). Send them to the full agent with a neutral instruction; the
+		// files themselves carry the question. Without a tray, still a no-op.
+		return ctx.hasAttachments
+			? { kind: "agent", prompt: "Look at the attached file(s) and describe what you see." }
+			: { kind: "noop" };
+	}
 
 	// 2. Keyboard modifiers (pure UI state — no classification needed).
 	if (ctx.ctrlKey && ctx.searchMode) {
@@ -206,7 +265,17 @@ export function decideSubmit(ctx: SubmitContext): SubmitAction {
 	}
 
 	// 5. Classify the raw input via the backend decision (single source of truth).
-	if (ctx.inputDecision) return fromDecision(ctx.inputDecision);
+	if (ctx.inputDecision) {
+		const action = fromDecision(ctx.inputDecision);
+		// With files staged, an ambiguous question is no longer ambiguous — the
+		// user attached material to ask ABOUT. Skip the fork card and answer it
+		// properly. (Attachments are UI state the classifier can't see, so this
+		// promotion belongs on this side of the boundary, not in the backend.)
+		if (ctx.hasAttachments && action.kind === "quick-ai") {
+			return { kind: "agent", prompt: action.prompt };
+		}
+		return action;
+	}
 	// No decision yet (race) — the caller awaits `classifyInput` and re-dispatches.
 	return { kind: "noop" };
 }

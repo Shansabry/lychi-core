@@ -1,5 +1,7 @@
 pub mod byo;
+pub mod capability;
 pub mod cloud;
+pub mod errors;
 pub mod factory;
 #[cfg(feature = "local-ai")]
 pub mod local;
@@ -37,15 +39,55 @@ pub enum Role {
     Tool,
 }
 
+/// A base64-encoded image attached to a `User` turn for vision models. `data` is
+/// the raw base64 (no `data:` URI prefix); `media_type` is the MIME (`image/png`,
+/// `image/jpeg`, …). Each wire encoder wraps this into its dialect's image block
+/// (Anthropic `source:{type:base64,…}`, OpenAI `image_url` data-URI).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+pub struct ImageSource {
+    pub media_type: String,
+    pub data: String,
+}
+
+/// One block of a message's content. A message is a sequence of these: prose
+/// (`Text`) interleaved with `Image` attachments. Text-only messages are a single
+/// `Text` part — the common case — so the string constructors below stay ergonomic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ContentPart {
+    Text { text: String },
+    Image { source: ImageSource },
+}
+
+impl ContentPart {
+    pub fn text(t: impl Into<String>) -> Self {
+        ContentPart::Text { text: t.into() }
+    }
+    pub fn image(media_type: impl Into<String>, data: impl Into<String>) -> Self {
+        ContentPart::Image {
+            source: ImageSource {
+                media_type: media_type.into(),
+                data: data.into(),
+            },
+        }
+    }
+}
+
 /// One conversation turn. A `Tool`-role message carries the `tool_call_id` it
 /// answers. An `Assistant` message that requested tools keeps those calls in
 /// `tool_calls` so the turn round-trips to the provider on the next request
 /// (Anthropic requires the `tool_use` blocks be replayed; OpenAI the
 /// `tool_calls` array).
+///
+/// `content` is a list of [`ContentPart`]s (text interleaved with images).
+/// Text-only turns hold a single `Text` part. The [`content_string_or_seq`] serde
+/// helper deserializes either a plain JSON string (legacy persisted sessions) or
+/// the block array, so history written before vision landed still loads.
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct ChatMessage {
     pub role: Role,
-    pub content: String,
+    #[serde(with = "content_string_or_seq")]
+    pub content: Vec<ContentPart>,
     /// Set on `Role::Tool` messages — the id of the `ToolCall` this result answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -57,6 +99,29 @@ pub struct ChatMessage {
     /// `is_error`, OpenAI conventionally a text marker). Only meaningful on `Tool`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
+    /// How this turn should RENDER, when that differs from its content.
+    ///
+    /// A preset folds a large payload out of the bubble into a collapsed chip
+    /// ("Summarize the following: …" + a chip holding the blob). The model still
+    /// receives the full `content`; this records the split the sender already
+    /// computed so a RECALLED conversation renders identically instead of
+    /// re-deriving the boundary from a flat string — which would be a second,
+    /// drifting decider. Purely presentational: never sent to any provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<MessageDisplay>,
+}
+
+/// The presentational split of a user turn: the instruction line shown in the
+/// bubble plus the payload folded into a collapsed chip. Computed ONCE by the
+/// sender (the frontend's `presetDisplay`) and persisted with the message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
+pub struct MessageDisplay {
+    /// The short line the bubble shows in place of the full content.
+    pub instruction: String,
+    /// The chip's caption (e.g. `Selected text · 1.2k`).
+    pub label: String,
+    /// The folded-out payload, revealed when the chip is expanded.
+    pub body: String,
 }
 
 impl ChatMessage {
@@ -69,6 +134,28 @@ impl ChatMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::plain(Role::Assistant, content)
     }
+    /// A user turn carrying text plus one or more image attachments (vision).
+    /// Empty `text` is fine — the images stand alone.
+    pub fn user_with_images(text: impl Into<String>, images: Vec<ImageSource>) -> Self {
+        let text = text.into();
+        let mut content: Vec<ContentPart> = Vec::with_capacity(images.len() + 1);
+        if !text.is_empty() {
+            content.push(ContentPart::Text { text });
+        }
+        content.extend(
+            images
+                .into_iter()
+                .map(|source| ContentPart::Image { source }),
+        );
+        Self {
+            role: Role::User,
+            content,
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+            is_error: false,
+            display: None,
+        }
+    }
     /// A tool-result turn answering `tool_call_id`.
     pub fn tool_result(
         tool_call_id: impl Into<String>,
@@ -77,20 +164,84 @@ impl ChatMessage {
     ) -> Self {
         Self {
             role: Role::Tool,
-            content: content.into(),
+            content: vec![ContentPart::text(content)],
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: Vec::new(),
             is_error,
+            display: None,
         }
     }
     fn plain(role: Role, content: impl Into<String>) -> Self {
         Self {
             role,
-            content: content.into(),
+            content: vec![ContentPart::text(content)],
             tool_call_id: None,
             tool_calls: Vec::new(),
             is_error: false,
+            display: None,
         }
+    }
+
+    /// The message's text, concatenating every `Text` part (images skipped).
+    /// This is what the many text-only read sites want.
+    pub fn content_text(&self) -> String {
+        let mut out = String::new();
+        for part in &self.content {
+            if let ContentPart::Text { text } = part {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(text);
+            }
+        }
+        out
+    }
+
+    /// True when the message carries at least one image attachment.
+    pub fn has_images(&self) -> bool {
+        self.content
+            .iter()
+            .any(|p| matches!(p, ContentPart::Image { .. }))
+    }
+
+    /// Replace the message's text in place, preserving any image parts (used by
+    /// `Session::set_system`, which only ever holds text).
+    pub fn set_text(&mut self, text: impl Into<String>) {
+        let images: Vec<ContentPart> = self
+            .content
+            .drain(..)
+            .filter(|p| matches!(p, ContentPart::Image { .. }))
+            .collect();
+        self.content = std::iter::once(ContentPart::text(text))
+            .chain(images)
+            .collect();
+    }
+}
+
+/// Serde adapter for `ChatMessage::content`: serializes as the block array, but
+/// deserializes from EITHER a plain string (legacy: pre-vision persisted history
+/// stored `content` as a bare JSON string) OR the block array. This is what keeps
+/// old `ai_history` conversations loadable after the multimodal migration.
+mod content_string_or_seq {
+    use super::ContentPart;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[ContentPart], s: S) -> Result<S::Ok, S::Error> {
+        v.serialize(s)
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrSeq {
+        Str(String),
+        Seq(Vec<ContentPart>),
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<ContentPart>, D::Error> {
+        Ok(match StringOrSeq::deserialize(d)? {
+            StringOrSeq::Str(s) => vec![ContentPart::Text { text: s }],
+            StringOrSeq::Seq(v) => v,
+        })
     }
 }
 

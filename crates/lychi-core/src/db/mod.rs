@@ -49,6 +49,12 @@ pub const AI_PRESETS: TableDefinition<&str, &[u8]> = TableDefinition::new("ai_pr
 /// (Phase 4). Capped + pruned so the DB doesn't grow unbounded.
 pub const AI_CONVERSATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("ai_conversations");
 
+/// Learned model capabilities: key = `<provider>/<model>`, value =
+/// postcard-serialized `ModelCapability`. Populated from provider metadata when
+/// the endpoint reports it, and from observed failures otherwise — so Lychi
+/// stops re-sending requests a model has already rejected.
+pub const MODEL_CAPS: TableDefinition<&str, &[u8]> = TableDefinition::new("model_caps");
+
 /// Open (or create) the redb database at the given path.
 /// If the file exists but uses an older format version, back it up and recreate.
 pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {

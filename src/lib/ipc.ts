@@ -19,17 +19,20 @@ import type {
 	CommandInfo,
 	CommandsConfig,
 	CompletionItem,
+	ContentPart,
 	Conversation,
 	ConversationSummary,
 	CreditBalance,
 	DirEntry,
 	EnvironmentContext,
+	FileAttachment,
 	FilePreviewData,
 	FirebaseUser,
 	GeneralConfig,
 	HotkeyStatus,
 	KeybindingsConfig,
 	LocalModelInfo,
+	MessageDisplay,
 	MountPoint,
 	NoteItem,
 	OllamaModelInfo,
@@ -56,12 +59,14 @@ export type {
 	AliasItem,
 	AllNotes,
 	AllSettings,
+	AttachmentRoute,
 	ChatMessage,
 	ClipboardContentType,
 	CommandInfo,
 	CommandsConfig,
 	CompletionItem,
 	ContainerInfo,
+	ContentPart,
 	Conversation,
 	ConversationSummary,
 	CreditBalance,
@@ -69,6 +74,8 @@ export type {
 	DirEntry,
 	DockerContext,
 	EnvironmentContext,
+	FileAttachment,
+	FileKind,
 	FilePreviewData,
 	FirebaseUser,
 	GeneralConfig,
@@ -76,6 +83,7 @@ export type {
 	HotkeyStatus,
 	KeybindingsConfig,
 	LocalModelInfo,
+	MessageDisplay,
 	MountPoint,
 	NetworkContext,
 	NoteItem,
@@ -279,6 +287,52 @@ export async function listDirectories(path: string): Promise<DirEntry[]> {
 	return unwrap(await commands.listDirectories(path));
 }
 
+/**
+ * Flatten a `ChatMessage.content` block list to its prose. Since vision landed,
+ * `content` is a `ContentPart[]` (text interleaved with images) rather than a
+ * string; anything that renders a stored message needs the text half. Mirrors
+ * the Rust `ChatMessage::content_text()` — keep the two in step.
+ */
+export function contentText(content: ContentPart[]): string {
+	return content
+		.filter((p) => p.type === "text")
+		.map((p) => p.text)
+		.join("");
+}
+
+/**
+ * Classify attached file paths into chip-ready descriptors. The backend decides
+ * kind/mime/thumbnail AND which pipe each file takes (`route`) — the frontend
+ * only renders the chips and forwards the paths on submit.
+ */
+export async function classifyFiles(paths: string[]): Promise<FileAttachment[]> {
+	if (!isTauri()) return [];
+	return unwrap(await commands.classifyFiles(paths));
+}
+
+/**
+ * Whether the selected model accepts images. `"unknown"` means no evidence —
+ * callers must ALLOW the attempt (refusing on absent evidence would block every
+ * newly released vision model). Learned from provider metadata or a previously
+ * observed rejection; never a hardcoded model list.
+ */
+export type ModelVision = "supported" | "unsupported" | "unknown";
+
+export async function getModelVision(): Promise<ModelVision> {
+	if (!isTauri()) return "unknown";
+	return unwrap(await commands.getModelVision()) as ModelVision;
+}
+
+/**
+ * Stage whatever the clipboard holds as attachments (the paste gesture): copied
+ * files, or copied image data spilled to disk. Copied TEXT returns nothing —
+ * that belongs in the input box, so the browser's own paste handles it.
+ */
+export async function attachFromClipboard(): Promise<FileAttachment[]> {
+	if (!isTauri()) return [];
+	return unwrap(await commands.attachFromClipboard());
+}
+
 // --- Recursive file search ---
 
 export async function getMountPoints(): Promise<MountPoint[]> {
@@ -368,23 +422,9 @@ export async function getAllSettings(): Promise<AllSettings> {
 				pinned_workspace: null,
 			},
 			privacy: { allow_ip_geolocation: false, allow_public_ip: false },
-			keybindings: {
-				toggle_history: "Ctrl+1",
-				toggle_notes: "Ctrl+2",
-				toggle_media: "Ctrl+3",
-				toggle_settings: "Ctrl+4",
-				open_inline_url: "Ctrl+O",
-				submit: "Enter",
-				dismiss: "Escape",
-				tab_complete: "Tab",
-				tab_back: "Shift+Tab",
-				switch_scope: "Ctrl+Tab",
-				web_search: "Ctrl+Enter",
-				run_inline: "Shift+Enter",
-				copy_path: "Ctrl+Shift+C",
-				screenshot: "Ctrl+Shift+S",
-				action_panel: "Ctrl+K",
-			},
+			// One source of truth — this literal used to be a second copy that had
+			// to be updated in lockstep whenever a binding was added.
+			keybindings: { ...KEYBINDINGS_DEFAULTS },
 			app_version: "0.0.0",
 			layer_shell_supported: false,
 			active_window_strategy: "x11",
@@ -543,6 +583,7 @@ export const KEYBINDINGS_DEFAULTS: KeybindingsConfig = {
 	copy_path: "Ctrl+Shift+C",
 	screenshot: "Ctrl+Shift+S",
 	action_panel: "Ctrl+K",
+	attach_file: "Ctrl+Shift+A",
 };
 
 export async function getKeybindingsConfig(): Promise<KeybindingsConfig> {
@@ -617,9 +658,13 @@ export async function agentChatStart(
 	fresh: boolean,
 	withTools: boolean,
 	generation: number,
+	images: string[] = [],
+	display: MessageDisplay | null = null,
 ): Promise<void> {
 	if (!isTauri()) return;
-	unwrap(await commands.agentChatStart(system, user, fresh, withTools, generation));
+	unwrap(
+		await commands.agentChatStart(system, user, fresh, withTools, generation, images, display),
+	);
 }
 
 /** Approve (or reject) a pending destructive tool call, resuming the agent. */

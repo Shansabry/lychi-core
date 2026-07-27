@@ -27,6 +27,10 @@ let {
 	ondrillinto = () => {},
 	oncopypath = () => {},
 	onactionpanel = () => {},
+	onattachfile = () => {},
+	onpastefiles = async () => false,
+	onremovelastattachment = () => {},
+	hasAttachments = false,
 	contextPill = "",
 	contextLoading = false,
 	searchGhost = "",
@@ -57,6 +61,10 @@ let {
 	ondrillinto?: () => void;
 	oncopypath?: () => void;
 	onactionpanel?: () => void;
+	onattachfile?: () => void;
+	onpastefiles?: () => Promise<boolean>;
+	onremovelastattachment?: () => void;
+	hasAttachments?: boolean;
 	contextPill?: string;
 	contextLoading?: boolean;
 	searchGhost?: string;
@@ -269,6 +277,28 @@ function acceptGhost() {
 	return false;
 }
 
+/**
+ * Ctrl+V — stage copied files/images as attachments instead of pasting text.
+ *
+ * We can't know from the event whether the clipboard holds files, so we let the
+ * browser's own text paste happen normally and ask the backend in parallel. If
+ * it staged something, the clipboard held FILES (never text — the backend
+ * ignores text), and any text the browser inserted is spurious, so we undo it by
+ * restoring the pre-paste value.
+ */
+function handlePaste(e: ClipboardEvent) {
+	// A text/plain payload is unambiguously a text paste — leave it alone. Only
+	// probe the backend when the clipboard offers no text (a file/image copy).
+	if (e.clipboardData?.types.includes("text/plain")) return;
+	const before = value;
+	onpastefiles().then((staged) => {
+		if (staged && value !== before) {
+			value = before;
+			oninputchange(value);
+		}
+	});
+}
+
 function handleKeydown(e: KeyboardEvent) {
 	if (matchesAction(e, "tab_back")) {
 		e.preventDefault();
@@ -302,6 +332,15 @@ function handleKeydown(e: KeyboardEvent) {
 	} else if (matchesAction(e, "copy_path") && searchMode) {
 		e.preventDefault();
 		oncopypath();
+	} else if (matchesAction(e, "attach_file")) {
+		// Ctrl+Shift+A — stage the highlighted file for the next AI turn.
+		e.preventDefault();
+		onattachfile();
+	} else if (e.key === "Backspace" && value === "" && hasAttachments) {
+		// Backspace on an empty input pops the last chip — the universal
+		// composer gesture (Slack/Discord/Gmail).
+		e.preventDefault();
+		onremovelastattachment();
 	} else if (matchesAction(e, "action_panel")) {
 		// ⌘K / Ctrl+K — open the secondary-actions panel for the selected result.
 		e.preventDefault();
@@ -373,6 +412,7 @@ function handleKeydown(e: KeyboardEvent) {
 			bind:this={inputEl}
 			bind:value
 			onkeydown={handleKeydown}
+			onpaste={handlePaste}
 			oninput={(e) => oninputchange(e.currentTarget.value)}
 			disabled={disabled || routing}
 			type="text"

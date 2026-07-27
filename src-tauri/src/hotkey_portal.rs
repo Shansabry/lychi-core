@@ -41,7 +41,11 @@ pub fn ensure_app_desktop_file() {
     let exec = std::env::var("APPIMAGE")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| std::env::current_exe().ok().map(|p| p.display().to_string()))
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .map(|p| p.display().to_string())
+        })
         .unwrap_or_else(|| "lychi-app".to_string());
 
     let contents = format!(

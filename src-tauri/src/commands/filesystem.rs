@@ -4,6 +4,7 @@ use lychi_core::file_search::{
     self, DirEntry, FileSearchBatch, FileSearchResult, MountPoint, build_result_modified,
     finalize_row, frecency_recency_bonus, search_display_label, section_header,
 };
+use lychi_core::files::attachment::{self, FileAttachment};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -49,6 +50,54 @@ pub async fn fuzzy_path_completions(
     })
     .await
     .map_err(|e| LychiError::ExecutionFailed(format!("fuzzy completions task panicked: {e}")))
+}
+
+/// Classify user-supplied file paths into chip-ready attachments (kind, mime,
+/// thumbnail, and which backend pipe they'll take). The frontend calls this once
+/// per attach gesture and renders the result; it never classifies files itself.
+#[tauri::command]
+#[specta::specta]
+pub async fn classify_files(paths: Vec<String>) -> Result<Vec<FileAttachment>, LychiError> {
+    // Thumbnail encoding decodes images — keep it off the async runtime.
+    tauri::async_runtime::spawn_blocking(move || attachment::classify_attachments(&paths))
+        .await
+        .map_err(|e| LychiError::ExecutionFailed(format!("classify_files task panicked: {e}")))
+}
+
+/// Stage whatever the clipboard holds as attachments (the paste gesture).
+///
+/// Two shapes, in order: copied FILES (a file manager's `file://` URI list —
+/// the bytes are already on disk, so we just take the paths), or copied IMAGE
+/// DATA (a screenshot tool / "copy image" — no path exists, so we spill it to
+/// the clipboard-images dir first and attach that). Copied text is deliberately
+/// ignored: it belongs in the input box, not the attachment tray.
+///
+/// Returns chips via the SAME classifier as every other attach gesture
+/// (`files::attachment`), so a pasted file and a picked file behave identically.
+#[tauri::command]
+#[specta::specta]
+pub async fn attach_from_clipboard() -> Result<Vec<FileAttachment>, LychiError> {
+    let is_wayland = lychi_core::context::is_wayland();
+    tauri::async_runtime::spawn_blocking(move || {
+        // 1. Copied files — the common case (Ctrl+C in Nautilus/Dolphin).
+        let paths = lychi_core::clipboard::files::read_clipboard_files(is_wayland);
+        if !paths.is_empty() {
+            let strs: Vec<String> = paths
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            return attachment::classify_attachments(&strs);
+        }
+
+        // 2. Copied image DATA — persist it so it has a path to attach.
+        if let Some(path) = lychi_core::clipboard::image_utils::spill_clipboard_image(is_wayland) {
+            return attachment::classify_attachments(&[path]);
+        }
+
+        Vec::new()
+    })
+    .await
+    .map_err(|e| LychiError::ExecutionFailed(format!("clipboard attach task panicked: {e}")))
 }
 
 /// List subdirectories of the given path (directories only, absolute paths).

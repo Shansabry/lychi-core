@@ -1,5 +1,5 @@
 <script lang="ts">
-import { Globe, Sparkles } from "lucide-svelte";
+import { Globe, Sparkles, TriangleAlert } from "lucide-svelte";
 import { renderMarkdown } from "$lib/markdown";
 import { sanitizeSvg } from "$lib/sanitize";
 
@@ -13,13 +13,26 @@ type ToolStep = {
 	artifactContent?: string;
 };
 type Approval = { callId: string; toolName: string; args: string; reason: string };
-type Turn = { user: string; text: string; toolSteps: ToolStep[] };
+type Attachment = { label: string; body: string };
+/** A file attached to a turn — display only; its content already went to the model. */
+type TurnFile = { name: string; thumbnail: string | null };
+type Turn = {
+	user: string;
+	text: string;
+	toolSteps: ToolStep[];
+	attachment?: Attachment;
+	files?: TurnFile[];
+};
 
 let {
 	/** Completed prior turns in this conversation (shown above the live answer). */
 	turns = [] as Turn[],
 	/** The current turn's user message — shown as a bubble above the live answer. */
 	lastUser = "",
+	/** A big payload folded out of the current user message into a collapsed chip. */
+	lastAttachment = null as Attachment | null,
+	/** Files attached to the current turn — shown as chips under the user bubble. */
+	lastFiles = [] as TurnFile[],
 	/** The assistant text for the current turn (streams in). */
 	text = "",
 	/** Whether tokens are still arriving (shows a blinking cursor + Stop). */
@@ -52,6 +65,8 @@ let {
 }: {
 	turns?: Turn[];
 	lastUser?: string;
+	lastAttachment?: Attachment | null;
+	lastFiles?: TurnFile[];
 	text?: string;
 	streaming?: boolean;
 	error?: string | null;
@@ -71,6 +86,17 @@ let {
 
 const md = renderMarkdown;
 let html = $derived(md(text));
+
+// Which attachment chips are expanded. Keyed by a stable id per bubble
+// (`turn-<i>` for prior turns, `live` for the current one).
+let expanded = $state(new Set<string>());
+function toggleChip(key: string) {
+	// Reassign so Svelte sees the mutation.
+	const next = new Set(expanded);
+	if (next.has(key)) next.delete(key);
+	else next.add(key);
+	expanded = next;
+}
 
 // Auto-scroll: keep the transcript pinned to the bottom as the answer streams
 // and as follow-up turns are added — but only when the user is already near the
@@ -185,11 +211,49 @@ function onWindowKeydown(e: KeyboardEvent) {
 	{/if}
 {/snippet}
 
+<!-- A large payload folded out of a user message: a collapsed chip that expands. -->
+{#snippet attachmentChip(att: Attachment, key: string)}
+	{@const open = expanded.has(key)}
+	<div class="attachment" class:open>
+		<button type="button" class="attachment-head" onclick={() => toggleChip(key)}>
+			<span class="attachment-icon" aria-hidden="true">📄</span>
+			<span class="attachment-label">{att.label}</span>
+			<span class="attachment-caret" aria-hidden="true">{open ? "▾" : "▸"}</span>
+		</button>
+		{#if open}
+			<div class="attachment-body">{att.body}</div>
+		{/if}
+	</div>
+{/snippet}
+
+<!-- Files the turn was asked about. Display only — the content already reached
+     the model as a vision block or inlined text, so these are never re-sent. -->
+{#snippet fileChips(files: TurnFile[])}
+	<div class="turn-files">
+		{#each files as f (f.name)}
+			<span class="turn-file" title={f.name}>
+				{#if f.thumbnail}
+					<img class="turn-file-thumb" src={f.thumbnail} alt="" />
+				{:else}
+					<span class="turn-file-icon" aria-hidden="true">📄</span>
+				{/if}
+				<span class="turn-file-name">{f.name}</span>
+			</span>
+		{/each}
+	</div>
+{/snippet}
+
 <div class="ai-chat">
 	<div class="ai-transcript" bind:this={transcriptEl} onscroll={onTranscriptScroll}>
 		<!-- Prior turns in this conversation. -->
 		{#each turns as turn, i (i)}
 			<div class="user-turn">{turn.user}</div>
+			{#if turn.files && turn.files.length > 0}
+				{@render fileChips(turn.files)}
+			{/if}
+			{#if turn.attachment}
+				{@render attachmentChip(turn.attachment, `turn-${i}`)}
+			{/if}
 			{@render toolStepsView(turn.toolSteps)}
 			<!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized -->
 			<div class="ai-md turn">{@html md(turn.text)}</div>
@@ -199,10 +263,19 @@ function onWindowKeydown(e: KeyboardEvent) {
 		{#if lastUser}
 			<div class="user-turn">{lastUser}</div>
 		{/if}
+		{#if lastFiles.length > 0}
+			{@render fileChips(lastFiles)}
+		{/if}
+		{#if lastAttachment}
+			{@render attachmentChip(lastAttachment, "live")}
+		{/if}
 		{@render toolStepsView(toolSteps)}
 
 		{#if error}
-			<div class="ai-error">{error}</div>
+			<div class="ai-error">
+				<TriangleAlert class="ai-error-icon" size={14} strokeWidth={1.75} />
+				<span>{error}</span>
+			</div>
 		{:else if text}
 			<!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized above -->
 			<div class="ai-md">{@html html}</div>{#if streaming && !approval}<span class="cursor" aria-hidden="true"></span>{/if}
@@ -294,10 +367,27 @@ function onWindowKeydown(e: KeyboardEvent) {
 		color: var(--fg);
 	}
 
+	/* An error is a message to the user, not a log line: sentence font, an icon
+	   to anchor it, and a tinted panel so it reads as a state rather than as
+	   failed output. */
 	.ai-error {
-		color: var(--error);
+		display: flex;
+		align-items: flex-start;
+		gap: 8px;
+		padding: 10px 12px;
+		border-radius: 8px;
+		background: color-mix(in srgb, var(--error) 10%, transparent);
+		border: 1px solid color-mix(in srgb, var(--error) 30%, transparent);
+		color: var(--fg);
 		font-size: 13px;
-		font-family: var(--font-mono);
+		font-family: var(--font-sans);
+		line-height: 1.5;
+	}
+
+	.ai-error :global(.ai-error-icon) {
+		flex-shrink: 0;
+		margin-top: 1px;
+		color: var(--error);
 	}
 
 	.truncated-note {
@@ -329,6 +419,91 @@ function onWindowKeydown(e: KeyboardEvent) {
 		margin: 10px 0 8px auto;
 		max-width: 85%;
 		width: fit-content;
+	}
+	/* A large payload folded out of a user message into a collapsed chip. */
+	/* Files attached to a turn — right-aligned to sit under the user bubble. */
+	.turn-files {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: flex-end;
+		gap: 5px;
+		margin: 0 0 8px auto;
+		max-width: 85%;
+	}
+	.turn-file {
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		max-width: 180px;
+		padding: 3px 8px;
+		background: var(--bg-secondary);
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		font-size: 11px;
+		color: var(--fg-muted);
+	}
+	.turn-file-thumb {
+		width: 16px;
+		height: 16px;
+		object-fit: cover;
+		border-radius: 3px;
+		flex-shrink: 0;
+	}
+	.turn-file-icon {
+		font-size: 11px;
+		flex-shrink: 0;
+	}
+	.turn-file-name {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.attachment {
+		margin: 0 0 8px auto;
+		max-width: 85%;
+		width: fit-content;
+	}
+	.attachment-head {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding: 4px 9px;
+		font-size: 12px;
+		color: var(--fg-muted);
+		background: var(--bg-secondary);
+		border: 1px solid var(--border, rgba(128, 128, 128, 0.18));
+		border-radius: 8px;
+		cursor: pointer;
+		font-family: inherit;
+		transition: color 0.12s ease;
+	}
+	.attachment-head:hover {
+		color: var(--fg);
+	}
+	.attachment-icon {
+		font-size: 11px;
+		opacity: 0.8;
+	}
+	.attachment-label {
+		white-space: nowrap;
+	}
+	.attachment-caret {
+		font-size: 9px;
+		opacity: 0.7;
+	}
+	.attachment-body {
+		margin-top: 4px;
+		padding: 8px 10px;
+		max-height: 240px;
+		overflow-y: auto;
+		font-size: 12px;
+		line-height: 1.5;
+		color: var(--fg-muted);
+		white-space: pre-wrap;
+		word-break: break-word;
+		background: var(--bg-secondary);
+		border-radius: 8px;
 	}
 	.ai-md.turn {
 		display: block;

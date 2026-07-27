@@ -9,9 +9,11 @@ pub mod clear;
 pub mod clipboard;
 pub mod color;
 pub mod context_debug;
+pub mod convert_image;
 pub mod define;
 pub mod dev_utils;
 pub mod emoji;
+pub mod extract;
 pub mod file_open;
 pub mod generate;
 pub mod icons;
@@ -47,3 +49,4 @@ pub mod window_switcher;
 #[cfg(target_os = "linux")]
 mod x11_windows;
 pub mod youtube;
+pub mod zip;

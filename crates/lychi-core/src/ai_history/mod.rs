@@ -42,8 +42,8 @@ pub fn derive_title(messages: &[ChatMessage]) -> String {
     let first_user = messages
         .iter()
         .find(|m| m.role == Role::User)
-        .map(|m| m.content.as_str())
-        .unwrap_or("");
+        .map(|m| m.content_text())
+        .unwrap_or_default();
     let line = first_user.lines().next().unwrap_or("").trim();
     const MAX: usize = 60;
     if line.chars().count() > MAX {

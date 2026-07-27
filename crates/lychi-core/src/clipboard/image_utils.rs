@@ -116,6 +116,31 @@ pub fn wl_paste_image() -> Option<Vec<u8>> {
     }
 }
 
+/// Read image DATA from the clipboard (a screenshot tool, "copy image") and
+/// persist it as a PNG, returning its path.
+///
+/// Copied image bytes have no path of their own — spilling them to the
+/// clipboard-images dir is what lets an image paste be attached like any other
+/// file. `None` when the clipboard holds no image, which is the ordinary case
+/// for a text or file copy.
+pub fn spill_clipboard_image(is_wayland: bool) -> Option<String> {
+    // Prefer the Wayland PNG straight from `wl-paste` — no decode/re-encode.
+    let png = if is_wayland { wl_paste_image() } else { None };
+    let png = match png {
+        Some(bytes) => bytes,
+        None => {
+            let mut cb = arboard::Clipboard::new().ok()?;
+            let img = cb.get_image().ok()?;
+            let (w, h) = (img.width as u32, img.height as u32);
+            if w == 0 || h == 0 {
+                return None;
+            }
+            encode_rgba_to_png(&img.bytes, w, h).ok()?
+        }
+    };
+    save_png(&png, &crate::db::new_id()).ok()
+}
+
 /// Decode PNG bytes to raw RGBA + dimensions. For re-reading saved thumbnails or images.
 pub fn decode_png_to_rgba(png_bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), LychiError> {
     let img = image::load_from_memory_with_format(png_bytes, image::ImageFormat::Png)

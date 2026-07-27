@@ -42,6 +42,24 @@ meval = "0.2"
 arboard = "3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff"] }
 base64 = "0.22"
+# File utilities (Phase 1): archives + magic-byte MIME sniffing. All pure-Rust
+# (no native libs) to keep the AppImage lean. zip >= 2.3.0 is required — earlier
+# versions have a symlink zip-slip (RUSTSEC GHSA-94vh-gphv-8pm8); we extract via
+# `enclosed_name()` + a canonicalize-under-dest guard regardless.
+zip = "8"
+tar = "0.4"
+flate2 = "1"
+infer = "0.22"
+mime_guess = "2"
+# Doc text extraction (Phase 3): docx/odt/pptx/xlsx are ZIP+XML containers we read
+# with `zip` (already above) + a streaming XML pull-parser. Pure-Rust, no native libs.
+quick-xml = "0.37"
+# PDF text extraction (Phase 3). Pure-Rust, MIT, no native libs (built on lopdf).
+# Known to PANIC on some malformed PDFs — we ALWAYS wrap it in `catch_unwind`
+# (see files/text_extract.rs `pdf_backend`), so a bad PDF degrades to an error,
+# never a crash. Chosen over pdf_oxide/ferrules/extractous (native/ML deps) for
+# the lean AppImage goal.
+pdf-extract = "0.12"
 sha2 = "0.10"
 md-5 = "0.10"
 hex = "0.4"

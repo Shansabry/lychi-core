@@ -20,7 +20,14 @@
  * are passed as component callback props.
  */
 
-import { type AgentEventDto, agentApprove, agentChatStart, cancelAiChat } from "$lib/ipc";
+import {
+	type AgentEventDto,
+	type MessageDisplay,
+	agentApprove,
+	agentChatStart,
+	cancelAiChat,
+} from "$lib/ipc";
+import { attachments } from "./attachments.svelte";
 import { ui } from "./ui.svelte";
 
 export type ToolStep = {
@@ -34,8 +41,29 @@ export type ToolStep = {
 	artifactContent?: string;
 };
 
+/**
+ * A large payload folded out of a user message into a collapsed chip. Presets
+ * that act on a selection/paste (`summarize`, `translate <blob>`) attach the
+ * blob here instead of dumping it inline — the model still gets the full text,
+ * the bubble shows `label` and expands `body` on click. Mirrors Raycast/ChatGPT.
+ */
+export type UserAttachment = { label: string; body: string };
+
+/**
+ * A file that was attached to a turn, kept only so the bubble can show which
+ * files that turn was asked about. A display record — the content already went
+ * to the model (inlined text or a vision block), so this is never re-sent.
+ */
+export type TurnFile = { name: string; thumbnail: string | null };
+
 /** A completed prior turn in the conversation (shown above the streaming answer). */
-export type AiTurn = { user: string; text: string; toolSteps: ToolStep[] };
+export type AiTurn = {
+	user: string;
+	text: string;
+	toolSteps: ToolStep[];
+	attachment?: UserAttachment;
+	files?: TurnFile[];
+};
 
 // --- System prompts (moved here with the chat logic that uses them) ---
 
@@ -70,6 +98,10 @@ class ChatSession {
 	turns = $state.raw<AiTurn[]>([]);
 	toolSteps = $state.raw<ToolStep[]>([]);
 	lastUser = $state("");
+	// A big payload folded out of the current user message into a collapsed chip.
+	lastAttachment = $state<UserAttachment | null>(null);
+	// Files attached to the live turn, shown as chips on the user bubble.
+	lastFiles = $state.raw<TurnFile[]>([]);
 
 	// Pending destructive-tool approval (loop suspended until decided).
 	approval = $state<{ callId: string; toolName: string; args: string; reason: string } | null>(
@@ -87,9 +119,21 @@ class ChatSession {
 	/** NON-reactive staleness guard (see file header). Bumped per run. */
 	gen = 0;
 
-	/** Reset the fields shared by every run start (not the transcript). */
-	#beginRun(user: string): number {
-		this.lastUser = user;
+	/**
+	 * Reset the fields shared by every run start (not the transcript). `display`
+	 * overrides the on-screen bubble text and `attachment` folds a big payload
+	 * into a collapsed chip; either way the full prompt still goes to the model
+	 * via the run starter (which passes it to `agentChatStart` independently).
+	 */
+	#beginRun(
+		user: string,
+		display?: string,
+		attachment?: UserAttachment | null,
+		files?: TurnFile[],
+	): number {
+		this.lastUser = display ?? user;
+		this.lastAttachment = attachment ?? null;
+		this.lastFiles = files ?? [];
 		this.text = "";
 		this.toolSteps = [];
 		this.error = null;
@@ -98,6 +142,21 @@ class ChatSession {
 		this.streaming = true;
 		ui.showAi();
 		return ++this.gen;
+	}
+
+	/**
+	 * Consume the staged attachment tray for one run: expand text-route files into
+	 * `@`-refs on the prompt, collect image paths for the vision argument, and
+	 * keep a display record for the bubble. Clears the tray — attachments belong
+	 * to the turn that sends them, not to the session.
+	 */
+	#takeAttachments(prompt: string): { prompt: string; images: string[]; files: TurnFile[] } {
+		if (!attachments.any) return { prompt, images: [], files: [] };
+		const expanded = attachments.applyToPrompt(prompt);
+		const images = attachments.imagePaths();
+		const files = attachments.usable.map((a) => ({ name: a.name, thumbnail: a.thumbnail }));
+		attachments.clear();
+		return { prompt: expanded, images, files };
 	}
 
 	#fail(gen: number, e: unknown): void {
@@ -118,12 +177,17 @@ class ChatSession {
 		this.approval = null;
 		this.turns = [];
 		this.lastUser = "";
+		this.lastAttachment = null;
+		this.lastFiles = [];
 		this.reply = "";
 		this.quick = false;
 		this.quickPrompt = "";
 		this.truncated = false;
 		this.tokensIn = 0;
 		this.tokensOut = 0;
+		// The tray is per-conversation: a fresh start (or a re-summon) shouldn't
+		// leave files staged from a session the user has moved on from.
+		attachments.clear();
 	};
 
 	/**
@@ -134,19 +198,32 @@ class ChatSession {
 	start = async (prompt: string, fresh = true): Promise<void> => {
 		const text = prompt.trim();
 		if (!text) return;
+		// Consume the staged attachments: doc/text files fold into the prompt as
+		// `@`-refs (the backend inlines their extracted text), images travel as
+		// paths the backend base64-encodes into vision blocks. Snapshot BEFORE the
+		// await so a fast second attach can't retro-apply to this turn.
+		const sent = this.#takeAttachments(text);
 		if (fresh) {
 			this.turns = [];
 		} else if (this.text) {
 			// Snapshot the completed answer into the transcript before the new turn.
 			this.turns = [
 				...this.turns,
-				{ user: this.lastUser, text: this.text, toolSteps: this.toolSteps },
+				{
+					user: this.lastUser,
+					text: this.text,
+					toolSteps: this.toolSteps,
+					attachment: this.lastAttachment ?? undefined,
+					files: this.lastFiles,
+				},
 			];
 		}
-		const gen = this.#beginRun(text);
+		// The bubble shows what the user typed; the model gets the `@`-expanded
+		// prompt. Same split the presets already use for a folded selection.
+		const gen = this.#beginRun(sent.prompt, text, null, sent.files);
 		this.quick = false; // full agent chat, not the fork card
 		try {
-			await agentChatStart(AGENT_SYSTEM, text, fresh, /* withTools */ true, gen);
+			await agentChatStart(AGENT_SYSTEM, sent.prompt, fresh, /* withTools */ true, gen, sent.images);
 		} catch (e) {
 			this.#fail(gen, e);
 		}
@@ -160,15 +237,40 @@ class ChatSession {
 		await this.start(text, /* fresh */ false);
 	};
 
-	/** Run a tool-FREE preset (text transform) — streams into the full surface. */
-	startPreset = async (prompt: string): Promise<void> => {
+	/**
+	 * Run a tool-FREE preset (text transform) — streams into the full surface.
+	 * The model receives the full `prompt`; `display` shapes the on-screen bubble
+	 * (instruction line + an optional collapsed attachment for a big selection).
+	 */
+	startPreset = async (
+		prompt: string,
+		display?: { instruction: string; attachment?: UserAttachment | null },
+	): Promise<void> => {
 		const text = prompt.trim();
 		if (!text) return;
 		this.turns = [];
-		const gen = this.#beginRun(text);
+		const gen = this.#beginRun(text, display?.instruction, display?.attachment);
 		this.quick = false;
+		// Persist the fold with the message. `presetDisplay` is the ONE decider of
+		// this split; recording its verdict here is what lets a recalled
+		// conversation render identically without a second, drifting resolver.
+		const stored: MessageDisplay | null = display?.attachment
+			? {
+					instruction: display.instruction,
+					label: display.attachment.label,
+					body: display.attachment.body,
+				}
+			: null;
 		try {
-			await agentChatStart(PRESET_SYSTEM, text, /* fresh */ true, /* withTools */ false, gen);
+			await agentChatStart(
+				PRESET_SYSTEM,
+				text,
+				/* fresh */ true,
+				/* withTools */ false,
+				gen,
+				[],
+				stored,
+			);
 		} catch (e) {
 			this.#fail(gen, e);
 		}
@@ -179,11 +281,21 @@ class ChatSession {
 		const text = prompt.trim();
 		if (!text) return;
 		this.turns = [];
-		this.quickPrompt = text;
-		const gen = this.#beginRun(text);
+		// Attachments apply to the fork card too — a screenshot with a one-line
+		// question is exactly the quick-answer shape.
+		const sent = this.#takeAttachments(text);
+		this.quickPrompt = sent.prompt;
+		const gen = this.#beginRun(sent.prompt, text, null, sent.files);
 		this.quick = true; // the fork card
 		try {
-			await agentChatStart(QUICK_AI_SYSTEM, text, /* fresh */ true, /* withTools */ true, gen);
+			await agentChatStart(
+				QUICK_AI_SYSTEM,
+				sent.prompt,
+				/* fresh */ true,
+				/* withTools */ true,
+				gen,
+				sent.images,
+			);
 		} catch (e) {
 			this.#fail(gen, e);
 		}
@@ -204,9 +316,17 @@ class ChatSession {
 		// Clear the live-turn fields so the snapshot doesn't ALSO render as the bubble.
 		this.turns = [
 			...this.turns,
-			{ user: this.lastUser, text: this.text, toolSteps: this.toolSteps },
+			{
+				user: this.lastUser,
+				text: this.text,
+				toolSteps: this.toolSteps,
+				attachment: this.lastAttachment ?? undefined,
+				files: this.lastFiles,
+			},
 		];
 		this.lastUser = "";
+		this.lastAttachment = null;
+		this.lastFiles = [];
 		this.text = "";
 		this.toolSteps = [];
 		this.quick = false;
@@ -239,9 +359,16 @@ class ChatSession {
 	 * Load a recalled conversation's turns onto the surface (no new request). The
 	 * caller supplies the paired turns + the last (live) turn.
 	 */
-	loadRecalled = (priorTurns: AiTurn[], liveUser: string, liveText: string): void => {
+	loadRecalled = (
+		priorTurns: AiTurn[],
+		liveUser: string,
+		liveText: string,
+		liveAttachment?: UserAttachment,
+	): void => {
 		this.turns = priorTurns;
 		this.lastUser = liveUser;
+		this.lastAttachment = liveAttachment ?? null;
+		this.lastFiles = [];
 		this.text = liveText;
 		this.toolSteps = [];
 		this.error = null;

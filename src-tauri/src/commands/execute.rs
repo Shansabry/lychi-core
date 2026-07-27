@@ -388,8 +388,10 @@ pub async fn suggest_correction(
     state: State<'_, AppState>,
 ) -> Result<Option<String>, LychiError> {
     let executor = state.executor.read().await;
-    Ok(lychi_core::intent::typo_suggest::suggest(&input, &executor.registry)
-        .and_then(|item| item.description))
+    Ok(
+        lychi_core::intent::typo_suggest::suggest(&input, &executor.registry)
+            .and_then(|item| item.description),
+    )
 }
 
 /// Dynamic command catalog for the Guide — generated from the live action

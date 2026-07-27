@@ -17,7 +17,9 @@ use crate::state::AppState;
 #[specta::specta]
 pub async fn cancel_ai_chat(state: State<'_, AppState>) -> Result<(), LychiError> {
     let cur = state.ai_generation.load(Ordering::Relaxed);
-    state.ai_generation.store(cur.wrapping_add(1), Ordering::Relaxed);
+    state
+        .ai_generation
+        .store(cur.wrapping_add(1), Ordering::Relaxed);
     if let Some(token) = state.ai_cancel.write().await.take() {
         token.cancel();
     }
