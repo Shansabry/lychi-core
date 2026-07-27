@@ -19,6 +19,7 @@ pub mod intent;
 #[cfg(feature = "mpris")]
 pub mod mpris;
 pub mod notes;
+pub mod notify;
 pub mod paths;
 pub mod process_tracker;
 pub mod providers;

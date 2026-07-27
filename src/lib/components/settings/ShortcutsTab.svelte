@@ -281,6 +281,30 @@ async function resetAllShortcuts() {
 	</button>
 </div>
 
+<!-- Desktop-level shortcuts. These can't be bound in-app: they act while
+     another window has focus, so the desktop has to deliver the key. -->
+<div class="section-label">Desktop shortcuts</div>
+<div class="field-hint">
+	Bind these commands in your desktop's own keyboard settings to use Lychi
+	without opening it first.
+</div>
+<div class="field shortcut-row">
+	<span class="field-label">Ask AI about selection</span>
+	<code class="cli-cmd">lychi --ai</code>
+</div>
+<div class="field shortcut-row">
+	<span class="field-label">Run an AI command on it</span>
+	<code class="cli-cmd">lychi --ai summarize</code>
+</div>
+<div class="field shortcut-row">
+	<span class="field-label">Capture a region</span>
+	<code class="cli-cmd">lychi --screenshot area</code>
+</div>
+<div class="field shortcut-row">
+	<span class="field-label">Show or hide Lychi</span>
+	<code class="cli-cmd">lychi --toggle</code>
+</div>
+
 <div class="section-label">Search shortcuts</div>
 <div class="field-hint">
 	Type a keyword then a query to search a site directly — e.g. <code>gh tokio</code>.
@@ -383,6 +407,22 @@ async function resetAllShortcuts() {
 {/if}
 
 <style>
+	/* The command sits where the hotkey button sits on the rows above, and is
+	   styled to match it — one list, not two designs. It isn't a button because
+	   it isn't rebindable here: the desktop owns these bindings. */
+	.cli-cmd {
+		min-width: 110px;
+		padding: 4px 8px;
+		background: var(--bg-secondary);
+		border: 1px solid var(--border);
+		border-radius: 4px;
+		color: var(--fg);
+		font-family: var(--font-mono);
+		font-size: 11px;
+		text-align: center;
+		user-select: all;
+	}
+
 	.section-label {
 		font-size: 11px;
 		color: var(--fg-muted);

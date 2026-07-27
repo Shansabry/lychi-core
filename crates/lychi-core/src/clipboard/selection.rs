@@ -11,11 +11,28 @@
 //! reading what the user highlights).
 //!
 //! Mechanism, in order:
-//!   - Wayland: `wl-paste --primary` (KWin/wlroots/etc. implement the
-//!     primary-selection protocol).
-//!   - X11 / XWayland fallback: `xclip -selection primary -o`.
-//! Both are the standard tools; no per-app accessibility setup, no clipboard
+//! - Wayland: `wl-paste --primary` (KWin/wlroots/etc. implement the
+//!   primary-selection protocol).
+//! - X11 / XWayland fallback: `xclip -selection primary -o`.
+//! - CLIPBOARD, as a last resort ([`read_for_ai`]) — see below.
+//!
+//! All standard tools; no per-app accessibility setup, no clipboard
 //! clobbering, no synthesized keystrokes.
+//!
+//! ## The GNOME Wayland exception
+//!
+//! One desktop can't serve PRIMARY to an external app. Mutter implements the
+//! protocol, but it only delivers the selection to the *focused* client — so
+//! the instant a launcher focuses itself to read, the source app loses focus
+//! and the selection is invalidated. A catch-22 specific to launchers. The
+//! privileged escape hatch other compositors expose (`wlr-data-control`) is
+//! precisely what GNOME declines to ship, on the stated grounds that it would
+//! let any running app read whatever you highlight.
+//!
+//! So [`read_for_ai`] falls back to the CLIPBOARD there and reports which
+//! source it used, letting the caller say so. Visible degradation, not a
+//! silent substitution — answering confidently about the wrong text is the
+//! failure users complain about most in comparable tools.
 
 use std::process::Command;
 
@@ -40,6 +57,50 @@ pub fn read_primary_selection(is_wayland: bool) -> Option<String> {
         }
     }
     None
+}
+
+/// Where the text handed to an "AI on selection" action actually came from.
+///
+/// Surfaced to the user because the difference is not cosmetic: on GNOME
+/// Wayland the PRIMARY selection is unreachable to an external app, so what the
+/// user highlighted may not be what we read. Saying so beats silently answering
+/// about the wrong text — the single most-complained-about failure mode in
+/// comparable macOS tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionSource {
+    /// The PRIMARY selection — text highlighted right now. What we want.
+    Primary,
+    /// The CLIPBOARD — the last explicit Ctrl+C. Used where PRIMARY can't be
+    /// read, so it may be stale relative to what's highlighted.
+    Clipboard,
+}
+
+/// Read the text an AI action should operate on, trying the best source first.
+///
+/// The ladder exists because PRIMARY is unavailable on GNOME Wayland — not an
+/// oversight but a deliberate GNOME security position. The protocol only
+/// delivers the selection to the FOCUSED client, so the moment a launcher
+/// focuses itself to read, the source app loses focus and the selection is
+/// invalidated. A catch-22 specific to launchers; the privileged escape hatch
+/// (`wlr-data-control`) is exactly what GNOME declines to ship.
+///
+/// Everywhere else — X11 (any desktop), KDE Plasma Wayland, and wlroots
+/// compositors (Sway/Hyprland/niri) — PRIMARY works.
+pub fn read_for_ai(is_wayland: bool) -> Option<(String, SelectionSource)> {
+    if let Some(text) = read_primary_selection(is_wayland) {
+        return Some((text, SelectionSource::Primary));
+    }
+    // Fall back to the clipboard so the feature still works on GNOME Wayland.
+    // The caller tells the user which source was used, so a stale clipboard is
+    // visible degradation rather than a silent substitution.
+    let mut cb = arboard::Clipboard::new().ok()?;
+    let text = cb.get_text().ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let capped: String = trimmed.chars().take(MAX_SELECTION_BYTES).collect();
+    Some((capped, SelectionSource::Clipboard))
 }
 
 /// Run one selection-reading tool, returning trimmed non-empty text.
@@ -72,5 +133,31 @@ fn read_with(tool: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_clipboard_read_is_worth_telling_the_user_about() {
+        // PRIMARY is the source we WANT — it's what the user highlighted, so
+        // there is nothing to explain. A clipboard read means PRIMARY was
+        // unavailable (GNOME Wayland) and the text may be stale, which the user
+        // must be told: silently answering about the wrong text is the failure
+        // mode this ladder exists to avoid.
+        assert_ne!(SelectionSource::Primary, SelectionSource::Clipboard);
+    }
+
+    #[test]
+    fn reading_never_panics_without_a_display() {
+        // CI and headless test runners have no X11/Wayland display and no
+        // clipboard daemon. Every rung of the ladder must degrade to `None`
+        // rather than panicking — this runs on the global-hotkey path, where a
+        // panic would take down the IPC listener.
+        let _ = read_primary_selection(true);
+        let _ = read_primary_selection(false);
+        let _ = read_for_ai(false);
     }
 }

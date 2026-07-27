@@ -163,6 +163,24 @@ export interface AgentEventDto {
 	artifact_content?: string;
 }
 
+/**
+ * A `lychi://ai-on-selection` payload — a global hotkey ran AI on whatever text
+ * the user had highlighted. Hand-written here (like `AgentEventDto`) because
+ * tauri-specta only exports types reachable from a command signature, and this
+ * rides an event.
+ */
+export interface AiOnSelectionPayload {
+	/** The fully rendered prompt for the model. */
+	prompt: string;
+	/** The instruction shown as the user's message. */
+	display: string;
+	/** The selected text, folded into a collapsed chip. */
+	body: string;
+	/** Non-empty when the text came from the clipboard rather than the live
+	 *  selection (GNOME Wayland), so the UI can say so. */
+	note: string;
+}
+
 export interface BrowserContext {
 	type: "GitHub" | "Localhost" | "StackOverflow" | "Documentation" | "Unknown";
 	owner?: string;

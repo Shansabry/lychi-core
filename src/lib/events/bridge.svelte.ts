@@ -16,6 +16,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { handleWindowKey, type WindowKeyEffects } from "$lib/commands/dispatch";
 import type {
 	AgentEventDto,
+	AiOnSelectionPayload,
 	EnvironmentContext,
 	FileSearchBatch,
 	StepEvent,
@@ -79,6 +80,11 @@ export async function attachTauriEvents(h: BridgeHandlers): Promise<() => void> 
 	);
 	offs.push(await win.listen<TrackInfo>("lychi://media-track", (e) => route.mediaTrack(e.payload)));
 	offs.push(await win.listen<string>("lychi://ai-load-state", (e) => route.aiLoadState(e.payload)));
+	offs.push(
+		await win.listen<AiOnSelectionPayload>("lychi://ai-on-selection", (e) =>
+			route.aiOnSelection(e.payload),
+		),
+	);
 	offs.push(
 		await win.listen<FileSearchBatch>("lychi://file-search-results", (e) =>
 			route.fileSearch(e.payload),

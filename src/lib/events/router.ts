@@ -12,7 +12,13 @@
  * event application is verifiable without a browser or the Tauri runtime.
  */
 
-import type { AgentEventDto, EnvironmentContext, FileSearchBatch, TrackInfo } from "$lib/ipc";
+import type {
+	AgentEventDto,
+	AiOnSelectionPayload,
+	EnvironmentContext,
+	FileSearchBatch,
+	TrackInfo,
+} from "$lib/ipc";
 import { chat } from "$lib/stores/chat.svelte";
 import { completions } from "$lib/stores/completions.svelte";
 import { context } from "$lib/stores/context.svelte";
@@ -40,4 +46,27 @@ export const route = {
 
 	/** `lychi://file-search-results` — apply one streamed search batch. */
 	fileSearch: (batch: FileSearchBatch): void => completions.applyFileSearchBatch(batch),
+
+	/**
+	 * `lychi://ai-on-selection` — a global hotkey ran AI on the user's selected
+	 * text (`lychi --ai [preset]`).
+	 *
+	 * The backend already read the selection and rendered the prompt, so this
+	 * just starts the turn. It goes through `startPreset`, which means the answer
+	 * lands in the SAME surface as every other AI answer — streaming, copy,
+	 * regenerate and follow-up all work with no extra code. The selection itself
+	 * folds into a collapsed chip rather than filling the bubble.
+	 */
+	aiOnSelection: (p: AiOnSelectionPayload): void => {
+		const label = p.note
+			? // Say when the text came from the clipboard instead of the live
+				// selection (GNOME Wayland can't share it) — a silent substitution
+				// would have the model answer about the wrong thing.
+				`Selected text · ${p.note}`
+			: "Selected text";
+		chat.startPreset(p.prompt, {
+			instruction: p.display,
+			attachment: { label, body: p.body },
+		});
+	},
 };
