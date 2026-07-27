@@ -181,7 +181,7 @@ impl ActionHandler for ClipboardHandler {
             .enumerate()
             .filter(|(_, e)| e.text.to_lowercase().contains(&lower_partial))
             .collect();
-        scored.sort_by(|(a, _), (b, _)| a.cmp(b)); // Keep recency order
+        scored.sort_by_key(|(a, _)| *a); // Keep recency order
 
         scored
             .iter()

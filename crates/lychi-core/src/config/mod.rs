@@ -134,7 +134,7 @@ mod tests {
         // The set field overrides.
         assert_eq!(cfg.general.theme, "light");
         // Sibling fields in the same section keep their defaults.
-        assert_eq!(cfg.general.hide_on_blur, true);
+        assert!(cfg.general.hide_on_blur);
         // Untouched sections are fully defaulted (search engines present).
         assert!(cfg.commands.search_engines.contains_key("gh"));
         assert_eq!(cfg.ai.timeout_secs, AiConfig::default().timeout_secs);

@@ -136,8 +136,8 @@ fn run(verb: &str, args: &str) -> Result<String, String> {
         }
         "upper" => require_text(args).map(|t| t.to_uppercase()),
         "lower" => require_text(args).map(|t| t.to_lowercase()),
-        "title" => require_text(args).map(|t| title_case(t)),
-        "slug" => require_text(args).map(|t| slugify(t)),
+        "title" => require_text(args).map(title_case),
+        "slug" => require_text(args).map(slugify),
         "reverse" => require_text(args).map(|t| t.chars().rev().collect()),
         "count" => require_text(args).map(|t| {
             let chars = t.chars().count();

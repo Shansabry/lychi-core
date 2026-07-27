@@ -15,7 +15,6 @@ import type {
 	AiTestResult,
 	AllNotes,
 	AllSettings,
-	ChatMessage,
 	CommandInfo,
 	CommandsConfig,
 	CompletionItem,

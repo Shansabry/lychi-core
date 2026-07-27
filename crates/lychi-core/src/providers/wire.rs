@@ -45,8 +45,6 @@ pub(crate) enum AuthStyle {
     None,
 }
 
-/// A configured client for one HTTP endpoint + dialect. Owns the complete
-/// streaming-chat mechanism so providers don't duplicate it.
 /// Notified when a request fails, so callers can LEARN from it (see
 /// `providers::capability`). Kept as a callback rather than a DB handle so the
 /// wire layer stays free of storage concerns and remains testable in isolation.
@@ -478,12 +476,11 @@ where
                             }
                         }
                         Some("input_json_delta") => {
-                            if let Some(j) = delta["partial_json"].as_str() {
-                                if let Some(acc) = tool_blocks.get_mut(&idx) {
+                            if let Some(j) = delta["partial_json"].as_str()
+                                && let Some(acc) = tool_blocks.get_mut(&idx) {
                                     acc.args_buf.push_str(j);
                                     yield StreamEvent::ToolCallArgsDelta { id: acc.id.clone(), delta: j.to_string() };
                                 }
-                            }
                         }
                         _ => {}
                     }
@@ -530,11 +527,10 @@ where
             if evt.trim() == "[DONE]" { break; }
             let data: Value = match serde_json::from_str(&evt) { Ok(v) => v, Err(_) => continue };
             let delta = &data["choices"][0]["delta"];
-            if let Some(t) = delta["content"].as_str() {
-                if !t.is_empty() {
+            if let Some(t) = delta["content"].as_str()
+                && !t.is_empty() {
                     yield StreamEvent::TextDelta(t.to_string());
                 }
-            }
             if let Some(calls) = delta["tool_calls"].as_array() {
                 for tc in calls {
                     let idx = tc["index"].as_u64().unwrap_or(0);
@@ -927,7 +923,10 @@ mod tests {
     fn text_only_user_still_encodes_as_bare_string() {
         // No images → the compact string form on BOTH dialects (no needless array).
         let msg = ChatMessage::user("hello");
-        assert_eq!(anthropic_messages(&[msg.clone()])[0]["content"], "hello");
+        assert_eq!(
+            anthropic_messages(std::slice::from_ref(&msg))[0]["content"],
+            "hello"
+        );
         assert_eq!(openai_messages(&[msg])[0]["content"], "hello");
     }
 

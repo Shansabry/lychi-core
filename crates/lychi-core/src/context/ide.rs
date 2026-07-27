@@ -707,13 +707,12 @@ fn disambiguate(candidates: &[String], hint: &ActiveHint) -> Option<String> {
     //    one of the candidates, that's where the user is working.
     if let Some(cwd) = hint.terminal_cwd.filter(|c| !c.is_empty())
         && let Some(repo_root) = super::git::find_git_root(cwd)
-    {
-        if let Some(hit) = candidates.iter().find(|c| {
+        && let Some(hit) = candidates.iter().find(|c| {
             // Same repo root, or same trailing dir name.
             **c == repo_root || path_matches_token(c, repo_root.rsplit('/').next().unwrap_or(""))
-        }) {
-            return Some(hit.clone());
-        }
+        })
+    {
+        return Some(hit.clone());
     }
 
     None

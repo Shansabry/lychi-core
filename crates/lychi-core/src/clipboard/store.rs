@@ -355,16 +355,15 @@ fn read_clipboard_text(is_wayland: bool) -> Option<String> {
         return Some(text);
     }
 
-    if is_wayland {
-        if let Ok(output) = std::process::Command::new("wl-paste")
+    if is_wayland
+        && let Ok(output) = std::process::Command::new("wl-paste")
             .args(["--no-newline", "--type", "text/plain"])
             .output()
-            && output.status.success()
-        {
-            let text = String::from_utf8_lossy(&output.stdout).to_string();
-            if !text.trim().is_empty() {
-                return Some(text);
-            }
+        && output.status.success()
+    {
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
+        if !text.trim().is_empty() {
+            return Some(text);
         }
     }
 
@@ -374,23 +373,22 @@ fn read_clipboard_text(is_wayland: bool) -> Option<String> {
 /// Try to get an image from the clipboard. Returns (rgba_bytes, width, height).
 fn try_get_image(is_wayland: bool) -> Option<(Vec<u8>, u32, u32)> {
     // Try arboard first
-    if let Ok(mut cb) = arboard::Clipboard::new() {
-        if let Ok(img) = cb.get_image() {
-            let w = img.width as u32;
-            let h = img.height as u32;
-            if w > 0 && h > 0 {
-                return Some((img.bytes.into_owned(), w, h));
-            }
+    if let Ok(mut cb) = arboard::Clipboard::new()
+        && let Ok(img) = cb.get_image()
+    {
+        let w = img.width as u32;
+        let h = img.height as u32;
+        if w > 0 && h > 0 {
+            return Some((img.bytes.into_owned(), w, h));
         }
     }
 
     // Wayland fallback: wl-paste --type image/png
-    if is_wayland {
-        if let Some(png_bytes) = super::image_utils::wl_paste_image() {
-            if let Ok((rgba, w, h)) = super::image_utils::decode_png_to_rgba(&png_bytes) {
-                return Some((rgba, w, h));
-            }
-        }
+    if is_wayland
+        && let Some(png_bytes) = super::image_utils::wl_paste_image()
+        && let Ok((rgba, w, h)) = super::image_utils::decode_png_to_rgba(&png_bytes)
+    {
+        return Some((rgba, w, h));
     }
 
     None

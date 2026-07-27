@@ -245,37 +245,37 @@ fn search(query: &str) -> Result<String, String> {
         }
     }
 
-    if have("flatpak") {
-        if let Ok(output) = Command::new("flatpak").args(["search", query]).output() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            let mut items: Vec<String> = text
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .filter_map(|l| {
-                    // flatpak columns are tab-separated: Name Desc AppID Version Branch Remote
-                    let cols: Vec<&str> = l.split('\t').map(|c| c.trim()).collect();
-                    if cols.len() >= 3 && cols[0] != "Name" {
-                        Some(format!(
-                            "{}  —  {}  ({})",
-                            cols[0],
-                            cols.get(1).unwrap_or(&""),
-                            cols[2]
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let total = items.len();
-            items.truncate(CAP);
-            if !items.is_empty() {
-                let more = if total > CAP {
-                    format!("\n… and {} more", total - CAP)
+    if have("flatpak")
+        && let Ok(output) = Command::new("flatpak").args(["search", query]).output()
+    {
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut items: Vec<String> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| {
+                // flatpak columns are tab-separated: Name Desc AppID Version Branch Remote
+                let cols: Vec<&str> = l.split('\t').map(|c| c.trim()).collect();
+                if cols.len() >= 3 && cols[0] != "Name" {
+                    Some(format!(
+                        "{}  —  {}  ({})",
+                        cols[0],
+                        cols.get(1).unwrap_or(&""),
+                        cols[2]
+                    ))
                 } else {
-                    String::new()
-                };
-                sections.push(format!("flatpak:\n{}{}", items.join("\n"), more));
-            }
+                    None
+                }
+            })
+            .collect();
+        let total = items.len();
+        items.truncate(CAP);
+        if !items.is_empty() {
+            let more = if total > CAP {
+                format!("\n… and {} more", total - CAP)
+            } else {
+                String::new()
+            };
+            sections.push(format!("flatpak:\n{}{}", items.join("\n"), more));
         }
     }
 

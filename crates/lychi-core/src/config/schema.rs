@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, specta::Type)]
 pub struct Config {
     pub general: GeneralConfig,
     pub commands: CommandsConfig,
@@ -11,22 +11,6 @@ pub struct Config {
     pub privacy: PrivacyConfig,
     pub keybindings: KeybindingsConfig,
     pub suggestions: SuggestionsConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            general: GeneralConfig::default(),
-            commands: CommandsConfig::default(),
-            history: HistoryConfig::default(),
-            ai: AiConfig::default(),
-            projects: ProjectsConfig::default(),
-            weather: WeatherConfig::default(),
-            privacy: PrivacyConfig::default(),
-            keybindings: KeybindingsConfig::default(),
-            suggestions: SuggestionsConfig::default(),
-        }
-    }
 }
 
 /// Controls the context-aware suggestion panel.

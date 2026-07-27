@@ -206,10 +206,9 @@ fn parse_conversion(input: &str) -> Option<Conversion> {
     // Find "to" or "in" separator
     let (left, right) = if let Some(pos) = lower.find(" to ") {
         (&lower[..pos], lower[pos + 4..].trim())
-    } else if let Some(pos) = lower.find(" in ") {
-        (&lower[..pos], lower[pos + 4..].trim())
     } else {
-        return None;
+        let pos = lower.find(" in ")?;
+        (&lower[..pos], lower[pos + 4..].trim())
     };
 
     let left = left.trim();

@@ -31,9 +31,7 @@ describe("presetDisplay — instruction + attachment split", () => {
 	});
 
 	it("formats the char-count label compactly", () => {
-		expect(presetDisplay("{input}", "x".repeat(812)).attachment?.label).toBe(
-		"Selected text · 812",
-		);
+		expect(presetDisplay("{input}", "x".repeat(812)).attachment?.label).toBe("Selected text · 812");
 		expect(presetDisplay("{input}", "x".repeat(1200)).attachment?.label).toBe(
 			"Selected text · 1.2k",
 		);

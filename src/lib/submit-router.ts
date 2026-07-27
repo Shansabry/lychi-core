@@ -300,14 +300,16 @@ function decideSelectedCompletion(ctx: SubmitContext, selected: RouterCompletion
 	// question web-searching or dead-ending instead of reaching the agent).
 	// A row whose `run` is a REAL command still wins below — a deliberately
 	// highlighted command is not overridden.
-	const inputIsNl =
-		ctx.inputDecision?.kind === "nl" || ctx.inputDecision?.kind === "ai-disabled";
+	// Narrow to the decision itself rather than a boolean, so the non-null case is
+	// carried by the type system instead of asserted.
+	const nlInput =
+		ctx.inputDecision?.kind === "nl" || ctx.inputDecision?.kind === "ai-disabled"
+			? ctx.inputDecision
+			: undefined;
 	const runIsNl =
-		!selected.run ||
-		ctx.runDecision?.kind === "nl" ||
-		ctx.runDecision?.kind === "ai-disabled";
-	if (inputIsNl && runIsNl) {
-		return fromDecision(ctx.inputDecision!);
+		!selected.run || ctx.runDecision?.kind === "nl" || ctx.runDecision?.kind === "ai-disabled";
+	if (nlInput && runIsNl) {
+		return fromDecision(nlInput);
 	}
 
 	// Calc results ("= 42") — display, don't execute.

@@ -245,15 +245,13 @@ fn try_bluetooth_connect(input: &str) -> Option<Result<String, String>> {
         .or_else(|| lower.strip_prefix("bt connect "))
     {
         ("connect", q.trim())
-    } else if let Some(q) = lower
-        .strip_prefix("disconnect bluetooth ")
-        .or_else(|| lower.strip_prefix("disconnect bt "))
-        .or_else(|| lower.strip_prefix("bluetooth disconnect "))
-        .or_else(|| lower.strip_prefix("bt disconnect "))
-    {
-        ("disconnect", q.trim())
     } else {
-        return None;
+        let q = lower
+            .strip_prefix("disconnect bluetooth ")
+            .or_else(|| lower.strip_prefix("disconnect bt "))
+            .or_else(|| lower.strip_prefix("bluetooth disconnect "))
+            .or_else(|| lower.strip_prefix("bt disconnect "))?;
+        ("disconnect", q.trim())
     };
 
     if query.is_empty() {
@@ -405,32 +403,30 @@ fn read_volume() -> String {
     // PipeWire: "Volume: 0.50" or "Volume: 0.50 [MUTED]"
     if let Ok(out) = run_cmd_output("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"]) {
         let trimmed = out.trim();
-        if let Some(rest) = trimmed.strip_prefix("Volume: ") {
-            if let Some(val) = rest.split_whitespace().next()
-                && let Ok(f) = val.parse::<f64>()
-            {
-                let pct = (f * 100.0).round() as u32;
-                let muted = if rest.contains("[MUTED]") {
-                    " (muted)"
-                } else {
-                    ""
-                };
-                return format!("Volume: {pct}%{muted}");
-            }
+        if let Some(rest) = trimmed.strip_prefix("Volume: ")
+            && let Some(val) = rest.split_whitespace().next()
+            && let Ok(f) = val.parse::<f64>()
+        {
+            let pct = (f * 100.0).round() as u32;
+            let muted = if rest.contains("[MUTED]") {
+                " (muted)"
+            } else {
+                ""
+            };
+            return format!("Volume: {pct}%{muted}");
         }
     }
 
     // PulseAudio: `pactl get-sink-volume @DEFAULT_SINK@` → a line containing
     // e.g. "front-left: 32768 /  50% / ...". Take the first percentage.
-    if let Ok(out) = run_cmd_output("pactl", &["get-sink-volume", "@DEFAULT_SINK@"]) {
-        if let Some(pct) = out
+    if let Ok(out) = run_cmd_output("pactl", &["get-sink-volume", "@DEFAULT_SINK@"])
+        && let Some(pct) = out
             .split('%')
             .next()
             .and_then(|s| s.rsplit(|c: char| !c.is_ascii_digit()).next())
             .filter(|s| !s.is_empty())
-        {
-            return format!("Volume: {pct}%");
-        }
+    {
+        return format!("Volume: {pct}%");
     }
 
     "Volume changed".to_string()

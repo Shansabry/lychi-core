@@ -235,12 +235,12 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
         resume_decision: Option<ApprovalDecision>,
     ) -> Outcome {
         // ── Apply a resume decision (if this is a resume) ────────────────────
-        if let Some(decision) = resume_decision {
-            if let Some(outcome) = self.apply_decision(&mut session, decision).await {
-                return outcome; // a nested approval or error surfaced
-            }
-            // else: results appended, fall through to continue the loop
+        if let Some(decision) = resume_decision
+            && let Some(outcome) = self.apply_decision(&mut session, decision).await
+        {
+            return outcome; // a nested approval or error surfaced
         }
+        // else: results appended, fall through to continue the loop
 
         // ── The turn loop ────────────────────────────────────────────────────
         let mut step = 0usize;

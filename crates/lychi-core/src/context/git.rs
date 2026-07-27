@@ -145,6 +145,28 @@ fn check_dirty(repo_root: &str) -> bool {
     }
 }
 
+/// Read the remote origin URL from `.git/config`.
+fn read_remote(repo_root: &str) -> Option<String> {
+    let config = fs::read_to_string(Path::new(repo_root).join(".git/config")).ok()?;
+
+    let mut in_remote_origin = false;
+    for line in config.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[remote \"origin\"]" {
+            in_remote_origin = true;
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            in_remote_origin = false;
+            continue;
+        }
+        if in_remote_origin && let Some(url) = trimmed.strip_prefix("url = ") {
+            return Some(url.to_string());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,26 +233,4 @@ mod tests {
             "resolved gitdir must be the repo's .git directory"
         );
     }
-}
-
-/// Read the remote origin URL from `.git/config`.
-fn read_remote(repo_root: &str) -> Option<String> {
-    let config = fs::read_to_string(Path::new(repo_root).join(".git/config")).ok()?;
-
-    let mut in_remote_origin = false;
-    for line in config.lines() {
-        let trimmed = line.trim();
-        if trimmed == "[remote \"origin\"]" {
-            in_remote_origin = true;
-            continue;
-        }
-        if trimmed.starts_with('[') {
-            in_remote_origin = false;
-            continue;
-        }
-        if in_remote_origin && let Some(url) = trimmed.strip_prefix("url = ") {
-            return Some(url.to_string());
-        }
-    }
-    None
 }

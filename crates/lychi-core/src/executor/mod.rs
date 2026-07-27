@@ -176,8 +176,7 @@ impl Executor {
         }
         let first_l = first.to_lowercase();
         self.bang_keywords
-            .iter()
-            .any(|k| *k == first_l)
+            .contains(&first_l)
             .then(|| trimmed.to_string())
     }
 
@@ -203,8 +202,7 @@ impl Executor {
             .unwrap_or(trimmed);
         let first_l = first.to_lowercase();
         self.script_keywords
-            .iter()
-            .any(|k| *k == first_l)
+            .contains(&first_l)
             .then(|| trimmed.to_string())
     }
 

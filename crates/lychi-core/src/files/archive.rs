@@ -321,7 +321,7 @@ mod tests {
         let a = work.join("a.txt");
         fs::write(&a, b"tar-hello").unwrap();
         let out = work.join("out.tar.gz");
-        targz_paths(&[a.clone()], &out).unwrap();
+        targz_paths(std::slice::from_ref(&a), &out).unwrap();
 
         let dest = work.join("un");
         let res = extract_archive(&out, &dest).unwrap();

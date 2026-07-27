@@ -207,16 +207,16 @@ fn route_inner(raw: &str, check_aliases: bool, registry: &ActionRegistry) -> Pat
     }
 
     // 5c. Bare hex color (e.g. "#FF5733", "#F53") — route to color handler
-    if trimmed.starts_with('#') {
-        let hex = &trimmed[1..];
-        if matches!(hex.len(), 3 | 6 | 8) && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-            return PatternResult::Match(Route {
-                handler: "color".to_string(),
-                args: trimmed.to_string(),
-                explicit: false,
-                confidence: Confidence::Strong,
-            });
-        }
+    if let Some(hex) = trimmed.strip_prefix('#')
+        && matches!(hex.len(), 3 | 6 | 8)
+        && hex.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return PatternResult::Match(Route {
+            handler: "color".to_string(),
+            args: trimmed.to_string(),
+            explicit: false,
+            confidence: Confidence::Strong,
+        });
     }
 
     // 5d. Structured power phrases — unambiguous, handle before AI fallback

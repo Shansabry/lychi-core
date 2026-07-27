@@ -109,10 +109,10 @@ pub fn normalize_wm_class(wm_class: &str) -> String {
         s = stripped.to_string();
     }
     // Reverse-DNS → last dotted segment.
-    if s.contains('.') {
-        if let Some(short) = s.rsplit('.').next() {
-            s = short.to_string();
-        }
+    if s.contains('.')
+        && let Some(short) = s.rsplit('.').next()
+    {
+        s = short.to_string();
     }
     // Noise suffixes.
     for suffix in ["-url-handler", "-server", "-bin", "-wrapped"] {

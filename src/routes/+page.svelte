@@ -20,9 +20,9 @@ import { attachTauriEvents } from "$lib/events/bridge.svelte";
 import type { AgentPlan, CommandResult, CompletionItem } from "$lib/ipc";
 import {
 	cancelFileSearch,
+	classifyInput,
 	clearConversations,
 	confirmExecution,
-	classifyInput,
 	contentText,
 	deleteConversation,
 	executeCommand,
@@ -53,7 +53,7 @@ import {
 import { loadKeybindings } from "$lib/keybindings";
 import { preloadAll } from "$lib/preloadCache";
 import { attachments } from "$lib/stores/attachments.svelte";
-import { type AiTurn, type UserAttachment, chat } from "$lib/stores/chat.svelte";
+import { type AiTurn, chat, type UserAttachment } from "$lib/stores/chat.svelte";
 import { completions } from "$lib/stores/completions.svelte";
 import { context } from "$lib/stores/context.svelte";
 import { media } from "$lib/stores/media.svelte";
@@ -751,8 +751,7 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 	const trimmed = inputValue.trim();
 	const needsDecision =
 		!opts?.ctrlKey && !opts?.runInline && !completions.searchMode && !completions.atMode;
-	const selected =
-		completions.index >= 0 ? completions.items[completions.index] : undefined;
+	const selected = completions.index >= 0 ? completions.items[completions.index] : undefined;
 	const selectedRun = selected?.run ?? undefined;
 
 	let inputDecision: RouteDecision | undefined;

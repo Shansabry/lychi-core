@@ -38,10 +38,10 @@ impl SshHost {
         } else if let Some(ref host) = self.hostname {
             parts.push(host.clone());
         }
-        if let Some(port) = self.port {
-            if port != 22 {
-                parts.push(format!(":{port}"));
-            }
+        if let Some(port) = self.port
+            && port != 22
+        {
+            parts.push(format!(":{port}"));
         }
         if let Some(ref id) = self.identity_file {
             // Show just the filename
@@ -83,12 +83,11 @@ fn load_ssh_hosts() -> Vec<SshHost> {
     };
 
     // Check cache
-    if let Ok(cache) = SSH_CACHE.lock() {
-        if let Some(ref c) = *cache {
-            if c.mtime == mtime {
-                return c.hosts.clone();
-            }
-        }
+    if let Ok(cache) = SSH_CACHE.lock()
+        && let Some(ref c) = *cache
+        && c.mtime == mtime
+    {
+        return c.hosts.clone();
     }
 
     let hosts = load_ssh_config_recursive(&config_path, 0);
@@ -205,21 +204,19 @@ fn parse_ssh_config(content: &str, base_dir: &Path, depth: u8) -> Vec<SshHost> {
                 let mut included = load_ssh_config_recursive(&inc_path, depth + 1);
                 hosts.append(&mut included);
             }
-        } else if !in_match_block {
-            if let Some(ref mut host) = current {
-                match key_lower.as_str() {
-                    "hostname" => host.hostname = Some(value.to_string()),
-                    "user" => host.user = Some(value.to_string()),
-                    "port" => host.port = value.parse().ok(),
-                    "identityfile" => host.identity_file = Some(value.to_string()),
-                    "proxyjump" => host.proxy_jump = Some(value.to_string()),
-                    _ => {}
-                }
+        } else if !in_match_block && let Some(ref mut host) = current {
+            match key_lower.as_str() {
+                "hostname" => host.hostname = Some(value.to_string()),
+                "user" => host.user = Some(value.to_string()),
+                "port" => host.port = value.parse().ok(),
+                "identityfile" => host.identity_file = Some(value.to_string()),
+                "proxyjump" => host.proxy_jump = Some(value.to_string()),
+                _ => {}
             }
-            // For multi-alias hosts, propagate fields to previously pushed aliases
-            // that share the same block (they were pushed with None fields).
-            // We handle this by back-patching after the block is complete — see below.
         }
+        // For multi-alias hosts, propagate fields to previously pushed aliases
+        // that share the same block (they were pushed with None fields).
+        // We handle this by back-patching after the block is complete — see below.
     }
 
     // Flush last host
@@ -466,7 +463,7 @@ impl ActionHandler for SshHandler {
                 let haystack = format!("{} {}", h.alias, h.display_description());
                 let haystack_chars: Vec<char> = haystack.chars().collect();
                 let utf32 = nucleo_matcher::Utf32Str::Unicode(&haystack_chars);
-                let score = pattern.score(utf32, matcher).map(|s| s as u32);
+                let score = pattern.score(utf32, matcher).map(|s| s);
                 score.map(|s| (s, h))
             })
             .collect();

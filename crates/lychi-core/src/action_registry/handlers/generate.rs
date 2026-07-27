@@ -29,7 +29,7 @@ const SYMBOLS: &[u8] = b"!@#$%^&*()-_=+[]{}|;:,.<>?";
 
 /// Generate a random password with guaranteed character class coverage.
 fn generate_password(length: usize) -> Result<String, LychiError> {
-    if length < 8 || length > 128 {
+    if !(8..=128).contains(&length) {
         return Err(LychiError::ExecutionFailed(
             "Password length must be between 8 and 128".to_string(),
         ));
@@ -117,7 +117,7 @@ fn parse_random_range(rest: &str) -> Result<(i64, i64), LychiError> {
 
 /// Generate a URL-safe base64 token.
 fn generate_token(length: usize) -> Result<String, LychiError> {
-    if length < 8 || length > 256 {
+    if !(8..=256).contains(&length) {
         return Err(LychiError::ExecutionFailed(
             "Token length must be between 8 and 256".to_string(),
         ));

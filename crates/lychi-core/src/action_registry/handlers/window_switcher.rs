@@ -30,10 +30,10 @@ fn display_name_for_class(wm_class: &str) -> String {
     let index = crate::desktop_apps::index::app_index();
     let wmc_lower = wm_class.to_lowercase();
     for entry in &index.entries {
-        if let Some(ref eclass) = entry.wm_class {
-            if eclass.to_lowercase() == wmc_lower {
-                return entry.name.clone();
-            }
+        if let Some(ref eclass) = entry.wm_class
+            && eclass.to_lowercase() == wmc_lower
+        {
+            return entry.name.clone();
         }
         if entry.exec_basename.to_lowercase() == wmc_lower {
             return entry.name.clone();
@@ -57,10 +57,8 @@ fn icon_for_class(wm_class: &str) -> Option<String> {
             .as_ref()
             .is_some_and(|c| c.to_lowercase() == wmc_lower)
             || entry.exec_basename.to_lowercase() == wmc_lower;
-        if matches {
-            if let Some(ref icon) = entry.icon {
-                return icons::resolve_icon(icon);
-            }
+        if matches && let Some(ref icon) = entry.icon {
+            return icons::resolve_icon(icon);
         }
     }
     None

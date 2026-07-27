@@ -129,24 +129,25 @@ pub fn suggest(raw: &str, registry: &ActionRegistry) -> Option<CompletionItem> {
     //    band — confident enough to offer, but below AUTO_LAUNCH_THRESHOLD so we
     //    don't silently launch the wrong app. Only fires for an unknown first
     //    word (a real command keyword is handled above).
-    if words.len() == 1 && first.len() >= MIN_WORD_LEN && !is_known {
-        if let Some((id, score)) = crate::desktop_apps::app_index().best_match(first)
-            && (APP_SUGGEST_FLOOR..crate::desktop_apps::AUTO_LAUNCH_THRESHOLD).contains(&score)
-        {
-            let name = crate::desktop_apps::app_index().entry(id).name.clone();
-            // Skip if the query already IS the app name (case-insensitive) — no typo.
-            if name.to_lowercase() != first {
-                let suggestion = format!("open {name}");
-                return Some(CompletionItem {
-                    label: format!("Did you mean: {suggestion}?"),
-                    icon_path: Some("__none__".to_string()),
-                    score: 90,
-                    description: Some(suggestion),
-                    reason: None,
-                    thumb_b64: None,
-                    ..Default::default()
-                });
-            }
+    if words.len() == 1
+        && first.len() >= MIN_WORD_LEN
+        && !is_known
+        && let Some((id, score)) = crate::desktop_apps::app_index().best_match(first)
+        && (APP_SUGGEST_FLOOR..crate::desktop_apps::AUTO_LAUNCH_THRESHOLD).contains(&score)
+    {
+        let name = crate::desktop_apps::app_index().entry(id).name.clone();
+        // Skip if the query already IS the app name (case-insensitive) — no typo.
+        if name.to_lowercase() != first {
+            let suggestion = format!("open {name}");
+            return Some(CompletionItem {
+                label: format!("Did you mean: {suggestion}?"),
+                icon_path: Some("__none__".to_string()),
+                score: 90,
+                description: Some(suggestion),
+                reason: None,
+                thumb_b64: None,
+                ..Default::default()
+            });
         }
     }
 

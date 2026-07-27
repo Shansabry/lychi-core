@@ -22,10 +22,10 @@
 
 import {
 	type AgentEventDto,
-	type MessageDisplay,
 	agentApprove,
 	agentChatStart,
 	cancelAiChat,
+	type MessageDisplay,
 } from "$lib/ipc";
 import { attachments } from "./attachments.svelte";
 import { ui } from "./ui.svelte";
@@ -223,7 +223,14 @@ class ChatSession {
 		const gen = this.#beginRun(sent.prompt, text, null, sent.files);
 		this.quick = false; // full agent chat, not the fork card
 		try {
-			await agentChatStart(AGENT_SYSTEM, sent.prompt, fresh, /* withTools */ true, gen, sent.images);
+			await agentChatStart(
+				AGENT_SYSTEM,
+				sent.prompt,
+				fresh,
+				/* withTools */ true,
+				gen,
+				sent.images,
+			);
 		} catch (e) {
 			this.#fail(gen, e);
 		}

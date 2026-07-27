@@ -161,10 +161,10 @@ fn extract_attr<'a>(chunk: &'a str, attr: &str) -> Option<&'a str> {
 /// relocations. Editors installed via Flatpak/Snap store config elsewhere.
 fn config_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            roots.push(PathBuf::from(xdg));
-        }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+        && !xdg.is_empty()
+    {
+        roots.push(PathBuf::from(xdg));
     }
     let home = std::env::var("HOME").unwrap_or_default();
     if !home.is_empty() {

@@ -27,7 +27,13 @@
 		}
 	},
 	"files": {
-		"includes": ["src/**/*.ts", "src/**/*.svelte", "src/**/*.css", "src/**/*.js"]
+		"includes": [
+			"src/**/*.ts",
+			"src/**/*.svelte",
+			"src/**/*.css",
+			"src/**/*.js",
+			"!src/lib/bindings.ts"
+		]
 	},
 	"css": {
 		"formatter": {

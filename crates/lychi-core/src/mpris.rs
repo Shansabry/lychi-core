@@ -632,12 +632,12 @@ mod tests {
         // Simulate get_all_status: a playing player, then two paused ones where
         // the second was used more recently. Expect: playing first, then the
         // recently-used paused player, then the older paused one.
-        let mut players = vec![
+        let mut players = [
             ("old_paused", Paused, 2u64),
             ("playing", Playing, 1u64),
             ("recent_paused", Paused, 5u64),
         ];
-        players.sort_by(|a, b| sort_key(&a.1, a.2).cmp(&sort_key(&b.1, b.2)));
+        players.sort_by_key(|a| sort_key(&a.1, a.2));
         let order: Vec<&str> = players.iter().map(|p| p.0).collect();
         assert_eq!(order, ["playing", "recent_paused", "old_paused"]);
     }
