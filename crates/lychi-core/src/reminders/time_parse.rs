@@ -437,8 +437,13 @@ mod tests {
     fn format_relative_display() {
         let now = crate::db::now_millis();
         assert_eq!(format_relative(now), "now");
-        assert_eq!(format_relative(now + 30_000), "in 30s");
-        assert_eq!(format_relative(now + 5 * 60_000), "in 5m");
-        assert_eq!(format_relative(now + 90 * 60_000), "in 1h 30m");
+        // FLAKE GUARD: `format_relative` re-reads the clock, so a few ms elapse
+        // between `now` here and `now` inside. An exact-multiple offset (30_000)
+        // therefore lands a hair BELOW the boundary and floors to the previous
+        // second ("in 29s"). Offsetting by half a second keeps each case
+        // comfortably inside its bucket regardless of that drift.
+        assert_eq!(format_relative(now + 30_500), "in 30s");
+        assert_eq!(format_relative(now + 5 * 60_000 + 500), "in 5m");
+        assert_eq!(format_relative(now + 90 * 60_000 + 500), "in 1h 30m");
     }
 }

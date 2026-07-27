@@ -323,6 +323,103 @@ pub fn find_doc_refs(prompt: &str) -> Vec<DocRef> {
     refs
 }
 
+/// A non-file `@`-reference that pulls in ambient context: `@clipboard` and
+/// `@selection`. These name a SOURCE rather than a path, so they resolve through
+/// a supplied reader instead of the filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextSource {
+    /// What's on the clipboard right now (Ctrl+C).
+    Clipboard,
+    /// What's highlighted in the focused window (PRIMARY selection).
+    Selection,
+}
+
+impl ContextSource {
+    /// The label shown on the inlined block.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Clipboard => "clipboard",
+            Self::Selection => "selection",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        match word.to_ascii_lowercase().as_str() {
+            "clipboard" | "clip" => Some(Self::Clipboard),
+            "selection" | "selected" => Some(Self::Selection),
+            _ => None,
+        }
+    }
+}
+
+/// Find `@clipboard` / `@selection` tokens in a prompt, in order, de-duplicated.
+/// Matched exactly (not as a path prefix) so a real file named `clipboard.txt`
+/// still resolves as a document.
+pub fn find_context_refs(prompt: &str) -> Vec<(String, ContextSource)> {
+    if !prompt.contains('@') {
+        return Vec::new();
+    }
+    let mut out: Vec<(String, ContextSource)> = Vec::new();
+    for tok in prompt.split_whitespace() {
+        let Some(rest) = tok.strip_prefix('@') else {
+            continue;
+        };
+        // Trailing punctuation is common in prose ("summarize @clipboard.").
+        let word = rest.trim_end_matches(['.', ',', '?', '!']);
+        if let Some(src) = ContextSource::parse(word)
+            && !out.iter().any(|(_, s)| *s == src)
+        {
+            out.push((tok.to_string(), src));
+        }
+    }
+    out
+}
+
+/// Expand `@clipboard` / `@selection` into inlined text, using `read` to fetch
+/// each source. Kept separate from the filesystem so core stays testable without
+/// a real clipboard — the caller supplies the reader.
+///
+/// A source that's empty or unreadable is reported inline rather than dropped,
+/// so the model doesn't silently answer about nothing.
+pub fn expand_context_refs(prompt: &str, read: &dyn Fn(ContextSource) -> Option<String>) -> String {
+    let refs = find_context_refs(prompt);
+    if refs.is_empty() {
+        return prompt.to_string();
+    }
+
+    let mut instruction = prompt.to_string();
+    for (token, _) in &refs {
+        instruction = instruction.replace(token, "");
+    }
+    // Collapse the gaps left by removed tokens.
+    let instruction = instruction.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    let mut out = if instruction.is_empty() {
+        String::new()
+    } else {
+        format!("{instruction}\n")
+    };
+    for (_, src) in &refs {
+        let label = src.label();
+        match read(*src).filter(|s| !s.trim().is_empty()) {
+            Some(body) => {
+                let original_len = body.len();
+                let capped = cap(body);
+                let trunc = if capped.len() < original_len {
+                    " (truncated)"
+                } else {
+                    ""
+                };
+                out.push_str(&format!("\n--- {label}{trunc} ---\n{capped}\n"));
+            }
+            None => {
+                out.push_str(&format!("\n--- {label} ---\n[nothing in the {label}]\n"));
+            }
+        }
+    }
+    out.trim_end().to_string()
+}
+
 /// Expand any `@`-referenced documents in `prompt` into inlined text for the AI:
 /// each doc's `@token` is removed from the sentence and its extracted text is
 /// appended as a fenced, labeled block. Returns the rewritten prompt unchanged
@@ -550,6 +647,76 @@ mod tests {
         let p = tmp("broken.pdf");
         std::fs::write(&p, b"%PDF-1.4\nnot a real pdf at all \x00\x01\x02").unwrap();
         assert!(extract_text(&p).is_err());
+    }
+
+    /// A reader that answers with canned text, so the expansion is testable
+    /// without a real clipboard or X display.
+    fn reader(
+        clip: Option<&'static str>,
+        sel: Option<&'static str>,
+    ) -> impl Fn(ContextSource) -> Option<String> {
+        move |src| match src {
+            ContextSource::Clipboard => clip.map(str::to_string),
+            ContextSource::Selection => sel.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn context_refs_are_found_and_deduped() {
+        let refs = find_context_refs("summarize @clipboard and @selection and @clipboard again");
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].1, ContextSource::Clipboard);
+        assert_eq!(refs[1].1, ContextSource::Selection);
+    }
+
+    #[test]
+    fn trailing_punctuation_still_matches() {
+        let refs = find_context_refs("what is @clipboard?");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].1, ContextSource::Clipboard);
+    }
+
+    #[test]
+    fn a_file_named_clipboard_is_not_a_context_ref() {
+        // Exact-match only — `@clipboard.txt` is a path, not the clipboard.
+        assert!(find_context_refs("read @clipboard.txt").is_empty());
+    }
+
+    #[test]
+    fn context_expansion_inlines_the_body_and_strips_the_token() {
+        let out = expand_context_refs("summarize @clipboard", &reader(Some("hello world"), None));
+        assert!(out.starts_with("summarize\n"));
+        assert!(!out.contains("@clipboard"));
+        assert!(out.contains("--- clipboard ---"));
+        assert!(out.contains("hello world"));
+    }
+
+    #[test]
+    fn an_empty_source_is_reported_not_silently_dropped() {
+        // Answering about nothing is worse than saying there was nothing.
+        let out = expand_context_refs("summarize @selection", &reader(None, None));
+        assert!(out.contains("[nothing in the selection]"));
+
+        let blank = expand_context_refs("summarize @clipboard", &reader(Some("   "), None));
+        assert!(blank.contains("[nothing in the clipboard]"));
+    }
+
+    #[test]
+    fn a_prompt_without_context_refs_is_returned_verbatim() {
+        let p = "what is rust?";
+        assert_eq!(expand_context_refs(p, &reader(Some("x"), None)), p);
+    }
+
+    #[test]
+    fn both_sources_expand_in_order() {
+        let out = expand_context_refs(
+            "compare @clipboard with @selection",
+            &reader(Some("AAA"), Some("BBB")),
+        );
+        let clip_at = out.find("AAA").unwrap();
+        let sel_at = out.find("BBB").unwrap();
+        assert!(clip_at < sel_at);
+        assert!(out.starts_with("compare with\n"));
     }
 
     #[test]

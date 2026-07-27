@@ -23,7 +23,11 @@ export type ActionId =
 	| "copy_path"
 	| "screenshot"
 	| "action_panel"
-	| "attach_file";
+	| "attach_file"
+	| "approve_action"
+	| "reject_action"
+	| "fork_web"
+	| "fork_chat";
 
 export const ACTION_LABELS: Record<ActionId, string> = {
 	toggle_history: "Toggle history",
@@ -42,6 +46,10 @@ export const ACTION_LABELS: Record<ActionId, string> = {
 	screenshot: "Quick screenshot",
 	action_panel: "Show actions for result",
 	attach_file: "Attach file to AI chat",
+	approve_action: "Approve a paused action",
+	reject_action: "Reject a paused action",
+	fork_web: "Quick answer: search the web instead",
+	fork_chat: "Quick answer: continue in full chat",
 };
 
 export const ALL_ACTIONS: ActionId[] = Object.keys(ACTION_LABELS) as ActionId[];
@@ -150,6 +158,34 @@ export function getDefaults(): KeybindingsConfig {
 	return { ...KEYBINDINGS_DEFAULTS };
 }
 
+/**
+ * Actions that MAY share a binding because they never compete: each is only
+ * live on a surface where the other isn't listening.
+ *
+ * The quick-AI fork card is modal — while it's showing, the launcher input is
+ * empty and idle. `fork_web` is the same INTENT as `web_search` ("search the
+ * web for this") and `fork_chat` the same as `submit`, so sharing a key is the
+ * consistent choice, not a collision. Warning about it would train users to
+ * ignore the conflict warning, which exists for real clashes.
+ *
+ * Keyed by a canonical sorted pair so lookup is order-independent.
+ */
+const ALLOWED_SHARED_BINDINGS = new Set([
+	"fork_web|web_search",
+	"fork_chat|submit",
+	// The approval prompt is modal too — while a destructive tool call is
+	// awaiting a decision, nothing else consumes Enter. Ctrl+Enter meaning
+	// "yes, go ahead" there is the same affirmative gesture it is elsewhere.
+	"approve_action|web_search",
+	"approve_action|fork_web",
+	// Escape always means "back out of this", whatever is showing.
+	"dismiss|reject_action",
+]);
+
+function isAllowedShare(a: ActionId, b: ActionId): boolean {
+	return ALLOWED_SHARED_BINDINGS.has([a, b].sort().join("|"));
+}
+
 /** Find conflicting action pairs that share the same key combo. */
 export function findConflicts(config: KeybindingsConfig): [ActionId, ActionId][] {
 	const seen = new Map<string, ActionId>();
@@ -158,7 +194,9 @@ export function findConflicts(config: KeybindingsConfig): [ActionId, ActionId][]
 		const fp = bindingFp(parseCombo(combo));
 		const existing = seen.get(fp);
 		if (existing) {
-			conflicts.push([existing, action as ActionId]);
+			if (!isAllowedShare(existing, action as ActionId)) {
+				conflicts.push([existing, action as ActionId]);
+			}
 		} else {
 			seen.set(fp, action as ActionId);
 		}

@@ -550,6 +550,16 @@ pub struct KeybindingsConfig {
     /// Stage the selected file as an attachment for the next AI turn (image →
     /// vision, document → inlined text). Ctrl+Shift+A.
     pub attach_file: String,
+    /// Approve a destructive tool call the Rules Engine paused. Ctrl+Enter.
+    pub approve_action: String,
+    /// Reject a paused tool call. Escape.
+    pub reject_action: String,
+    /// Quick-AI fork card: bail out to a plain web search. Ctrl+Enter —
+    /// deliberately the SAME binding as `web_search`, since it is the same
+    /// intent ("search the web for this") on a different surface.
+    pub fork_web: String,
+    /// Quick-AI fork card: escalate the short answer into full chat. Enter.
+    pub fork_chat: String,
 }
 
 impl Default for KeybindingsConfig {
@@ -571,6 +581,10 @@ impl Default for KeybindingsConfig {
             screenshot: "Ctrl+Shift+S".to_string(),
             action_panel: "Ctrl+K".to_string(),
             attach_file: "Ctrl+Shift+A".to_string(),
+            approve_action: "Ctrl+Enter".to_string(),
+            reject_action: "Escape".to_string(),
+            fork_web: "Ctrl+Enter".to_string(),
+            fork_chat: "Enter".to_string(),
         }
     }
 }

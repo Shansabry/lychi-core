@@ -35,6 +35,8 @@ export interface RouterCompletion {
 	description?: string | null;
 	/** Sentinel icon path; drives a few special cases (separators, context). */
 	icon_path?: string | null;
+	/** Typed row kind, when selection behaves specially. Never match on `label`. */
+	kind?: string | null;
 }
 
 /** Everything `decideSubmit` needs to know about the current UI state. */
@@ -145,8 +147,13 @@ export type SubmitAction =
 	| { kind: "completion-select"; label: string; ctrlKey: boolean }
 	/** Fill the input with tab-to-complete text (an argument hint), then re-suggest. */
 	| { kind: "fill"; value: string }
-	/** Fill the input with corrected text (typo "Did you mean"), then re-suggest. */
-	| { kind: "correct"; value: string }
+	/**
+	 * Apply a correction. `run: false` (the default) FILLS the input so the user
+	 * can confirm — right for an auto-offered guess on a typo they typed. `run:
+	 * true` executes immediately: the user already picked the row, so asking
+	 * them to press Enter a second time is pure friction.
+	 */
+	| { kind: "correct"; value: string; run?: boolean }
 	/** Show a calc result inline without executing anything. */
 	| { kind: "calc-display"; text: string }
 	/** Try to open a literal filesystem path (search mode, no selectable result). */
@@ -293,6 +300,33 @@ function decideSelectedCompletion(ctx: SubmitContext, selected: RouterCompletion
 	if (ctx.atMode || ctx.searchMode) {
 		return { kind: "completion-select", label: selected.label, ctrlKey: ctx.ctrlKey };
 	}
+
+	// A correction row is an EXPLICIT choice and always wins.
+	//
+	// Checked before the NL guard below. Since natural phrasing became
+	// suggestible ("can you define gallop" → "define gallop"), the input itself
+	// classifies as `nl` while the row carries no `run` — exactly the shape that
+	// guard treats as "the question owns Enter". That made selecting the
+	// suggestion silently open AI chat instead of running the command the user
+	// just picked. The guard exists for AUTO-selected fallback rows; a row the
+	// user deliberately highlighted is not one of those.
+	if (selected.kind === "correction" && selected.description) {
+		// Selected deliberately → run it. (An auto-offered typo correction still
+		// only fills, so a wrong guess never executes on its own.)
+		return { kind: "correct", value: selected.description, run: true };
+	}
+
+	// "Ask AI" — the user explicitly chose the agent over the suggested command,
+	// so go straight there. Also checked before the NL guard: that guard exists
+	// for AUTO-selected fallback rows and would otherwise substitute the input's
+	// own (possibly ambiguous, or AI-disabled → web) decision for the explicit
+	// choice just made.
+	if (selected.kind === "ask-ai" && selected.description) {
+		return { kind: "agent", prompt: selected.description };
+	}
+	if (selected.kind === "search-web" && selected.description) {
+		return { kind: "command", command: `web ${selected.description}` };
+	}
 	// Both the raw input AND the highlighted row's `run` classify as natural
 	// language → the question owns Enter. This is the case where an auto-selected
 	// "Ask AI: …" / "Search web: …" fallback row (its `run` is `ask …`/`web …`)
@@ -312,13 +346,11 @@ function decideSelectedCompletion(ctx: SubmitContext, selected: RouterCompletion
 		return fromDecision(nlInput);
 	}
 
-	// Calc results ("= 42") — display, don't execute.
-	if (selected.label.startsWith("= ")) {
-		return { kind: "calc-display", text: selected.label.slice(2) };
-	}
-	// Typo suggestion ("Did you mean: X?") — fill with the correction (in `description`).
-	if (selected.label.startsWith("Did you mean:") && selected.description) {
-		return { kind: "correct", value: selected.description };
+	// A calc row is an ANSWER — display it, never execute it. Identified by its
+	// typed kind; the value is still read off the label because that IS the
+	// rendered answer ("= 42" → "42").
+	if (selected.kind === "calc") {
+		return { kind: "calc-display", text: selected.label.replace(/^=\s*/, "") };
 	}
 	// Tab-complete hint → fill the input (an argument-needing command).
 	if (selected.fill) {

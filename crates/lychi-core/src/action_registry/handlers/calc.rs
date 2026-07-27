@@ -158,6 +158,9 @@ impl ActionHandler for CalcHandler {
                 reason: None,
                 thumb_b64: None,
                 run: Some(format!("calc {expr}")),
+                // An answer, not a command — the frontend shows it instead of
+                // running it, and must not parse that intent out of the label.
+                kind: Some(crate::action_registry::CompletionKind::Calc),
                 ..Default::default()
             }];
         }
@@ -172,6 +175,9 @@ impl ActionHandler for CalcHandler {
                 reason: None,
                 thumb_b64: None,
                 run: Some(format!("calc {expr}")),
+                // An answer, not a command — the frontend shows it instead of
+                // running it, and must not parse that intent out of the label.
+                kind: Some(crate::action_registry::CompletionKind::Calc),
                 ..Default::default()
             }]
         } else {

@@ -31,8 +31,13 @@ use crate::db::frecency;
 use super::EnvironmentContext;
 use providers::{Candidate, ProviderTier, SuggestCtx, providers};
 
-/// Cap on frecency recents shown on the empty prompt.
-const MAX_COLD_RECENTS: usize = 8;
+/// Cap on rows shown on the empty prompt.
+///
+/// Every comparable launcher sits well below what a "show everything" zero
+/// state produces: PowerToys Run 4, Superhuman and Flow Launcher 5, Chrome's
+/// omnibox 8, Alfred and Ulauncher 9 (hard ceilings). Six keeps the whole list
+/// scannable in one glance, which is the entire point of the zero state.
+const MAX_COLD_RECENTS: usize = 6;
 
 // ── Tuning ──────────────────────────────────────────────────────────────
 
@@ -200,13 +205,52 @@ fn frecency_recents(db: Option<&Arc<Database>>) -> Vec<CompletionItem> {
         .filter(|(cmd, _)| !cmd.is_empty())
         .collect();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Collapse near-duplicates. Asking the same thing four ways ("can you define
+    // gallop", "define gallop", "define the gallop", "define gallop?") is four
+    // history entries but ONE intent, and showing all four buries everything
+    // else. Keyed on the significant words — order-insensitive, punctuation and
+    // filler removed — so the phrasings converge on `{define, gallop}`.
+    //
+    // Highest-scoring phrasing wins, since `scored` is already sorted.
+    let mut seen_intent: std::collections::HashSet<String> = std::collections::HashSet::new();
     scored
         .into_iter()
+        .filter(|(cmd, _)| seen_intent.insert(intent_key(cmd)))
         .take(MAX_COLD_RECENTS)
         .map(|(cmd, _)| {
             CompletionItem::new(cmd.clone(), Some("__history__".to_string()), 0).with_run(cmd)
         })
         .collect()
+}
+
+/// A canonical key for "what this command is really asking".
+///
+/// Lowercased, punctuation-stripped, deduplicated and SORTED words. Sorting
+/// makes word order irrelevant; the set makes repetition irrelevant.
+///
+/// Deliberately NOT a stop-word list. That would collapse "can you define
+/// gallop" onto "define gallop" too, but at the cost of a hand-maintained table
+/// of meaningless words — English-only, and stale the moment it ships. What
+/// this key does cover is the cheap, certain half: case, trailing punctuation,
+/// and word order. Phrasings that differ by filler stay separate rows, and the
+/// row cap keeps that bounded.
+///
+/// Edit distance was rejected outright: at any threshold loose enough to merge
+/// "define gallop" with "can you define gallop", it also merges "define gallop"
+/// with "define canter".
+fn intent_key(cmd: &str) -> String {
+    let mut words: Vec<String> = cmd
+        .split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| c.is_ascii_punctuation() && c != '-' && c != '_')
+                .to_lowercase()
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
+    words.sort();
+    words.dedup();
+    words.join(" ")
 }
 
 /// The empty-state hint shown to a brand-new user with no recents.
@@ -393,6 +437,63 @@ fn rank(
 mod tests {
     use super::providers::Candidate;
     use super::*;
+
+    #[test]
+    fn case_punctuation_and_word_order_collapse() {
+        // The cheap, certain half of dedup — no word list required.
+        let k = intent_key("define gallop");
+        for variant in [
+            "define gallop?",
+            "DEFINE GALLOP",
+            "gallop define",
+            "define  gallop",
+        ] {
+            assert_eq!(
+                intent_key(variant),
+                k,
+                "{variant:?} should collapse onto {k:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn filler_words_do_not_collapse_and_that_is_deliberate() {
+        // "can you define gallop" keeps its own key. Collapsing it would need a
+        // stop-word list (hand-maintained, English-only) or edit distance —
+        // which at any threshold loose enough to merge it with "define gallop"
+        // also merges "define gallop" with "define canter". The row cap bounds
+        // the cost instead.
+        assert_ne!(
+            intent_key("can you define gallop"),
+            intent_key("define gallop")
+        );
+    }
+
+    #[test]
+    fn genuinely_different_commands_keep_distinct_keys() {
+        // The failure mode to avoid: over-merging. Edit distance would risk
+        // this; a word-set key doesn't.
+        let keys = [
+            intent_key("open spotify"),
+            intent_key("open firefox"),
+            intent_key("define gallop"),
+            intent_key("weather in tokyo"),
+            intent_key("weather in london"),
+        ];
+        let unique: std::collections::HashSet<_> = keys.iter().collect();
+        assert_eq!(
+            unique.len(),
+            keys.len(),
+            "distinct commands merged: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn the_argument_still_distinguishes_otherwise_identical_commands() {
+        // "define gallop" and "define canter" share a verb but ask different
+        // things — they must remain separate rows.
+        assert_ne!(intent_key("define gallop"), intent_key("define canter"));
+    }
 
     fn cand(cmd: &str, relevance: u16) -> Candidate {
         Candidate {

@@ -583,6 +583,11 @@ export const KEYBINDINGS_DEFAULTS: KeybindingsConfig = {
 	screenshot: "Ctrl+Shift+S",
 	action_panel: "Ctrl+K",
 	attach_file: "Ctrl+Shift+A",
+	approve_action: "Ctrl+Enter",
+	reject_action: "Escape",
+	// Same binding as `web_search` on purpose: same intent, different surface.
+	fork_web: "Ctrl+Enter",
+	fork_chat: "Enter",
 };
 
 export async function getKeybindingsConfig(): Promise<KeybindingsConfig> {

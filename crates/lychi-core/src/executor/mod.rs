@@ -994,6 +994,11 @@ impl Executor {
                 }
             }
 
+            // The escape hatches ride along even when there ARE results: the
+            // top match may not be what the user meant, and "Ask AI" /
+            // "Search web" should never require clearing the box first. They
+            // sort last (low score) and are never auto-selected.
+            handler_results.extend(fallback_rows(raw, self.has_ai()));
             return handler_results;
         }
 
@@ -1011,16 +1016,37 @@ impl Executor {
             }
         }
 
-        // Typo correction: suggest "Did you mean: X?" for near-miss inputs.
-        // Skip for web routes and NoMatch (natural language isn't a typo).
-        if let PatternResult::Match(r) = &route
-            && r.handler != "web"
+        // "Did you mean: X?" — a near-miss offer, shown when nothing else matched.
+        //
+        // This runs for `NoMatch` too, which is the whole point: a naturally
+        // phrased request ("can you define gallop") produces NoMatch, and the
+        // suggestion is what keeps it from falling straight to a slow AI call.
+        // It is only ever an OFFER — the classifier decides what Enter does, and
+        // deliberately ignores this class of hit (see `typo_suggest::Kind`).
+        //
+        // Still skipped for an explicit `web` route: the user asked for a search.
+        let is_web_route = matches!(&route, PatternResult::Match(r) if r.handler == "web");
+        let mut out = Vec::new();
+        if !is_web_route
             && let Some(suggestion) = crate::intent::typo_suggest::suggest(raw, &self.registry)
         {
-            return vec![suggestion];
+            out.push(suggestion);
         }
 
-        Vec::new()
+        // Always end with the two escape hatches. Without them an unmatched
+        // query is a DEAD END — "defuu" showed an empty list and no next step.
+        // Alfred's model: fallbacks are always available, pinned last, and never
+        // auto-selected. (They were once removed wholesale because they WERE
+        // auto-selectable and hijacked Enter; being present-but-never-preselected
+        // is what makes them safe to bring back.)
+        out.extend(fallback_rows(raw, self.has_ai()));
+        out
+    }
+
+    /// Whether a query is worth offering fallbacks for. Blank or single-character
+    /// input isn't a question yet — offering to search the web for "d" is noise.
+    fn wants_fallbacks(raw: &str) -> bool {
+        raw.trim().chars().count() >= 2
     }
 
     /// Ask AI for a plan.
@@ -1076,6 +1102,48 @@ impl Executor {
     pub fn refresh_context(&mut self, pre_window: Option<crate::context::WindowContext>) {
         self.context = Some(crate::context::gather(pre_window));
     }
+}
+
+/// The two universal escape hatches, in the order they should appear.
+///
+/// These are FALLBACKS, not results: they carry a deliberately low score so
+/// they sort last, and the frontend never auto-selects a fallback row. Both
+/// declare their intent via `kind` and carry the QUERY in `description` — no
+/// command string for anything downstream to re-parse (there is no `ask`
+/// handler at all, so a `run: "ask …"` row would silently pattern-route to a
+/// web search).
+///
+/// Empty for a query too short to be a real question. "Ask AI" is omitted
+/// entirely when no provider is configured — an escape hatch that leads
+/// nowhere is worse than no escape hatch, since it looks like an answer.
+/// Web search always works, so it is always offered.
+fn fallback_rows(raw: &str, has_ai: bool) -> Vec<CompletionItem> {
+    use crate::action_registry::CompletionKind;
+
+    let q = raw.trim();
+    if !Executor::wants_fallbacks(q) {
+        return Vec::new();
+    }
+    let mut rows = Vec::with_capacity(2);
+    if has_ai {
+        rows.push(CompletionItem {
+            label: format!("Ask AI: {q}"),
+            icon_path: Some("__ai_chat__".to_string()),
+            score: 2,
+            description: Some(q.to_string()),
+            kind: Some(CompletionKind::AskAi),
+            ..Default::default()
+        });
+    }
+    rows.push(CompletionItem {
+        label: format!("Search web: {q}"),
+        icon_path: Some("__web__".to_string()),
+        score: 1,
+        description: Some(q.to_string()),
+        kind: Some(CompletionKind::SearchWeb),
+        ..Default::default()
+    });
+    rows
 }
 
 /// Try to expand an underspecified verb using clipboard content as the implicit object.
@@ -1969,12 +2037,14 @@ mod tests {
     }
 
     /// 6. Completions: a NoMatch natural-language query surfaces NO inline
-    /// "Ask AI:" / "Search web:" fallback rows. Those were removed for routing
-    /// consistency (Raycast/Alfred standard) — NL routing is decided by the
-    /// single classifier (`intent::classify`) and the fork card, not by an
-    /// auto-selectable completion row that competes with it.
+    /// Fallbacks are always OFFERED but never auto-selected.
+    ///
+    /// They were once removed wholesale because they were auto-selectable and
+    /// hijacked Enter on a question. The fix is not absence — an unmatched query
+    /// with an empty list is a dead end ("defuu" showed nothing at all) — it's
+    /// that they sort last and the frontend never preselects a fallback.
     #[tokio::test]
-    async fn completions_no_inline_fallback_rows_for_no_match() {
+    async fn fallback_rows_are_offered_but_rank_last() {
         let ex = make_executor(registry_open_fails());
         let completions = ex
             .completions(
@@ -1982,13 +2052,189 @@ mod tests {
                 &crate::config::schema::SuggestionsConfig::default(),
             )
             .await;
-        let has_fallback = completions
+        let web = completions
             .iter()
-            .any(|c| c.label.starts_with("Search web:") || c.label.starts_with("Ask AI:"));
+            .find(|c| c.kind == Some(crate::action_registry::CompletionKind::SearchWeb))
+            .unwrap_or_else(|| panic!("expected a web fallback, got: {completions:?}"));
+        // Lowest score in the list → sorts last, so it can never outrank a real
+        // result or be the default selection.
         assert!(
-            !has_fallback,
-            "expected NO inline fallback rows for a no-match query, got: {completions:?}"
+            completions.iter().all(|c| c.score >= web.score),
+            "the fallback must rank last, got: {completions:?}"
         );
+    }
+
+    /// A dead end is the bug being fixed: an unmatched query must still offer a
+    /// way forward.
+    #[tokio::test]
+    async fn an_unmatched_query_is_never_a_dead_end() {
+        let ex = make_executor(registry_open_fails());
+        let completions = ex
+            .completions(
+                "defuu",
+                &crate::config::schema::SuggestionsConfig::default(),
+            )
+            .await;
+        assert!(
+            !completions.is_empty(),
+            "an unmatched query must offer SOMETHING"
+        );
+        assert!(
+            completions
+                .iter()
+                .any(|c| c.kind.is_some_and(|k| k.is_fallback())),
+            "expected a fallback escape hatch, got: {completions:?}"
+        );
+    }
+
+    /// A one-character query isn't a question yet — offering to search the web
+    /// for "d" is noise on the way to typing a real command.
+    #[tokio::test]
+    async fn very_short_input_gets_no_fallbacks() {
+        let ex = make_executor(registry_open_fails());
+        let completions = ex
+            .completions("d", &crate::config::schema::SuggestionsConfig::default())
+            .await;
+        assert!(
+            !completions
+                .iter()
+                .any(|c| c.kind.is_some_and(|k| k.is_fallback())),
+            "no fallbacks for a single character, got: {completions:?}"
+        );
+    }
+
+    /// A handler that declares a real trigger keyword, so the "Did you mean"
+    /// matcher has a vocabulary to find.
+    struct KeywordHandler;
+
+    #[async_trait]
+    impl ActionHandler for KeywordHandler {
+        fn id(&self) -> &str {
+            "define"
+        }
+        fn description(&self) -> &str {
+            "Define a word"
+        }
+        fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+            static T: &[crate::action_registry::Trigger] =
+                &[crate::action_registry::Trigger::keywords(&["define"])];
+            T
+        }
+        async fn execute(
+            &self,
+            _ctx: &crate::action_registry::ExecContext,
+            _args: &str,
+        ) -> Result<ActionResult, crate::error::LychiError> {
+            Ok(ActionResult::default())
+        }
+    }
+
+    /// A naturally-phrased request must surface a "Did you mean" row rather than
+    /// falling silently through to AI. This is the completions half of the
+    /// feature; the routing half deliberately ignores it (see
+    /// `intent::typo_suggest::Kind`), so the user is the one who decides.
+    #[tokio::test]
+    async fn natural_phrasing_offers_a_did_you_mean_row() {
+        let mut r = ActionRegistry::new();
+        r.register(Box::new(KeywordHandler));
+        r.register(Box::new(StubHandler { id: "web" }));
+        let ex = make_executor(r);
+
+        let completions = ex
+            .completions(
+                "can you define gallop",
+                &crate::config::schema::SuggestionsConfig::default(),
+            )
+            .await;
+        let row = completions
+            .iter()
+            .find(|c| c.kind == Some(crate::action_registry::CompletionKind::Correction))
+            .unwrap_or_else(|| panic!("expected a suggestion row, got: {completions:?}"));
+        assert_eq!(row.description.as_deref(), Some("define gallop"));
+
+        // An escape hatch rides along so a wrong guess isn't a dead end. This
+        // executor has NO AI configured, so "Ask AI" is correctly absent and the
+        // web fallback stands in — an AI row that leads nowhere would be worse
+        // than none, since it looks like an answer.
+        assert!(!ex.has_ai(), "test executor should have no AI provider");
+        assert!(
+            completions
+                .iter()
+                .all(|c| c.kind != Some(crate::action_registry::CompletionKind::AskAi)),
+            "Ask AI must not be offered without a provider, got: {completions:?}"
+        );
+        let web = completions
+            .iter()
+            .find(|c| c.kind == Some(crate::action_registry::CompletionKind::SearchWeb))
+            .unwrap_or_else(|| panic!("expected a web fallback, got: {completions:?}"));
+        // The QUERY travels in `description`; no command string to re-parse.
+        assert_eq!(web.description.as_deref(), Some("can you define gallop"));
+        assert!(
+            web.run.is_none(),
+            "a fallback row carries no `run` to re-parse"
+        );
+        // …and ranked below the correction, so the likelier answer stays first.
+        assert!(web.score < row.score);
+    }
+
+    /// Every `run` string a completion offers must name a REAL registered
+    /// trigger.
+    ///
+    /// This is the defect class that sent "Ask AI" to a web search: the row
+    /// carried `run: "ask …"`, no `ask` handler existed, and the executor's
+    /// pattern router silently fell through to `web`. A row whose meaning has to
+    /// be recovered by re-parsing text can break without anything failing
+    /// loudly — so assert the contract instead of trusting it.
+    #[tokio::test]
+    async fn completion_run_strings_name_real_triggers() {
+        let mut r = ActionRegistry::new();
+        r.register(Box::new(KeywordHandler));
+        r.register(Box::new(StubHandler { id: "web" }));
+        let ex = make_executor(r);
+
+        for query in ["can you define gallop", "weathr tokyo", "define gallop"] {
+            let completions = ex
+                .completions(query, &crate::config::schema::SuggestionsConfig::default())
+                .await;
+            for c in &completions {
+                let Some(run) = c.run.as_deref() else {
+                    continue;
+                };
+                let Some(first) = run.split_whitespace().next() else {
+                    continue;
+                };
+                assert!(
+                    ex.registry.is_known_prefix(first),
+                    "completion {:?} has run={run:?} whose first word is not a \
+                     registered trigger — it would pattern-route to a web search",
+                    c.label
+                );
+            }
+        }
+    }
+
+    /// The row must be identifiable by a TYPED field, not by its display text.
+    /// Labels get reworded and translated; routing that keys on them breaks
+    /// silently when they do.
+    #[tokio::test]
+    async fn a_correction_row_is_typed_not_label_matched() {
+        let mut r = ActionRegistry::new();
+        r.register(Box::new(KeywordHandler));
+        r.register(Box::new(StubHandler { id: "web" }));
+        let ex = make_executor(r);
+
+        let completions = ex
+            .completions(
+                "can you define gallop",
+                &crate::config::schema::SuggestionsConfig::default(),
+            )
+            .await;
+        let row = completions
+            .iter()
+            .find(|c| c.kind == Some(crate::action_registry::CompletionKind::Correction))
+            .expect("correction row must carry its kind");
+        // The correction to apply lives in a field, not parsed back out of the label.
+        assert_eq!(row.description.as_deref(), Some("define gallop"));
     }
 
     // ── Golden Scenario: resolve_with_clipboard ───────────────────────────

@@ -91,18 +91,63 @@ pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
     Ok(Arc::new(db))
 }
 
-/// Create an in-memory database for testing.
+/// Create a throwaway database for testing.
+///
+/// Uniqueness comes from a process-wide ATOMIC COUNTER, not a timestamp. Two
+/// parallel tests can read the same nanosecond, and a shared path means both
+/// open the same file — one of them then trips `open_database`'s recover branch
+/// (which renames to a single `.redb.bak` path shared by every test) and the
+/// whole thing races. A counter cannot collide by construction.
+///
+/// The returned handle owns its file: when the last `Arc` drops, the file and
+/// its siblings are removed. Tests used to leak one database per call — ~2000
+/// files and 78 MB of `/tmp` had accumulated, which is also what kept feeding
+/// the recover branch.
 #[cfg(test)]
 pub fn open_test_database() -> Arc<Database> {
-    let dir = std::env::temp_dir().join(format!(
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let path = std::env::temp_dir().join(format!(
         "lychi-test-{}-{}.redb",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
+        SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    open_database(&dir).expect("Failed to create test database")
+    // A previous aborted run may have left this exact path behind (same pid is
+    // possible after a crash); start clean so we never hit the recover branch.
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("redb.bak"));
+
+    // Sweep debris from runs that have already exited. Done once per process,
+    // and only for OTHER pids — our own files are still open.
+    sweep_stale_test_databases();
+
+    open_database(&path).expect("Failed to create test database")
+}
+
+/// Remove `lychi-test-*` files left by earlier (already-exited) test runs.
+///
+/// redb keeps its file open for the life of the `Database`, and tests share the
+/// `Arc` freely, so deleting per-test isn't reliable. Sweeping other processes'
+/// leftovers on startup is — and it's what stops `/tmp` growing without bound
+/// (this had reached ~2000 files / 78 MB before the sweep existed).
+#[cfg(test)]
+fn sweep_stale_test_databases() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let mine = format!("lychi-test-{}-", std::process::id());
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with("lychi-test-") && !name.starts_with(&mine) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    });
 }
 
 /// Row counts for each table (includes soft-deleted rows).

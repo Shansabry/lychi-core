@@ -184,20 +184,126 @@ describe("decideSubmit — selected completion actuation", () => {
 	it("a calc row displays, does not execute", () => {
 		const c = ctx({
 			trimmed: "= 6*7",
-			completions: [comp({ label: "= 42" })],
+			completions: [comp({ label: "= 42", kind: "calc" })],
 			completionIndex: 0,
 			inputDecision: CMD("= 6*7"),
 		});
 		expect(decideSubmit(c)).toEqual({ kind: "calc-display", text: "42" });
 	});
 
-	it("a 'Did you mean' row fills the correction", () => {
+	it("a correction row fills the correction", () => {
 		const c = ctx({
 			trimmed: "spoti",
-			completions: [comp({ label: "Did you mean: open Spotify?", description: "open Spotify" })],
+			completions: [
+				comp({
+					label: "Did you mean: open Spotify?",
+					description: "open Spotify",
+					kind: "correction",
+				}),
+			],
 			completionIndex: 0,
 		});
-		expect(decideSubmit(c)).toEqual({ kind: "correct", value: "open Spotify" });
+		expect(decideSubmit(c)).toEqual({ kind: "correct", value: "open Spotify", run: true });
+	});
+
+	it("a selected 'Ask AI' row reaches the agent, not a web search", () => {
+		// REGRESSION: this row used to carry `run: "ask <q>"`. No `ask` handler
+		// exists in the registry, so the executor's pattern router found no
+		// trigger and fell through to a WEB SEARCH. The intent now travels as a
+		// typed kind, so nothing has to recover it by re-parsing a command string.
+		const c = ctx({
+			trimmed: "can you define gallop",
+			// Ambiguous on its own → would otherwise be a fork card…
+			inputDecision: NL("can you define gallop", false),
+			completions: [
+				comp({
+					label: "Ask AI: can you define gallop",
+					description: "can you define gallop",
+					kind: "ask-ai",
+				}),
+			],
+			completionIndex: 0,
+		});
+		// …but the explicit choice wins.
+		expect(decideSubmit(c)).toEqual({ kind: "agent", prompt: "can you define gallop" });
+	});
+
+	it("a selected 'Search web' row runs the web handler", () => {
+		const c = ctx({
+			trimmed: "defuu",
+			inputDecision: NL("defuu", false),
+			completions: [comp({ label: "Search web: defuu", description: "defuu", kind: "search-web" })],
+			completionIndex: 0,
+		});
+		expect(decideSubmit(c)).toEqual({ kind: "command", command: "web defuu" });
+	});
+
+	it("an Ask AI row carries no run string to be re-parsed", () => {
+		// The defect class: a row whose meaning depends on downstream text
+		// parsing. `description` holds the QUERY; `kind` holds the intent.
+		const c = ctx({
+			trimmed: "x",
+			inputDecision: NL("x", false),
+			completions: [comp({ label: "Ask AI: x", description: "x", kind: "ask-ai" })],
+			completionIndex: 0,
+		});
+		expect(decideSubmit(c)).toEqual({ kind: "agent", prompt: "x" });
+	});
+
+	it("a selected correction WINS over the natural-language guard", () => {
+		// REGRESSION: "can you define gallop" classifies as `nl`, and a correction
+		// row carries no `run` — the shape the NL guard treats as "the question
+		// owns Enter". That made selecting the suggestion silently open AI chat
+		// instead of running the command the user just picked.
+		const c = ctx({
+			trimmed: "can you define gallop",
+			inputDecision: NL("can you define gallop", false),
+			completions: [
+				comp({
+					label: "Did you mean: define gallop?",
+					description: "define gallop",
+					kind: "correction",
+				}),
+			],
+			completionIndex: 0,
+		});
+		expect(decideSubmit(c)).toEqual({ kind: "correct", value: "define gallop", run: true });
+	});
+
+	it("a SELECTED correction runs immediately; an auto-offered one only fills", () => {
+		// Selecting the row is a decision already made — requiring a second Enter
+		// was friction. An auto-offered guess (from the backend classifier on a
+		// typo the user typed) still fills, so a wrong guess never self-executes.
+		const selected = decideSubmit(
+			ctx({
+				trimmed: "can you define gallop",
+				inputDecision: NL("can you define gallop", false),
+				completions: [comp({ label: "x", description: "define gallop", kind: "correction" })],
+				completionIndex: 0,
+			}),
+		);
+		expect(selected).toEqual({ kind: "correct", value: "define gallop", run: true });
+
+		const offered = decideSubmit(
+			ctx({ trimmed: "weathr", inputDecision: { kind: "correct", corrected: "weather" } }),
+		);
+		expect(offered).toEqual({ kind: "correct", value: "weather" });
+	});
+
+	it("identifies a correction by its kind, not its label", () => {
+		// A reworded label must still route correctly.
+		const c = ctx({
+			trimmed: "spoti",
+			completions: [
+				comp({
+					label: "Perhaps you wanted open Spotify",
+					description: "open Spotify",
+					kind: "correction",
+				}),
+			],
+			completionIndex: 0,
+		});
+		expect(decideSubmit(c)).toEqual({ kind: "correct", value: "open Spotify", run: true });
 	});
 
 	it("a tab-complete hint fills the input", () => {

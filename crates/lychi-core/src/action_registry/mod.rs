@@ -405,6 +405,60 @@ pub struct CompletionItem {
     /// `None` means the completion executes (via `run` or the fallback).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill: Option<String>,
+    /// What KIND of row this is, when that changes how selecting it behaves.
+    ///
+    /// The frontend switches on this instead of matching display text. Label
+    /// strings are for humans: they get reworded, translated, and truncated, and
+    /// routing that depends on them breaks silently when they do. A row that
+    /// needs special handling declares it here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<CompletionKind>,
+}
+
+/// Rows whose selection behaviour differs from "run the command".
+///
+/// Deliberately small: most completions need no kind at all (`None` = an
+/// ordinary row that runs via `run`/`fill`/`label`). Add a variant only when the
+/// frontend must genuinely branch, never as a decorative tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompletionKind {
+    /// A "Did you mean: X?" offer. Selecting it fills the corrected command
+    /// (carried in `description`) rather than running the row's text, and — the
+    /// part that needs a flag — it must WIN over the natural-language guard: the
+    /// user explicitly picked a command, so Enter must not fall through to AI.
+    Correction,
+    /// A computed result (`= 42`). It's an ANSWER, not a command: selecting it
+    /// displays the value rather than executing anything, and it must never be
+    /// written back into the input as if it were runnable text.
+    Calc,
+    /// "Ask AI: …" — send the query to the agent.
+    ///
+    /// This is a KIND rather than a `run` string because there is no `ask`
+    /// handler in the registry: a `run: "ask …"` row would be re-parsed by the
+    /// executor's pattern router, find no such trigger, and fall through to a
+    /// web search. Encoding the intent in the type means nothing has to recover
+    /// it from text. The query itself travels in `description`.
+    AskAi,
+    /// "Search web: …" — the other universal escape hatch, alongside `AskAi`.
+    /// Same reasoning: the query lives in `description`, not in a command
+    /// string something downstream has to parse.
+    SearchWeb,
+}
+
+impl CompletionKind {
+    /// Whether this row is a FALLBACK — an escape hatch offered when nothing
+    /// else fits, rather than a result in its own right.
+    ///
+    /// Fallbacks pin to the bottom of the list and are never auto-selected
+    /// (the Alfred model). That distinction is load-bearing: these rows were
+    /// once removed entirely because they WERE auto-selectable, so Enter on a
+    /// question ran whichever fallback frecency floated up — competing with the
+    /// single input classifier. Present but never preselected keeps the escape
+    /// hatch without re-creating that bug.
+    pub fn is_fallback(self) -> bool {
+        matches!(self, Self::AskAi | Self::SearchWeb)
+    }
 }
 
 impl CompletionItem {

@@ -120,6 +120,31 @@ class ChatSession {
 	gen = 0;
 
 	/**
+	 * Everything needed to re-run the last turn verbatim.
+	 *
+	 * NOT `lastUser` — that's the DISPLAY text, which for a preset or an
+	 * attachment turn deliberately differs from what the model received
+	 * (instruction-only, `@`-expanded). Regenerating from the bubble would send a
+	 * different prompt than the one that failed. Non-reactive: it only feeds an
+	 * action, never renders.
+	 */
+	#lastRun: {
+		system: string;
+		prompt: string;
+		withTools: boolean;
+		images: string[];
+		quick: boolean;
+		display?: string;
+		attachment?: UserAttachment | null;
+		files?: TurnFile[];
+	} | null = null;
+
+	/** Whether there's a turn to regenerate (drives the button). */
+	get canRegenerate(): boolean {
+		return this.#lastRun !== null;
+	}
+
+	/**
 	 * Reset the fields shared by every run start (not the transcript). `display`
 	 * overrides the on-screen bubble text and `attachment` folds a big payload
 	 * into a collapsed chip; either way the full prompt still goes to the model
@@ -188,6 +213,8 @@ class ChatSession {
 		// The tray is per-conversation: a fresh start (or a re-summon) shouldn't
 		// leave files staged from a session the user has moved on from.
 		attachments.clear();
+		// Nothing to regenerate once the conversation is gone.
+		this.#lastRun = null;
 	};
 
 	/**
@@ -222,6 +249,15 @@ class ChatSession {
 		// prompt. Same split the presets already use for a folded selection.
 		const gen = this.#beginRun(sent.prompt, text, null, sent.files);
 		this.quick = false; // full agent chat, not the fork card
+		this.#lastRun = {
+			system: AGENT_SYSTEM,
+			prompt: sent.prompt,
+			withTools: true,
+			images: sent.images,
+			quick: false,
+			display: text,
+			files: sent.files,
+		};
 		try {
 			await agentChatStart(
 				AGENT_SYSTEM,
@@ -230,6 +266,35 @@ class ChatSession {
 				/* withTools */ true,
 				gen,
 				sent.images,
+			);
+		} catch (e) {
+			this.#fail(gen, e);
+		}
+	};
+
+	/**
+	 * Re-run the last turn with the exact prompt the model already received.
+	 *
+	 * `fresh: true` deliberately — a regenerate REPLACES the previous attempt
+	 * rather than appending a second copy of the same question to the session.
+	 * That matters most for the case this exists for: an empty or garbled
+	 * response, where a follow-up would leave the dud turn in the model's context.
+	 */
+	regenerate = async (): Promise<void> => {
+		const last = this.#lastRun;
+		if (!last || this.streaming) return;
+		this.turns = [];
+		const gen = this.#beginRun(last.prompt, last.display, last.attachment, last.files);
+		this.quick = last.quick;
+		if (last.quick) this.quickPrompt = last.prompt;
+		try {
+			await agentChatStart(
+				last.system,
+				last.prompt,
+				/* fresh */ true,
+				last.withTools,
+				gen,
+				last.images,
 			);
 		} catch (e) {
 			this.#fail(gen, e);
@@ -258,6 +323,15 @@ class ChatSession {
 		this.turns = [];
 		const gen = this.#beginRun(text, display?.instruction, display?.attachment);
 		this.quick = false;
+		this.#lastRun = {
+			system: PRESET_SYSTEM,
+			prompt: text,
+			withTools: false,
+			images: [],
+			quick: false,
+			display: display?.instruction,
+			attachment: display?.attachment,
+		};
 		// Persist the fold with the message. `presetDisplay` is the ONE decider of
 		// this split; recording its verdict here is what lets a recalled
 		// conversation render identically without a second, drifting resolver.
@@ -294,6 +368,15 @@ class ChatSession {
 		this.quickPrompt = sent.prompt;
 		const gen = this.#beginRun(sent.prompt, text, null, sent.files);
 		this.quick = true; // the fork card
+		this.#lastRun = {
+			system: QUICK_AI_SYSTEM,
+			prompt: sent.prompt,
+			withTools: true,
+			images: sent.images,
+			quick: true,
+			display: text,
+			files: sent.files,
+		};
 		try {
 			await agentChatStart(
 				QUICK_AI_SYSTEM,

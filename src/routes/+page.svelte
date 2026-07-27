@@ -50,7 +50,7 @@ import {
 	saveWindowPosition,
 	startFileSearch,
 } from "$lib/ipc";
-import { loadKeybindings } from "$lib/keybindings";
+import { getComboString, loadKeybindings } from "$lib/keybindings";
 import { preloadAll } from "$lib/preloadCache";
 import { attachments } from "$lib/stores/attachments.svelte";
 import { type AiTurn, chat, type UserAttachment } from "$lib/stores/chat.svelte";
@@ -206,20 +206,15 @@ const CHAT_RUN_PREFIX = "__chat__:";
 function loadEmptySuggestions() {
 	if (inputValue.trim().length > 0) return;
 	const gen = ++completions.completionGen;
-	// Fetch command recents + a few recent AI chats in parallel, then merge:
-	// chats first (with an AI icon), then the command/context recents.
-	Promise.all([getCompletions(""), getConversations().catch(() => [])])
-		.then(([rawResults, convs]) => {
+	// Recents only. AI chats are NOT mixed in here: no comparable launcher
+	// interleaves conversations with commands (Raycast keeps chat history inside
+	// the AI surface; Claude's quick entry gates it behind an explicit click),
+	// and four chat rows pushed the actual commands below the fold. Conversations
+	// are recalled via the `chat` keyword and the History panel — one place each.
+	getCompletions("")
+		.then((rawResults) => {
 			if (gen !== completions.completionGen || inputValue.trim().length > 0) return;
-			const recents = context.extractStale(rawResults);
-			const chatRows: CompletionItem[] = convs.slice(0, 4).map((c) => ({
-				label: c.title,
-				icon_path: "__ai_chat__",
-				score: 0,
-				description: `${c.turn_count} turn${c.turn_count === 1 ? "" : "s"} · AI chat`,
-				run: `${CHAT_RUN_PREFIX}${c.id}`,
-			}));
-			completions.items = [...chatRows, ...recents];
+			completions.items = context.extractStale(rawResults);
 			// Do NOT preselect: on an empty box these are recents, not a query
 			// result. Selection happens only on mouse press or arrow key.
 			completions.index = -1;
@@ -272,17 +267,46 @@ function isPathLikeAt(partial: string): boolean {
 
 // @ mode completion fetch. Bare queries fuzzy-jump across the whole home index;
 // path-like queries (drilling into a dir, or a typed path) list that directory.
+/**
+ * Ambient context sources offered alongside file results in `@` mode. These
+ * aren't paths — the backend resolves them at send time (`expand_context_refs`)
+ * — but they share the `@` syntax, so they belong in the same picker. Listed
+ * first when they match, since they're short and exact.
+ */
+const AT_CONTEXT_SOURCES = [
+	{ keyword: "clipboard", description: "What you last copied" },
+	{ keyword: "selection", description: "Text highlighted in the focused window" },
+];
+
+function contextCompletions(partial: string): CompletionItem[] {
+	const q = partial.toLowerCase();
+	return AT_CONTEXT_SOURCES.filter((s) => s.keyword.startsWith(q)).map(
+		(s) =>
+			({
+				label: `@${s.keyword}`,
+				description: s.description,
+				// `fill` completes the token in place, matching how other
+				// argument-hint rows behave.
+				fill: `@${s.keyword} `,
+				icon_path: "__context__",
+			}) as CompletionItem,
+	);
+}
+
 async function fetchAtCompletions(partial: string) {
 	try {
 		const results =
 			partial.length > 0 && !isPathLikeAt(partial)
 				? await fuzzyPathCompletions(partial)
 				: await listPathCompletions(partial);
+		// Context sources lead — they're exact short matches, and a path query
+		// (`~/`, `/`, `.`) filters them out naturally since none start that way.
+		const merged = [...contextCompletions(partial), ...results];
 		// Defer state update to next frame so it never blocks a keystroke paint
 		requestAnimationFrame(() => {
-			completions.items = results;
-			completions.index = results.length > 0 ? 0 : -1;
-			completions.atNoResults = results.length === 0 && partial.length > 0;
+			completions.items = merged;
+			completions.index = merged.length > 0 ? 0 : -1;
+			completions.atNoResults = merged.length === 0 && partial.length > 0;
 		});
 		// Stay in @ mode even when empty — user can backspace to navigate up
 	} catch (err) {
@@ -475,7 +499,21 @@ const NON_ACTIONABLE_ICONS = new Set([
 ]);
 function defaultMatchIndex(results: CompletionItem[], input: string): number {
 	if (!input.trim()) return -1;
-	return results.findIndex((c) => !c.icon_path || !NON_ACTIONABLE_ICONS.has(c.icon_path));
+	return results.findIndex(
+		(c) =>
+			// Fallbacks ("Ask AI" / "Search web") are always present as an escape
+			// hatch but must NEVER be Enter's default. Auto-selecting them is
+			// precisely why they were removed once before: Enter on a question ran
+			// whichever fallback frecency floated up, competing with the single
+			// input classifier. Present, last, never preselected.
+			!isFallbackKind(c.kind) && (!c.icon_path || !NON_ACTIONABLE_ICONS.has(c.icon_path)),
+	);
+}
+
+/** Rows that are escape hatches rather than results. Mirrors the Rust
+ *  `CompletionKind::is_fallback`. */
+function isFallbackKind(kind: string | null | undefined): boolean {
+	return kind === "ask-ai" || kind === "search-web";
 }
 
 onMount(() => {
@@ -811,10 +849,27 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 			return;
 
 		case "fill":
-		case "correct":
-			inputValue = action.value;
+			// A tab-to-complete hint always fills — it's an incomplete command
+			// waiting for an argument, so there is nothing to run yet.
 			completions.items = [];
 			completions.index = -1;
+			inputValue = action.value;
+			handleInput(inputValue);
+			return;
+
+		case "correct":
+			completions.items = [];
+			completions.index = -1;
+			if (action.run) {
+				// The user picked this row — run it now. Filling and making them
+				// press Enter again is friction for a choice already made.
+				inputValue = "";
+				await runCommand(action.value);
+				return;
+			}
+			// An auto-offered guess: fill and let the user confirm, so a wrong
+			// correction never executes on its own.
+			inputValue = action.value;
 			handleInput(inputValue);
 			return;
 
@@ -1141,32 +1196,47 @@ let panelActions = $derived.by((): PanelAction[] => {
 	const hasPath =
 		completions.searchMode || completions.atMode || completions.filePathMap.has(item.label);
 	const isApp = item.run?.startsWith("appctl") || item.run?.startsWith("open ");
-	const isCalc = item.label.startsWith("= ");
+	const isCalc = item.kind === "calc";
 	const isAiChat = item.run?.startsWith(CHAT_RUN_PREFIX);
 
 	if (isAiChat) {
 		// An AI-chat recall row: open/continue it, or delete it.
-		acts.push({ id: "open", label: "Open conversation", hint: "Enter" });
+		acts.push({ id: "open", label: "Open conversation", hint: getComboString("submit") });
 		acts.push({ id: "ai_delete_chat", label: "Delete conversation" });
 		return acts;
 	}
 
 	if (hasPath) {
-		acts.push({ id: "open", label: isFolder ? "Open folder" : "Open", hint: "Enter" });
-		if (isFolder) acts.push({ id: "drill", label: "Browse inside", hint: "Tab" });
-		acts.push({ id: "reveal", label: "Reveal in file manager", hint: "Ctrl+Enter" });
-		acts.push({ id: "copy_path", label: "Copy path", hint: "Ctrl+Shift+C" });
+		acts.push({
+			id: "open",
+			label: isFolder ? "Open folder" : "Open",
+			hint: getComboString("submit"),
+		});
+		if (isFolder)
+			acts.push({ id: "drill", label: "Browse inside", hint: getComboString("tab_complete") });
+		// `reveal` is Ctrl+Enter in search mode — the same binding `web_search`
+		// owns elsewhere, so read it from there rather than restating the string.
+		acts.push({
+			id: "reveal",
+			label: "Reveal in file manager",
+			hint: getComboString("web_search"),
+		});
+		acts.push({ id: "copy_path", label: "Copy path", hint: getComboString("copy_path") });
 	} else if (isApp) {
-		acts.push({ id: "open", label: "Open / focus", hint: "Enter" });
+		acts.push({ id: "open", label: "Open / focus", hint: getComboString("submit") });
 	} else if (isCalc) {
-		acts.push({ id: "copy_value", label: "Copy result", hint: "Enter" });
+		acts.push({ id: "copy_value", label: "Copy result", hint: getComboString("submit") });
 	} else {
 		// Generic: runnable and/or fillable.
 		if (item.fill) {
-			acts.push({ id: "insert", label: "Insert into input", hint: "Tab" });
+			acts.push({
+				id: "insert",
+				label: "Insert into input",
+				hint: getComboString("tab_complete"),
+			});
 		}
 		if (item.run || !item.fill) {
-			acts.push({ id: "open", label: "Run", hint: "Enter" });
+			acts.push({ id: "open", label: "Run", hint: getComboString("submit") });
 		}
 		if (item.run) {
 			acts.push({ id: "copy_command", label: "Copy command" });
@@ -1291,6 +1361,20 @@ function handleCompletionSelect(label: string, forceOpen?: boolean) {
 
 	// @ browse mode — reference a file in the command line
 	if (completions.atMode) {
+		// A context source (@clipboard / @selection) isn't a path: complete the
+		// token in place and leave @ mode. The backend resolves it at send time.
+		if (clicked?.icon_path === "__context__") {
+			const before = inputValue.slice(0, completions.atStart);
+			const afterAt = inputValue.slice(completions.atStart);
+			const spaceIdx = afterAt.indexOf(" ", 1);
+			const after = spaceIdx === -1 ? "" : afterAt.slice(spaceIdx);
+			inputValue = `${before}${label} ${after.trimStart()}`.trimEnd().concat(" ");
+			completions.atMode = false;
+			completions.atStart = -1;
+			completions.items = [];
+			completions.index = -1;
+			return;
+		}
 		if (label.endsWith("/")) {
 			const before = inputValue.slice(0, completions.atStart);
 			const afterAt = inputValue.slice(completions.atStart);
@@ -1323,10 +1407,37 @@ function handleCompletionSelect(label: string, forceOpen?: boolean) {
 	const item =
 		completions.items.find((c) => c.label === label) ?? completions.items[completions.index];
 
-	// "Did you mean: X?" typo suggestion — fill input with corrected text
-	if (item?.description && label.startsWith("Did you mean:")) {
-		inputValue = item.description;
-		handleInput(inputValue);
+	// A correction row — fill the input with the corrected text. Identified by
+	// its typed `kind`, never by its label (labels get reworded/translated).
+	// A correction the user CHOSE — run it. Same as selecting it and pressing
+	// Enter; making a click merely fill the box would be the double-Enter
+	// friction in another guise.
+	if (item?.kind === "correction" && item.description) {
+		completions.items = [];
+		completions.index = -1;
+		inputValue = "";
+		runCommand(item.description);
+		return;
+	}
+
+	// "Ask AI" — send the query straight to the agent. Handled here as well as in
+	// the submit reducer so clicking the row behaves exactly like selecting it.
+	if (item?.kind === "ask-ai" && item.description) {
+		completions.items = [];
+		completions.index = -1;
+		inputValue = "";
+		lastResult = null;
+		chat.start(item.description, /* fresh */ true);
+		return;
+	}
+
+	// "Search web" — the other escape hatch. Runs through the normal `web`
+	// handler, so nothing special happens downstream.
+	if (item?.kind === "search-web" && item.description) {
+		completions.items = [];
+		completions.index = -1;
+		inputValue = "";
+		runCommand(`web ${item.description}`);
 		return;
 	}
 
@@ -1463,9 +1574,9 @@ function fillFromSelection() {
 	if (completions.atMode || completions.searchMode) return;
 	const sel = completions.items[completions.index];
 	if (!sel || sel.icon_path === "__separator__" || sel.icon_path === "__info__") return;
-	// A calc row ("= 42") or a "Did you mean" row isn't a runnable command — don't
+	// A calc row ("= 42") or a correction row isn't a runnable command — don't
 	// clobber the input with their display text.
-	if (sel.label.startsWith("= ") || sel.label.startsWith("Did you mean:")) return;
+	if (sel.kind === "correction" || sel.kind === "calc") return;
 	const text = sel.run ?? sel.fill ?? sel.label;
 	if (text) inputValue = text;
 }
@@ -1736,6 +1847,7 @@ async function handleDismiss() {
 				bind:reply={chat.reply}
 				onreply={chat.sendReply}
 				onstop={chat.cancel}
+				onregenerate={chat.regenerate}
 				quick={chat.quick}
 				onwebsearch={quickWebSearch}
 				onfullchat={escalateToChat}

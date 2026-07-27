@@ -217,9 +217,20 @@ pub fn classify_string(
                 };
             }
 
-            // A near-miss typo → offer the correction (uniformly, multi-word too).
-            if let Some(corrected) = crate::intent::typo_suggest::suggest(trimmed, registry)
-                .and_then(|item| item.description)
+            // A near-miss TYPO → offer the correction (uniformly, multi-word too).
+            //
+            // `TypoOnly` deliberately: `Correct` rewrites the user's input, so
+            // only an actual misspelling qualifies. A correctly-spelled command
+            // word sitting inside a question ("how do i open a jar file") must
+            // NOT be corrected — that would convert the question into a command.
+            // The completions list still offers it as a clickable row; routing
+            // stays match-first, AI-last, and the user decides.
+            if let Some(corrected) = crate::intent::typo_suggest::suggest_kind(
+                trimmed,
+                registry,
+                crate::intent::typo_suggest::Kind::TypoOnly,
+            )
+            .and_then(|item| item.description)
             {
                 return RouteDecision::Correct { corrected };
             }
@@ -401,6 +412,23 @@ mod tests {
                 prompt: "pastarecipe".into(),
                 confident: false
             }
+        );
+    }
+
+    #[test]
+    fn a_natural_question_containing_a_command_word_still_reaches_ai() {
+        // ARCHITECTURE GUARD. `typo_suggest` now finds a command word anywhere
+        // in a sentence, which is what powers the "Did you mean" row. But this
+        // classifier must NOT turn that into a `Correct` decision: rewriting the
+        // user's input mid-question is a routing change, and the suggestion is
+        // meant to be an OFFER shown in the completions list, not a reroute.
+        //
+        // "how do i open a jar file" mentions `open`, but it is a question.
+        let r = test_registry();
+        let d = classify_string("how do i open a jar file", &r, no_presets, true);
+        assert!(
+            matches!(d, RouteDecision::Nl { .. }),
+            "a question must reach AI, got {d:?}"
         );
     }
 

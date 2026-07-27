@@ -450,10 +450,17 @@ pub async fn agent_chat_start(
     // Inline any `@`-referenced documents (pdf/docx/…) as extracted text so the
     // model sees content, not a path. Off-runtime: extraction reads + parses files.
     // On any failure, fall back to the user's original text (never drop it).
+    // Both `@` expansions run in the same blocking hop: documents become inlined
+    // text, and `@clipboard` / `@selection` pull in ambient context. Context is
+    // resolved first so a doc ref inside pasted text still expands afterwards.
     let user = {
         let raw = user.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            lychi_core::files::text_extract::expand_doc_refs(&raw)
+            let is_wayland = lychi_core::context::is_wayland();
+            let with_context = lychi_core::files::text_extract::expand_context_refs(&raw, &|src| {
+                lychi_core::clipboard::read_context_source(src, is_wayland)
+            });
+            lychi_core::files::text_extract::expand_doc_refs(&with_context)
         })
         .await
         .unwrap_or(user)

@@ -1,5 +1,6 @@
 <script lang="ts">
-import { Globe, Sparkles, TriangleAlert } from "lucide-svelte";
+import { Check, Copy, Globe, RefreshCw, Sparkles, TriangleAlert } from "lucide-svelte";
+import { getComboString, matchesAction } from "$lib/keybindings";
 import { renderMarkdown } from "$lib/markdown";
 import { sanitizeSvg } from "$lib/sanitize";
 
@@ -51,6 +52,8 @@ let {
 	onreply,
 	/** Called to stop an in-flight answer. */
 	onstop,
+	/** Re-run the last question unchanged (empty/garbled answer, or just retry). */
+	onregenerate,
 	/** Quick-AI fork card: show [Search web] / [Full chat] instead of a reply box. */
 	quick = false,
 	/** Fork-card: bail out to a plain web search. */
@@ -76,6 +79,7 @@ let {
 	onapprove?: (approve: boolean) => void;
 	onreply?: () => void;
 	onstop?: () => void;
+	onregenerate?: () => void;
 	quick?: boolean;
 	onwebsearch?: () => void;
 	onfullchat?: () => void;
@@ -86,6 +90,42 @@ let {
 
 const md = renderMarkdown;
 let html = $derived(md(text));
+
+// Copy-answer feedback. Holds the key of the row that just flashed "Copied",
+// cleared on a timer — cheaper than a per-row boolean and self-resetting.
+let copiedKey = $state<string | null>(null);
+let copyTimer: ReturnType<typeof setTimeout> | undefined;
+async function copyAnswer(body: string, key: string) {
+	try {
+		await navigator.clipboard.writeText(body);
+		copiedKey = key;
+		clearTimeout(copyTimer);
+		copyTimer = setTimeout(() => {
+			copiedKey = null;
+		}, 1400);
+	} catch {
+		// Clipboard denied — silently no-op rather than replacing the answer
+		// with an error the user can do nothing about.
+	}
+}
+
+/**
+ * Copy a code block when its button is clicked. The rendered markdown is
+ * `{@html}`, so per-block buttons can't be Svelte components — instead one
+ * delegated listener reads the `<pre>` the click landed in. Keeps the
+ * sanitized-HTML boundary intact (no injected interactive markup).
+ */
+function onAnswerClick(e: MouseEvent) {
+	const target = e.target as HTMLElement;
+	const pre = target.closest("pre");
+	if (!pre) return;
+	// Only the top-right corner acts as the copy affordance, so selecting code
+	// normally still works.
+	const box = pre.getBoundingClientRect();
+	if (e.clientX < box.right - 32 || e.clientY > box.top + 28) return;
+	const code = pre.querySelector("code")?.textContent ?? pre.textContent ?? "";
+	if (code.trim()) copyAnswer(code, `pre-${box.top}`);
+}
 
 // Which attachment chips are expanded. Keyed by a stable id per bubble
 // (`turn-<i>` for prior turns, `live` for the current one).
@@ -142,7 +182,7 @@ export function focusReply() {
 	requestAnimationFrame(() => replyEl?.focus());
 }
 function onReplyKeydown(e: KeyboardEvent) {
-	if (e.key === "Enter" && !e.shiftKey) {
+	if (matchesAction(e, "submit") && !e.shiftKey) {
 		e.preventDefault();
 		e.stopPropagation();
 		onreply?.();
@@ -150,23 +190,23 @@ function onReplyKeydown(e: KeyboardEvent) {
 }
 
 // Keyboard shortcuts for the AI answer's action buttons, so they're not
-// mouse-only:
-//   - Approval prompt (Approve/Reject): ⌘/Ctrl+Enter or Y = approve,
-//     Escape or N = reject. This is a decision point, so it takes priority.
-//   - Fork card (Search web / Full chat): ⌘/Ctrl+Enter = search web,
-//     Enter = full chat (mirrors the button kbd hints).
+// mouse-only. Every binding comes from the SAME configurable table the rest of
+// the app uses (`matchesAction`), and every on-screen hint is rendered from
+// that table via `getComboString` — so rebinding a key in Settings moves the
+// handler and the label together. Previously these were raw `e.ctrlKey` checks
+// with hardcoded "⌘↵" labels, which (a) showed macOS notation in a Linux-only
+// app and (b) silently ignored a rebind.
 function onWindowKeydown(e: KeyboardEvent) {
 	if (approval) {
-		const key = e.key.toLowerCase();
-		if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+		// `y`/`n` stay as raw letters: they're mnemonic accelerators for a
+		// yes/no prompt, not app-wide shortcuts, and binding them would put two
+		// unrebindable letters in the Settings list for no gain.
+		const letter = e.key.toLowerCase();
+		if (matchesAction(e, "approve_action") || letter === "y") {
 			e.preventDefault();
 			e.stopPropagation();
 			onapprove?.(true);
-		} else if (key === "y") {
-			e.preventDefault();
-			e.stopPropagation();
-			onapprove?.(true);
-		} else if (key === "n" || e.key === "Escape") {
+		} else if (matchesAction(e, "reject_action") || letter === "n") {
 			e.preventDefault();
 			e.stopPropagation();
 			onapprove?.(false);
@@ -175,11 +215,11 @@ function onWindowKeydown(e: KeyboardEvent) {
 	}
 	// Fork card is showing (idle quick answer with buttons).
 	if (quick && !streaming) {
-		if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+		if (matchesAction(e, "fork_web")) {
 			e.preventDefault();
 			e.stopPropagation();
 			onwebsearch?.();
-		} else if (e.key === "Enter") {
+		} else if (matchesAction(e, "fork_chat")) {
 			e.preventDefault();
 			e.stopPropagation();
 			onfullchat?.();
@@ -278,9 +318,30 @@ function onWindowKeydown(e: KeyboardEvent) {
 			</div>
 		{:else if text}
 			<!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized above -->
-			<div class="ai-md">{@html html}</div>{#if streaming && !approval}<span class="cursor" aria-hidden="true"></span>{/if}
+			<div class="ai-md" role="presentation" onclick={onAnswerClick}>{@html html}</div>{#if streaming && !approval}<span class="cursor" aria-hidden="true"></span>{/if}
 		{:else if streaming && !approval}
 			<div class="thinking"><span class="cursor" aria-hidden="true"></span></div>
+		{/if}
+
+		<!-- Answer actions. Only once the turn is settled: mid-stream the text is
+		     still changing, so copying it would capture a partial answer. -->
+		{#if !streaming && !approval && (text || error)}
+			<div class="answer-actions">
+				{#if text}
+					<button class="answer-action" onclick={() => copyAnswer(text, "answer")}>
+						{#if copiedKey === "answer"}
+							<Check size={12} strokeWidth={2} /> Copied
+						{:else}
+							<Copy size={12} strokeWidth={2} /> Copy
+						{/if}
+					</button>
+				{/if}
+				<!-- Regenerate re-sends the SAME question, which is the fix for an
+				     empty/garbled response — the case where retyping is pure friction. -->
+				<button class="answer-action" onclick={() => onregenerate?.()}>
+					<RefreshCw size={12} strokeWidth={2} /> Regenerate
+				</button>
+			</div>
 		{/if}
 
 		{#if truncated && !streaming}
@@ -294,11 +355,19 @@ function onWindowKeydown(e: KeyboardEvent) {
 				<div class="approval-reason">⚠ {approval.reason}</div>
 				<div class="approval-cmd"><code>{approval.toolName} {approval.args}</code></div>
 				<div class="approval-actions">
-					<button class="approve" onclick={() => onapprove?.(true)} title="Approve (⌘↵ or Y)">
-						Approve <kbd>⌘↵</kbd>
+					<button
+						class="approve"
+						onclick={() => onapprove?.(true)}
+						title={`Approve (${getComboString("approve_action")} or Y)`}
+					>
+						Approve <kbd>{getComboString("approve_action")}</kbd>
 					</button>
-					<button class="reject" onclick={() => onapprove?.(false)} title="Reject (Esc or N)">
-						Reject <kbd>Esc</kbd>
+					<button
+						class="reject"
+						onclick={() => onapprove?.(false)}
+						title={`Reject (${getComboString("reject_action")} or N)`}
+					>
+						Reject <kbd>{getComboString("reject_action")}</kbd>
 					</button>
 				</div>
 			</div>
@@ -314,19 +383,23 @@ function onWindowKeydown(e: KeyboardEvent) {
 			{#if streaming}
 				<button class="stop-btn" onclick={() => onstop?.()}>■ Stop</button>
 			{:else if quick}
-				<button class="fork-btn" onclick={() => onwebsearch?.()} title="Search the web (⌘↵)">
+				<button
+					class="fork-btn"
+					onclick={() => onwebsearch?.()}
+					title={`Search the web (${getComboString("fork_web")})`}
+				>
 					<Globe size={14} strokeWidth={2} />
 					<span>Search web</span>
-					<kbd>⌘↵</kbd>
+					<kbd>{getComboString("fork_web")}</kbd>
 				</button>
 				<button
 					class="fork-btn primary"
 					onclick={() => onfullchat?.()}
-					title="Continue in full chat (↵)"
+					title={`Continue in full chat (${getComboString("fork_chat")})`}
 				>
 					<Sparkles size={14} strokeWidth={2} />
 					<span>Full chat</span>
-					<kbd>↵</kbd>
+					<kbd>{getComboString("fork_chat")}</kbd>
 				</button>
 			{:else}
 				<input
@@ -388,6 +461,59 @@ function onWindowKeydown(e: KeyboardEvent) {
 		flex-shrink: 0;
 		margin-top: 1px;
 		color: var(--error);
+	}
+
+	/* Answer actions: quiet until hovered, so they don't compete with the answer. */
+	.answer-actions {
+		display: flex;
+		gap: 6px;
+		margin-top: 8px;
+	}
+
+	.answer-action {
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		padding: 4px 8px;
+		background: none;
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		color: var(--fg-muted);
+		font-family: var(--font-sans);
+		font-size: 11px;
+		cursor: pointer;
+		opacity: 0.65;
+		transition: opacity 120ms ease;
+	}
+
+	.answer-action:hover {
+		opacity: 1;
+		background: var(--bg-secondary);
+		color: var(--fg);
+	}
+
+	/* Code blocks get a copy affordance in the top-right corner (handled by a
+	   delegated click, since the markdown is injected HTML). The label is CSS-only
+	   so no interactive markup is inserted into sanitized output. */
+	.ai-md :global(pre) {
+		position: relative;
+	}
+
+	.ai-md :global(pre::after) {
+		content: "copy";
+		position: absolute;
+		top: 4px;
+		right: 6px;
+		font-family: var(--font-sans);
+		font-size: 10px;
+		color: var(--fg-muted);
+		opacity: 0;
+		transition: opacity 120ms ease;
+		pointer-events: none;
+	}
+
+	.ai-md :global(pre:hover::after) {
+		opacity: 0.6;
 	}
 
 	.truncated-note {
