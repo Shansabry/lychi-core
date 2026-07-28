@@ -3,6 +3,7 @@ import { Check, Pencil, X } from "lucide-svelte";
 import type { CommandsConfig, Quicklink } from "$lib/ipc";
 import { getReservedKeywords, saveCommandsConfig } from "$lib/ipc";
 import { invalidateSettings } from "$lib/preloadCache";
+import Select from "../../Select.svelte";
 
 let {
 	commandsConfig = $bindable(),
@@ -43,6 +44,10 @@ const KINDS = [
 // fallback in one place instead of a `?? "url"` at each use.
 type Kind = NonNullable<Quicklink["kind"]>;
 const kindOf = (link: Quicklink): Kind => link.kind ?? "url";
+
+// The shared dropdown takes {value,label}; KINDS also carries a placeholder, so
+// the option list is derived rather than maintained separately.
+const KIND_OPTIONS = KINDS.map((k) => ({ value: k.value, label: k.label }));
 const labelOf = (kind: Kind) => KINDS.find((k) => k.value === kind)?.label ?? kind;
 
 let rows = $derived(
@@ -210,11 +215,16 @@ async function saveEdit(originalKeyword: string) {
 							else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); cancelEdit(); }
 						}}
 					/>
-					<select class="kind-select" bind:value={editKind} oninput={() => (error = "")}>
-						{#each KINDS as k (k.value)}
-							<option value={k.value}>{k.label}</option>
-						{/each}
-					</select>
+					<div class="kind-select">
+						<Select
+							value={editKind}
+							options={KIND_OPTIONS}
+							onchange={(v) => {
+								editKind = v as Kind;
+								error = "";
+							}}
+						/>
+					</div>
 					<input
 						type="text"
 						class="row-input value-input"
@@ -284,11 +294,16 @@ async function saveEdit(originalKeyword: string) {
 		oninput={() => (error = "")}
 		onkeydown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }}
 	/>
-	<select class="kind-select" bind:value={newKind} oninput={() => (error = "")}>
-		{#each KINDS as k (k.value)}
-			<option value={k.value}>{k.label}</option>
-		{/each}
-	</select>
+	<div class="kind-select">
+		<Select
+			value={newKind}
+			options={KIND_OPTIONS}
+			onchange={(v) => {
+				newKind = v as Kind;
+				error = "";
+			}}
+		/>
+	</div>
 	<input
 		type="text"
 		class="row-input value-input"
@@ -319,18 +334,13 @@ async function saveEdit(originalKeyword: string) {
 <style>
 	@import "./rows.css";
 
-	/* Kind picker — same visual weight as the inputs it sits between, so the row
-	   still reads as one control strip rather than three designs. */
+	/* Kind picker. Uses the shared Select so Settings has ONE dropdown design — a
+	   native <select> here was drawn by the desktop's own widget, which ignores
+	   the theme and looked foreign beside the inputs. The wrapper only fixes the
+	   width; Select itself fills 100%. */
 	.kind-select {
-		flex: 0 0 108px;
-		background: var(--bg-secondary);
-		color: var(--fg);
-		border: 1px solid var(--border);
-		border-radius: 4px;
-		padding: 5px 6px;
-		font-family: var(--font-mono);
-		font-size: 11px;
-		cursor: pointer;
+		flex: 0 0 118px;
+		min-width: 0;
 	}
 
 	/* The kind on a saved row: quieter than the keyword, since the keyword is what

@@ -79,6 +79,22 @@
 
 /* --- text inputs --- */
 
+/* One height for every control in a row.
+   An <input> derives its intrinsic height from its own line box and ignores an
+   inherited line-height; a flex <button> does not. With the inherited 1.5 that
+   makes the dropdown ~3.6px taller than the inputs beside it, despite identical
+   padding, border and font-size.
+   30px is the taller of the two (12px font x 1.5 + 10px padding + 2px border),
+   so pinning it makes them agree WITHOUT clipping either. Note there is no
+   `:global()` here — this is a plain stylesheet, not a Svelte <style> block, so
+   nothing is scoped and the pseudo-class would be emitted literally. */
+.row-input,
+.kind-select .select-trigger,
+.add-btn {
+	height: 30px;
+	box-sizing: border-box;
+}
+
 .row-input {
 	background: var(--bg-secondary);
 	color: var(--fg);
@@ -189,7 +205,12 @@
 	color: var(--accent);
 	border: 1px solid var(--border);
 	border-radius: 4px;
-	padding: 5px 12px;
+	/* Vertical padding is 0: the pinned height owns the box and flex-centring
+	   owns the label. Keeping `padding: 5px` fought the fixed height. */
+	padding: 0 12px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
 	font-family: var(--font-mono);
 	font-size: 12px;
 	cursor: pointer;

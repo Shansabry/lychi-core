@@ -22,6 +22,7 @@ import {
 } from "$lib/ipc";
 import { ACCENTS, resolveAccent, type Theme, type ThemeMode } from "$lib/theme";
 import Select from "../Select.svelte";
+import FontPicker from "./FontPicker.svelte";
 
 let {
 	generalConfig = $bindable(),
@@ -166,15 +167,6 @@ $effect(() => {
 			// No fontconfig — the pickers stay empty and the CSS stack applies.
 		});
 });
-
-// Monospace families first: Lychi's interface is monospace-heavy by design, so
-// those are the likely picks. Both groups are offered because the choice drives
-// UI text — command output stays fixed-width either way.
-let fontOptions = $derived([
-	{ value: "", label: "System default" },
-	...fontFamilies.filter((f) => f.monospace).map((f) => ({ value: f.name, label: f.name })),
-	...fontFamilies.filter((f) => !f.monospace).map((f) => ({ value: f.name, label: f.name })),
-]);
 
 async function applyAndSaveTheme() {
 	const theme: Theme = {
@@ -331,16 +323,16 @@ async function handleTerminalChange(val: string) {
      uninstalling the font later degrades to the fallbacks instead of breaking. -->
 <div class="field">
 	<label for="font-family">Font</label>
-	<Select
-		id="font-family"
+	<FontPicker
 		value={generalConfig.font_family ?? ""}
-		options={fontOptions}
+		fonts={fontFamilies}
 		onchange={handleFontChange}
 	/>
 </div>
 <div class="field-hint font-hint">
-	Applies across the app. Command output stays fixed-width whatever you pick, so
-	tables and <code>git status</code> keep their columns.
+	Applies across the app. Each option is shown in its own typeface. Command
+	output stays fixed-width whatever you pick, so tables and
+	<code>git status</code> keep their columns.
 </div>
 <div class="field">
 	<label for="autostart">Start at login</label>
