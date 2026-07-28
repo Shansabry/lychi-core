@@ -186,6 +186,13 @@ fn build_body(
         Dialect::OpenAi => {
             let mut b = json!({
                 "model": model, "max_tokens": max_tokens, "stream": true,
+                // Token usage is OMITTED from a stream unless explicitly asked
+                // for — the default is `null` on every chunk. With this set, one
+                // extra final chunk carries the totals for the whole request.
+                // Anthropic sends usage unprompted; OpenAI-compatible providers
+                // (Groq, OpenRouter, …) do not, which is why the chat showed no
+                // token count.
+                "stream_options": { "include_usage": true },
                 "messages": openai_messages(messages),
             });
             if !tools.is_empty() {
@@ -519,6 +526,7 @@ where
         yield StreamEvent::MessageStart { model };
         let mut tool_blocks: std::collections::HashMap<u64, ToolAccum> = std::collections::HashMap::new();
         let mut stop = StopReason::EndTurn;
+        let mut usage = super::Usage::default();
         let mut sse = SseReader::new(byte_stream);
 
         loop {
@@ -526,6 +534,19 @@ where
             let evt = match sse.next_event().await? { Some(e) => e, None => break };
             if evt.trim() == "[DONE]" { break; }
             let data: Value = match serde_json::from_str(&evt) { Ok(v) => v, Err(_) => continue };
+            // Usage rides on ONE extra chunk at the end (requested via
+            // `stream_options.include_usage`), whose `choices` array is empty.
+            // Read it before touching `choices` so the empty-array case is a
+            // no-op rather than a miss. OpenAI names the fields
+            // prompt_/completion_tokens; Anthropic uses input_/output_tokens.
+            if let Some(u) = data.get("usage").filter(|u| !u.is_null()) {
+                if let Some(n) = u["prompt_tokens"].as_u64() {
+                    usage.input_tokens = n as u32;
+                }
+                if let Some(n) = u["completion_tokens"].as_u64() {
+                    usage.output_tokens = n as u32;
+                }
+            }
             let delta = &data["choices"][0]["delta"];
             if let Some(t) = delta["content"].as_str()
                 && !t.is_empty() {
@@ -563,7 +584,7 @@ where
             let acc = tool_blocks.remove(&idx).unwrap();
             yield StreamEvent::ToolCallComplete { id: acc.id, name: acc.name, args: unwrap_args(&acc.args_buf) };
         }
-        yield StreamEvent::Done { stop_reason: stop, usage: None };
+        yield StreamEvent::Done { stop_reason: stop, usage: Some(usage) };
     }
     .boxed()
 }
@@ -757,6 +778,66 @@ mod tests {
     }
 
     // message_delta carries the authoritative stop_reason (max_tokens) + usage.
+    #[tokio::test]
+    async fn openai_stream_reports_usage_from_the_final_chunk() {
+        // Groq/OpenAI send usage on ONE extra chunk after the content, whose
+        // `choices` array is empty. Every earlier chunk carries `usage: null`.
+        // Without parsing this the chat showed no token count at all.
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":31,\"completion_tokens\":7,\"total_tokens\":38}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let chunks: Vec<reqwest::Result<Vec<u8>>> = vec![Ok(sse.as_bytes().to_vec())];
+        let stream = super::openai_event_stream(
+            futures_util::stream::iter(chunks),
+            "llama".into(),
+            CancellationToken::new(),
+        );
+        let events = collect(stream).await;
+        match events.last() {
+            Some(StreamEvent::Done { usage, .. }) => {
+                let u = usage.expect("usage reported");
+                assert_eq!(u.input_tokens, 31);
+                assert_eq!(u.output_tokens, 7);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_stream_without_usage_still_completes() {
+        // A provider that ignores `stream_options` (or a cancelled stream that
+        // never reaches the final chunk) must still terminate cleanly, reporting
+        // zeros rather than failing.
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let chunks: Vec<reqwest::Result<Vec<u8>>> = vec![Ok(sse.as_bytes().to_vec())];
+        let stream = super::openai_event_stream(
+            futures_util::stream::iter(chunks),
+            "llama".into(),
+            CancellationToken::new(),
+        );
+        match collect(stream).await.last() {
+            Some(StreamEvent::Done { usage, .. }) => {
+                let u = usage.expect("usage present but zeroed");
+                assert_eq!(u.input_tokens, 0);
+                assert_eq!(u.output_tokens, 0);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openai_requests_ask_for_usage_explicitly() {
+        // The parser above is useless unless the request opts in — usage is
+        // omitted from OpenAI-compatible streams by default.
+        let body = super::build_body(super::Dialect::OpenAi, "llama", 100, &[], &[]);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
     #[tokio::test]
     async fn anthropic_stream_reports_truncation_and_usage() {
         let sse = concat!(
