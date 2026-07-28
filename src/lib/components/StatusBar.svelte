@@ -367,7 +367,7 @@ async function togglePlayPause() {
 	/* Parked AI answer: tinted with the AI hue + a soft pulse so it reads as
 	   "answer waiting" rather than an inert toggle. */
 	.bar-icon.ai-parked {
-		color: var(--ai);
+		color: var(--accent);
 		animation: ai-park-pulse 2s ease-in-out infinite;
 	}
 
@@ -565,7 +565,7 @@ async function togglePlayPause() {
 	}
 
 	.ai-loading {
-		color: var(--ai);
+		color: var(--accent);
 		animation: pulse 1.4s ease-in-out infinite;
 	}
 
@@ -626,11 +626,11 @@ async function togglePlayPause() {
 	}
 
 	.confirm {
-		color: #ffaa00;
+		color: var(--warning);
 	}
 
 	.ai-indicator {
-		color: var(--ai);
+		color: var(--accent);
 		display: flex;
 		align-items: center;
 	}

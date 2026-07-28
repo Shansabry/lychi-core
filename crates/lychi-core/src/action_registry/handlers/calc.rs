@@ -1015,6 +1015,10 @@ mod tests {
     }
 
     #[test]
+    // The literal is a decimal-formatting sample, not an approximation of π —
+    // substituting `PI` would change what this asserts (it would then depend on
+    // how many digits of the real constant we print).
+    #[allow(clippy::approx_constant)]
     fn test_format_result() {
         assert_eq!(CalcHandler::format_result(4.0), "4");
         assert_eq!(CalcHandler::format_result(3.14159), "3.14159");

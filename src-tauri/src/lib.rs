@@ -84,6 +84,8 @@ pub fn run() {
             commands::config::get_general_config,
             commands::config::save_general_config,
             commands::config::get_commands_config,
+            commands::config::get_reserved_keywords,
+            commands::config::get_installed_fonts,
             commands::config::save_commands_config,
             commands::config::get_projects_config,
             commands::config::save_projects_config,

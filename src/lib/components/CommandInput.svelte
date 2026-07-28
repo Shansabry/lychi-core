@@ -460,7 +460,7 @@ function handleKeydown(e: KeyboardEvent) {
 		font-family: var(--font-mono);
 		color: var(--fg-muted);
 		opacity: 0.45;
-		background: rgba(255, 255, 255, 0.06);
+		background: var(--overlay-wash);
 		padding: 2px 8px;
 		border-radius: 9999px;
 		white-space: nowrap;
@@ -550,7 +550,10 @@ function handleKeydown(e: KeyboardEvent) {
 
 	.hl-at {
 		color: transparent;
-		background: rgba(0, 255, 200, 0.12);
+		/* The @-reference highlight behind transparent text. Tied to --success
+		   (the same green family) so it tracks the theme instead of staying a
+		   fixed neon that glares on the light ground. */
+		background: color-mix(in srgb, var(--success) 18%, transparent);
 		border-radius: 3px;
 		padding: 1px 0;
 	}

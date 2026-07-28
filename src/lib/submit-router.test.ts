@@ -315,6 +315,40 @@ describe("decideSubmit — selected completion actuation", () => {
 		expect(decideSubmit(c)).toEqual({ kind: "fill", value: "tz " });
 	});
 
+	it("a row with both fill and run EXECUTES on Enter", () => {
+		// A multi-repo pick carries both: `fill` so Tab can refine the query,
+		// `run` so Enter executes in the chosen repo. Checking `fill` first made
+		// Enter re-fill the input — the row looked selected and did nothing.
+		const action = decideSubmit(
+			ctx({
+				trimmed: "git status rturn-api",
+				completions: [
+					comp({
+						label: "git status › rturn-api",
+						fill: "git status rturn-api",
+						run: "run git status @@/home/u/ws/rturn-api",
+					}),
+				],
+				completionIndex: 0,
+			}),
+		);
+		expect(action.kind).toBe("command");
+		expect(action).toHaveProperty("command", "run git status @@/home/u/ws/rturn-api");
+	});
+
+	it("a row with only fill still fills", () => {
+		// The tab-complete case must keep working: no `run` means there is
+		// nothing to execute, so filling is the correct answer.
+		const action = decideSubmit(
+			ctx({
+				trimmed: "tz",
+				completions: [comp({ label: "tz tokyo", fill: "tz " })],
+				completionIndex: 0,
+			}),
+		);
+		expect(action.kind).toBe("fill");
+	});
+
 	it("@-browse selection drills into the row", () => {
 		const c = ctx({
 			trimmed: "@src",

@@ -13,6 +13,7 @@ import type {
 	AiPresetItem,
 	AiStatus,
 	AiTestResult,
+	AliasItem,
 	AllNotes,
 	AllSettings,
 	CommandInfo,
@@ -27,6 +28,7 @@ import type {
 	FileAttachment,
 	FilePreviewData,
 	FirebaseUser,
+	FontFamily,
 	GeneralConfig,
 	HotkeyStatus,
 	KeybindingsConfig,
@@ -77,6 +79,7 @@ export type {
 	FileKind,
 	FilePreviewData,
 	FirebaseUser,
+	FontFamily,
 	GeneralConfig,
 	GitContext,
 	HotkeyStatus,
@@ -94,6 +97,8 @@ export type {
 	ProjectKind,
 	ProjectScript,
 	ProjectsConfig,
+	Quicklink,
+	QuicklinkKind,
 	ReminderItem,
 	RiskLevel,
 	RouteDecision,
@@ -517,8 +522,43 @@ export async function getCommandsConfig(): Promise<CommandsConfig> {
 			extra_ides: [],
 			terminal_routing: "manual",
 			search_engines: {},
+			quicklinks: [],
 		};
 	return unwrap(await commands.getCommandsConfig());
+}
+
+/// Keywords already taken by built-in commands, from the backend's live action
+/// registry. The Settings UI uses this for an instant collision warning instead
+/// of keeping its own copy, which would drift as handlers are added.
+export async function getReservedKeywords(): Promise<string[]> {
+	if (!isTauri()) return [];
+	return unwrap(await commands.getReservedKeywords());
+}
+
+/// Font families installed on this system, for the Settings font pickers. The
+/// WebView can't enumerate these itself, so the list comes from fontconfig.
+export async function getInstalledFonts(): Promise<FontFamily[]> {
+	if (!isTauri()) return [];
+	return unwrap(await commands.getInstalledFonts());
+}
+
+// --- Aliases ---
+
+export async function getAliases(): Promise<AliasItem[]> {
+	if (!isTauri()) return [];
+	return unwrap(await commands.getAliases());
+}
+
+export async function addAlias(name: string, command: string): Promise<AliasItem> {
+	return unwrap(await commands.addAlias(name, command));
+}
+
+export async function updateAlias(name: string, command: string): Promise<void> {
+	unwrap(await commands.updateAlias(name, command));
+}
+
+export async function deleteAlias(name: string): Promise<void> {
+	unwrap(await commands.deleteAlias(name));
 }
 
 export async function getInstalledTerminals(): Promise<string[]> {

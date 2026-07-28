@@ -16,8 +16,27 @@
 	--accent-blue: #7c8cff;
 	--error: #ff4444;
 	--success: #44ff44;
+	/* Caution — a risky-but-permitted action (confirm prompts, high-risk plan
+	   steps, a destructive verb awaiting approval). Distinct from --error, which
+	   means something already went wrong. Was hardcoded as #ffaa00 in five
+	   components, so it never adapted to the light theme. */
+	--warning: #ffaa00;
+	/* The muted companion to --warning, for body text and borders inside a
+	   caution block where full-strength amber would shout. */
+	--warning-muted: #d0b060;
 	--border: #222;
-	--ai: #a78bfa;
+	/* Elevation shadow for floating surfaces (action panel, previews). A token
+	   because the shadow has to invert with the theme: a black glow reads as
+	   depth on a dark ground and as dirt on a light one. */
+	--shadow-overlay: rgba(0, 0, 0, 0.45);
+	/* A wash used for hover/selected states over the base ground. Light-on-dark
+	   here, dark-on-light in the light theme — the reason a literal
+	   rgba(255,255,255,…) can't be used. */
+	--overlay-wash: rgba(255, 255, 255, 0.06);
+	/* Neutral ground for a QR code / anything needing a guaranteed-white plate
+	   to stay scannable. Deliberately constant across themes. */
+	--plate: #fff;
+	--plate-fg: #1a1a1a;
 	/* Guide category hues (dark) — one per command family. */
 	--cat-files: #7c8cff;
 	--cat-ai: #a78bfa;
@@ -27,8 +46,31 @@
 	--cat-media: #f472b6;
 	--cat-utilities: #9aa0a6;
 	--cat-general: #9aa0a6;
-	--font-mono: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
-	--font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+	/* The first two are the preferred faces but are NOT bundled and are rarely
+	   installed on Linux — without the fallbacks below, the stack drops straight
+	   to generic `monospace`, which fontconfig commonly resolves to Bitstream
+	   Vera Sans Mono (a 1990s face that reads soft at UI sizes). The middle
+	   entries are the fonts actually shipped by mainstream distros, so the
+	   realistic worst case is now Noto/DejaVu rather than Vera. */
+	--font-mono:
+		"JetBrains Mono", "Fira Code", "Cascadia Code", "Source Code Pro", "Noto Sans Mono",
+		"DejaVu Sans Mono", "Liberation Mono", ui-monospace, monospace;
+	/* `system-ui` is listed early so the app follows the desktop's own UI font
+	   (Cantarell on GNOME, Noto on KDE) rather than imposing one. The named
+	   Linux faces after it matter because bare `sans-serif` is resolved by
+	   fontconfig, which on many systems still lands on Bitstream Vera Sans —
+	   visibly soft next to any modern face. The Apple/Microsoft names stay for
+	   completeness but never match here. */
+	--font-sans:
+		system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", "Cantarell", "Noto Sans",
+		"Roboto", "DejaVu Sans", sans-serif;
+	/* Command OUTPUT only. Deliberately NOT covered by the font picker: `git
+	   status`, `ls -la` and table output rely on fixed-width columns, and a
+	   proportional face turns them ragged. The picker retargets --font-mono
+	   (which the UI uses); this token stays fixed-width whatever is chosen. */
+	--font-output:
+		"JetBrains Mono", "Fira Code", "Cascadia Code", "Source Code Pro", "Noto Sans Mono",
+		"DejaVu Sans Mono", "Liberation Mono", ui-monospace, monospace;
 	--font-brand: "Lexend", sans-serif;
 
 	/* Syntax-highlight tokens (highlight.js) — dark palette. */
@@ -52,8 +94,15 @@
 	--accent-blue: #5060cc;
 	--error: #cc2222;
 	--success: #228822;
+	/* Darkened well past the dark-theme amber: #ffaa00 on a #f5f5f5 ground is
+	   roughly 1.8:1 contrast — effectively unreadable. */
+	--warning: #b36b00;
+	--warning-muted: #8a6520;
 	--border: #ddd;
-	--ai: #7c3aed;
+	--shadow-overlay: rgba(0, 0, 0, 0.18);
+	--overlay-wash: rgba(0, 0, 0, 0.05);
+	--plate: #fff;
+	--plate-fg: #1a1a1a;
 	/* Guide category hues (light) — darkened for contrast on the light ground. */
 	--cat-files: #5060cc;
 	--cat-ai: #7c3aed;
@@ -144,9 +193,15 @@ body {
 	color: var(--fg);
 	font-family: var(--font-sans);
 	font-size: 14px;
-	-webkit-font-smoothing: antialiased;
+	/* Deliberately NOT `-webkit-font-smoothing: antialiased`.
+	   That property disables subpixel antialiasing and falls back to grayscale.
+	   It exists to counteract macOS's heavy stem darkening; on Linux, where
+	   FreeType already renders at the right weight, it only discards the
+	   horizontal-resolution gain of subpixel rendering and makes text thinner
+	   and blurrier. Letting the platform decide is sharper here. */
+	text-rendering: optimizeLegibility;
 }
 
 ::selection {
-	background: rgba(128, 128, 128, 0.2);
+	background: color-mix(in srgb, var(--fg-muted) 35%, transparent);
 }

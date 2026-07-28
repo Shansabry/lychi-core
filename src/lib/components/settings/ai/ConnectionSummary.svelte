@@ -79,11 +79,11 @@ const subtitle = $derived(
 		height: 38px;
 		border-radius: 9px;
 		flex-shrink: 0;
-		background: color-mix(in srgb, var(--ai) 16%, var(--bg-secondary));
-		border: 1px solid color-mix(in srgb, var(--ai) 30%, transparent);
+		background: color-mix(in srgb, var(--accent) 16%, var(--bg-secondary));
+		border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
 		display: grid;
 		place-items: center;
-		color: var(--ai);
+		color: var(--accent);
 		font-size: 17px;
 	}
 	.main {
@@ -160,8 +160,8 @@ const subtitle = $derived(
 		cursor: default;
 	}
 	.btn.ai {
-		color: var(--ai);
-		border-color: color-mix(in srgb, var(--ai) 35%, transparent);
+		color: var(--accent);
+		border-color: color-mix(in srgb, var(--accent) 35%, transparent);
 	}
 	.btn.ghost {
 		background: transparent;

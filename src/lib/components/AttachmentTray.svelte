@@ -148,7 +148,7 @@ function humanSize(bytes: number | null): string {
 
 	.remove:hover {
 		opacity: 1;
-		background: rgba(255, 255, 255, 0.08);
+		background: var(--overlay-wash);
 	}
 
 	/* A caution, not an error: the send still works, the model just won't see

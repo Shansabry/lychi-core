@@ -520,9 +520,9 @@ function onWindowKeydown(e: KeyboardEvent) {
 		margin-top: 10px;
 		padding: 7px 10px;
 		border-radius: 6px;
-		border: 1px solid color-mix(in srgb, #d0b060 40%, var(--border));
-		background: color-mix(in srgb, #d0b060 10%, transparent);
-		color: #d0b060;
+		border: 1px solid color-mix(in srgb, var(--warning-muted) 40%, var(--border));
+		background: color-mix(in srgb, var(--warning-muted) 10%, transparent);
+		color: var(--warning-muted);
 		font-size: 12px;
 		line-height: 1.45;
 	}
@@ -776,7 +776,7 @@ function onWindowKeydown(e: KeyboardEvent) {
 		padding-top: 2px;
 	}
 	.ai-md :global(code) {
-		font-family: var(--font-mono);
+		font-family: var(--font-output);
 		font-size: 0.9em;
 		background: var(--bg-secondary);
 		padding: 0.1em 0.35em;
@@ -828,7 +828,7 @@ function onWindowKeydown(e: KeyboardEvent) {
 		align-self: flex-start;
 		margin: 6px 0 4px;
 		padding: 10px;
-		background: #fff;
+		background: var(--plate);
 		border-radius: 8px;
 		border: 1px solid var(--border);
 	}
@@ -871,12 +871,12 @@ function onWindowKeydown(e: KeyboardEvent) {
 	.approval {
 		margin-top: 12px;
 		padding: 10px 12px;
-		border: 1px solid rgba(208, 176, 96, 0.3);
-		background: rgba(208, 176, 96, 0.08);
+		border: 1px solid color-mix(in srgb, var(--warning-muted) 30%, transparent);
+		background: color-mix(in srgb, var(--warning-muted) 8%, transparent);
 		border-radius: 6px;
 	}
 	.approval-reason {
-		color: #d0b060;
+		color: var(--warning-muted);
 		font-size: 12.5px;
 		margin-bottom: 6px;
 	}

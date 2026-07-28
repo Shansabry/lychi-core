@@ -21,6 +21,18 @@ export interface Theme {
 	 * the theme's default monochrome accent.
 	 */
 	accent: string;
+	/**
+	 * The app's font family, or "" for the built-in stacks.
+	 *
+	 * ONE choice drives the whole interface — it retargets both `--font-sans`
+	 * and `--font-mono`, so labels and the command input agree. Command
+	 * *output* is deliberately excluded (it reads `--font-output`) because
+	 * `git status` and `ls -la` lose their columns in a proportional face.
+	 *
+	 * Prepended to each stack rather than replacing it, so an uninstalled font
+	 * falls back to the normal stack instead of to nothing.
+	 */
+	fontFamily?: string;
 }
 
 /** A named accent swatch for the settings picker. */
@@ -190,4 +202,76 @@ export function applyTheme(theme: Theme): void {
 	} else {
 		root.style.removeProperty("--accent");
 	}
+
+	// One choice, both stacks — so a label and the command input never disagree.
+	// `--font-output` is intentionally untouched: command output stays
+	// fixed-width whatever the user picks.
+	applyFont(root, "--font-sans", theme.fontFamily, BASE_SANS);
+	applyFont(root, "--font-mono", theme.fontFamily, BASE_MONO);
+}
+
+/**
+ * The fallback stacks from app.css, repeated here because a CSS custom property
+ * can't reference its own previous value — setting `--font-sans` inline
+ * replaces the stylesheet's definition outright, so the fallbacks have to be
+ * re-stated when prepending a choice.
+ *
+ * Kept in sync with app.css by the test in theme.test.ts.
+ */
+const BASE_SANS =
+	'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", "Cantarell", "Noto Sans", "Roboto", "DejaVu Sans", sans-serif';
+const BASE_MONO =
+	'"JetBrains Mono", "Fira Code", "Cascadia Code", "Source Code Pro", "Noto Sans Mono", "DejaVu Sans Mono", "Liberation Mono", ui-monospace, monospace';
+
+/**
+ * Put the user's chosen family at the head of a font stack.
+ *
+ * Prepending rather than replacing is deliberate: if the chosen font is later
+ * uninstalled (or the config is copied to another machine that lacks it), the
+ * browser walks on to the next entry and the app still renders in something
+ * sensible. Replacing the stack outright would drop straight to the generic
+ * `monospace`/`sans-serif`, which fontconfig frequently resolves to Bitstream
+ * Vera — visibly soft next to any modern face.
+ */
+function applyFont(
+	root: HTMLElement,
+	property: string,
+	choice: string | undefined,
+	base: string,
+): void {
+	const stack = fontStack(choice, base);
+	if (stack) {
+		root.style.setProperty(property, stack);
+	} else {
+		root.style.removeProperty(property);
+	}
+}
+
+/**
+ * The full font stack for a chosen family, or `null` when nothing is chosen
+ * (meaning: clear the override and let the stylesheet's stack apply).
+ *
+ * Separated from the DOM write so the stack-building rules — quoting, escaping,
+ * fallback order — are testable without a browser environment.
+ */
+export function fontStack(choice: string | undefined, base: string): string | null {
+	const family = choice?.trim();
+	if (!family) return null;
+	return `${quoteFamily(family)}, ${base}`;
+}
+
+/** The built-in stacks, exported so callers and tests can reference them. */
+export const FONT_STACKS = { sans: BASE_SANS, mono: BASE_MONO } as const;
+
+/**
+ * Quote a family name for CSS unless it is a bare single identifier.
+ *
+ * Family names with spaces ("JetBrains Mono") or punctuation ("Anka/Coder")
+ * are invalid unquoted, and fontconfig genuinely reports names like the latter.
+ */
+function quoteFamily(family: string): string {
+	if (/^[a-zA-Z][a-zA-Z0-9-]*$/.test(family)) return family;
+	// Escape embedded quotes/backslashes so a hostile or odd family name can't
+	// terminate the declaration and inject further CSS.
+	return `"${family.replace(/[\\"]/g, "\\$&")}"`;
 }

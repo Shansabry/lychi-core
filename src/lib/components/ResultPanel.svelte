@@ -332,9 +332,11 @@ function handleKeydown(e: KeyboardEvent) {
 		margin-right: 6px;
 	}
 
-	/* Terminal output — monospace with ANSI colors */
+	/* Terminal output — fixed-width with ANSI colors. Uses --font-output, NOT
+	   --font-mono: the font picker retargets --font-mono for the whole UI, but
+	   command output must stay aligned whatever the user picks. */
 	pre {
-		font-family: var(--font-mono);
+		font-family: var(--font-output);
 		font-size: 13px;
 		white-space: pre-wrap;
 		word-break: break-word;
@@ -358,7 +360,7 @@ function handleKeydown(e: KeyboardEvent) {
 	.output.svg-output :global(svg) {
 		width: 180px;
 		height: 180px;
-		background: #fff;
+		background: var(--plate);
 		border-radius: 6px;
 		padding: 8px;
 		box-sizing: border-box;
@@ -436,7 +438,7 @@ function handleKeydown(e: KeyboardEvent) {
 	}
 
 	.confirm-header.high {
-		color: #ffaa00;
+		color: var(--warning);
 	}
 
 	.confirm-icon {
@@ -467,7 +469,7 @@ function handleKeydown(e: KeyboardEvent) {
 	}
 
 	.confirm-risk.high {
-		color: #ffaa00;
+		color: var(--warning);
 	}
 
 	.confirm-actions {
@@ -513,9 +515,9 @@ function handleKeydown(e: KeyboardEvent) {
 	}
 
 	.btn-confirm.high {
-		background: #ffaa00;
-		border-color: #ffaa00;
-		color: #1a1a1a;
+		background: var(--warning);
+		border-color: var(--warning);
+		color: var(--plate-fg);
 	}
 
 	.kbd {

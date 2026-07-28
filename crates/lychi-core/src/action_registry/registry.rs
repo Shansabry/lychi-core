@@ -48,7 +48,7 @@ impl ActionRegistry {
 
     pub fn register(&mut self, handler: Box<dyn ActionHandler>) {
         // Index this handler's keyword triggers. Registering a handler with an
-        // id that already exists (hot-reload of shell/bang/project handlers)
+        // id that already exists (hot-reload of shell/quicklink/project handlers)
         // replaces both the handler and its prefix routes.
         let id = handler.id().to_string();
         // Drop any stale routes that pointed at this id (in case its triggers changed).
@@ -85,9 +85,16 @@ impl ActionRegistry {
         ))
     }
 
-    /// All registered keyword prefixes (for diagnostics / help).
+    /// All registered keyword prefixes (for diagnostics / help), sorted.
+    ///
+    /// Also serves the Settings UI's collision warning, so the frontend does not
+    /// keep its own copy of the list — a hand-maintained duplicate is a second
+    /// decider that drifts silently as handlers are added. Sorted so the order
+    /// is stable across runs (`HashMap` iteration order is arbitrary).
     pub fn known_prefixes(&self) -> Vec<&str> {
-        self.prefix_index.keys().map(|s| s.as_str()).collect()
+        let mut out: Vec<&str> = self.prefix_index.keys().map(|s| s.as_str()).collect();
+        out.sort_unstable();
+        out
     }
 
     pub fn get(&self, id: &str) -> Option<&dyn ActionHandler> {

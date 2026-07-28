@@ -55,16 +55,16 @@ impl EventHandler for CommandsReactor {
                 commands.shell.clone(),
             ),
         ));
-        // Re-register the bang handler + refresh routing keywords so search-engine
-        // edits go live without a restart.
-        let keywords: Vec<String> = commands.search_engines.keys().cloned().collect();
+        // Re-register the quicklink handler + refresh routing so quicklink edits
+        // go live without a restart. `resolved_quicklinks` merges the legacy
+        // `search_engines` map in, so both config shapes stay live.
+        let links = commands.resolved_quicklinks();
         executor.registry.register(Box::new(
-            lychi_core::action_registry::handlers::bang::BangHandler::new(
-                commands.search_engines.clone(),
-            ),
+            lychi_core::action_registry::handlers::quicklink::QuicklinkHandler::new(links.clone()),
         ));
-        executor.set_bang_keywords(keywords);
-        tracing::info!("[reactor] commands config applied (shell + bangs)");
+        let count = links.len();
+        executor.set_quicklinks(links);
+        tracing::info!("[reactor] commands config applied (shell + {count} quicklinks)");
     }
 }
 

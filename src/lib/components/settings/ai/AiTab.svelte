@@ -202,7 +202,7 @@ function handleKeydown(e: KeyboardEvent) {
 		right: 10px;
 		bottom: -1px;
 		height: 2px;
-		background: var(--ai);
+		background: var(--accent);
 		border-radius: 2px;
 	}
 	.seg .count {
@@ -248,6 +248,6 @@ function handleKeydown(e: KeyboardEvent) {
 	.token {
 		font-family: var(--font-mono);
 		font-size: 11px;
-		color: var(--ai);
+		color: var(--accent);
 	}
 </style>

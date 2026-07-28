@@ -233,7 +233,7 @@ export function dismissConfirm(): boolean {
 		color: var(--fg);
 	}
 	.cmd-item.active .cmd-kw {
-		color: var(--ai);
+		color: var(--accent);
 	}
 	.cmd-shortcut {
 		margin-left: auto;
@@ -326,8 +326,8 @@ export function dismissConfirm(): boolean {
 		border-color: var(--fg-muted);
 	}
 	.btn.ai {
-		color: var(--ai);
-		border-color: color-mix(in srgb, var(--ai) 35%, transparent);
+		color: var(--accent);
+		border-color: color-mix(in srgb, var(--accent) 35%, transparent);
 	}
 	.btn.del {
 		background: transparent;

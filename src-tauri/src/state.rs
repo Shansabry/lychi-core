@@ -7,7 +7,6 @@ use redb::Database;
 use lychi_core::action_registry::handlers::aliases::AliasHandler;
 use lychi_core::action_registry::handlers::app_control::AppControlHandler;
 use lychi_core::action_registry::handlers::app_launcher::AppLauncher;
-use lychi_core::action_registry::handlers::bang::BangHandler;
 use lychi_core::action_registry::handlers::bookmarks::BookmarkHandler;
 use lychi_core::action_registry::handlers::browse::BrowseHandler;
 use lychi_core::action_registry::handlers::calc::CalcHandler;
@@ -29,6 +28,7 @@ use lychi_core::action_registry::handlers::packages::PackagesHandler;
 use lychi_core::action_registry::handlers::pin_workspace::PinWorkspaceHandler;
 use lychi_core::action_registry::handlers::project_open::ProjectOpen;
 use lychi_core::action_registry::handlers::qr::QrHandler;
+use lychi_core::action_registry::handlers::quicklink::QuicklinkHandler;
 use lychi_core::action_registry::handlers::reminders::RemindersHandler;
 use lychi_core::action_registry::handlers::resize_image::ResizeImageHandler;
 use lychi_core::action_registry::handlers::screenshot::ScreenshotHandler;
@@ -349,11 +349,11 @@ impl AppState {
         // fast answer, replacing the slow buffered handlers. `ai_provider` below
         // feeds the router/agent, not any handler.
 
-        // Custom search-engine shortcuts ("bangs") — user-extensible via config.
-        let bang_keywords: Vec<String> = config.commands.search_engines.keys().cloned().collect();
-        registry.register(Box::new(BangHandler::new(
-            config.commands.search_engines.clone(),
-        )));
+        // Quicklinks — user-defined parameterized commands, extensible via
+        // config. `resolved_quicklinks` merges the legacy `search_engines` map
+        // in as URL quicklinks, so existing configs keep working untouched.
+        let quicklinks = config.commands.resolved_quicklinks();
+        registry.register(Box::new(QuicklinkHandler::new(quicklinks.clone())));
 
         // Script Commands — files in ~/.config/lychi/scripts/ become named
         // commands. Discovered at startup; hot-reloaded by the scripts watcher.
@@ -377,7 +377,7 @@ impl AppState {
         let resolver = IntentResolver::new(ai_router);
         let rules = RulesEngine::new();
         let mut executor = Executor::new(registry, rules, resolver, history.clone(), db.clone());
-        executor.set_bang_keywords(bang_keywords);
+        executor.set_quicklinks(quicklinks);
         executor.set_script_keywords(script_keywords);
 
         Self {

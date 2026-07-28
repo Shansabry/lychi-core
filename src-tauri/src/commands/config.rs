@@ -101,19 +101,52 @@ pub async fn get_commands_config(state: State<'_, AppState>) -> Result<CommandsC
     Ok(config.commands.clone())
 }
 
+/// Font families installed on this system, for the Settings font pickers.
+///
+/// The WebView can't answer this itself — `document.fonts` only knows faces the
+/// page has loaded — so it comes from fontconfig. Runs on a blocking thread
+/// because it shells out to `fc-list`, which walks the font cache and takes
+/// tens of milliseconds on a system with a thousand families.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_installed_fonts() -> Result<Vec<lychi_core::fonts::FontFamily>, LychiError> {
+    tokio::task::spawn_blocking(lychi_core::fonts::installed_families)
+        .await
+        .map_err(|e| LychiError::Config(format!("font enumeration failed: {e}")))
+}
+
+/// Every keyword already taken by a built-in command.
+///
+/// Serves the Settings UI so it can warn about a colliding quicklink keyword
+/// while typing. The list comes from the live registry — the same source the
+/// save-path check uses — so the two can never disagree. A hand-maintained copy
+/// in the frontend would drift silently every time a handler is added.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_reserved_keywords(state: State<'_, AppState>) -> Result<Vec<String>, LychiError> {
+    let executor = state.executor.read().await;
+    Ok(executor
+        .registry
+        .known_prefixes()
+        .into_iter()
+        .map(String::from)
+        .collect())
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn save_commands_config(
     state: State<'_, AppState>,
     commands: CommandsConfig,
 ) -> Result<(), LychiError> {
-    // Reject search-engine shortcuts that collide with a reserved command
-    // before persisting, so a bad keyword never shadows a real command. The
-    // reserved-command check is delegated to the live action registry.
+    // Reject quicklinks that collide with a reserved command before persisting,
+    // so a bad keyword never shadows a real command. The reserved-command check
+    // is delegated to the live action registry — the single source of truth for
+    // what a keyword would shadow.
     {
         let executor = state.executor.read().await;
         commands
-            .validate_search_engines(&|w| executor.registry.is_known_prefix(w))
+            .validate_quicklinks(&|w| executor.registry.is_known_prefix(w))
             .map_err(LychiError::Config)?;
     }
 

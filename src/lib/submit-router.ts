@@ -353,7 +353,14 @@ function decideSelectedCompletion(ctx: SubmitContext, selected: RouterCompletion
 		return { kind: "calc-display", text: selected.label.replace(/^=\s*/, "") };
 	}
 	// Tab-complete hint → fill the input (an argument-needing command).
-	if (selected.fill) {
+	//
+	// Only when the row has NOTHING to run. A row may carry both: a multi-repo
+	// pick offers `fill` so Tab can refine the query, and `run` so Enter
+	// executes in the chosen repo. Checking `fill` first made Enter re-fill the
+	// input instead of running — the row looked selected and did nothing.
+	// Tab reads `fill` on its own path (`+page.svelte`), so deferring to `run`
+	// here costs that behaviour nothing.
+	if (selected.fill && !selected.run) {
 		return { kind: "fill", value: selected.fill };
 	}
 	// The backend declared the exact command to run — classify it (the backend

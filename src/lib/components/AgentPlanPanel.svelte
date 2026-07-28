@@ -181,11 +181,13 @@ function statusIcon(status: StepStatus): string {
 	}
 
 	.step.dangerous {
-		border-color: #664400;
+		/* Dimmed amber: present enough to flag the row, not so loud it competes
+		   with the confirm button. Derived from the token so it tracks the theme. */
+		border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
 	}
 
 	.step.caution {
-		border-color: #4a4020;
+		border-color: color-mix(in srgb, var(--warning-muted) 30%, var(--border));
 	}
 
 	.step-line {
@@ -250,11 +252,11 @@ function statusIcon(status: StepStatus): string {
 	}
 
 	.step-label.dangerous {
-		color: #ffaa00;
+		color: var(--warning);
 	}
 
 	.step-label.caution {
-		color: #d0b060;
+		color: var(--warning-muted);
 	}
 
 	.risk-badge {
@@ -263,18 +265,18 @@ function statusIcon(status: StepStatus): string {
 	}
 
 	.risk-badge.high {
-		color: #ffaa00;
+		color: var(--warning);
 	}
 
 	.risk-badge.medium {
-		color: #d0b060;
+		color: var(--warning-muted);
 	}
 
 	.plan-warning {
 		font-size: 11px;
-		color: #d0b060;
-		background: rgba(208, 176, 96, 0.08);
-		border: 1px solid rgba(208, 176, 96, 0.25);
+		color: var(--warning-muted);
+		background: color-mix(in srgb, var(--warning-muted) 8%, transparent);
+		border: 1px solid color-mix(in srgb, var(--warning-muted) 25%, transparent);
 		border-radius: 4px;
 		padding: 6px 8px;
 		margin-top: 10px;

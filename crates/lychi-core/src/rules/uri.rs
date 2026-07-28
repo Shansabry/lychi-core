@@ -1,7 +1,7 @@
 //! Central URI-scheme decider — the single authority for "may we hand this URI
 //! to the desktop to open?". Mirrors the shell decider (`rules::shell::authorize`):
 //! every place that opens a URI (`platform::open_uri`, and thus every `navigate`
-//! result — web/yt/bang/bookmarks/url/file-open) funnels through `authorize_uri`,
+//! result — web/yt/quicklink/bookmarks/url/file-open) funnels through `authorize_uri`,
 //! so a dangerous scheme cannot slip in from any one source.
 //!
 //! The motivating case: browser bookmarks commonly hold `javascript:` bookmarklets

@@ -41,6 +41,18 @@ pub struct GeneralConfig {
     /// monochrome accent. Drives the `--accent` CSS variable. Part of the small
     /// theming engine — see `src/lib/theme.ts`.
     pub accent: String,
+    /// The app's font family, e.g. "Inter" or "JetBrains Mono". Empty = the
+    /// built-in stack, which starts at `system-ui` and follows the desktop.
+    ///
+    /// ONE font drives the whole interface. Command *output* is the deliberate
+    /// exception: it stays fixed-width regardless, because `git status` and
+    /// `ls -la` lose their columns in a proportional face. So this is a single
+    /// user-facing choice, not two.
+    ///
+    /// Prepended to the CSS stack rather than replacing it, so a font that is
+    /// later uninstalled degrades to the same fallbacks instead of to nothing.
+    #[serde(default)]
+    pub font_family: String,
     pub hotkey: String,
     pub window_x: Option<i32>,
     pub window_y: Option<i32>,
@@ -60,6 +72,7 @@ impl Default for GeneralConfig {
             show_duration_ms: true,
             theme: "dark".to_string(),
             accent: String::new(),
+            font_family: String::new(),
             hotkey: "Super+Space".to_string(),
             window_x: None,
             window_y: None,
@@ -95,7 +108,30 @@ pub struct CommandsConfig {
     /// `gh tokio` open a GitHub search. Fully user-extensible — the core of a
     /// no-code "ecosystem". Ships with a few sensible defaults; user entries in
     /// config.toml override/extend them.
+    ///
+    /// **Superseded by [`Self::quicklinks`]**, which can also produce shell
+    /// commands, opened paths, and Lychi commands. Kept because it is what
+    /// sits in every existing user's config.toml — entries here are merged in
+    /// as URL quicklinks at load time (see [`crate::quicklinks::migrate`]).
+    /// New entries should be written as `[[commands.quicklinks]]`.
     pub search_engines: std::collections::HashMap<String, String>,
+    /// User-defined parameterized commands. Each has a keyword, a `kind`
+    /// (url/shell/open/command) saying what its expansion IS, and a template
+    /// with `{named}` placeholders:
+    ///
+    /// ```toml
+    /// [[commands.quicklinks]]
+    /// keyword  = "co"
+    /// name     = "Git checkout"
+    /// kind     = "shell"
+    /// template = "git checkout {branch}"
+    /// ```
+    ///
+    /// `kind` is stored rather than guessed from the template, because it
+    /// selects which permission decider authorizes the expansion — see
+    /// [`crate::quicklinks`].
+    #[serde(default)]
+    pub quicklinks: Vec<crate::quicklinks::Quicklink>,
 }
 
 /// Sensible built-in search shortcuts. Users add their own in config.toml.
@@ -125,11 +161,67 @@ impl Default for CommandsConfig {
             extra_ides: Vec::new(),
             terminal_routing: "manual".to_string(),
             search_engines: default_search_engines(),
+            // Empty by default: the built-in shortcuts live in
+            // `search_engines` and are merged in as URL quicklinks at load
+            // time, so they aren't duplicated across both fields.
+            quicklinks: Vec::new(),
         }
     }
 }
 
 impl CommandsConfig {
+    /// The effective quicklink list: explicit `[[commands.quicklinks]]` entries
+    /// plus any legacy `search_engines` entry that doesn't already have a
+    /// new-form counterpart.
+    ///
+    /// This is the ONE place the two shapes are reconciled. Everything
+    /// downstream (the router, the handler, Settings) reads this rather than
+    /// either field directly, so no caller has to know the legacy form exists.
+    pub fn resolved_quicklinks(&self) -> Vec<crate::quicklinks::Quicklink> {
+        crate::quicklinks::migrate::merge(self.quicklinks.clone(), &self.search_engines)
+    }
+
+    /// Validate every quicklink, returning the first error found. Used on the
+    /// save path so a bad entry is rejected up front with a message the UI can
+    /// surface rather than being silently dropped.
+    pub fn validate_quicklinks(&self, is_reserved: &dyn Fn(&str) -> bool) -> Result<(), String> {
+        if self.quicklinks.len() > crate::quicklinks::MAX_QUICKLINKS {
+            return Err(format!(
+                "Too many quicklinks (max {})",
+                crate::quicklinks::MAX_QUICKLINKS
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for link in &self.quicklinks {
+            if let Some(err) = link.validation_error(is_reserved) {
+                return Err(err);
+            }
+            let key = crate::quicklinks::Quicklink::normalize_keyword(&link.keyword);
+            if !seen.insert(key.clone()) {
+                return Err(format!("Duplicate quicklink keyword: \"{key}\""));
+            }
+        }
+        self.validate_search_engines(is_reserved)
+    }
+
+    /// Drop any quicklink that fails validation. Used on the load path so a
+    /// hand-edited config with one bad entry degrades gracefully instead of
+    /// failing to load. Returns the keywords removed, for logging.
+    pub fn sanitize_quicklinks(&mut self, is_reserved: &dyn Fn(&str) -> bool) -> Vec<String> {
+        let mut removed = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        self.quicklinks.retain(|link| {
+            let key = crate::quicklinks::Quicklink::normalize_keyword(&link.keyword);
+            let bad = link.validation_error(is_reserved).is_some() || !seen.insert(key.clone());
+            if bad {
+                removed.push(key);
+            }
+            !bad
+        });
+        removed.extend(self.sanitize_search_engines(is_reserved));
+        removed
+    }
+
     /// Normalize a would-be search-engine keyword: trimmed, lowercased.
     /// Bang keywords are matched case-insensitively at the router, so we store
     /// them canonically to keep collision checks and lookups consistent.

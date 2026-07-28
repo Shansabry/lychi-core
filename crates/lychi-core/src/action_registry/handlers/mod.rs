@@ -1,7 +1,6 @@
 pub mod aliases;
 pub mod app_control;
 pub mod app_launcher;
-pub mod bang;
 pub mod bookmarks;
 pub mod browse;
 pub mod calc;
@@ -26,6 +25,7 @@ pub mod packages;
 pub mod pin_workspace;
 pub mod project_open;
 pub mod qr;
+pub mod quicklink;
 pub mod reminders;
 pub mod resize_image;
 pub mod screenshot;

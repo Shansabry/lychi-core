@@ -123,12 +123,18 @@ pub struct Executor {
     /// extracted into its own collaborator so the Executor doesn't carry the
     /// ad-hoc mutexes inline. The Executor still owns the policy (what to record).
     suggestions: SuggestionTracker,
-    /// Lowercased custom search-engine ("bang") keywords, so the router can send
-    /// `gh tokio` to the `bang` handler. Set from config after construction.
-    bang_keywords: Vec<String>,
+    /// The user's quicklinks, so the router can send `gh tokio` to the right
+    /// place. Set from config after construction.
+    ///
+    /// The full records are held (not just keywords) because routing depends on
+    /// each link's `kind`: a shell quicklink must be dispatched to `run` so it
+    /// meets the shell gate, while a URL one is handled by the quicklink
+    /// handler itself. Same side-channel pattern as `script_keywords` — these
+    /// are runtime-defined, and `triggers()` is `'static`.
+    quicklinks: Vec<crate::quicklinks::Quicklink>,
     /// Lowercased Script Command keywords (from `~/.config/lychi/scripts/`), so
     /// the router can send `deploy prod` to the `script` handler. Rebuilt by the
-    /// scripts fs-watcher. Same side-channel pattern as `bang_keywords` (can't use
+    /// scripts fs-watcher. Same side-channel pattern as `quicklinks` (can't use
     /// `triggers()` — those are `'static`, these are runtime-discovered).
     script_keywords: Vec<String>,
     /// Execution-concurrency policy (G4): enforces each handler's `ExecutionMode`
@@ -154,30 +160,70 @@ impl Executor {
             db,
             context: None,
             suggestions: SuggestionTracker::new(),
-            bang_keywords: Vec::new(),
+            quicklinks: Vec::new(),
             script_keywords: Vec::new(),
             gate: ConcurrencyGate::new(),
         }
     }
 
-    /// Register the configured custom-search-engine keywords (lowercased) so the
-    /// router can recognise `gh tokio` and route it to the `bang` handler.
-    pub fn set_bang_keywords(&mut self, keywords: Vec<String>) {
-        self.bang_keywords = keywords.into_iter().map(|k| k.to_lowercase()).collect();
+    /// Register the user's quicklinks so the router can recognise `gh tokio`.
+    pub fn set_quicklinks(&mut self, links: Vec<crate::quicklinks::Quicklink>) {
+        self.quicklinks = links;
     }
 
-    /// If `input`'s first word is a configured bang keyword AND there's a query
-    /// after it, return `(keyword, full_args)` for routing to the `bang` handler.
-    fn bang_route(&self, input: &str) -> Option<String> {
+    /// Number of registered quicklinks (for logging).
+    pub fn quicklink_count(&self) -> usize {
+        self.quicklinks.len()
+    }
+
+    /// Resolve `input` to `(action_id, args)` when it starts with a quicklink
+    /// keyword.
+    ///
+    /// The dispatch target depends on the quicklink's `kind`, and that is the
+    /// whole point: a `Shell` quicklink resolves to the `run` action carrying
+    /// its EXPANDED command, so it travels the same path as a typed `run` —
+    /// Rules Engine, then `shell_exec`'s spawn-point gate. Routing every kind
+    /// to the quicklink handler would have made that handler a second spawn
+    /// point, which is the bypass shape the security audit found twice.
+    ///
+    /// Returns `None` for a bare keyword with no input, letting normal routing
+    /// handle it (so a quicklink keyword that is also an app name still opens
+    /// the app when typed alone).
+    fn quicklink_route(&self, input: &str) -> Option<(String, String)> {
         let trimmed = input.trim();
-        let (first, rest) = trimmed.split_once(char::is_whitespace)?;
-        if rest.trim().is_empty() {
-            return None; // bare keyword, no query — let normal routing handle it
+        let (first, rest) = match trimmed.split_once(char::is_whitespace) {
+            Some((k, r)) => (k, r.trim()),
+            // A bare keyword with no input after it.
+            None => (trimmed, ""),
+        };
+        let link = self
+            .quicklinks
+            .iter()
+            .find(|q| q.keyword.eq_ignore_ascii_case(first))?;
+
+        // A quicklink whose template has no placeholder is a complete action by
+        // itself — `ghvs` opening a fixed URL needs no input, so requiring some
+        // would make it unreachable. One that DOES take a placeholder still
+        // falls through when typed bare, so the keyword can also match an app or
+        // a command until the user actually supplies input.
+        if rest.is_empty() && !crate::quicklinks::placeholders_in(&link.template).is_empty() {
+            return None;
         }
-        let first_l = first.to_lowercase();
-        self.bang_keywords
-            .contains(&first_l)
-            .then(|| trimmed.to_string())
+        let handler = crate::action_registry::handlers::quicklink::QuicklinkHandler::new(
+            self.quicklinks.clone(),
+        );
+        handler.resolve_route(trimmed)
+    }
+
+    /// If `input` is a `Command`-kind quicklink, the Lychi command it expands
+    /// to. Applied BEFORE resolution so the expansion is routed as if the user
+    /// had typed it — meaning the target command's own gate applies, and no
+    /// second dispatcher is introduced here.
+    fn quicklink_rewrite(&self, input: &str) -> Option<String> {
+        match self.quicklink_route(input) {
+            Some((action, args)) if action == "__reroute__" => Some(args),
+            _ => None,
+        }
     }
 
     /// Register the discovered Script Command keywords (lowercased) so the router
@@ -192,7 +238,7 @@ impl Executor {
     }
 
     /// If `input`'s first word is a discovered Script Command keyword, return the
-    /// full input for routing to the `script` handler. Unlike bangs, a BARE
+    /// full input for routing to the `script` handler. Unlike quicklinks, a BARE
     /// keyword (no args) is valid — many scripts take no arguments.
     fn script_route(&self, input: &str) -> Option<String> {
         let trimmed = input.trim();
@@ -418,8 +464,15 @@ impl Executor {
         let Some(resolved) = crate::context::multi_repo::resolve_run_targets(command, &rctx) else {
             return Vec::new();
         };
+        // One unambiguous target: still show a row, so a typed shell command is
+        // visibly runnable and names where it will run. Returning nothing here
+        // meant `git status` in a single repo produced only Ask-AI/Search-web —
+        // the command was executable but nothing said so.
         if resolved.mode != TargetMode::Pick {
-            return Vec::new(); // single target → runs directly, no picker
+            return match resolved.candidates.first() {
+                Some(target) => vec![single_target_row(command, target)],
+                None => Vec::new(),
+            };
         }
 
         // A trailing token narrows the repo rows (`pnpm dev ap` → repos matching
@@ -602,11 +655,18 @@ impl Executor {
             .and_then(|ctx| resolve_with_clipboard(input, ctx))
             .unwrap_or_else(|| input.to_string());
 
+        // A `command`-kind quicklink expands to another Lychi command; rewrite
+        // the input here so it resolves exactly as if the user had typed it,
+        // and the target command's own gate applies.
+        let effective_input = self
+            .quicklink_rewrite(&effective_input)
+            .unwrap_or(effective_input);
+
         // A pre-resolved intent (confirmation re-run) is used verbatim — no
         // re-resolution, so the confirmed action is exactly what was assessed.
-        // Otherwise resolve fresh. Priority: user Script Commands, then bang
-        // shortcuts, then the general resolver. Scripts are the user's own named
-        // commands (highest intent), so they win over app/web fallbacks.
+        // Otherwise resolve fresh. Priority: user Script Commands, then
+        // quicklinks, then the general resolver. Scripts are the user's own
+        // named commands (highest intent), so they win over app/web fallbacks.
         let mut intent = if let Some(intent) = preresolved {
             intent
         } else if let Some(full) = self.script_route(&effective_input) {
@@ -615,10 +675,10 @@ impl Executor {
                 args: full,
                 routing: crate::intent::RoutingMethod::Explicit,
             }
-        } else if let Some(full) = self.bang_route(&effective_input) {
+        } else if let Some((action_id, args)) = self.quicklink_route(&effective_input) {
             crate::intent::ResolvedIntent {
-                action_id: "bang".to_string(),
-                args: full,
+                action_id,
+                args,
                 routing: crate::intent::RoutingMethod::Explicit,
             }
         } else {
@@ -859,18 +919,39 @@ impl Executor {
             }
         }
 
-        // Custom search-engine shortcut preview: `gh tok` → a top row that opens
-        // the configured search. Shown ahead of everything else so a configured
-        // bang always leads once a query follows the keyword.
-        if let Some(full) = self.bang_route(raw) {
-            let (kw, query) = full
-                .split_once(char::is_whitespace)
-                .map(|(k, q)| (k, q.trim()))
-                .unwrap_or((full.as_str(), ""));
+        // Quicklink preview: `gh tok` → a top row showing what will happen.
+        // Shown ahead of everything else so a configured quicklink always leads
+        // once input follows the keyword.
+        //
+        // The row previews the EXPANDED result rather than echoing the typed
+        // text, so a shell quicklink shows the actual command before it runs —
+        // the user sees what they are about to approve.
+        // `quicklink_route` is the single decider for "is this a quicklink, and
+        // what does it expand to" — asking it (rather than re-deriving the
+        // keyword here) keeps the preview and the execution in agreement,
+        // including about when a bare keyword counts.
+        if let Some((_, expanded)) = self.quicklink_route(raw)
+            && let Some(keyword) = raw.trim().split_whitespace().next()
+            && let Some(link) = self
+                .quicklinks
+                .iter()
+                .find(|q| q.keyword.eq_ignore_ascii_case(keyword))
+        {
+            use crate::quicklinks::QuicklinkKind;
+            let (icon, verb) = match link.kind {
+                QuicklinkKind::Url => ("__web__", "Open"),
+                QuicklinkKind::Shell => ("__terminal__", "Run"),
+                QuicklinkKind::Open => ("__file__", "Open"),
+                QuicklinkKind::Command => ("__command__", "Run"),
+            };
             return vec![
-                CompletionItem::new(format!("Search {kw}: {query}"), Some("__web__".into()), 200)
-                    .with_run(full.clone())
-                    .with_description("Enter to open"),
+                CompletionItem::new(
+                    format!("{verb} {}: {expanded}", link.display_name()),
+                    Some(icon.into()),
+                    200,
+                )
+                .with_run(raw.trim().to_string())
+                .with_description("Enter to run"),
             ];
         }
 
@@ -1061,7 +1142,7 @@ impl Executor {
 
     /// Classify a raw input string into a [`RouteDecision`] — the SINGLE source of
     /// truth the frontend actuates on Enter. Folds the executor-owned side-channels
-    /// (user Script Commands, bang shortcuts) BEFORE the general classifier, in the
+    /// (user Script Commands, quicklinks) BEFORE the general classifier, in the
     /// same priority order `run_inner` dispatches them, so a script/bang keyword
     /// classifies as a `Command` the frontend runs verbatim. Everything else
     /// delegates to [`crate::intent::classify::classify_string`] (the one place
@@ -1077,9 +1158,9 @@ impl Executor {
             };
         }
 
-        // User Script Commands and bang shortcuts win over the general router
+        // User Script Commands and quicklinks win over the general router
         // (highest intent), exactly as in `run_inner`. Both run verbatim.
-        if self.script_route(trimmed).is_some() || self.bang_route(trimmed).is_some() {
+        if self.script_route(trimmed).is_some() || self.quicklink_route(trimmed).is_some() {
             return RouteDecision::Command {
                 command: trimmed.to_string(),
             };
@@ -1211,12 +1292,15 @@ fn fanout_command(cmd: &str, dirs: &[String]) -> String {
             .unwrap_or(dir);
         let header = shell_single_quote(&format!("=== {name} ==="));
         let qdir = shell_single_quote(dir);
-        let fail = shell_single_quote(&format!("\u{2717} {name}: failed"));
-        // The subshell's exit status drives a per-repo failure marker, so a
-        // `git pull` across several repos shows which ones failed at a glance.
-        out.push_str(&format!(
-            "echo {header}; (cd {qdir} && {cmd}) || echo {fail}; echo ''"
-        ));
+        // Deliberately no `|| echo failed` marker. It read nicely, but `||`
+        // contains `|`, which the shell decider flags as a pipe — so EVERY
+        // fan-out prompted for confirmation, including a read-only `git
+        // status`, for an operator the app itself injected. Generating syntax
+        // that trips our own gate trains the user to click through prompts.
+        //
+        // Failures are still visible: each repo prints its own header, and the
+        // command's own stderr appears beneath it.
+        out.push_str(&format!("echo {header}; (cd {qdir} && {cmd}); echo ''"));
     }
     out
 }
@@ -1279,6 +1363,20 @@ fn fuzzy_contains(hay: &str, needle: &str) -> bool {
 /// Build a "run `<cmd>` in `<repo>`" completion row. The `run` field carries the
 /// exact chosen directory via the `@@` sigil so execution is unambiguous, and a
 /// `fill` extends the input toward the repo name for tab-completion.
+/// The row for a command with exactly ONE target.
+///
+/// Reads as the command itself — there is no choice to present, so naming the
+/// repo in the title would be noise. The directory goes in the description, so
+/// it is still obvious where the command lands.
+fn single_target_row(
+    command: &str,
+    target: &crate::context::multi_repo::RunTarget,
+) -> CompletionItem {
+    CompletionItem::new(command.to_string(), Some("__terminal__".into()), 150)
+        .with_run(format!("run {command}"))
+        .with_description(format!("Run in {}", target.name))
+}
+
 fn repo_row(
     command: &str,
     target: &crate::context::multi_repo::RunTarget,
@@ -1432,6 +1530,68 @@ fn resolve_routing_target(
     // Auto mode: fall back to any recent terminal
     let (win, src) = crate::context::window_stack::find_recent_terminal(focused);
     win.map(|w| (w, src))
+}
+
+#[cfg(test)]
+mod run_row_tests {
+    use super::*;
+    use crate::context::multi_repo::RunTarget;
+
+    fn target(name: &str) -> RunTarget {
+        RunTarget {
+            dir: format!("/home/u/ws/{name}"),
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_single_target_command_still_gets_a_row() {
+        // The reported bug, twice: typing `git status` in a single repo showed
+        // only Ask-AI / Search-web. The command was perfectly runnable, but
+        // nothing in the list said so, so there was nothing to press Enter on.
+        let row = single_target_row("git status", &target("api"));
+        assert_eq!(row.label, "git status");
+        assert_eq!(row.run.as_deref(), Some("run git status"));
+    }
+
+    #[test]
+    fn a_single_target_row_says_where_it_runs() {
+        // No choice to present, so the repo belongs in the description rather
+        // than cluttering the title.
+        let row = single_target_row("git status", &target("api"));
+        assert!(
+            row.description.as_deref().unwrap_or("").contains("api"),
+            "description must name the target: {:?}",
+            row.description
+        );
+        assert!(!row.label.contains("api"), "title must stay clean");
+    }
+
+    #[test]
+    fn a_multi_target_row_names_its_repo_in_the_title() {
+        // Here the repo IS the distinguishing information — three rows differ
+        // only by target, so the title has to carry it.
+        let row = repo_row("git status", &target("admin"), 120);
+        assert!(row.label.contains("admin"), "got {}", row.label);
+        assert!(
+            row.run.as_deref().unwrap_or("").contains("@@"),
+            "multi-target row must pin its directory: {:?}",
+            row.run
+        );
+    }
+
+    #[test]
+    fn every_run_row_carries_an_executable_command() {
+        // A row with no `run` falls back to executing its label, which for a
+        // pinned row would drop the directory and run in the wrong place.
+        for row in [
+            single_target_row("ls -la", &target("api")),
+            repo_row("ls -la", &target("api"), 100),
+        ] {
+            let run = row.run.as_deref().unwrap_or("");
+            assert!(run.starts_with("run "), "not executable: {run:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1926,6 +2086,81 @@ mod tests {
             HistoryStore::new(500, true),
             crate::db::open_test_database(),
         )
+    }
+
+    // --- Quicklink routing ---
+
+    fn quicklink(
+        keyword: &str,
+        kind: crate::quicklinks::QuicklinkKind,
+        template: &str,
+    ) -> crate::quicklinks::Quicklink {
+        crate::quicklinks::Quicklink {
+            keyword: keyword.to_string(),
+            name: String::new(),
+            kind,
+            template: template.to_string(),
+        }
+    }
+
+    fn executor_with_quicklinks() -> Executor {
+        use crate::quicklinks::QuicklinkKind;
+        let mut ex = make_executor(registry_web_only());
+        ex.set_quicklinks(vec![
+            // No placeholder — a complete action on its own.
+            quicklink(
+                "ghvs",
+                QuicklinkKind::Url,
+                "https://github.com/ValariSolutions",
+            ),
+            // Takes input.
+            quicklink(
+                "gh",
+                QuicklinkKind::Url,
+                "https://github.com/search?q={query}",
+            ),
+        ]);
+        ex
+    }
+
+    #[test]
+    fn a_placeholderless_quicklink_runs_from_the_bare_keyword() {
+        // The reported bug: `ghvs` alone did nothing, because routing inherited
+        // the bang rule of "keyword must be followed by a query". A quicklink
+        // with no placeholder needs no input, so requiring some made it
+        // unreachable.
+        let ex = executor_with_quicklinks();
+        let (action, args) = ex.quicklink_route("ghvs").expect("bare keyword must route");
+        assert_eq!(action, "quicklink");
+        assert_eq!(args, "ghvs");
+    }
+
+    #[test]
+    fn a_placeholderless_quicklink_routes_with_trailing_whitespace() {
+        let ex = executor_with_quicklinks();
+        assert!(ex.quicklink_route("ghvs  ").is_some());
+    }
+
+    #[test]
+    fn a_parameterized_quicklink_still_falls_through_when_typed_bare() {
+        // `gh` alone should stay available to app-launch/search, since the
+        // quicklink can't do anything useful without input.
+        let ex = executor_with_quicklinks();
+        assert!(ex.quicklink_route("gh").is_none());
+    }
+
+    #[test]
+    fn a_parameterized_quicklink_routes_once_input_arrives() {
+        let ex = executor_with_quicklinks();
+        let (_, args) = ex.quicklink_route("gh tokio").expect("should route");
+        assert_eq!(args, "gh tokio");
+    }
+
+    #[test]
+    fn an_unconfigured_keyword_never_routes() {
+        let ex = executor_with_quicklinks();
+        assert!(ex.quicklink_route("nope").is_none());
+        assert!(ex.quicklink_route("nope input").is_none());
     }
 
     /// Registry with only a "web" stub (no "open" handler)
@@ -2434,8 +2669,38 @@ mod tests {
         let out = super::fanout_command("git status", &dirs);
         // The dir is safely quoted (no raw apostrophe breaking the cd).
         assert!(out.contains("cd '/home/sab/sab'\\''s-project'"));
-        // Per-repo failure marker present.
-        assert!(out.contains("|| echo"));
-        assert!(out.contains("failed"));
+    }
+
+    #[test]
+    fn a_fanout_command_does_not_trip_our_own_shell_gate() {
+        // The generated wrapper used `|| echo failed` as a per-repo failure
+        // marker. `||` contains `|`, which the shell decider flags as a pipe —
+        // so every fan-out asked for confirmation, including a read-only `git
+        // status`, for an operator the app injected itself. Prompting the user
+        // about our own syntax trains them to click through prompts.
+        let dirs = vec!["/home/u/ws/api".to_string(), "/home/u/ws/admin".to_string()];
+        let out = super::fanout_command("git status", &dirs);
+        assert!(!out.contains('|'), "fan-out must not emit a pipe: {out}");
+        assert!(
+            !out.contains('>'),
+            "fan-out must not emit a redirect: {out}"
+        );
+        assert!(
+            matches!(
+                crate::rules::shell::authorize(&out),
+                crate::rules::shell::ShellDecision::Allow
+            ),
+            "a read-only fan-out must not need confirmation: {out}"
+        );
+    }
+
+    #[test]
+    fn a_fanout_still_labels_each_repo() {
+        // Dropping the failure marker must not cost the per-repo headers —
+        // without them the combined output is an unattributed wall of text.
+        let dirs = vec!["/home/u/ws/api".to_string(), "/home/u/ws/admin".to_string()];
+        let out = super::fanout_command("git status", &dirs);
+        assert!(out.contains("=== api ==="), "missing header: {out}");
+        assert!(out.contains("=== admin ==="), "missing header: {out}");
     }
 }

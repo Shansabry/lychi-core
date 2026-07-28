@@ -14,7 +14,11 @@ function handleThemeChange(e: Event) {
 
 onMount(() => {
 	getGeneralConfig().then((config) => {
-		applyTheme({ mode: (config.theme as ThemeMode) ?? "dark", accent: config.accent ?? "" });
+		applyTheme({
+			mode: (config.theme as ThemeMode) ?? "dark",
+			accent: config.accent ?? "",
+			fontFamily: config.font_family ?? "",
+		});
 	});
 
 	window.addEventListener("lychi-theme-change", handleThemeChange);

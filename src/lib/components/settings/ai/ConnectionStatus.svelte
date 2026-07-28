@@ -84,8 +84,8 @@ let {
 		align-items: center;
 		gap: 7px;
 		background: color-mix(in srgb, var(--bg-secondary) 60%, var(--bg));
-		color: var(--ai);
-		border: 1px solid color-mix(in srgb, var(--ai) 35%, transparent);
+		color: var(--accent);
+		border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
 		border-radius: 7px;
 		padding: 5px 11px;
 		font-family: var(--font-mono);
@@ -93,7 +93,7 @@ let {
 		cursor: pointer;
 	}
 	.test-btn:hover:not(:disabled) {
-		border-color: color-mix(in srgb, var(--ai) 55%, transparent);
+		border-color: color-mix(in srgb, var(--accent) 55%, transparent);
 	}
 	.test-btn:disabled {
 		opacity: 0.5;

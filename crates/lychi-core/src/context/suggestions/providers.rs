@@ -6,15 +6,15 @@ use std::sync::Arc;
 use redb::Database;
 
 use crate::action_registry::CompletionItem;
+use crate::context::EnvironmentContext;
 use crate::context::clipboard_detect::ClipboardContentType;
-use crate::context::{EnvironmentContext, ProjectKind};
 use crate::db::frecency;
 
 use super::SuggestionReason;
 
 /// A proposed suggestion: a concrete, honest command plus provenance.
 pub struct Candidate {
-    /// Exactly what lands in the input / executes on Enter.
+    /// Exactly what executes on Enter.
     pub command: String,
     /// Human explanation of what the command does.
     pub description: String,
@@ -40,12 +40,17 @@ impl Candidate {
 
     pub fn into_completion_item(self) -> CompletionItem {
         CompletionItem {
-            label: self.command,
+            label: self.command.clone(),
             icon_path: Some("__context__".to_string()),
             score: self.relevance,
             description: Some(self.description),
             reason: Some(self.reason.user_reason()),
             thumb_b64: None,
+            // `run` carries the REAL command. Without it the row falls back to
+            // executing its label, which for a scoped git row would drop the
+            // `-C` and run in whatever directory the shell resolves — the exact
+            // wrong-repo failure the scoping exists to prevent.
+            run: Some(self.command),
             ..Default::default()
         }
     }
@@ -102,11 +107,22 @@ pub fn providers() -> &'static [Box<dyn SuggestionProvider>] {
     static PROVIDERS: std::sync::OnceLock<Vec<Box<dyn SuggestionProvider>>> =
         std::sync::OnceLock::new();
     PROVIDERS.get_or_init(|| {
+        // Git, project and docker verb-guessing used to live here. They
+        // proposed commands from a hardcoded verb list — `git pull`, `npm
+        // install`, `docker ps` — whether or not the user wanted them, which
+        // buried real results under speculation and still missed whatever was
+        // actually being typed.
+        //
+        // What remains never invents a command:
+        //   - clipboard  — acts on what IS on the clipboard right now
+        //   - navigation — facts about the current workspace (open root, unpin)
+        //   - memory     — commands the user actually ran here before
+        //
+        // Commands the user types are resolved to a target by
+        // `Executor::multi_repo_rows`, which offers one row per repo. The
+        // command is theirs; only the target needs picking.
         vec![
             Box::new(ClipboardProvider),
-            Box::new(GitProvider),
-            Box::new(ProjectProvider),
-            Box::new(DockerProvider),
             Box::new(NavigationProvider),
             Box::new(MemoryProvider),
         ]
@@ -192,198 +208,6 @@ impl SuggestionProvider for ClipboardProvider {
             // UUID / Plain / non-git hash: no useful action
             _ => Vec::new(),
         }
-    }
-}
-
-// ── Git ─────────────────────────────────────────────────────────────────
-
-struct GitProvider;
-
-impl SuggestionProvider for GitProvider {
-    fn id(&self) -> &'static str {
-        "git"
-    }
-    fn keywords(&self) -> &'static [&'static str] {
-        &[
-            "commit", "branch", "stash", "diff", "status", "push", "pull",
-        ]
-    }
-
-    fn suggest(&self, ctx: &SuggestCtx) -> Vec<Candidate> {
-        let Some(ref git) = ctx.env.git else {
-            return Vec::new();
-        };
-        let feature_branch = match git.branch.as_str() {
-            "main" | "master" | "develop" => None,
-            b => Some(b.to_string()),
-        };
-        let reason = |fallback: SuggestionReason| match &feature_branch {
-            Some(branch) => SuggestionReason::GitFeatureBranch {
-                branch: branch.clone(),
-            },
-            None => fallback,
-        };
-
-        if git.dirty {
-            [
-                ("git commit", "Commit staged changes", 100u16),
-                ("git diff", "View uncommitted changes", 95),
-                ("git status", "Show working tree status", 88),
-                ("git stash", "Stash current changes", 85),
-            ]
-            .into_iter()
-            .map(|(cmd, desc, score)| {
-                Candidate::new(cmd, desc, score, reason(SuggestionReason::GitDirty))
-            })
-            .collect()
-        } else {
-            [
-                ("git pull", "Pull latest changes", 100u16),
-                ("git push", "Push commits to remote", 95),
-            ]
-            .into_iter()
-            .map(|(cmd, desc, score)| {
-                Candidate::new(cmd, desc, score, reason(SuggestionReason::GitClean))
-            })
-            .collect()
-        }
-    }
-}
-
-// ── Project (install + scripts + workspace scripts) ────────────────────
-
-struct ProjectProvider;
-
-impl SuggestionProvider for ProjectProvider {
-    fn id(&self) -> &'static str {
-        "project"
-    }
-    fn keywords(&self) -> &'static [&'static str] {
-        &[
-            "deps",
-            "dependencies",
-            "packages",
-            "install",
-            "build",
-            "dev",
-            "test",
-            "script",
-        ]
-    }
-
-    fn suggest(&self, ctx: &SuggestCtx) -> Vec<Candidate> {
-        let Some(ref project) = ctx.env.project else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-
-        if project.kind == ProjectKind::Node {
-            let pm = project.package_manager.as_deref().unwrap_or("npm");
-            out.push(Candidate::new(
-                format!("run {pm} install"),
-                "Install dependencies",
-                86,
-                SuggestionReason::ProjectInstall { pm: pm.into() },
-            ));
-        }
-
-        for (i, script) in project.scripts.iter().enumerate() {
-            let command = if script.name.is_empty() {
-                format!("run {}", script.runner)
-            } else {
-                format!("run {} {}", script.runner, script.name)
-            };
-            out.push(Candidate::new(
-                command,
-                format!("Run {} {}", script.runner, script.name),
-                90u16.saturating_sub(i as u16).max(84),
-                SuggestionReason::ProjectScript {
-                    runner: script.runner.clone(),
-                },
-            ));
-        }
-
-        for (i, script) in project.workspace_scripts.iter().enumerate() {
-            let base = if script.name.is_empty() {
-                format!("run {}", script.runner)
-            } else {
-                format!("run {} {}", script.runner, script.name)
-            };
-            out.push(Candidate::new(
-                format!("{base} (workspace)"),
-                format!("Run {} {} at workspace root", script.runner, script.name),
-                82u16.saturating_sub(i as u16).max(70),
-                SuggestionReason::ProjectScript {
-                    runner: format!("{} (workspace)", script.runner),
-                },
-            ));
-        }
-
-        out
-    }
-}
-
-// ── Docker (compose + running containers) ──────────────────────────────
-
-struct DockerProvider;
-
-impl SuggestionProvider for DockerProvider {
-    fn id(&self) -> &'static str {
-        "docker"
-    }
-    fn keywords(&self) -> &'static [&'static str] {
-        &[
-            "container",
-            "containers",
-            "image",
-            "images",
-            "compose",
-            "service",
-            "logs",
-        ]
-    }
-
-    fn suggest(&self, ctx: &SuggestCtx) -> Vec<Candidate> {
-        let mut out = Vec::new();
-
-        if ctx.env.project.as_ref().is_some_and(|p| p.has_compose) {
-            for (cmd, desc, score) in [
-                ("run docker compose up -d", "Start all services", 82u16),
-                ("run docker compose down", "Stop all services", 80),
-                ("run docker compose logs", "View service logs", 78),
-            ] {
-                out.push(Candidate::new(
-                    cmd,
-                    desc,
-                    score,
-                    SuggestionReason::DockerCompose,
-                ));
-            }
-        }
-
-        if let Some(ref docker) = ctx.env.docker
-            && !docker.containers.is_empty()
-        {
-            let reason = SuggestionReason::DockerRunning {
-                count: docker.containers.len(),
-            };
-            out.push(Candidate::new(
-                "run docker ps",
-                "List running containers",
-                77,
-                reason.clone(),
-            ));
-            if let Some(first) = docker.containers.first() {
-                out.push(Candidate::new(
-                    format!("run docker logs {}", first.name),
-                    format!("Logs for {}", first.name),
-                    76,
-                    reason,
-                ));
-            }
-        }
-
-        out
     }
 }
 

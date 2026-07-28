@@ -539,7 +539,7 @@ function formatSize(bytes: number | null | undefined): string {
 	}
 
 	.icon :global(.icon-warning) {
-		color: #e5a00d;
+		color: var(--warning);
 		opacity: 0.9;
 	}
 
@@ -548,7 +548,7 @@ function formatSize(bytes: number | null | undefined): string {
 		opacity: 0.8;
 	}
 	.icon :global(.icon-ai-chat) {
-		color: var(--ai);
+		color: var(--accent);
 	}
 
 	.icon :global(.icon-terminal) {

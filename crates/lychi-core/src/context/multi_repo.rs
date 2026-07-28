@@ -77,10 +77,26 @@ pub struct ResolvedTargets {
 pub fn resolve_run_targets(command: &str, ctx: &RunContext) -> Option<ResolvedTargets> {
     // Produce the raw candidate directories per focus.
     let (mut candidates, container) = match &ctx.focused {
-        // Terminal focused → its cwd is the single target.
+        // Terminal focused → its cwd is the target, UNLESS that cwd is a
+        // container of repos rather than a repo itself. `cd ~/workspace/amt`
+        // (holding `admin`, `api`, `web`) then typing `git status` has three
+        // possible targets, not one — the same ambiguity the IDE branch below
+        // already handles, and treating it as a single target silently ran the
+        // command in the container where there is no repo at all.
         FocusedWindow::Terminal { cwd } => {
             let dir = cwd.clone()?;
-            (vec![dir], None)
+            let dir_path = Path::new(&dir);
+            if crate::context::ide::is_project_dir(dir_path) {
+                (vec![dir], None)
+            } else {
+                let repos = crate::context::ide::enumerate_child_repos(dir_path);
+                if repos.is_empty() {
+                    // An ordinary directory: run there, as before.
+                    (vec![dir], None)
+                } else {
+                    (repos, Some(dir))
+                }
+            }
         }
         FocusedWindow::Ide { workspace_root } => {
             let root = workspace_root.as_deref()?;
@@ -288,6 +304,48 @@ mod tests {
         let r = resolve_run_targets("ls", &ctx).unwrap();
         assert_eq!(r.mode, TargetMode::AutoRun);
         assert_eq!(r.candidates[0].dir, "/tmp/somewhere");
+    }
+
+    #[test]
+    fn terminal_in_a_repo_container_gives_a_pick_list() {
+        // `cd ~/workspace/amt` (holding admin/api/web) then `git status` has
+        // three possible targets. Treating the terminal's cwd as a single
+        // target ran the command in the container itself, where there is no
+        // repo — so nothing useful happened and no picker appeared.
+        let db = crate::db::open_test_database();
+        let base = std::env::temp_dir().join(format!("lychi-term-cont-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        mkrepo(&base, "admin");
+        mkrepo(&base, "api");
+        mkrepo(&base, "web");
+
+        let ctx = RunContext {
+            focused: FocusedWindow::Terminal {
+                cwd: Some(base.to_string_lossy().into_owned()),
+            },
+            coherent_terminal_cwd: None,
+            db: &db,
+        };
+        let r = resolve_run_targets("git status", &ctx).unwrap();
+        assert_eq!(r.mode, TargetMode::Pick, "expected a repo picker");
+        assert_eq!(r.candidates.len(), 3);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn terminal_in_an_ordinary_directory_still_autoruns() {
+        // The container case must not make every directory ambiguous.
+        let db = crate::db::open_test_database();
+        let ctx = RunContext {
+            focused: FocusedWindow::Terminal {
+                cwd: Some("/tmp/plain-dir-with-no-repos".into()),
+            },
+            coherent_terminal_cwd: None,
+            db: &db,
+        };
+        let r = resolve_run_targets("ls", &ctx).unwrap();
+        assert_eq!(r.mode, TargetMode::AutoRun);
     }
 
     #[test]

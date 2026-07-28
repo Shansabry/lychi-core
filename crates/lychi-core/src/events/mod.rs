@@ -7,7 +7,7 @@
 //!
 //! The motivating case (and the first migration): saving settings used to have a
 //! command imperatively poke five subsystems (re-register the shell handler,
-//! refresh bang keywords, update IDE markers, set the pinned workspace, …). Now
+//! refresh quicklink keywords, update IDE markers, set the pinned workspace, …). Now
 //! the command emits a single `ConfigChanged` and each subsystem reacts to its
 //! own concern. The command no longer knows those subsystems exist.
 //!

@@ -51,6 +51,10 @@ const MAX_PER_PROVIDER: usize = 4;
 /// Maximum score points a fully-learned habit adds on top of the prior.
 const LEARNED_BOOST_MAX: f64 = 40.0;
 /// Cap on context matches blended into typed completions.
+///
+/// Deliberately small: context actions share the list with real handler
+/// results, and burying an app launch under speculative suggestions is the
+/// failure this cap prevents.
 const MAX_TYPED_MATCHES: usize = 2;
 
 // ── Suggestion Reason ───────────────────────────────────────────────────
@@ -577,6 +581,32 @@ mod tests {
         env
     }
 
+    /// A multi-repo workspace: `git` is None, `repos` carries the siblings.
+    /// This is the shape the model exists to represent — the container is not a
+    /// repo, so there is no single unambiguous target.
+
+    #[test]
+    fn typing_a_command_never_proposes_a_different_one() {
+        // The contract this module now holds: suggestions never invent a
+        // command the user didn't type. Git/project/docker verb-guessing used
+        // to answer "git" with `git pull`/`git push` — commands nobody asked
+        // for, which buried real results and still missed the actual intent.
+        //
+        // Where the command should RUN is a separate question, answered by
+        // `Executor::multi_repo_rows` once a command exists to place.
+        let env = dev_env();
+        for query in ["git", "git status", "npm", "docker"] {
+            let items = typed_matches(&env, None, query);
+            for item in &items {
+                let run = item.run.as_deref().unwrap_or(&item.label);
+                assert!(
+                    run.to_lowercase().contains(&query.to_lowercase()),
+                    "query {query:?} produced unrelated suggestion {run:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn zero_state_never_shows_speculative_context() {
         // Dirty git repo, terminal focused, but NO history/recents. The
@@ -643,53 +673,6 @@ mod tests {
     }
 
     #[test]
-    fn learned_boost_reorders_typed_context() {
-        let db = crate::db::open_test_database();
-        let env = dev_env(); // context_key = app:org.gnome.terminal (no project)
-        // User habitually accepts "git stash" (prior 85, below git commit's 100).
-        // Context actions are typed-gated now — assert via typed_matches("git").
-        for _ in 0..10 {
-            frecency::record_suggestion(&db, &context_key(&env), "git stash").unwrap();
-        }
-        let items = typed_matches(&env, Some(&db), "git");
-        assert_eq!(
-            items[0].label, "git stash",
-            "accepted suggestion must outrank higher static prior"
-        );
-    }
-
-    #[test]
-    fn typed_matches_filters_and_caps() {
-        let env = dev_env();
-        let matches = typed_matches(&env, None, "git");
-        assert!(!matches.is_empty());
-        assert!(matches.len() <= MAX_TYPED_MATCHES);
-        assert!(matches.iter().all(|m| m.label.contains("git")));
-        assert!(typed_matches(&env, None, "zzzz").is_empty());
-        // Below 2 chars: no blend
-        assert!(typed_matches(&env, None, "g").is_empty());
-    }
-
-    #[test]
-    fn typed_docker_surfaces_docker_actions() {
-        let mut env = dev_env();
-        env.docker = Some(super::super::DockerContext {
-            containers: vec![super::super::ContainerInfo {
-                id: "abc123".into(),
-                name: "yusbuild-db".into(),
-                image: "postgres".into(),
-                status: "running".into(),
-            }],
-        });
-        // Typing "docker" surfaces docker actions…
-        let docker = typed_matches(&env, None, "docker");
-        assert!(docker.iter().any(|m| m.label == "run docker ps"));
-        // …but typing "git" does not.
-        let git = typed_matches(&env, None, "git");
-        assert!(!git.iter().any(|m| m.label.contains("docker")));
-    }
-
-    #[test]
     fn fuzzy_subsequence_matches_in_order() {
         assert!(fuzzy_subsequence("cont", "container"));
         assert!(fuzzy_subsequence("dpnd", "dependencies"));
@@ -715,22 +698,5 @@ mod tests {
             workspace_scripts: vec![],
         });
         assert_eq!(workspace_root(&env).as_deref(), Some("/home/u/proj"));
-    }
-
-    #[test]
-    fn keyword_match_surfaces_context_without_literal_substring() {
-        let mut env = dev_env();
-        env.docker = Some(super::super::DockerContext {
-            containers: vec![super::super::ContainerInfo {
-                id: "abc".into(),
-                name: "db".into(),
-                image: "postgres".into(),
-                status: "running".into(),
-            }],
-        });
-        // "container" is nowhere in "run docker ps", but it's a docker keyword,
-        // so typing it still surfaces the docker action.
-        let m = typed_matches(&env, None, "container");
-        assert!(m.iter().any(|i| i.label == "run docker ps"));
     }
 }

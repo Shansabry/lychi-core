@@ -242,8 +242,8 @@ onMount(() => {
 		border-color: color-mix(in srgb, var(--fg-muted) 60%, transparent);
 	}
 	.card.active {
-		border-color: color-mix(in srgb, var(--ai) 45%, transparent);
-		background: color-mix(in srgb, var(--ai) 7%, var(--bg-secondary));
+		border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+		background: color-mix(in srgb, var(--accent) 7%, var(--bg-secondary));
 	}
 	.ic {
 		width: 34px;
@@ -257,7 +257,7 @@ onMount(() => {
 		font-size: 15px;
 	}
 	.card.active .ic {
-		color: var(--ai);
+		color: var(--accent);
 	}
 	.main {
 		flex: 1;
@@ -290,8 +290,8 @@ onMount(() => {
 		border: 1px solid var(--border);
 	}
 	.tag.active {
-		color: var(--ai);
-		border-color: color-mix(in srgb, var(--ai) 35%, transparent);
+		color: var(--accent);
+		border-color: color-mix(in srgb, var(--accent) 35%, transparent);
 	}
 	.progress {
 		height: 4px;
@@ -303,7 +303,7 @@ onMount(() => {
 	.progress i {
 		display: block;
 		height: 100%;
-		background: var(--ai);
+		background: var(--accent);
 		border-radius: 3px;
 	}
 	.btn {
@@ -321,14 +321,14 @@ onMount(() => {
 		border-color: var(--fg-muted);
 	}
 	.btn.ai {
-		color: var(--ai);
-		border-color: color-mix(in srgb, var(--ai) 35%, transparent);
+		color: var(--accent);
+		border-color: color-mix(in srgb, var(--accent) 35%, transparent);
 	}
 	.btn.ghost {
 		background: transparent;
 	}
 	.warn-gate {
-		border: 1px solid color-mix(in srgb, var(--ai) 40%, transparent);
+		border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
 		border-radius: 9px;
 		padding: 14px;
 		margin-top: 12px;

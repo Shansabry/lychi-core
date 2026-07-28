@@ -129,7 +129,7 @@ function handleBlur(e: FocusEvent) {
 		border-radius: 8px;
 		padding: 4px;
 		z-index: 100;
-		box-shadow: 0 -6px 24px rgba(0, 0, 0, 0.45);
+		box-shadow: 0 -6px 24px var(--shadow-overlay);
 		outline: none;
 	}
 

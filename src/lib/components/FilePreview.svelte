@@ -177,7 +177,7 @@ function formatRelativeTime(epoch: number): string {
 		max-height: 60vh;
 		background: var(--bg);
 		border-radius: 12px;
-		box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+		box-shadow: 0 8px 32px var(--shadow-overlay);
 		overflow: hidden;
 		display: flex;
 		flex-direction: column;
@@ -244,7 +244,8 @@ function formatRelativeTime(epoch: number): string {
 	}
 
 	.preview-content.code {
-		font-family: var(--font-mono);
+		/* Source code: fixed-width regardless of the UI font choice. */
+		font-family: var(--font-output);
 		font-size: 12px;
 		line-height: 1.5;
 		color: var(--fg);
@@ -282,7 +283,7 @@ function formatRelativeTime(epoch: number): string {
 	}
 
 	.preview-content.markdown :global(code) {
-		font-family: var(--font-mono);
+		font-family: var(--font-output);
 		font-size: 12px;
 		background: var(--bg-secondary);
 		padding: 1px 4px;

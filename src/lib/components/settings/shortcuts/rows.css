@@ -1,0 +1,202 @@
+/* Shared row/field styling for the Shortcuts views (Keys / Quicklinks /
+   Aliases).
+
+   These three views are separate components but must read as ONE settings page,
+   so the primitives live here rather than being copy-pasted into each. A
+   duplicated rule set is the visual equivalent of a duplicated decider: it
+   drifts silently, and the drift is only ever noticed by the user. */
+
+.section-label {
+	font-size: 11px;
+	color: var(--fg-muted);
+	text-transform: uppercase;
+	letter-spacing: 0.05em;
+	padding: 12px 0 4px;
+	border-top: 1px solid var(--border);
+	margin-top: 4px;
+}
+
+/* The first section in a view sits directly under the sub-tab bar, which is
+   already a divider — a second line there would read as a double rule. */
+.section-label.first {
+	border-top: none;
+	margin-top: 0;
+	padding-top: 0;
+}
+
+.field {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 6px 0;
+	gap: 12px;
+}
+
+.field-label {
+	color: var(--fg-muted);
+	font-size: 12px;
+	flex-shrink: 0;
+	width: 120px;
+}
+
+.field-error {
+	font-size: 11px;
+	color: var(--error);
+	padding: 2px 0 4px 0;
+}
+
+.field-hint {
+	font-size: 10px;
+	color: var(--fg-muted);
+	opacity: 0.7;
+	padding: 0 0 6px;
+}
+
+.field-hint code {
+	font-family: var(--font-mono);
+	background: var(--bg-secondary);
+	padding: 1px 4px;
+	border-radius: 3px;
+	user-select: all;
+}
+
+/* Empty state: shown instead of a list when nothing is configured yet. Explains
+   what the feature is FOR, since an empty list teaches nothing. */
+.empty-state {
+	font-size: 11px;
+	color: var(--fg-muted);
+	opacity: 0.75;
+	padding: 10px 0 12px;
+	line-height: 1.55;
+}
+
+.empty-state code {
+	font-family: var(--font-mono);
+	background: var(--bg-secondary);
+	padding: 1px 4px;
+	border-radius: 3px;
+}
+
+/* --- text inputs --- */
+
+.row-input {
+	background: var(--bg-secondary);
+	color: var(--fg);
+	border: 1px solid var(--border);
+	border-radius: 4px;
+	padding: 5px 8px;
+	font-family: var(--font-mono);
+	font-size: 12px;
+	outline: none;
+	min-width: 0;
+}
+
+.row-input:focus {
+	border-color: var(--fg-muted);
+}
+
+/* --- entry lists (quicklinks, aliases) --- */
+
+.entry-list {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	padding: 4px 0 8px;
+}
+
+.entry-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	min-width: 0;
+}
+
+/* The typed keyword — accented because it is the thing the user actually types
+   to invoke the entry. */
+.entry-keyword {
+	font-family: var(--font-mono);
+	font-size: 12px;
+	color: var(--accent);
+	background: var(--bg-secondary);
+	border: 1px solid var(--border);
+	border-radius: 3px;
+	padding: 2px 6px;
+	flex-shrink: 0;
+	min-width: 48px;
+	text-align: center;
+}
+
+/* What the keyword expands to. Muted and ellipsised: it can be long, and it is
+   reference information rather than the thing being scanned for. */
+.entry-value {
+	font-family: var(--font-mono);
+	font-size: 11px;
+	color: var(--fg-muted);
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.entry-icon-btn {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	background: none;
+	border: none;
+	color: var(--fg-muted);
+	cursor: pointer;
+	padding: 3px;
+	border-radius: 3px;
+	flex-shrink: 0;
+	transition:
+		color 100ms ease,
+		background 100ms ease;
+}
+
+.entry-icon-btn:hover {
+	color: var(--fg);
+	background: var(--bg-secondary);
+}
+
+.entry-icon-btn.remove:hover {
+	color: var(--error);
+}
+
+.entry-icon-btn.save,
+.entry-icon-btn.save:hover {
+	color: var(--accent);
+}
+
+.entry-add {
+	display: flex;
+	gap: 6px;
+	align-items: center;
+	padding: 2px 0 4px;
+}
+
+.kw-input {
+	flex: 0 0 80px;
+}
+
+.value-input {
+	flex: 1;
+}
+
+.add-btn {
+	background: var(--bg-secondary);
+	color: var(--accent);
+	border: 1px solid var(--border);
+	border-radius: 4px;
+	padding: 5px 12px;
+	font-family: var(--font-mono);
+	font-size: 12px;
+	cursor: pointer;
+	flex-shrink: 0;
+	transition: background 100ms ease;
+}
+
+.add-btn:hover {
+	background: var(--border);
+}

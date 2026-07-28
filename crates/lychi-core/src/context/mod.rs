@@ -53,6 +53,13 @@ pub struct EnvironmentContext {
     /// Used to launch `run` commands in the same terminal the user already uses.
     #[serde(default)]
     pub terminal_class: Option<String>,
+    /// Git state when the working directory resolves to exactly ONE repo.
+    ///
+    /// `None` in a multi-repo workspace: there is no single answer, and
+    /// inventing one would let a `git commit` target the wrong repo. Where a
+    /// typed command should run is resolved by
+    /// `multi_repo::resolve_run_targets`, which enumerates repos when asked
+    /// rather than caching a second copy of the same fact here.
     pub git: Option<GitContext>,
     pub project: Option<ProjectContext>,
     pub docker: Option<DockerContext>,

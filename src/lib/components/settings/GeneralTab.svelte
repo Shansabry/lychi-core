@@ -1,9 +1,16 @@
 <script lang="ts">
 import { Moon, Sun, X } from "lucide-svelte";
-import type { CommandsConfig, GeneralConfig, HotkeyStatus, PrivacyConfig } from "$lib/ipc";
+import type {
+	CommandsConfig,
+	FontFamily,
+	GeneralConfig,
+	HotkeyStatus,
+	PrivacyConfig,
+} from "$lib/ipc";
 import {
 	getAutostartEnabled,
 	getHotkeyStatus,
+	getInstalledFonts,
 	getInstalledTerminals,
 	recordHotkey,
 	restartApp,
@@ -146,10 +153,34 @@ async function handleWindowStrategyChange(val: string) {
 
 // Emit the full theme to the engine (in +layout.svelte) + persist. One helper
 // for both mode and accent so the applier stays centralized.
+// Installed font families, loaded once for the two pickers. Fire-and-forget:
+// enumerating shells out to fontconfig, and blocking the panel's first paint on
+// it would be a bad trade for a dropdown most users never open.
+let fontFamilies = $state<FontFamily[]>([]);
+$effect(() => {
+	getInstalledFonts()
+		.then((f) => {
+			fontFamilies = f;
+		})
+		.catch(() => {
+			// No fontconfig — the pickers stay empty and the CSS stack applies.
+		});
+});
+
+// Monospace families first: Lychi's interface is monospace-heavy by design, so
+// those are the likely picks. Both groups are offered because the choice drives
+// UI text — command output stays fixed-width either way.
+let fontOptions = $derived([
+	{ value: "", label: "System default" },
+	...fontFamilies.filter((f) => f.monospace).map((f) => ({ value: f.name, label: f.name })),
+	...fontFamilies.filter((f) => !f.monospace).map((f) => ({ value: f.name, label: f.name })),
+]);
+
 async function applyAndSaveTheme() {
 	const theme: Theme = {
 		mode: (generalConfig.theme as ThemeMode) ?? "dark",
 		accent: generalConfig.accent ?? "",
+		fontFamily: generalConfig.font_family ?? "",
 	};
 	window.dispatchEvent(new CustomEvent<Theme>("lychi-theme-change", { detail: theme }));
 	try {
@@ -167,6 +198,11 @@ async function handleThemeChange(val: string) {
 
 async function handleAccentChange(val: string) {
 	generalConfig.accent = val;
+	await applyAndSaveTheme();
+}
+
+async function handleFontChange(val: string) {
+	generalConfig.font_family = val;
 	await applyAndSaveTheme();
 }
 
@@ -288,6 +324,23 @@ async function handleTerminalChange(val: string) {
 			></button>
 		{/each}
 	</div>
+</div>
+<!-- One font for the whole interface. The list is what's actually installed
+     (via fontconfig) rather than a canned set, so every option is one this
+     machine can render, and the choice is prepended to the CSS stack so
+     uninstalling the font later degrades to the fallbacks instead of breaking. -->
+<div class="field">
+	<label for="font-family">Font</label>
+	<Select
+		id="font-family"
+		value={generalConfig.font_family ?? ""}
+		options={fontOptions}
+		onchange={handleFontChange}
+	/>
+</div>
+<div class="field-hint font-hint">
+	Applies across the app. Command output stays fixed-width whatever you pick, so
+	tables and <code>git status</code> keep their columns.
 </div>
 <div class="field">
 	<label for="autostart">Start at login</label>

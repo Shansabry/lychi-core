@@ -373,7 +373,7 @@ function handleKeydown(e: KeyboardEvent) {
 		line-height: 1.45;
 	}
 	mark {
-		background: color-mix(in srgb, var(--ai) 30%, transparent);
+		background: color-mix(in srgb, var(--accent) 30%, transparent);
 		color: var(--fg);
 		border-radius: 2px;
 		padding: 0 1px;

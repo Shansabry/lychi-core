@@ -14,6 +14,7 @@ pub mod executor;
 pub mod file_search;
 pub mod file_search_score;
 pub mod files;
+pub mod fonts;
 pub mod history;
 pub mod intent;
 #[cfg(feature = "mpris")]
@@ -23,6 +24,7 @@ pub mod notify;
 pub mod paths;
 pub mod process_tracker;
 pub mod providers;
+pub mod quicklinks;
 pub mod reminders;
 pub mod rules;
 pub mod script_commands;
