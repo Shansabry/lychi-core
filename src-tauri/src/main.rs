@@ -13,6 +13,13 @@ fn main() {
     #[cfg(unix)]
     if let Some(cmd) = cli_command(&std::env::args().collect::<Vec<_>>()) {
         if cmd == "--help" {
+            // Rust ignores SIGPIPE so `println!` returns an error instead of
+            // exiting — which makes `lychi --help | head` print a panic. Every
+            // standard Unix tool just dies quietly when the reader goes away.
+            // Restored only on this CLI path; the GUI keeps Rust's default.
+            //
+            // SAFETY: single-threaded here — nothing has spawned yet.
+            unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
             print_cli_help();
             return;
         }

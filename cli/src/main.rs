@@ -78,6 +78,12 @@ fn parse(args: &[String]) -> Option<Verb> {
 }
 
 fn print_help() {
+    // Rust ignores SIGPIPE, so `println!` errors instead of exiting when the
+    // reader goes away — `lychi --help | head` would print a panic. Standard
+    // Unix tools die quietly; restore that.
+    //
+    // SAFETY: single-threaded — this runs before anything is spawned.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     println!("Lychi CLI");
     println!("  toggle, --toggle              Toggle the Lychi launcher window");
     println!("  screenshot, --screenshot      Capture full screen (no window)");
