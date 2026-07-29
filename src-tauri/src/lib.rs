@@ -18,6 +18,155 @@ pub fn ipc_socket_path() -> std::path::PathBuf {
     platform::ipc_path()
 }
 
+/// The single source of truth for which commands cross the IPC boundary.
+///
+/// Extracted from `run()` so the binding export can also be driven from a test
+/// (`export_bindings`). tauri-specta documents both a debug-startup export and
+/// a unit-test export; we do both, from this one list, so they cannot disagree.
+fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
+    tauri_specta::Builder::<tauri::Wry>::new().commands(tauri_specta::collect_commands![
+        commands::execute::execute_command,
+        commands::execute::confirm_execution,
+        commands::execute::get_completions,
+        commands::execute::classify_input,
+        commands::execute::suggest_correction,
+        commands::execute::get_command_catalog,
+        commands::execute::get_trigger_catalog,
+        commands::history::get_history,
+        commands::history::clear_history,
+        commands::config::get_all_settings,
+        commands::config::get_hide_on_blur,
+        commands::config::save_window_position,
+        commands::ai::get_ai_config,
+        commands::ai::save_ai_config,
+        commands::ai::set_api_key,
+        commands::ai::get_masked_api_key,
+        commands::ai::get_ai_status,
+        commands::ai::check_ai_health,
+        commands::ai::get_model_vision,
+        commands::ai::test_ai_connection,
+        commands::ai::list_ollama_models,
+        commands::ai::get_local_models,
+        commands::ai::download_local_model,
+        commands::ai::delete_local_model,
+        commands::ai_chat::cancel_ai_chat,
+        commands::agent_chat::agent_chat_start,
+        commands::agent_chat::agent_approve,
+        commands::config::get_general_config,
+        commands::config::save_general_config,
+        commands::config::get_commands_config,
+        commands::config::get_reserved_keywords,
+        commands::config::get_installed_fonts,
+        commands::config::save_commands_config,
+        commands::config::get_projects_config,
+        commands::config::save_projects_config,
+        commands::config::get_privacy_config,
+        commands::config::save_privacy_config,
+        commands::config::grant_privacy_consent,
+        commands::config::get_keybindings_config,
+        commands::config::save_keybindings_config,
+        commands::config::restart_app,
+        commands::config::set_hotkey,
+        commands::config::record_hotkey,
+        commands::config::get_installed_terminals,
+        commands::config::get_layer_shell_supported,
+        commands::config::get_active_window_strategy,
+        commands::config::get_hotkey_status,
+        commands::config::get_autostart_enabled,
+        commands::config::set_autostart_enabled,
+        commands::config::hide_launcher,
+        commands::agent::get_agent_plan,
+        commands::agent::store_agent_plan,
+        commands::agent::execute_agent_plan,
+        commands::filesystem::list_path_completions,
+        commands::filesystem::fuzzy_path_completions,
+        commands::filesystem::list_directories,
+        commands::filesystem::get_mount_points,
+        commands::filesystem::start_file_search,
+        commands::filesystem::cancel_file_search,
+        commands::filesystem::classify_files,
+        commands::filesystem::attach_from_clipboard,
+        commands::media::media_get_status,
+        commands::media::media_control,
+        commands::media::media_control_all,
+        commands::media::media_seek,
+        commands::media::media_refresh,
+        commands::open_uri::open_uri,
+        commands::reveal_path::reveal_path,
+        commands::reveal_path::open_path,
+        commands::notes::get_all_notes,
+        commands::notes::get_all_items,
+        commands::notes::toggle_item,
+        commands::notes::delete_item,
+        commands::notes::get_notes,
+        commands::notes::add_note,
+        commands::notes::update_note,
+        commands::notes::delete_note,
+        commands::notes::get_todos,
+        commands::notes::add_todo,
+        commands::notes::toggle_todo,
+        commands::notes::delete_todo,
+        commands::aliases::get_aliases,
+        commands::aliases::add_alias,
+        commands::aliases::update_alias,
+        commands::aliases::delete_alias,
+        commands::preview::get_file_preview,
+        commands::timer::get_timers,
+        commands::reminders::get_reminders,
+        commands::reminders::add_reminder,
+        commands::reminders::delete_reminder,
+        commands::snippets::get_snippets,
+        commands::snippets::add_snippet,
+        commands::snippets::update_snippet,
+        commands::snippets::delete_snippet,
+        commands::ai_presets::get_ai_presets,
+        commands::ai_presets::add_ai_preset,
+        commands::ai_presets::update_ai_preset,
+        commands::ai_presets::delete_ai_preset,
+        commands::ai_history::get_conversations,
+        commands::ai_history::get_conversation,
+        commands::ai_history::delete_conversation,
+        commands::ai_history::clear_conversations,
+        commands::ai_history::load_conversation,
+        commands::context::get_context,
+        commands::context::read_selection,
+        commands::firebase_auth::firebase_sign_in,
+        commands::firebase_auth::firebase_sign_out,
+        commands::firebase_auth::firebase_get_user,
+        commands::firebase_auth::cloud_get_credits,
+    ])
+}
+
+/// TypeScript export configuration, shared by the debug-startup export and the
+/// test, so both produce byte-identical output.
+///
+/// Maps Rust u64/i64 (durations, timestamps, ids) to a JS `number`. Specta
+/// forbids this by default (values past 2^53 lose precision), but our u64
+/// fields are millisecond durations / small counts that never approach that
+/// ceiling, so `number` is correct and ergonomic.
+#[cfg(debug_assertions)]
+fn ts_config() -> specta_typescript::Typescript {
+    specta_typescript::Typescript::default().bigint(specta_typescript::BigIntExportBehavior::Number)
+}
+
+/// Where the bindings land, relative to the crate root (`src-tauri/`).
+#[cfg(debug_assertions)]
+const BINDINGS_PATH: &str = "../src/lib/bindings.ts";
+
+/// Regenerates `src/lib/bindings.ts`.
+///
+/// This is why the frontend needs no Rust toolchain and no display server to
+/// get bindings: `cargo test -p lychi-app` writes them. CI regenerates and
+/// diffs against the committed copy, so a command added without regenerating
+/// fails loudly instead of drifting silently.
+#[cfg(all(test, debug_assertions))]
+#[test]
+fn export_bindings() {
+    specta_builder()
+        .export(ts_config(), BINDINGS_PATH)
+        .expect("failed to export typescript bindings");
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Kept alive for the whole program — dropping it flushes and stops the
@@ -52,130 +201,14 @@ pub fn run() {
 
     // Typesafe IPC: tauri-specta collects command + type signatures and (in debug)
     // exports them to `src/lib/bindings.ts`, so the frontend can't drift from Rust.
-    let specta_builder =
-        tauri_specta::Builder::<tauri::Wry>::new().commands(tauri_specta::collect_commands![
-            commands::execute::execute_command,
-            commands::execute::confirm_execution,
-            commands::execute::get_completions,
-            commands::execute::classify_input,
-            commands::execute::suggest_correction,
-            commands::execute::get_command_catalog,
-            commands::execute::get_trigger_catalog,
-            commands::history::get_history,
-            commands::history::clear_history,
-            commands::config::get_all_settings,
-            commands::config::get_hide_on_blur,
-            commands::config::save_window_position,
-            commands::ai::get_ai_config,
-            commands::ai::save_ai_config,
-            commands::ai::set_api_key,
-            commands::ai::get_masked_api_key,
-            commands::ai::get_ai_status,
-            commands::ai::check_ai_health,
-            commands::ai::get_model_vision,
-            commands::ai::test_ai_connection,
-            commands::ai::list_ollama_models,
-            commands::ai::get_local_models,
-            commands::ai::download_local_model,
-            commands::ai::delete_local_model,
-            commands::ai_chat::cancel_ai_chat,
-            commands::agent_chat::agent_chat_start,
-            commands::agent_chat::agent_approve,
-            commands::config::get_general_config,
-            commands::config::save_general_config,
-            commands::config::get_commands_config,
-            commands::config::get_reserved_keywords,
-            commands::config::get_installed_fonts,
-            commands::config::save_commands_config,
-            commands::config::get_projects_config,
-            commands::config::save_projects_config,
-            commands::config::get_privacy_config,
-            commands::config::save_privacy_config,
-            commands::config::grant_privacy_consent,
-            commands::config::get_keybindings_config,
-            commands::config::save_keybindings_config,
-            commands::config::restart_app,
-            commands::config::set_hotkey,
-            commands::config::record_hotkey,
-            commands::config::get_installed_terminals,
-            commands::config::get_layer_shell_supported,
-            commands::config::get_active_window_strategy,
-            commands::config::get_hotkey_status,
-            commands::config::get_autostart_enabled,
-            commands::config::set_autostart_enabled,
-            commands::config::hide_launcher,
-            commands::agent::get_agent_plan,
-            commands::agent::store_agent_plan,
-            commands::agent::execute_agent_plan,
-            commands::filesystem::list_path_completions,
-            commands::filesystem::fuzzy_path_completions,
-            commands::filesystem::list_directories,
-            commands::filesystem::get_mount_points,
-            commands::filesystem::start_file_search,
-            commands::filesystem::cancel_file_search,
-            commands::filesystem::classify_files,
-            commands::filesystem::attach_from_clipboard,
-            commands::media::media_get_status,
-            commands::media::media_control,
-            commands::media::media_control_all,
-            commands::media::media_seek,
-            commands::media::media_refresh,
-            commands::open_uri::open_uri,
-            commands::reveal_path::reveal_path,
-            commands::reveal_path::open_path,
-            commands::notes::get_all_notes,
-            commands::notes::get_all_items,
-            commands::notes::toggle_item,
-            commands::notes::delete_item,
-            commands::notes::get_notes,
-            commands::notes::add_note,
-            commands::notes::update_note,
-            commands::notes::delete_note,
-            commands::notes::get_todos,
-            commands::notes::add_todo,
-            commands::notes::toggle_todo,
-            commands::notes::delete_todo,
-            commands::aliases::get_aliases,
-            commands::aliases::add_alias,
-            commands::aliases::update_alias,
-            commands::aliases::delete_alias,
-            commands::preview::get_file_preview,
-            commands::timer::get_timers,
-            commands::reminders::get_reminders,
-            commands::reminders::add_reminder,
-            commands::reminders::delete_reminder,
-            commands::snippets::get_snippets,
-            commands::snippets::add_snippet,
-            commands::snippets::update_snippet,
-            commands::snippets::delete_snippet,
-            commands::ai_presets::get_ai_presets,
-            commands::ai_presets::add_ai_preset,
-            commands::ai_presets::update_ai_preset,
-            commands::ai_presets::delete_ai_preset,
-            commands::ai_history::get_conversations,
-            commands::ai_history::get_conversation,
-            commands::ai_history::delete_conversation,
-            commands::ai_history::clear_conversations,
-            commands::ai_history::load_conversation,
-            commands::context::get_context,
-            commands::context::read_selection,
-            commands::firebase_auth::firebase_sign_in,
-            commands::firebase_auth::firebase_sign_out,
-            commands::firebase_auth::firebase_get_user,
-            commands::firebase_auth::cloud_get_credits,
-        ]);
+    let specta_builder = specta_builder();
 
+    // Keeps bindings fresh during `cargo tauri dev`. The same export also runs
+    // as a test (see export_bindings), which is what CI and a fresh clone use —
+    // neither can start a GUI app.
     #[cfg(debug_assertions)]
     specta_builder
-        .export(
-            // Map Rust u64/i64 (durations, timestamps, ids) to a JS `number`.
-            // Specta forbids this by default (values past 2^53 lose precision),
-            // but our u64 fields are millisecond durations / small counts that
-            // never approach that ceiling, so `number` is correct and ergonomic.
-            specta_typescript::Typescript::default()
-                .bigint(specta_typescript::BigIntExportBehavior::Number),
-            "../src/lib/bindings.ts",
-        )
+        .export(ts_config(), BINDINGS_PATH)
         .expect("failed to export typescript bindings");
 
     let app = tauri::Builder::default()

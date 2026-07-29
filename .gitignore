@@ -49,4 +49,9 @@ npm-debug.log*
 
 # Generated CLI sidecar artifacts (built by pnpm build:cli)
 **/src-tauri/binaries/
-src/lib/bindings.ts
+
+# NOTE: src/lib/bindings.ts is deliberately NOT ignored. It's generated, but
+# its consumers are TypeScript files, and requiring a Rust toolchain + WebKit
+# dev stack to run `pnpm test:fe` is a barrier for frontend contributors.
+# Regenerate with `cargo test -p lychi-app export_bindings`; CI regenerates and
+# diffs, so a stale copy fails the build rather than drifting silently.
