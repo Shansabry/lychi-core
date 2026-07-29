@@ -25,22 +25,22 @@ jobs:
             libayatana-appindicator3-dev libgtk-layer-shell-dev \
             libssl-dev libdbus-1-dev xdg-utils desktop-file-utils
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install pnpm + Node
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
 
       - name: Cache cargo + tauri bundler tools
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -76,7 +76,7 @@ jobs:
         run: bash scripts/fix-appimage-codecs.sh
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lychi-linux-bundles
           path: |
