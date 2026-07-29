@@ -1,0 +1,90 @@
+name: Bug report
+description: Something doesn't work
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this.
+
+        Lychi aims to work the same on every Linux desktop, and window
+        behaviour is the part that varies most between them — so the
+        environment fields below are the most useful part of this form.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+      placeholder: |
+        I typed "firefox" and pressed Enter. I expected Firefox to launch;
+        instead the window went blank.
+    validations:
+      required: true
+
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution
+      placeholder: "Fedora 43, Ubuntu 25.10, Arch, …"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: desktop
+    attributes:
+      label: Desktop environment
+      options:
+        - GNOME
+        - KDE Plasma
+        - Hyprland
+        - Sway
+        - XFCE
+        - Cinnamon
+        - MATE
+        - Other (say which below)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: session
+    attributes:
+      label: Session type
+      description: "Not sure? Run `echo $XDG_SESSION_TYPE`"
+      options:
+        - Wayland
+        - X11
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Lychi version
+      description: The AppImage filename, or the commit you built from
+      placeholder: "Lychi_0.1.0_amd64.AppImage"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Run Lychi from a terminal and paste the output — the first ~20 lines
+        matter most, since they show which window strategy was chosen.
+        Fuller logs live in `~/.local/share/lychi/logs/`.
+
+        Please skim for anything private (paths, filenames, clipboard content)
+        before pasting.
+      render: shell
+
+  - type: checkboxes
+    id: window-issue
+    attributes:
+      label: Is this about how the window looks or behaves?
+      description: These get priority — the launcher should look and behave the same everywhere.
+      options:
+        - label: The launcher appears in the wrong place, wrong size, or covers the screen
+        - label: The launcher won't take keyboard focus
+        - label: The launcher won't close when it should (or closes when it shouldn't)

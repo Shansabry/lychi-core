@@ -1,0 +1,44 @@
+version: 2
+updates:
+  # Rust. Grouped into a single PR per week: Lychi pins several crates to exact
+  # versions that must move together (webkit2gtk matches wry's pin, the gtk/gdk/
+  # gio/glib set shares a generation), so one-PR-per-crate would produce builds
+  # that can't compile in isolation.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      rust-dependencies:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    ignore:
+      # Bumping these independently of Tauri breaks the build: the webview
+      # types must resolve to the same version wry uses. They move when Tauri
+      # moves, not before.
+      - dependency-name: "webkit2gtk"
+      - dependency-name: "gtk"
+      - dependency-name: "gdk"
+      - dependency-name: "gio"
+      - dependency-name: "glib"
+
+  # Frontend
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      frontend-dependencies:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # Workflow actions — small, and worth keeping current for supply-chain reasons.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]

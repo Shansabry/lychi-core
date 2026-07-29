@@ -303,9 +303,40 @@ Every execution passes through the rules engine, which owns the shell/path/URI p
 | `pnpm clippy` | `cargo clippy --workspace` | Lint Rust |
 | `pnpm clean` | `rm -rf .svelte-kit node_modules/.vite` | Clear frontend caches |
 
+## Testing and feedback
+
+Lychi is pre-1.0 and solo-maintained. The single most useful thing you can do is **run it on your setup and say what happened** — especially if your desktop, compositor, or distro isn't a common one.
+
+Lychi aims to behave identically on every Linux desktop, and window management is where they differ most: placement, focus, transparency, and dismiss behaviour are all compositor-dependent. Bugs there are close to impossible to find without reports from the desktop they happen on.
+
+Useful things to report:
+
+- The launcher appears in the wrong place, at the wrong size, or covers the screen
+- It won't take keyboard focus, or won't dismiss when it should
+- A command didn't do what its name suggests
+- You opened it, didn't know what to type, and closed it again — genuinely useful, and hard to see from the inside
+
+[Open an issue](https://github.com/Shansabry/lychi-core/issues) — the bug form asks for your distro, desktop, and session type, which is usually enough to reproduce. Running Lychi from a terminal and pasting the first ~20 lines of output helps too; those lines show which window strategy was picked.
+
 ## Contributing
 
-Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the dev workflow, architecture rules, and performance budgets.
+Pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for setup, architecture rules, and performance budgets.
+
+Good places to start:
+
+- **A new command.** The easiest contribution by design: implement `ActionHandler` in one file under `crates/lychi-core/src/action_registry/handlers/`, add one registration line in `src-tauri/src/state.rs`. No frontend changes needed.
+- **Desktop-environment fixes.** If you use a desktop where something is off and you can debug it, that's high-value work — see `src-tauri/src/platform/linux.rs`.
+- **Packaging.** AUR, Flatpak, and nixpkgs packaging would all help; the AppImage is currently the only distribution channel.
+
+Two things worth knowing before a large PR: business logic belongs in `crates/lychi-core` and must compile without Tauri, and Lychi is local-first — features that require network access or send data off the machine need explicit user opt-in.
+
+## Security
+
+Please report vulnerabilities privately — see [SECURITY.md](SECURITY.md).
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

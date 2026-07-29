@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest an idea
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Lychi is opinionated and solo-maintained, so not every idea will be a
+        fit — but a clear description of the problem is useful even when the
+        proposed solution isn't taken up.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: What are you trying to do that Lychi makes hard or impossible today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: What would you like it to do?
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Does this fit Lychi's constraints?
+      description: |
+        Lychi is local-first and keyboard-driven. Features that require sending
+        data off the machine without explicit opt-in, or that only work online,
+        are unlikely to land.
+      options:
+        - label: This works offline, or degrades gracefully without a network
+        - label: This doesn't send anything off the machine without the user opting in
