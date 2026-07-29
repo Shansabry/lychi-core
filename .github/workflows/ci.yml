@@ -43,6 +43,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # tauri.conf.json declares the CLI as an externalBin, so lychi-app's build
+      # script refuses to run without it — and src-tauri/binaries/ is gitignored,
+      # so a clean checkout never has one. Anything that compiles lychi-app
+      # (including `clippy --all-targets`) needs this first.
+      - name: Build CLI sidecar
+        run: |
+          cargo build --release -p lychi-cli
+          mkdir -p src-tauri/binaries
+          cp target/release/lychi src-tauri/binaries/lychi-x86_64-unknown-linux-gnu
+
       - name: Format
         run: cargo fmt --all --check
 
@@ -95,6 +105,10 @@ jobs:
       # so this MUST run from src-tauri/ or the file lands somewhere useless.
       - name: Generate Tauri bindings
         run: |
+          # externalBin sidecar — see the note in the rust job.
+          cargo build --release -p lychi-cli
+          mkdir -p src-tauri/binaries
+          cp target/release/lychi src-tauri/binaries/lychi-x86_64-unknown-linux-gnu
           cargo build -p lychi-app
           cd src-tauri && xvfb-run -a timeout 60 ../target/debug/lychi-app --hidden || true
           test -s src/lib/bindings.ts
