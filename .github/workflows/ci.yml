@@ -1,0 +1,111 @@
+name: CI
+
+# Runs on every PR and every push to main. This is the gate that lets an
+# outside PR (or a Dependabot bump) be trusted without building it by hand.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push to the same PR cancels the previous run — no point finishing a
+# build for a commit that's already been replaced.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fewer codegen units and no incremental artifacts: CI builds once, so the
+  # incremental cache is pure overhead here.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tauri needs the full GTK/WebKit stack even to type-check, because the
+      # -sys crates run pkg-config at build time.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev libgtk-layer-shell-dev \
+            libssl-dev libdbus-1-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      # local-ai is deliberately excluded: it statically links llama.cpp, which
+      # dominates CI time. The release workflow builds with it; correctness of
+      # the AI plumbing is covered by tests that don't need the engine.
+      - name: Test
+        run: cargo test --workspace
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev libgtk-layer-shell-dev \
+            libssl-dev libdbus-1-dev pkg-config xvfb
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # src/lib/bindings.ts is generated, gitignored, and written by the DEBUG
+      # binary at startup — so a clean checkout doesn't have it, and anything
+      # importing ipc.ts fails to resolve. Booting the app under a virtual
+      # display is how CI gets it, and it doubles as a smoke test that the app
+      # still starts. `|| true` because the app is killed by timeout, not by
+      # exiting on its own; the real check is the file existing afterwards.
+      # NOTE: the export path in lib.rs is relative ("../src/lib/bindings.ts"),
+      # so this MUST run from src-tauri/ or the file lands somewhere useless.
+      - name: Generate Tauri bindings
+        run: |
+          cargo build -p lychi-app
+          cd src-tauri && xvfb-run -a timeout 60 ../target/debug/lychi-app --hidden || true
+          test -s src/lib/bindings.ts
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Test
+        run: pnpm test:fe
+
+      # svelte-check runs last: it's the slowest, and it needs both the
+      # generated bindings above and SvelteKit's own generated types.
+      - name: Type check
+        run: pnpm check
