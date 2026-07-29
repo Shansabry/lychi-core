@@ -36,21 +36,52 @@ if [ ! -x "$GOOD_BINARY" ]; then
   exit 1
 fi
 
-echo "==> Stripping bundled libs the host already provides"
-moved=0
+# WHAT WE KEEP — an explicit policy, NOT a scan of this machine.
+#
+# The previous rule was "drop anything the build host also has". That makes the
+# artifact a function of whoever built it: on a full KDE workstation the host has
+# the entire GStreamer stack, so it all got stripped and the AppImage silently
+# depended on the TARGET having it too. It didn't — a GNOME tester's WebProcess
+# died on `appsink` and the UI went blank (I-013). The build machine cannot tell
+# us what a user's machine has, so it must not be asked.
+#
+# Instead: keep exactly the plugin modules that are dlopen'd at runtime (no
+# DT_NEEDED entry, so nothing auto-detects them) and drop every shared library,
+# which we deliberately take from the host. That contract is only safe because
+# the app asks the host for very little — see harden_webview() in
+# platform/linux.rs, which switches off WebKit's media stack so the GStreamer
+# libraries below are never loaded at all.
+#
+# If Lychi ever needs media, this policy must change with it: bundle the
+# GStreamer runtime here AND set GST_PLUGIN_SYSTEM_PATH in AppRun.
+KEEP_GLOB='im-*.so io-*.so libpixbufloader-*.so libprintbackend-*.so'
+
+echo "==> Applying bundle policy (keep dlopen'd plugins, drop shared libs)"
+kept=0; dropped=0
 for f in "$APPDIR"/usr/lib/*.so*; do
   [ -e "$f" ] || continue
   base="$(basename "$f")"
-  # Keep only libs the host lacks; the host's copy of anything else is known-good.
-  if [ -e "/usr/lib64/$base" ] || [ -e "/lib64/$base" ] \
-     || [ -e "/usr/lib/x86_64-linux-gnu/$base" ] \
-     || ldconfig -p 2>/dev/null | grep -qF " $base "; then
-    rm -f "$f"; moved=$((moved + 1))
+  keep=0
+  for pat in $KEEP_GLOB; do
+    # shellcheck disable=SC2254 # $pat is a glob on purpose
+    case "$base" in $pat) keep=1; break ;; esac
+  done
+  if [ "$keep" = 1 ]; then
+    kept=$((kept + 1))
+  else
+    rm -f "$f"; dropped=$((dropped + 1))
   fi
 done
-# Pulse ships under a versioned host subdir, so name-match above misses it.
-rm -f "$APPDIR"/usr/lib/libpulse*.so* 2>/dev/null || true
-echo "    removed $moved host-provided libs"
+echo "    kept $kept dlopen'd plugins, dropped $dropped host-provided libs"
+
+# Fail loudly if the policy stops matching reality. A silent zero here would
+# mean shipping an AppImage with no input-method or pixbuf plugins, which
+# degrades quietly (no CJK input, missing image formats) rather than crashing.
+if [ "$kept" -eq 0 ]; then
+  echo "fix-appimage-codecs: KEEP_GLOB matched nothing — did linuxdeploy's" >&2
+  echo "  layout change? Expected plugins like im-ibus.so in $APPDIR/usr/lib" >&2
+  exit 1
+fi
 
 echo "==> Restoring the un-patchelf'd application binary"
 # linuxdeploy patchelf-mangles the copied binary (changes size, can corrupt it).

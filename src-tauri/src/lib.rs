@@ -249,6 +249,10 @@ pub fn run() {
             // Platform-specific window setup (layer-shell, skip-taskbar, etc.)
             if let Some(win) = app.get_webview_window("main") {
                 let app_state = app.state::<AppState>();
+                // Before anything renders: turn off the WebKit subsystems we
+                // don't use, so a host missing GStreamer can't kill the
+                // WebProcess and leave a blank window behind.
+                platform::harden_webview(&win);
                 platform::init_window(&win, &window_strategy);
                 platform::setup_dismiss_on_blur(
                     &win,

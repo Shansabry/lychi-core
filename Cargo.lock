@@ -3125,6 +3125,7 @@ dependencies = [
  "wayland-backend",
  "wayland-client",
  "wayland-protocols-plasma",
+ "webkit2gtk",
  "zbus",
 ]
 

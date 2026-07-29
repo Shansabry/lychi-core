@@ -31,6 +31,47 @@ fn desktop_contains(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Switch off WebKit subsystems Lychi does not use.
+///
+/// **Why this exists.** WebKitGTK builds a GStreamer pipeline in every
+/// WebProcess, whether or not the page has media in it. On a host without
+/// `gst-plugins-base` the pipeline can't be built, the WebProcess dies, and the
+/// UI goes blank while the app process stays alive — reported from GNOME
+/// Wayland as "crashes on any keystroke, and I have to Ctrl-C it".
+///
+/// Lychi renders no `<video>`, no `<audio>`, and calls no `getUserMedia`. So
+/// this is not a workaround for a missing codec: it removes a dependency the
+/// app never had. Bundling GStreamer to satisfy a subsystem we then don't use
+/// would add ~15MB and re-open the `_dl_init` crash class that
+/// `scripts/fix-appimage-codecs.sh` exists to prevent.
+///
+/// **Adding media later.** If Lychi ever needs a `<video>`, delete the
+/// `set_enable_media(false)` line — and then the AppImage genuinely must ship
+/// GStreamer, because the host can no longer be assumed to have it.
+#[cfg(target_os = "linux")]
+pub fn harden_webview(window: &WebviewWindow) {
+    use webkit2gtk::{SettingsExt, WebViewExt};
+
+    // with_webview runs on the main thread; failure here is not fatal — the
+    // app still works on hosts that do have the codecs, so log and continue.
+    let result = window.with_webview(|webview| {
+        let wv = webview.inner();
+        let Some(settings) = WebViewExt::settings(&wv) else {
+            tracing::warn!("[webview] no WebKitSettings — media stays enabled");
+            return;
+        };
+        settings.set_enable_media(false);
+        // WebRTC and the media-stream APIs pull in the same GStreamer stack
+        // (and a launcher has no business opening a camera or microphone).
+        settings.set_enable_media_stream(false);
+        settings.set_enable_webrtc(false);
+        tracing::info!("[webview] media/webrtc disabled (unused; avoids GStreamer dependency)");
+    });
+    if let Err(e) = result {
+        tracing::warn!("[webview] could not apply settings: {e}");
+    }
+}
+
 /// The window strategy init_window() resolved for this session.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WindowStrategy {
@@ -61,6 +102,39 @@ static TOPLEVEL_PLAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 fn toplevel_plain() -> bool {
     TOPLEVEL_PLAIN.get().copied().unwrap_or(false)
+}
+
+/// Whether to ask the compositor for true fullscreen on the toplevel path.
+///
+/// **Never on Mutter.** GNOME deliberately paints an opaque black backdrop
+/// behind fullscreen windows (mutter "Draw black background for fullscreen
+/// windows"), which destroys the alpha the whole toplevel design depends on:
+/// the window covers the monitor precisely so CSS can float a small launcher
+/// bar over a transparent backdrop. Asking for fullscreen there is asking for
+/// the one state where our transparency is guaranteed to be thrown away —
+/// GNOME users see an opaque full-screen panel instead of a launcher.
+///
+/// Dropping the request costs nothing: the window is already sized to the full
+/// monitor via `set_size_request`, and Mutter centers it. Fullscreen was only
+/// ever a positioning trick, because Mutter ignores `move_()` — but a window
+/// that already fills the monitor has nowhere to be mispositioned to.
+///
+/// KDE takes neither branch (it honours `move_()`, handled separately), and
+/// `toplevel-window` remains the user-facing escape hatch.
+fn wants_fullscreen() -> bool {
+    !toplevel_plain() && !is_gnome_like()
+}
+
+/// GNOME/Mutter, or anything presenting itself as GNOME (Unity, Pantheon,
+/// Budgie all run Mutter or a fork). Matched by desktop name rather than by
+/// probing for a Mutter-specific protocol, because the black-fullscreen
+/// behaviour lives in the shell's compositing path, not in a protocol we can
+/// feature-detect.
+fn is_gnome_like() -> bool {
+    is_wayland_session()
+        && ["GNOME", "UNITY", "PANTHEON", "BUDGIE"]
+            .iter()
+            .any(|d| desktop_contains(d))
 }
 
 /// Whether the X11 screen has a compositor. Without one (xfwm4/Marco with
@@ -435,7 +509,7 @@ pub fn reposition_to_monitor(window: &WebviewWindow, monitor: &gdk::Monitor) {
         gtk_win.set_size_request(geom.width(), geom.height());
         if is_kde_wayland() {
             gtk_win.move_(geom.x(), geom.y());
-        } else if !toplevel_plain() {
+        } else if wants_fullscreen() {
             // Mutter ignores move_() — retarget via fullscreen-on-output
             if let Some(display) = gdk::Display::default() {
                 gtk_win.fullscreen_on_monitor(
@@ -584,12 +658,11 @@ pub fn init_window(window: &WebviewWindow, strategy: &str) {
                     crate::platform::kde_taskbar::mark_unmapped();
                     glib::Propagation::Proceed
                 });
-            } else if strategy != "toplevel-window" {
-                // GNOME/unknown Wayland: move_() is a no-op on Mutter. The only
-                // sanctioned positioning primitive is xdg_toplevel.set_fullscreen
-                // on a specific output, which fullscreen_on_monitor() maps to.
-                // "toplevel-window" is the escape hatch: plain monitor-sized
-                // window, compositor decides placement.
+            } else if wants_fullscreen() {
+                // Unknown Wayland compositors: move_() is a no-op on Mutter and
+                // friends, so fullscreen-on-output is the only sanctioned way to
+                // pin the surface to a specific monitor. Deliberately NOT taken
+                // on GNOME — see wants_fullscreen().
                 gtk_win.fullscreen_on_monitor(&screen, monitor_index(&display, &monitor));
             }
             tracing::debug!(
@@ -969,5 +1042,110 @@ fn gdk_keyval_to_tauri_name(keyval: gdk::keys::Key) -> String {
             // Fall back to GDK key name
             keyval.name().map(|n| n.to_string()).unwrap_or_default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// These helpers read process-global env vars, so the tests mutate shared
+    /// state and must not run concurrently. Cargo runs tests in one process on
+    /// multiple threads, so a mutex is the guard; one test function per concern
+    /// would race even with `--test-threads=1` on other crates' tests.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set the session vars, run `f`, restore. Restoring matters because a
+    /// leaked XDG_CURRENT_DESKTOP would silently change later tests.
+    fn with_session<T>(session_type: &str, desktop: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = [
+            ("XDG_SESSION_TYPE", std::env::var_os("XDG_SESSION_TYPE")),
+            (
+                "XDG_SESSION_DESKTOP",
+                std::env::var_os("XDG_SESSION_DESKTOP"),
+            ),
+            (
+                "XDG_CURRENT_DESKTOP",
+                std::env::var_os("XDG_CURRENT_DESKTOP"),
+            ),
+        ];
+        // SAFETY: single-threaded within the ENV_LOCK critical section.
+        unsafe {
+            std::env::set_var("XDG_SESSION_TYPE", session_type);
+            std::env::set_var("XDG_SESSION_DESKTOP", desktop);
+            std::env::remove_var("XDG_CURRENT_DESKTOP");
+        }
+        let out = f();
+        unsafe {
+            for (k, v) in saved {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        out
+    }
+
+    /// The regression this guards: asking Mutter for fullscreen makes it paint
+    /// an opaque black backdrop, so the transparent monitor-covering window
+    /// that the whole toplevel design depends on renders as a solid panel.
+    #[test]
+    fn gnome_wayland_never_requests_fullscreen() {
+        for desktop in [
+            "GNOME",
+            "gnome",
+            "ubuntu:GNOME",
+            "Unity",
+            "Pantheon",
+            "Budgie",
+        ] {
+            assert!(
+                with_session("wayland", desktop, is_gnome_like),
+                "{desktop} should be detected as Mutter-based"
+            );
+            assert!(
+                !with_session("wayland", desktop, wants_fullscreen),
+                "{desktop} must not request fullscreen"
+            );
+        }
+    }
+
+    /// Other Wayland compositors still need fullscreen-on-output: it's the only
+    /// sanctioned way to pin a surface to a monitor when move_() is ignored.
+    #[test]
+    fn unknown_wayland_still_requests_fullscreen() {
+        assert!(with_session("wayland", "sway", wants_fullscreen));
+        assert!(!with_session("wayland", "sway", is_gnome_like));
+    }
+
+    /// GNOME detection is Wayland-gated: the black-fullscreen behaviour is in
+    /// Mutter's Wayland compositing path, and the X11 branch never reaches
+    /// wants_fullscreen() anyway.
+    #[test]
+    fn gnome_on_x11_is_not_treated_as_mutter_wayland() {
+        assert!(!with_session("x11", "GNOME", is_gnome_like));
+    }
+
+    /// Substring matching must not fire on unrelated names that merely contain
+    /// a desktop word — "GNOME Flashback" is Mutter, "gnome-ish" is nobody.
+    #[test]
+    fn detection_is_case_insensitive_and_matches_compound_names() {
+        assert!(with_session(
+            "wayland",
+            "GNOME-Flashback:GNOME",
+            is_gnome_like
+        ));
+        assert!(!with_session("wayland", "KDE", is_gnome_like));
+        assert!(!with_session("wayland", "", is_gnome_like));
+    }
+
+    /// KDE goes down the move_() branch, so it must not be misdetected as
+    /// GNOME — and it keeps its own non-fullscreen path for I-001 (blur/dim).
+    #[test]
+    fn kde_wayland_is_distinct_from_gnome() {
+        assert!(with_session("wayland", "KDE", is_kde_wayland));
+        assert!(!with_session("wayland", "KDE", is_gnome_like));
     }
 }

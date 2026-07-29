@@ -63,3 +63,14 @@ gdk = "0.18"
 gio = "0.18"
 glib = "0.18"
 gtk-layer-shell = { version = "0.8.2", features = ["v0_6"] }
+# Reaching the WebKitWebView behind Tauri's PlatformWebview, to switch off the
+# multimedia stack Lychi never uses (see platform::linux::harden_webview).
+#
+# Pinned `=` to match wry's own exact pin: both must resolve to ONE version or
+# the `WebViewExt` we call is a different type from the one Tauri hands us. A
+# wry bump then breaks the build loudly at compile time, which is the point —
+# the alternative is two webkit2gtk copies and a confusing type mismatch.
+#
+# v2_38 matches the feature wry already enables, so this adds no new API
+# surface beyond what is compiled in regardless. set_enable_webrtc needs it.
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
