@@ -66,6 +66,38 @@ pub fn harden_webview(window: &WebviewWindow) {
         settings.set_enable_media_stream(false);
         settings.set_enable_webrtc(false);
         tracing::info!("[webview] media/webrtc disabled (unused; avoids GStreamer dependency)");
+
+        // When the WebProcess dies the window goes blank, but THIS process
+        // keeps running and keeps logging — so the logs look healthy while the
+        // app is unusable. That's exactly how I-013 was reported: "the UI
+        // crashes but the app doesn't quit, I have to Ctrl-C it", with nothing
+        // in the log naming a cause.
+        //
+        // Two responses, and the reload is the one the user notices. WebKit
+        // supports recovering a dead WebProcess by reloading, which turns
+        // "blank window, kill it from a terminal" into "it blinked and came
+        // back". Reload once per death and let the log carry the diagnosis;
+        // if it dies repeatedly the log shows a run of these rather than a
+        // silent loop.
+        wv.connect_web_process_terminated(|view, reason| {
+            tracing::error!(
+                ?reason,
+                "[webview] WebProcess terminated — the UI went blank; reloading. \
+                 If this repeats, please report it with this log."
+            );
+            view.reload();
+        });
+
+        // A failed load is the other way to end up staring at a blank window,
+        // with a different cause (missing/broken frontend assets) and the same
+        // symptom. Distinguishing the two in the log is the difference between
+        // a diagnosable report and a guess.
+        wv.connect_load_failed(|_, event, uri, error| {
+            tracing::error!(?event, uri, %error, "[webview] load failed");
+            // false = let WebKit show its own error page rather than swallow it
+            // silently; a visible error beats an unexplained blank window.
+            false
+        });
     });
     if let Err(e) = result {
         tracing::warn!("[webview] could not apply settings: {e}");
