@@ -28,6 +28,11 @@ jobs:
 
       # Tauri needs the full GTK/WebKit stack even to type-check, because the
       # -sys crates run pkg-config at build time.
+      #
+      # Deliberately NOT cached: actions/cache runs as a non-root user and
+      # can't read /var/cache/apt/archives, and the third-party apt-cache
+      # actions would mean trusting an unpinned action in CI for a modest win.
+      # The package list matches release.yml's proven set.
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -41,7 +46,12 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # Keyed on the lockfile and rustc version by default. `save-if` means only
+      # main writes the cache: PR branches read it but don't each push their own
+      # copy, which would evict main's shared entry under the 10GB repo limit.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # tauri.conf.json declares the CLI as an externalBin, so lychi-app's build
       # script refuses to run without it — and src-tauri/binaries/ is gitignored,
@@ -96,6 +106,15 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # svelte-check re-resolves every dependency's types on a cold run. The
+      # .svelte-kit dir is generated (sync) and safe to reuse for a given
+      # config + lockfile; a miss just regenerates it.
+      - name: Cache SvelteKit artifacts
+        uses: actions/cache@v4
+        with:
+          path: .svelte-kit
+          key: svelte-kit-${{ hashFiles('pnpm-lock.yaml', 'svelte.config.js', 'vite.config.ts', 'tsconfig.json') }}
 
       - name: Lint
         run: pnpm lint
