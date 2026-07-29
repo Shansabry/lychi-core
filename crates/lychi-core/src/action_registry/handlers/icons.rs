@@ -55,7 +55,22 @@ pub fn resolve_icon_cached(icon: &str) -> Option<String> {
     {
         let cache = icon_cache().lock().unwrap();
         if let Some(hit) = cache.entries.get(icon) {
-            return hit.clone();
+            // A cached path is only good while the file is still there.
+            // Flatpak icons live under a per-commit directory
+            // (…/stable/<64-hex>/export/share/icons/…), so every app update
+            // moves them and every previously cached path 404s forever — the
+            // app silently loses its icon and the asset protocol logs an
+            // ERROR on each render. Re-resolve instead of trusting the hit.
+            //
+            // Negative entries (None) are kept as-is: they mean "no icon was
+            // found", which re-resolving would just rediscover at the cost of
+            // a filesystem sweep on every lookup.
+            match hit {
+                Some(path) if !std::path::Path::new(path).exists() => {
+                    tracing::debug!(icon, path, "[icons] cached path is gone — re-resolving");
+                }
+                _ => return hit.clone(),
+            }
         }
     }
     let resolved = resolve_icon(icon);
