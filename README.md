@@ -1,6 +1,6 @@
 # Lychi
 
-A local-first, Linux-only desktop command launcher. Think Spotlight/Raycast for Linux — keyboard-driven, privacy-friendly, AI optional (BYO key or local Ollama).
+A local-first, Linux-only desktop command launcher. Think Spotlight/Raycast for Linux — keyboard-driven, privacy-friendly, AI optional (bundled local model, BYO key, or Ollama).
 
 Built with **Tauri v2** (Rust backend) + **Svelte 5** (SvelteKit frontend), distributed as an **AppImage**.
 
@@ -12,10 +12,12 @@ Lychi picks the best window strategy for your session automatically:
 |---------|----------|
 | wlroots compositors (Hyprland, Sway, …) | wlr-layer-shell overlay |
 | KDE Plasma Wayland | toplevel window (KWin layer-shell focus is unreliable) |
-| GNOME Wayland | fullscreen-transparent toplevel (Mutter has no layer-shell) |
+| GNOME Wayland | monitor-covering transparent toplevel (Mutter has no layer-shell) |
 | X11 (KDE, XFCE, Cinnamon, MATE, …) | fullscreen overlay, or a compact opaque window when compositing is off |
 
-**Wayland hotkey note:** Wayland doesn't let apps register global hotkeys. Bind a system shortcut to `lychi --toggle` in your desktop's keyboard settings — Lychi shows a first-run tip explaining this.
+On GNOME the window covers the monitor with a transparent surface and the launcher is centered by CSS — Mutter does not let applications position their own windows. True fullscreen is deliberately **not** requested there, because Mutter paints an opaque backdrop behind fullscreen windows.
+
+**Wayland hotkey note:** Wayland doesn't let apps register global hotkeys directly. Lychi uses the XDG GlobalShortcuts portal where available (GNOME, KDE); otherwise bind a system shortcut to `lychi --toggle` in your desktop's keyboard settings.
 
 ## Prerequisites
 
@@ -34,8 +36,8 @@ Lychi picks the best window strategy for your session automatically:
 
 ```bash
 # Clone the repo
-git clone <repo-url>
-cd lychi/core
+git clone https://github.com/Shansabry/lychi-core.git
+cd lychi-core
 
 # Install frontend dependencies
 pnpm install
@@ -51,11 +53,17 @@ cargo tauri --version
 # Launch the app with hot reload (frontend + backend)
 pnpm dev
 
-# Run all tests
+# Same, with the bundled local AI compiled in (slower first build)
+pnpm dev:local-ai
+
+# Run all Rust tests
 pnpm test
 
 # Run core library tests only
 pnpm test:core
+
+# Run frontend tests (Vitest)
+pnpm test:fe
 ```
 
 ## Code Quality
@@ -63,30 +71,18 @@ pnpm test:core
 ### Rust
 
 ```bash
-# Format Rust code
-pnpm format:rust
-
-# Lint with Clippy
-pnpm clippy
-
-# Type check all crates
-cargo check
+pnpm format:rust   # cargo fmt --all
+pnpm clippy        # cargo clippy --workspace
+cargo check        # type check all crates
 ```
 
 ### TypeScript / Svelte
 
 ```bash
-# Lint with Biome
-pnpm lint
-
-# Lint and auto-fix
-pnpm lint:fix
-
-# Format frontend code
-pnpm format
-
-# Svelte type check
-pnpm check
+pnpm lint          # Biome lint
+pnpm lint:fix      # Biome lint + auto-fix
+pnpm format        # Biome format
+pnpm check         # svelte-check
 ```
 
 ## Build
@@ -96,7 +92,11 @@ pnpm check
 pnpm build
 ```
 
-The AppImage will be output to `src-tauri/target/release/bundle/appimage/`.
+This builds the CLI binary, runs `tauri build` with the `local-ai` feature and `NO_STRIP=1`, then post-processes the AppImage with `scripts/fix-appimage-codecs.sh`.
+
+The output lands in **`target/release/bundle/appimage/`** (a Cargo workspace shares one `target/` at the root).
+
+> **The post-build step is not optional.** Tauri's linuxdeploy bundles WebKitGTK's entire transitive GStreamer stack, whose ELF constructors crash the dynamic loader at `_dl_init` on hosts with a newer glibc than the build box. `fix-appimage-codecs.sh` keeps only the `dlopen`'d GTK plugins (input-method, pixbuf, print), drops the shared libraries, and repacks — which also takes the AppImage from ~114 MB to ~16 MB. Anything it keeps or drops is an explicit policy in that file, deliberately **not** a scan of the build machine.
 
 ## Project Structure
 
@@ -106,56 +106,137 @@ core/
 ├── crates/lychi-core/             # Core library — all business logic
 │   └── src/
 │       ├── action_registry/       # ActionHandler trait + handler implementations
-│       │   └── handlers/          # open, web, yt, run, calc, spotify, media, notes, etc.
-│       ├── intent/                # Intent resolution (pattern matching + AI routing)
-│       ├── rules/                 # Rules engine (risk levels, denylist, shell patterns)
+│       │   └── handlers/          # ~45 handlers: open, web, run, calc, file, media, …
+│       ├── intent/                # Intent resolution (patterns, classifier, AI routing)
+│       ├── rules/                 # Permission deciders (shell, path, uri) + risk levels
 │       ├── executor/              # Executor pipeline: resolve → validate → execute
-│       ├── providers/             # AI backends (BYO OpenAI/Anthropic/Groq)
-│       ├── history/               # Command history (JSON persistence)
-│       ├── notes/                 # Notes & todo store (JSON persistence)
-│       ├── config/                # App config (TOML with serde defaults)
-│       ├── mpris/                 # MPRIS D-Bus media control (feature-gated)
+│       ├── coordinator/           # Cross-brick orchestration
+│       ├── providers/             # AI backends (BYO, Ollama, bundled local llama.cpp)
+│       ├── ai_history/            # Chat conversation persistence
+│       ├── ai_presets/            # User-defined keyword → prompt AI commands
+│       ├── context/               # Focused-window / project / git context awareness
+│       ├── file_search/           # Fuzzy file index + frecency ranking
+│       ├── files/                 # File operations (convert, zip, extract)
+│       ├── db/                    # redb tables + migrations
+│       ├── config/                # TOML config (default-overlay merge) + syncable subset
+│       ├── history/               # Command history
+│       ├── notes/                 # Notes & todos
+│       ├── clipboard/             # Clipboard history + image store
+│       ├── quicklinks/            # Parameterized user commands
+│       ├── script_commands/       # User scripts from ~/.config/lychi/scripts
+│       ├── snippets/ aliases/ reminders/
+│       ├── desktop_apps/          # XDG .desktop discovery
+│       ├── events/                # Internal event bus
+│       ├── mpris.rs               # MPRIS D-Bus media control (feature-gated)
+│       ├── fonts.rs               # Installed font enumeration (fontconfig)
 │       ├── error.rs               # LychiError (thiserror)
 │       └── paths.rs               # XDG directory resolution
 ├── src-tauri/                     # Tauri app — thin bridge layer
 │   └── src/
 │       ├── lib.rs                 # Tauri Builder setup
 │       ├── state.rs               # AppState + handler registration
-│       ├── ipc_server.rs          # Unix domain socket IPC
+│       ├── window.rs              # Show/hide/toggle + monitor repositioning
 │       ├── platform/              # Platform abstraction (linux.rs — GTK/GDK/layer-shell)
+│       ├── hotkey_portal.rs       # XDG GlobalShortcuts portal
+│       ├── ipc_server.rs          # Unix domain socket IPC
+│       ├── reactors.rs            # Event-driven side effects (e.g. AI hot-swap)
 │       └── commands/              # #[tauri::command] IPC wrappers
-├── cli/                           # CLI binary for `lychi --toggle`
+├── cli/                           # CLI binary (`lychi start|--toggle|…`)
 ├── src/                           # Svelte 5 frontend
 │   ├── lib/
 │   │   ├── ipc.ts                 # Typed wrappers for Tauri invoke()
+│   │   ├── keybindings.ts         # Shortcut table (mirrors config.keybindings)
 │   │   └── components/            # Svelte components
 │   └── routes/                    # SvelteKit pages (SPA)
-├── biome.json                     # Biome formatter/linter config
-├── rustfmt.toml                   # Rust formatter config
-├── clippy.toml                    # Clippy linter config
+├── scripts/                       # Build post-processing
 └── package.json                   # Frontend deps + all scripts
 ```
 
 ## Built-in Commands
 
-| Prefix | Example | Action |
-|--------|---------|--------|
-| `open` | `open firefox` | Launch a desktop application (XDG .desktop discovery) |
-| `web` | `web rust lang` | Search the web (opens default browser) |
-| `yt` | `yt lofi beats` | Search YouTube |
-| `run` | `run ls -la` | Execute a shell command |
-| `calc` | `calc 2+2` | Evaluate a math expression |
-| `project` | `project lychi` | Open a project directory in your editor |
-| `spotify` | `spotify next` | Control Spotify (play, pause, next, prev) |
-| `media` | `media pause all` | Control any media player via MPRIS |
-| `note` | `note pick up milk` | Save a quick note |
-| `todo` | `todo add fix bug` | Manage todo list (add, list, done, delete) |
+Around 45 handlers ship built in. The most-used ones:
 
-With AI routing enabled, natural language input is parsed into structured commands automatically.
+| Command | Example | Action |
+|---------|---------|--------|
+| `open` | `open firefox` | Launch a desktop application (XDG .desktop discovery) |
+| `web` | `web rust lang` | Search the web (custom engines + bangs supported) |
+| `yt` | `yt lofi beats` | Search YouTube |
+| `run` | `run ls -la` | Execute a shell command (gated by the shell rules engine) |
+| `calc` | `calc 2+2` | Math, unit and currency conversion |
+| `file` | `/ report.pdf` | Fuzzy file search — open, reveal, or drill into folders |
+| `project` | `project lychi` | Open a project directory in your editor |
+| `media` | `media pause all` | Control any MPRIS player (Spotify, browsers, VLC, …) |
+| `clip` | `cl: token` | Browse and paste from clipboard history |
+| `note` / `todo` | `note pick up milk` | Quick notes and todos |
+| `quicklink` | `gh lychi` | Your own parameterized commands (URL, shell, path, or Lychi command) |
+| `script` | `deploy` | Run a Script Command from `~/.config/lychi/scripts/` |
+| `screenshot` | `screenshot area` | Capture full screen, region, or window |
+| `packages` | `packages install ripgrep` | Search/install/remove packages (dnf, apt, pacman, zypper, flatpak) |
+| `service` | `service restart nginx` | Control systemd services |
+| `win` | `win code` | Switch between open windows |
+| `devutil` | `devutil base64 hi` | base64, hash, urlencode, epoch, json, text-case |
+| `sysinfo` | `si: mem` | ip, cpu, mem, disk, temp, gpu, battery, net, audio, display, os |
+| `snip` / `alias` | `sn: sig` | Snippets and command aliases |
+| `timer` / `reminder` | `tm: 5m tea` | Timers and reminders (persist across restarts) |
+| `generate` | `generate uuid` | Passwords, UUIDs, tokens, random numbers |
+| `color` | `#3b82f6` | Convert hex/RGB/HSL, nearest Tailwind match |
+| `emoji` / `unicode` / `qr` | `e: rocket` | Emoji picker, Unicode search, QR codes |
+| `define` / `weather` / `ssh` / `bm` | `define ephemeral` | Dictionary, weather, SSH hosts, browser bookmarks |
+
+### Trigger characters
+
+| Input | Routes to |
+|-------|-----------|
+| `=` | Math / unit / currency expression |
+| `>` | Shell command |
+| `/` | Fuzzy file search |
+| `~/` | Open a path from home |
+| `@` | Reference a file inside a command |
+| `#hex` | Preview a hex colour |
+| `example.com` | Open a URL |
+
+Two-letter colon prefixes route directly to a handler: `bm:`, `cl:`, `sym:`, `sys:`, `si:`, `yt:`, `e:`, `u:`, `w:`, `r:`, `c:`, `f:`, `o:`, `n:`, `m:`, `p:`, `tz:`, `al:`, `sn:`, `tm:`, `rm:`.
+
+With AI enabled, natural-language input is routed to the right command automatically. Settings → Guide lists every command and trigger, generated from the live registry.
+
+## Keyboard Shortcuts
+
+All shortcuts are user-configurable under `[keybindings]` in `config.toml`. Defaults:
+
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl+K` | Action panel for the selected result |
+| `Ctrl+1` | Toggle history panel |
+| `Ctrl+2` | Toggle notes panel |
+| `Ctrl+3` | Toggle media panel |
+| `Ctrl+4` | Toggle settings panel |
+| `Enter` | Submit |
+| `Escape` | Dismiss window / close panel |
+| `Tab` / `Shift+Tab` | Accept completion / step back |
+| `Ctrl+Tab` | Switch scope |
+| `Up` / `Down` | Navigate results and history |
+| `Ctrl+Enter` | Search the web with the current input |
+| `Shift+Enter` | Run in a new terminal |
+| `Ctrl+O` | Open inline URL |
+| `Ctrl+Shift+C` | Copy path |
+| `Ctrl+Shift+S` | Screenshot |
+| `Ctrl+Shift+A` | Attach file |
+
+## CLI
+
+```bash
+lychi start                      # start Lychi (no-op if already running)
+lychi --toggle                   # show/hide the launcher
+lychi --screenshot [area|window] # capture without opening the launcher
+lychi --ai [preset]              # run an AI preset on the selected text
+lychi --help
+```
+
+Every verb except `start` talks to a running instance over a Unix socket, so they're cheap to bind to desktop shortcuts.
 
 ## Config
 
-Config lives at `~/.config/lychi/config.toml`. All fields have defaults — missing or empty file is valid.
+Config lives at `~/.config/lychi/config.toml`. Every field has a default — a missing or empty file is valid, and unknown keys are merged over the defaults rather than rejected.
 
 ```toml
 [general]
@@ -171,53 +252,56 @@ max_entries = 500
 deduplicate = true
 
 [ai]
-mode = "disabled"       # "disabled", "byo", "ollama"
-provider = "openai"     # "openai", "anthropic", "groq"
-model = "gpt-4o-mini"
+mode = "disabled"        # "disabled" | "byo" | "ollama" | "local"
+provider = "anthropic"   # BYO preset: anthropic, openai, groq, grok, gemini, openrouter, custom
+model = "claude-sonnet-4-5-20250929"   # always user-typed — no baked-in model lists
+base_url = ""            # override the preset's endpoint (https required, except loopback)
+wire_format = ""         # "openai" | "anthropic" | "gemini" — inferred from the preset if empty
+ollama_url = "http://localhost:11434"
+local_model = ""         # bundled llama.cpp model, downloaded on demand
 ```
+
+API keys are stored in the system keyring, never in `config.toml`.
 
 ## Data Files
 
-| File | Path | Purpose |
-|------|------|---------|
-| Config | `~/.config/lychi/config.toml` | App configuration |
-| History | `~/.local/share/lychi/history.json` | Command history |
-| Notes | `~/.local/share/lychi/notes.json` | Sticky note + todo list |
+| Path | Purpose |
+|------|---------|
+| `~/.config/lychi/config.toml` | App configuration |
+| `~/.config/lychi/scripts/` | Script Commands (any executable becomes a command) |
+| `~/.local/share/lychi/lychi.redb` | History, notes, todos, clipboard, snippets, aliases, reminders, timers, AI presets & chats |
+| `~/.local/share/lychi/models/` | Downloaded local AI weights |
+| `~/.local/share/lychi/clipboard-images/` | Clipboard image store |
+| `~/.local/share/lychi/logs/` | Rotating JSON logs |
 
 ## Architecture
 
-- **`lychi-core`** — All business logic. Zero Tauri knowledge. Testable in isolation. Organized as LEGO bricks: action_registry, rules, intent, executor, providers.
-- **`src-tauri`** — Thin Tauri shell. Bridges core to frontend via IPC commands (5-10 lines each).
-- **`cli`** — Tiny binary for `lychi --toggle` via Unix domain socket.
+- **`lychi-core`** — All business logic. Zero Tauri knowledge. Testable in isolation. Organised as LEGO bricks: action_registry, rules, intent, executor, coordinator, providers.
+- **`src-tauri`** — Thin Tauri shell. Bridges core to frontend via IPC commands (5–10 lines each).
+- **`cli`** — Tiny binary that talks to the running app over a Unix domain socket.
 
-Commands are extensible via the `ActionHandler` trait + `ActionRegistry` dispatch pattern. Adding a new command = 1 new handler file + 1 registration line in `state.rs`.
+Commands are extensible via the `ActionHandler` trait + `ActionRegistry` dispatch. Adding a new command = 1 new handler file + 1 registration line in `state.rs`; no frontend changes are needed.
 
-## Keyboard Shortcuts
-
-| Shortcut | Action |
-|----------|--------|
-| `Ctrl+1` | Toggle history panel |
-| `Ctrl+2` | Toggle media panel |
-| `Ctrl+3` | Toggle settings panel |
-| `Ctrl+4` | Toggle notes panel |
-| `Escape` | Dismiss window / close panel |
-| `Up/Down` | Navigate history |
-| `Tab` / `Right Arrow` | Accept history ghost autofill |
+Every execution passes through the rules engine, which owns the shell/path/URI permission decisions in one place. AI suggests actions but never executes them directly.
 
 ## All Scripts Reference
 
 | Script | Command | Description |
 |--------|---------|-------------|
-| `pnpm dev` | `tauri dev` | Launch app with hot reload |
-| `pnpm build` | `tauri build --bundles appimage` | Build production AppImage |
-| `pnpm test` | `cargo test --workspace` | Run all Rust tests |
-| `pnpm test:core` | `cargo test -p lychi-core` | Run core library tests |
+| `pnpm dev` | `RUST_LOG=debug tauri dev` | Launch app with hot reload |
+| `pnpm dev:local-ai` | `tauri dev --features local-ai` | Hot reload with bundled local AI |
+| `pnpm build` | build CLI → `tauri build` → codec fixup | Build production AppImage |
+| `pnpm build:debug` | `tauri build --debug` | Unoptimised bundle |
+| `pnpm build:cli` | `cargo build --release -p lychi-cli` | Build the CLI binary only |
+| `pnpm test` | `cargo test --workspace` | All Rust tests |
+| `pnpm test:core` | `cargo test -p lychi-core` | Core library tests |
+| `pnpm test:fe` | `vitest run` | Frontend tests |
 | `pnpm check` | `svelte-check` | TypeScript/Svelte type check |
-| `pnpm lint` | `biome check src/` | Lint frontend code |
-| `pnpm lint:fix` | `biome check --write src/` | Lint + auto-fix frontend |
-| `pnpm format` | `biome format --write src/` | Format frontend code |
-| `pnpm format:rust` | `cargo fmt --all` | Format Rust code |
-| `pnpm clippy` | `cargo clippy --workspace` | Lint Rust code |
+| `pnpm lint` / `lint:fix` | `biome check src/` | Lint frontend (optionally auto-fix) |
+| `pnpm format` | `biome format --write src/` | Format frontend |
+| `pnpm format:rust` | `cargo fmt --all` | Format Rust |
+| `pnpm clippy` | `cargo clippy --workspace` | Lint Rust |
+| `pnpm clean` | `rm -rf .svelte-kit node_modules/.vite` | Clear frontend caches |
 
 ## Contributing
 
