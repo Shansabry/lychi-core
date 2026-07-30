@@ -445,6 +445,20 @@ pub async fn agent_chat_start(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), LychiError> {
+    // Entry marker for the AI path. Lengths and counts only — never prompt text,
+    // which would put user content in the log file. Earns its place because
+    // "the AI never responded" is otherwise indistinguishable from "the request
+    // never arrived": a stale completion index once made Enter run a leftover
+    // file row instead of starting a turn, and this line is what separated the
+    // two cases.
+    tracing::debug!(
+        generation,
+        with_tools,
+        fresh,
+        images = images.len(),
+        user_len = user.len(),
+        "[agent] chat turn requested"
+    );
     state.ai_generation.store(generation, Ordering::Relaxed);
     let images = encode_images(images).await;
     // Inline any `@`-referenced documents (pdf/docx/…) as extracted text so the

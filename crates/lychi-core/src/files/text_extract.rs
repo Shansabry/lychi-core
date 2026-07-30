@@ -291,6 +291,51 @@ pub struct DocRef {
     pub path: std::path::PathBuf,
 }
 
+/// Resolve the longest `@`-prefixed prefix of `at_token` that is a real file.
+///
+/// Filenames contain spaces — `Sudhagar_ATS_Resume (1) 2026.docx` is an ordinary
+/// download — so a reference cannot be delimited by whitespace. Splitting on it
+/// truncated the path at the first space, the file never resolved, and the
+/// `@`-ref was passed to the model as literal text; the model then answered "no
+/// text provided, this appears to be a file path", which is exactly what it was
+/// given.
+///
+/// Rather than invent a quoting rule the user would have to know about, this asks
+/// the filesystem. Candidate prefixes are tried longest-first, so the greediest
+/// real file wins and trailing prose is left in the instruction. `@a.pdf and
+/// @b.pdf` still resolves as two refs, because neither candidate that spans the
+/// `and` exists.
+///
+/// Returns the matched token *including* the leading `@` (so the caller can strip
+/// it from the instruction verbatim) and the tilde-expanded path.
+fn longest_existing_path(at_token: &str) -> Option<(String, std::path::PathBuf)> {
+    debug_assert!(at_token.starts_with('@'));
+    let rest = &at_token[1..];
+    // Stop at a newline: a reference never spans lines, and without this bound a
+    // whole multi-line prompt would be probed as one filename.
+    let rest = rest.split('\n').next().unwrap_or(rest);
+
+    // Candidate end positions: after each whitespace-delimited word, longest
+    // first. Includes the full remainder, so a path with no spaces still works.
+    let mut ends: Vec<usize> = rest
+        .char_indices()
+        .filter(|&(_, c)| c.is_whitespace())
+        .map(|(i, _)| i)
+        .collect();
+    ends.push(rest.len());
+    for end in ends.into_iter().rev() {
+        let candidate = rest[..end].trim_end();
+        if candidate.is_empty() {
+            continue;
+        }
+        let path = super::paths::expand_home(candidate);
+        if path.is_file() {
+            return Some((format!("@{candidate}"), path));
+        }
+    }
+    None
+}
+
 /// Scan a prompt for `@`-referenced paths that resolve to a **document** on disk
 /// (`FileKind::Doc`). Text/image/archive/`Other` refs are ignored here — text
 /// files inline fine as paths, images go through the vision param, and the rest
@@ -301,10 +346,18 @@ pub fn find_doc_refs(prompt: &str) -> Vec<DocRef> {
         return Vec::new();
     }
     let mut refs = Vec::new();
-    for tok in prompt.split_whitespace() {
-        let Some(rest) = tok.strip_prefix('@') else {
+    for (start, _) in prompt.char_indices().filter(|&(_, c)| c == '@') {
+        // `@` must begin a token, not sit mid-word — otherwise `foo@bar.com`
+        // would be read as a reference.
+        if start > 0
+            && !prompt[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_whitespace())
+        {
             continue;
-        };
+        }
+        let rest = &prompt[start + 1..];
         let looks_like_path = rest
             .chars()
             .next()
@@ -312,12 +365,10 @@ pub fn find_doc_refs(prompt: &str) -> Vec<DocRef> {
         if !looks_like_path {
             continue;
         }
-        let path = super::paths::expand_home(rest);
-        if path.is_file() && classify_path(&path).kind == FileKind::Doc {
-            refs.push(DocRef {
-                token: tok.to_string(),
-                path,
-            });
+        if let Some((token, path)) = longest_existing_path(&prompt[start..]) {
+            if classify_path(&path).kind == FileKind::Doc {
+                refs.push(DocRef { token, path });
+            }
         }
     }
     refs
@@ -565,6 +616,64 @@ mod tests {
         zw.write_all(xml.as_bytes()).unwrap();
         zw.finish().unwrap();
         p
+    }
+
+    /// Filenames contain spaces, and a real download looked like
+    /// `Sudhagar_ATS_Resume (1) 2026.docx`. Splitting the prompt on whitespace
+    /// truncated the path at the first space, so the file never resolved and the
+    /// `@`-ref reached the model as literal text — which answered "no text
+    /// provided, this appears to be a file path".
+    #[test]
+    fn a_doc_ref_with_spaces_in_the_name_resolves() {
+        let doc = docx_with("My Resume (1) 2026.docx", "hello from a spaced name");
+
+        let prompt = format!("summarize this @{}", doc.display());
+        let refs = find_doc_refs(&prompt);
+        assert_eq!(refs.len(), 1, "spaced filename did not resolve");
+        assert_eq!(refs[0].path, doc);
+        // The matched token must cover the WHOLE name, or stripping it from the
+        // instruction would leave `(1) 2026.docx` behind as prose.
+        assert!(
+            refs[0].token.ends_with("2026.docx"),
+            "token truncated: {:?}",
+            refs[0].token
+        );
+
+        let out = expand_doc_refs(&prompt);
+        assert!(out.contains("hello from a spaced name"), "text not inlined");
+        // The instruction line must be clean. Checked on the first line only: the
+        // filename legitimately reappears below as the document's header label.
+        let instruction = out.lines().next().unwrap_or_default();
+        assert_eq!(
+            instruction.trim(),
+            "summarize this",
+            "leftover path fragment in the instruction"
+        );
+    }
+
+    /// Greedy matching must not swallow following prose or a second reference.
+    #[test]
+    fn two_spaced_refs_resolve_independently() {
+        let a = docx_with("First Doc.docx", "alpha body");
+        let b = docx_with("Second Doc.docx", "beta body");
+
+        let prompt = format!("compare @{} and @{} please", a.display(), b.display());
+        let refs = find_doc_refs(&prompt);
+        assert_eq!(refs.len(), 2, "expected two refs, got {refs:?}");
+
+        let out = expand_doc_refs(&prompt);
+        assert!(out.contains("alpha body") && out.contains("beta body"));
+        // The connecting prose survives — greedy matching stopped at a real file.
+        assert!(out.contains("compare") && out.contains("please"), "{out}");
+    }
+
+    /// A `@`-ref pointing at nothing must leave the prompt alone rather than
+    /// consuming the rest of the line looking for a file.
+    #[test]
+    fn a_nonexistent_doc_ref_is_left_alone() {
+        let prompt = "summarize @/nope/does not exist.docx and then stop";
+        assert!(find_doc_refs(prompt).is_empty());
+        assert_eq!(expand_doc_refs(prompt), prompt);
     }
 
     #[test]
