@@ -111,8 +111,17 @@ pub async fn setup(app: tauri::AppHandle, configured_hotkey: String) {
                         RETRY_SCHEDULE_SECS.len()
                     );
                 } else {
-                    tracing::debug!(
-                        "[portal] attempt {}/{} failed ({e}) — retrying (portal may still be starting)",
+                    // WARN, not DEBUG. A retry logs "[portal] registered host
+                    // app-id" on the way in, so at default level the user sees
+                    // that line repeat on a 1/2/4/8/15s backoff with no reason
+                    // attached — which reads as the app malfunctioning when the
+                    // usual cause is mundane: another Lychi (autostart) already
+                    // holds the shortcut, so this instance's CreateSession is
+                    // refused. The symptom was visible and the cause was not.
+                    tracing::warn!(
+                        "[portal] attempt {}/{} failed ({e}) — retrying. If another \
+                         Lychi is already running (autostart), it owns the hotkey and \
+                         this one does not need it.",
                         attempt + 1,
                         RETRY_SCHEDULE_SECS.len()
                     );

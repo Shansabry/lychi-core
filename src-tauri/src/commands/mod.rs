@@ -10,6 +10,7 @@ pub mod context;
 pub mod execute;
 pub mod filesystem;
 pub mod firebase_auth;
+pub mod frontend_log;
 pub mod history;
 pub mod media;
 pub mod notes;

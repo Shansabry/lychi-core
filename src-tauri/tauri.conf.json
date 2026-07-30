@@ -25,7 +25,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data:; font-src 'self'; connect-src 'self' https:; frame-ancestors 'none';",
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data:; font-src 'self'; connect-src 'self' https: ipc: http://ipc.localhost; frame-ancestors 'none';",
       "assetProtocol": {
         "enable": true,
         "scope": [
@@ -45,8 +45,14 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["appimage", "deb", "rpm"],
-    "externalBin": ["binaries/lychi"],
+    "targets": [
+      "appimage",
+      "deb",
+      "rpm"
+    ],
+    "externalBin": [
+      "binaries/lychi"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -55,18 +61,33 @@
     ],
     "linux": {
       "deb": {
-        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0", "libgtk-layer-shell0"],
-        "recommends": ["libayatana-appindicator3-1"]
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0",
+          "libgtk-layer-shell0"
+        ],
+        "recommends": [
+          "libayatana-appindicator3-1"
+        ]
       },
       "rpm": {
-        "depends": ["webkit2gtk4.1", "gtk3", "gtk-layer-shell"]
+        "depends": [
+          "webkit2gtk4.1",
+          "gtk3",
+          "gtk-layer-shell"
+        ]
       }
+    },
+    "resources": {
+      "../THIRD-PARTY-NOTICES.html": "THIRD-PARTY-NOTICES.html"
     }
   },
   "plugins": {
     "deep-link": {
       "desktop": {
-        "schemes": ["lychi"]
+        "schemes": [
+          "lychi"
+        ]
       }
     }
   }

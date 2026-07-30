@@ -59,6 +59,7 @@ import { context } from "$lib/stores/context.svelte";
 import { media } from "$lib/stores/media.svelte";
 import { ui } from "$lib/stores/ui.svelte";
 import { decideSubmit, presetDisplay, type RouteDecision, renderPreset } from "$lib/submit-router";
+import { installUiLogging } from "$lib/uiLog";
 
 let inputValue = $state("");
 let isExecuting = $state(false);
@@ -529,6 +530,10 @@ function isFallbackKind(kind: string | null | undefined): boolean {
 }
 
 onMount(() => {
+	// First thing in onMount: an uncaught error thrown before this runs is
+	// invisible to the log file, and a frontend crash otherwise leaves a log
+	// that looks perfectly healthy.
+	installUiLogging();
 	getActiveWindowStrategy().then((s) => {
 		windowStrategy = s;
 	});

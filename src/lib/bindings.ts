@@ -1031,6 +1031,15 @@ async readSelection() : Promise<Result<string | null, string>> {
 }
 },
 /**
+ * Record a frontend event in the backend log.
+ * 
+ * Never fails: a logging call that can error is a logging call that gets
+ * wrapped in a try/catch and then quietly dropped.
+ */
+async logFrontend(entry: FrontendLog) : Promise<void> {
+    await TAURI_INVOKE("log_frontend", { entry });
+},
+/**
  * Open the hosted sign-in page in the system browser.
  */
 async firebaseSignIn() : Promise<Result<null, string>> {
@@ -1617,6 +1626,18 @@ name: string;
  * misalign every column of command output.
  */
 monospace: boolean }
+/**
+ * A log record originating in the webview.
+ */
+export type FrontendLog = { 
+/**
+ * `error` | `warn` | `info`. Anything else is logged at info.
+ */
+level: string; message: string; 
+/**
+ * JS stack trace when the source was an exception.
+ */
+stack: string | null }
 export type GeneralConfig = { hide_on_blur: boolean; show_duration_ms: boolean; theme: string; 
 /**
  * Accent color (hex, e.g. "#7c8cff"). Empty = use the theme's default

@@ -131,6 +131,7 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::ai_history::load_conversation,
         commands::context::get_context,
         commands::context::read_selection,
+        commands::frontend_log::log_frontend,
         commands::firebase_auth::firebase_sign_in,
         commands::firebase_auth::firebase_sign_out,
         commands::firebase_auth::firebase_get_user,
