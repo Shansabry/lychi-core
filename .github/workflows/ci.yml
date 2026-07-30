@@ -86,6 +86,27 @@ jobs:
             exit 1
           fi
 
+  licenses:
+    name: Dependency licences
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Fails on any dependency whose licence is not in about.toml's accepted
+      # list. Lychi is GPL-3.0-only, so a crate under GPL-2.0-only, AGPL, SSPL,
+      # BUSL, CDDL or EPL would be a real distribution problem — and one added
+      # transitively is invisible until someone audits by hand. This is the
+      # audit, run per PR.
+      #
+      # Deliberately NOT building the AppImage: the check is about the graph, so
+      # it needs the manifests and nothing else.
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --features cli
+
+      - name: Check licences and generate notices
+        run: cargo about generate about.hbs --features local-ai -o /dev/null
+
   frontend:
     name: Frontend
     runs-on: ubuntu-latest

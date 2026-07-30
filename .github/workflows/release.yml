@@ -104,6 +104,16 @@ jobs:
       # into the release (statically linked; runtime AI-mode switching is pure
       # config). The AVX2 baseline (crates/lychi-core/.cargo/config.toml) keeps
       # it portable across x86-64.
+      # The AppImage ships THIRD-PARTY-NOTICES.html as a bundled resource (see
+      # tauri.conf.json), because MIT/BSD/Apache/MPL all require their notices
+      # to travel WITH the binary — having them in the repo is not enough.
+      # Generated here rather than committed so they can never describe a
+      # different dependency set than the binary beside them.
+      - name: Generate third-party notices
+        run: |
+          cargo install cargo-about --locked --features cli
+          cargo about generate about.hbs --features local-ai -o THIRD-PARTY-NOTICES.html
+
       - name: Build AppImage
         run: pnpm exec tauri build --verbose --bundles appimage --features local-ai
 

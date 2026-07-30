@@ -1,0 +1,58 @@
+# cargo-about: which dependency licences may ship in the AppImage.
+#
+# Two jobs in one file. `cargo about generate` collects the licence TEXTS that
+# MIT/BSD/Apache/MPL require to travel with a binary distribution, and it FAILS
+# on any crate whose licence is not listed here — so a dependency with
+# incompatible terms cannot reach a release quietly.
+#
+# Lychi is GPL-3.0-only. Everything below is compatible with that; the list is
+# the result of auditing the real graph (~594 crates), not a guess.
+
+# Linux is the only target, so evaluating other platforms' dependency trees
+# would pull in licences we never actually ship.
+targets = ["x86_64-unknown-linux-gnu"]
+
+accepted = [
+    # Lychi's own crates. Listed because cargo-about checks every package in the
+    # graph including the workspace members, not just third-party ones.
+    "GPL-3.0-only",
+
+    # Permissive — no conditions beyond attribution, which is what the
+    # generated notices file satisfies.
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unlicense",
+    "CC0-1.0",
+    "BSL-1.0",
+    "bzip2-1.0.6",
+
+    # Apache-2.0 with the LLVM exception (target-lexicon). A distinct SPDX
+    # expression, not covered by plain "Apache-2.0" — the exception only REMOVES
+    # obligations (it waives the patent/attribution requirements for binaries),
+    # so it is strictly more permissive than what we already accept.
+    "Apache-2.0 WITH LLVM-exception",
+
+    # Unicode data tables (icu / idna). DFS-2016 is the older spelling still
+    # used by a few crates.
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+
+    # Weak, file-level copyleft. GPL-compatible via MPL section 3.3 — verified
+    # that none of the seven MPL crates we pull (nucleo, nucleo-matcher,
+    # cssparser, cssparser-macros, selectors, option-ext, dtoa-short) elects
+    # the "Incompatible With Secondary Licenses" notice in its sources, which
+    # is the thing that would break that compatibility.
+    "MPL-2.0",
+]
+
+# Deliberately NOT accepted, and each would be a real problem rather than a
+# formality: GPL-2.0-only (incompatible with GPL-3.0), AGPL (extends
+# obligations over a network), SSPL / BUSL / Commons-Clause (not free software
+# at all), CDDL and EPL (file-level copyleft the FSF considers GPL-incompatible).
+# Adding one to this list is a licensing decision, not a build fix.
