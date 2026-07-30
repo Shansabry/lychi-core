@@ -3,6 +3,19 @@ name: Release builds
 # Builds the Linux bundles (AppImage, deb, rpm) on Ubuntu 22.04 so the
 # AppImage keeps a glibc 2.35 baseline — do NOT build release artifacts on
 # newer distros or they won't run on older LTS systems.
+#
+# glibc is backward- but not forward-compatible: a binary linked against 2.39
+# refuses to start on a host with 2.35, while one linked against 2.35 runs on
+# everything newer. So the container is pinned to the OLDEST base we intend to
+# support, not the newest available. Demonstrated the hard way — a local Fedora
+# build (glibc 2.43) could not be shared with a tester at all.
+#
+# `runs-on: ubuntu-latest` is only the host that runs the container, and is free
+# to float. `container:` is the thing that sets the baseline. Bumping the
+# container is a support-matrix decision: 24.04 would mean glibc 2.39, dropping
+# Ubuntu 22.04 LTS, Debian 12 and RHEL 9. If a toolchain here turns out too old
+# (e.g. CMake 3.22 for llama.cpp), install a newer one INSIDE this container
+# rather than moving the base.
 on:
   workflow_dispatch:
   push:
@@ -34,20 +47,32 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
             libayatana-appindicator3-dev libgtk-layer-shell-dev \
             libssl-dev libdbus-1-dev xdg-utils desktop-file-utils \
-            cmake clang libclang-dev
+            cmake clang libclang-dev \
+            xz-utils ca-certificates
 
       - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install pnpm + Node
+      # `standalone: true` installs @pnpm/exe — pnpm with Node.js bundled in.
+      #
+      # Required because this job runs inside a bare `ubuntu:22.04` container
+      # with no Node. The action's default path self-installs via `npm`, which
+      # fails there with `spawn npm ENOENT`. `ci.yml` keeps the plain form
+      # because it runs directly on the GitHub runner, which ships Node — so the
+      # two workflows differ on purpose, not by oversight.
+      #
+      # pnpm stays FIRST so `cache: pnpm` on setup-node can resolve the store
+      # path (it shells out to pnpm to find it), which is the documented order.
+      - name: Install pnpm
         uses: pnpm/action-setup@v6
         with:
           version: 10
+          standalone: true
       - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
 
       - name: Cache cargo + tauri bundler tools
