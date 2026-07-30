@@ -386,11 +386,23 @@ function handleInput(val: string) {
 				completions.searchScopePath = "";
 			}
 
-			// Don't clear completions — keep showing old results until new ones arrive
+			// Keep the current ROWS on screen until the replacement batch lands, but
+			// still drop the SELECTION.
+			//
+			// Clearing `items` here is what made the list flicker: every keystroke
+			// emptied it, and the empty-state branch renders "Searching..." whenever
+			// `items` is empty and the search is unfinished — so each keypress
+			// flashed results → "Searching..." → results. Each batch carries the
+			// FULL ranked set for its query and replaces `items` wholesale, so there
+			// is nothing to clear: stale rows are overwritten, not appended to.
+			//
+			// `index` is a different matter and MUST be reset. Submit resolves the
+			// selected row via `items[index]`, so an index left pointing into the
+			// previous query's list makes Enter run a leftover row instead of what
+			// the user typed — which looked like "the AI never responds".
 			if (raw.length > 0 || lastSlash >= 0) {
+				completions.index = -1;
 				completions.debounceTimer = setTimeout(() => {
-					completions.items = [];
-					completions.index = -1;
 					if (searchScope) startFileSearch(searchTerm, searchScope, id);
 				}, 150);
 			} else {
@@ -1881,6 +1893,10 @@ async function handleDismiss() {
 			{#if completions.items.length === 0 && completions.atMode && completions.atNoResults}
 				<div class="empty-state">Empty folder</div>
 			{:else if completions.items.length === 0 && completions.searchMode && !completions.searchDone}
+				<!-- Only reachable with genuinely nothing to show: a cold first query,
+				     or a scope whose walk hasn't produced matches yet. Keystrokes no
+				     longer clear `items`, so this can't flash between result sets
+				     anymore — it used to, once per keypress. -->
 				<div class="empty-state">Searching...</div>
 			{:else if completions.items.length === 0 && completions.pending && !completions.atMode && !completions.searchMode && inputValue.trim().length > 0}
 				<!-- Cold-start hint: the first query hasn't returned yet. Subtle,

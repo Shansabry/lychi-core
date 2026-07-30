@@ -134,9 +134,11 @@ pub struct AppState {
     /// one confirm prompt at a time.
     pub pending_execution: Arc<RwLock<Option<PendingExecution>>>,
     pub active_file_search: Arc<AtomicU64>,
-    /// Persistent per-scope fuzzy file indexes (nucleo engines). Built lazily on
-    /// first search of a scope, reused across keystrokes for instant matching.
-    pub file_index: Arc<lychi_core::file_search::FileIndexStore>,
+    /// The in-flight file search, plus the generation guard that makes the newest
+    /// query the only one able to emit. Owns one matcher per search rather than
+    /// sharing one across surfaces, so results can never be attributed to the
+    /// wrong query.
+    pub live_search: Arc<lychi_core::file_search::live::LiveSearch>,
     pub timer_state: TimerState,
     /// Dismiss-on-blur armed flag. Set true when the user interacts with the
     /// launcher (key press, pointer click). Reset on hide. Focus-out only
@@ -395,7 +397,9 @@ impl AppState {
             pending_plan: Arc::new(RwLock::new(None)),
             pending_execution: Arc::new(RwLock::new(None)),
             active_file_search: Arc::new(AtomicU64::new(0)),
-            file_index: Arc::new(lychi_core::file_search::FileIndexStore::default()),
+            live_search: Arc::new(lychi_core::file_search::live::LiveSearch::new(Arc::new(
+                lychi_core::file_search::corpus::CorpusStore::default(),
+            ))),
             timer_state,
             dismiss_armed: Arc::new(AtomicBool::new(false)),
             summon_seq: Arc::new(AtomicU64::new(0)),

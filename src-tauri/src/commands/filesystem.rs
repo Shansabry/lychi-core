@@ -40,13 +40,13 @@ pub async fn fuzzy_path_completions(
     query: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<CompletionItem>, LychiError> {
-    let index = state.file_index.clone();
+    let live = state.live_search.clone();
     let db = state.db.clone();
     let scope = dirs::home_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "/".to_string());
     tauri::async_runtime::spawn_blocking(move || {
-        file_search::fuzzy_path_completions(&index, &scope, &query, &db, 15)
+        file_search::fuzzy_path_completions(&live, &scope, &query, &db, 15)
     })
     .await
     .map_err(|e| LychiError::ExecutionFailed(format!("fuzzy completions task panicked: {e}")))
@@ -145,78 +145,80 @@ pub async fn start_file_search(
         return Ok(());
     }
 
-    // Fuzzy search via the persistent index. Get/build the scope's engine, then
-    // match. `notify` re-runs the search when more of the index streams in, so
-    // results fill as the background walk progresses.
-    let store = state.file_index.clone();
-    let app_notify = app.clone();
-    let scope_notify = scope.clone();
-    let query_notify = query.clone();
-    let db_notify = db.clone();
-    let active_notify = active_id.clone();
-    let store_notify = store.clone();
-    let notify: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
-        // Only re-emit if this scope's search is still the active one.
-        if active_notify.load(Ordering::Relaxed) == search_id {
-            emit_index_results(
-                &store_notify,
-                &scope_notify,
-                &query_notify,
-                search_id,
-                &db_notify,
-                &app_notify,
-            );
-        }
-    });
+    // Fuzzy search. `LiveSearch` owns the session and the generation together, so
+    // starting this search cancels the previous one by dropping its matcher —
+    // there is no in-flight query left to race with.
+    let live = state.live_search.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
-        let index = store.get_or_build(&scope, notify);
-        // Run the match, then emit whatever's matched so far. The notify
-        // callback handles later fills as indexing completes.
-        if let Ok(mut idx) = index.lock() {
-            idx.search(&query, 10);
-        }
-        emit_index_results(&store, &scope, &query, search_id, &db, &app);
+        // nucleo calls the redraw hook from its own threadpool as more results
+        // score, and it needs the generation to ask for results — which `begin`
+        // only returns once it has been given the hook. A shared cell closes that
+        // cycle: written once here, read on every later redraw.
+        let generation_cell = Arc::new(std::sync::OnceLock::new());
+
+        let redraw: Arc<dyn Fn() + Send + Sync> = {
+            let live = live.clone();
+            let cell = generation_cell.clone();
+            let db = db.clone();
+            let app = app.clone();
+            Arc::new(move || {
+                // Before the cell is set, the initial emit below hasn't run yet
+                // and will cover this. Afterwards, `emit_ranked_results` drops
+                // the batch itself if the generation has been superseded.
+                if let Some(&generation) = cell.get() {
+                    emit_ranked_results(&live, generation, &db, &app, search_id);
+                }
+            })
+        };
+
+        let generation = live.begin(&scope, &query, redraw);
+        let _ = generation_cell.set(generation);
+        emit_ranked_results(&live, generation, &db, &app, search_id);
     });
 
     Ok(())
 }
 
-/// Read the current matches from the scope's index, RE-RANK them with explicit
-/// match tiers (Spotlight/Raycast/fzf model — see `lychi_core::file_search_score`),
-/// split into Folders and Files groups, and emit with section-header rows.
+/// Rank the current matches and emit one batch to the frontend.
 ///
-/// nucleo is used only as a fast candidate *generator* (its parallel walk +
-/// fuzzy filter narrows millions of paths to the matching set); ranking is ours,
-/// because nucleo's path-scheme score ties a folder with its own children.
-fn emit_index_results(
-    store: &Arc<lychi_core::file_search::FileIndexStore>,
-    scope: &str,
-    query: &str,
-    search_id: u64,
+/// Ranking is `lychi_core::file_search::rank` — the SAME function the `@`
+/// reference uses, not a copy of it, so both surfaces order results identically.
+/// nucleo is only a candidate generator here: its path-scheme score ties a folder
+/// with its own children, so final order has to be ours.
+///
+/// A superseded generation emits nothing. `LiveSearch::results` returns `None`
+/// once a newer query has started, so a late redraw from a previous keystroke
+/// cannot repaint the list — the "latest wins" rule lives there, once, rather
+/// than being re-checked here.
+fn emit_ranked_results(
+    live: &Arc<lychi_core::file_search::live::LiveSearch>,
+    generation: lychi_core::file_search::session::Generation,
     db: &Arc<redb::Database>,
     app: &AppHandle,
+    search_id: u64,
 ) {
-    use lychi_core::file_search_score::{MatchScore, classify};
+    use lychi_core::file_search::{RANK_POOL, rank};
 
-    // Per group; folders and files are ranked independently, so each can fill
-    // its own section without one starving the other.
+    // Per group; folders and files are ranked independently so each fills its own
+    // section without one starving the other.
     const PER_GROUP: usize = 25;
-    // Over-fetch from nucleo: it fuzzy-filtered already, so this pool is "paths
-    // that match at all". We re-rank the whole pool, then take the best per group.
-    const CANDIDATE_POOL: usize = 400;
 
-    let (items, done) = {
-        let Some(index) = store.peek(scope) else {
-            return;
-        };
-        let Ok(mut idx) = index.lock() else {
-            return;
-        };
-        // Pull any newly-injected/matched items into the snapshot before reading.
-        idx.refresh(10);
-        (idx.top(CANDIDATE_POOL), idx.is_complete())
+    let Some(results) = live.results(generation, RANK_POOL) else {
+        tracing::debug!(
+            ?generation,
+            search_id,
+            "[file-search] superseded — not emitting"
+        );
+        return; // superseded — a newer query owns the screen
     };
+    tracing::debug!(
+        query = %results.query,
+        candidates = results.items.len(),
+        complete = results.complete,
+        search_id,
+        "[file-search] emitting"
+    );
 
     let frecency_scores = lychi_core::db::frecency::get_scores(db);
     let now_secs = std::time::SystemTime::now()
@@ -225,76 +227,19 @@ fn emit_index_results(
         .unwrap_or(0);
     let home = dirs::home_dir();
 
-    // Classify every candidate into a match tier + in-tier signals. Anything the
-    // scorer rejects (query hits neither name nor any ancestor dir) is dropped —
-    // an extra guard on top of nucleo's own filter.
-    struct Row {
-        score: MatchScore,
-        bonus: u16,
-        is_dir: bool,
-        result: FileSearchResult,
-    }
-    let mut rows: Vec<Row> = items
-        .into_iter()
-        .filter_map(|d| {
-            let score = classify(query, &d.file_name, &d.rel_path)?;
-            let bonus = frecency_recency_bonus(
-                frecency_scores.get(&d.full_path).copied(),
-                d.modified_secs,
-                now_secs,
-            );
-            let path = Path::new(&d.full_path);
-            let description = if d.is_dir {
-                Some("Folder".to_string())
-            } else {
-                d.file_name
-                    .rsplit('.')
-                    .next()
-                    .filter(|ext| !ext.is_empty() && ext.len() < 6 && *ext != d.file_name)
-                    .map(|ext| ext.to_uppercase())
-            };
-            Some(Row {
-                score,
-                bonus,
-                is_dir: d.is_dir,
-                result: FileSearchResult {
-                    label: search_display_label(path, d.is_dir, home.as_deref()),
-                    full_path: d.full_path.clone(),
-                    is_dir: d.is_dir,
-                    score: 0, // set below from final display rank
-                    description,
-                    size_bytes: d.size_bytes,
-                    modified_secs: d.modified_secs,
-                },
-            })
-        })
-        .collect();
-
-    // Rank: tier (best first) → shorter filename → shallower path → more used.
-    // This is fzf's `--tiebreak=pathname,length` plus a Raycast usage layer, but
-    // gated under a discrete tier so a real filename match always beats a
-    // path-only one (the parent-vs-children fix is structural, not a tiebreak).
-    let rank = |a: &Row, b: &Row| {
-        a.score
-            .tier
-            .cmp(&b.score.tier) // lower tier value = better match
-            .then_with(|| a.score.name_len.cmp(&b.score.name_len)) // shorter name first
-            .then_with(|| a.score.depth.cmp(&b.score.depth)) // shallower first
-            .then_with(|| b.bonus.cmp(&a.bonus)) // more used first
-            .then_with(|| a.result.label.cmp(&b.result.label)) // stable
-    };
-
-    let (mut folders, mut files): (Vec<Row>, Vec<Row>) = rows.drain(..).partition(|r| r.is_dir);
-    folders.sort_by(&rank);
-    files.sort_by(&rank);
-    folders.truncate(PER_GROUP);
-    files.truncate(PER_GROUP);
+    let ranked = rank::rank(&results.query, results.items, |d| {
+        frecency_recency_bonus(
+            frecency_scores.get(&d.full_path).copied(),
+            d.modified_secs,
+            now_secs,
+        )
+    });
+    let (folders, files) = rank::split_groups(ranked, PER_GROUP);
 
     // Build the emitted list: a "folders" section header, the folders, then a
-    // "files" section header, then the files. Headers use the `__separator__`
-    // sentinel the CompletionsList already renders (centered label between
-    // lines) — no new UI. A section is omitted entirely when it has no matches,
-    // so an all-files or all-folders query shows just the one group.
+    // "files" header, then the files. Headers use the `__separator__` sentinel
+    // the CompletionsList already renders — no new UI. A section is omitted
+    // entirely when empty, so an all-files query shows just the one group.
     //
     // Display score is a single descending integer so the frontend's own
     // score-sort preserves exactly this order (headers get a score above their
@@ -302,25 +247,36 @@ fn emit_index_results(
     let mut out: Vec<FileSearchResult> = Vec::with_capacity(folders.len() + files.len() + 2);
     let mut next_score: u16 = (folders.len() + files.len() + 4) as u16;
 
-    if !folders.is_empty() {
-        out.push(section_header("folders", &mut next_score));
-        for row in folders {
-            out.push(finalize_row(row.result, &mut next_score));
-        }
-    }
-    if !files.is_empty() {
-        out.push(section_header("files", &mut next_score));
-        for row in files {
-            out.push(finalize_row(row.result, &mut next_score));
-        }
-    }
+    let mut push_group =
+        |label: &str, group: Vec<rank::Ranked>, out: &mut Vec<FileSearchResult>| {
+            if group.is_empty() {
+                return;
+            }
+            out.push(section_header(label, &mut next_score));
+            for r in group {
+                out.push(finalize_row(
+                    FileSearchResult {
+                        label: rank::display_label(&r.data, home.as_deref()),
+                        full_path: r.data.full_path.clone(),
+                        is_dir: r.data.is_dir,
+                        score: 0, // set by finalize_row from the display rank
+                        description: r.description,
+                        size_bytes: r.data.size_bytes,
+                        modified_secs: r.data.modified_secs,
+                    },
+                    &mut next_score,
+                ));
+            }
+        };
+    push_group("folders", folders, &mut out);
+    push_group("files", files, &mut out);
 
     let _ = app.emit(
         "lychi://file-search-results",
         FileSearchBatch {
             search_id,
             results: out,
-            done,
+            done: results.complete,
             has_ignore_rules: false,
         },
     );
@@ -330,7 +286,12 @@ fn emit_index_results(
 #[tauri::command]
 #[specta::specta]
 pub async fn cancel_file_search(state: State<'_, AppState>) -> Result<(), LychiError> {
+    // Still used by the directory-listing path (`walk_and_emit`), which is a
+    // plain walk with no session behind it.
     state.active_file_search.store(0, Ordering::SeqCst);
+    // Drop the fuzzy session and bump the generation, so an in-flight redraw
+    // that fires after the user dismissed cannot repaint the list.
+    state.live_search.cancel();
     Ok(())
 }
 

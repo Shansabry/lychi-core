@@ -305,13 +305,15 @@ pub fn run() {
             tauri::async_runtime::spawn_blocking(|| {
                 lychi_core::file_search::warmup_fs_cache();
             });
-            // Eagerly build the home fuzzy index so the first `@` reference (and
-            // `/` search) is instant instead of triggering a cold walk.
+            // Eagerly walk the home corpus so the first `@` reference (and `/`
+            // search) matches against a warm path set instead of triggering a
+            // cold walk. Only the paths are shared; each search still gets its
+            // own matcher.
             {
-                let index = app.state::<AppState>().file_index.clone();
+                let live = app.state::<AppState>().live_search.clone();
                 tauri::async_runtime::spawn_blocking(move || {
                     if let Some(home) = dirs::home_dir() {
-                        index.get_or_build(&home.to_string_lossy(), std::sync::Arc::new(|| {}));
+                        live.corpus(&home.to_string_lossy());
                     }
                 });
             }

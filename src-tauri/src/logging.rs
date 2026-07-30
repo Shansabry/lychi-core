@@ -78,6 +78,19 @@ struct ResourceSnapshot {
     threads: u64,
     /// Open file descriptors.
     open_fds: u64,
+    /// Peak RSS ever reached (`VmHWM`). RSS alone can't distinguish "never grew"
+    /// from "grew and gave it back", and those need opposite fixes: a high peak
+    /// with low current RSS is transient churn, while peak == current is memory
+    /// genuinely still held.
+    rss_peak_kb: u64,
+    /// Anonymous resident memory (`RssAnon`) — the heap and allocator arenas, as
+    /// opposed to file-backed pages (`RssFile`: the binary, mmapped libraries).
+    ///
+    /// This is the field that localizes a memory problem. In a debug build the
+    /// binary alone contributes tens of MB of `RssFile` that release builds
+    /// don't have, so bare RSS overstates the real cost. Growth that is ours to
+    /// fix shows up here and nowhere else.
+    rss_anon_kb: u64,
 }
 
 fn read_resources() -> ResourceSnapshot {
@@ -95,6 +108,8 @@ fn read_resources() -> ResourceSnapshot {
                 _ if line.starts_with("VmRSS:") => snap.rss_kb = val(),
                 _ if line.starts_with("VmSize:") => snap.vsz_kb = val(),
                 _ if line.starts_with("Threads:") => snap.threads = val(),
+                _ if line.starts_with("VmHWM:") => snap.rss_peak_kb = val(),
+                _ if line.starts_with("RssAnon:") => snap.rss_anon_kb = val(),
                 _ => {}
             }
         }
@@ -121,9 +136,18 @@ pub fn spawn_health_monitor(interval: std::time::Duration) {
                 let m = lychi_core::context::metrics::snapshot();
                 tracing::info!(
                     rss_mb = r.rss_kb / 1024,
+                    // Anonymous (heap/arena) vs peak: together these say whether
+                    // a large RSS is our allocations, transient churn already
+                    // returned, or just file-backed pages from the binary.
+                    rss_anon_mb = r.rss_anon_kb / 1024,
+                    rss_peak_mb = r.rss_peak_kb / 1024,
                     vsz_mb = r.vsz_kb / 1024,
                     threads = r.threads,
                     open_fds = r.open_fds,
+                    // Indexed path count, so memory growth can be attributed to
+                    // the index rather than guessed at. A flat count beside a
+                    // rising rss_anon_mb means the leak is elsewhere.
+                    indexed_paths = lychi_core::file_search::indexed_path_count(),
                     stale_hits = m.soft_stale_hit + m.hard_stale_hit,
                     ctx_refreshes = m.stale_refresh_triggered,
                     "[health] resource snapshot"
