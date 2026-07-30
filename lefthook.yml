@@ -57,9 +57,19 @@ pre-push:
     tests:
       run: cargo test --workspace --quiet
 
-    # Lints only what CI lints, so a green hook means a green CI job.
+    # Deliberately WITHOUT `-D warnings`, to match ci.yml exactly.
+    #
+    # Adding it here looked like a free improvement and was not: it failed on 19
+    # pre-existing style lints in test code that CI accepts, so the hook blocked
+    # a push CI would have passed. A local gate that is stricter than the remote
+    # one breaks the promise this file is built on — that a green hook means a
+    # green CI — and the only way through is `--no-verify`, which disables every
+    # other check too.
+    #
+    # If those lints should be errors, make them errors in ci.yml and fix them
+    # there; the hook follows CI, not the other way round.
     clippy:
-      run: cargo clippy --workspace --all-targets -- -D warnings
+      run: cargo clippy --workspace --all-targets
 
     frontend-check:
       run: pnpm check

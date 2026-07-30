@@ -365,10 +365,10 @@ pub fn find_doc_refs(prompt: &str) -> Vec<DocRef> {
         if !looks_like_path {
             continue;
         }
-        if let Some((token, path)) = longest_existing_path(&prompt[start..]) {
-            if classify_path(&path).kind == FileKind::Doc {
-                refs.push(DocRef { token, path });
-            }
+        if let Some((token, path)) = longest_existing_path(&prompt[start..])
+            && classify_path(&path).kind == FileKind::Doc
+        {
+            refs.push(DocRef { token, path });
         }
     }
     refs

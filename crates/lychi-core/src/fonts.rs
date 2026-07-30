@@ -112,7 +112,7 @@ fn parse_fc_list(text: &str) -> Vec<FontFamily> {
         .collect();
     // Sorted so the picker is stable across launches — `HashMap` order is
     // arbitrary and would otherwise reshuffle the list every time.
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|a| a.name.to_lowercase());
     out
 }
 

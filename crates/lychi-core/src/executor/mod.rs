@@ -931,7 +931,7 @@ impl Executor {
         // keyword here) keeps the preview and the execution in agreement,
         // including about when a bare keyword counts.
         if let Some((_, expanded)) = self.quicklink_route(raw)
-            && let Some(keyword) = raw.trim().split_whitespace().next()
+            && let Some(keyword) = raw.split_whitespace().next()
             && let Some(link) = self
                 .quicklinks
                 .iter()
