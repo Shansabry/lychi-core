@@ -17,7 +17,20 @@ Lychi picks the best window strategy for your session automatically:
 
 On GNOME the window covers the monitor with a transparent surface and the launcher is centered by CSS — Mutter does not let applications position their own windows. True fullscreen is deliberately **not** requested there, because Mutter paints an opaque backdrop behind fullscreen windows.
 
-**Wayland hotkey note:** Wayland doesn't let apps register global hotkeys directly. Lychi uses the XDG GlobalShortcuts portal where available (GNOME, KDE); otherwise bind a system shortcut to `lychi --toggle` in your desktop's keyboard settings.
+**Global hotkey:** Lychi registers `Super+Space` for you where it can, by three
+routes in order of preference:
+
+| Session | How |
+|---------|-----|
+| GNOME, KDE (Wayland) | XDG GlobalShortcuts portal — the compositor asks you to confirm |
+| XFCE, GNOME, Cinnamon (X11) | written into the desktop's own keyboard settings |
+| Everything else | X11 key-grab, or bind `lychi --toggle` yourself |
+
+An X11 key-grab alone is not enough: it cannot override a combination the window
+manager already owns, and it fails *silently* — which is why the desktop's own
+settings are written too. If the key you picked is already taken, Lychi says so
+in the log and leaves the existing binding alone rather than stealing it; pick
+another in Settings, or bind `lychi --toggle` manually.
 
 ## Prerequisites
 

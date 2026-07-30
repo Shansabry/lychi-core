@@ -1,5 +1,6 @@
 mod commands;
 #[cfg(target_os = "linux")]
+mod hotkey_de;
 mod hotkey_portal;
 #[cfg(unix)]
 mod ipc_server;
@@ -485,6 +486,40 @@ pub fn run() {
                         tracing::warn!(
                             "Global shortcut registration failed for {hotkey_str}: {e} — use `lychi --toggle` via a system shortcut"
                         );
+                    }
+                }
+
+                // An X11 grab succeeding is NOT the same as owning the key. A
+                // grab cannot override a combination the window manager already
+                // claims: the grab returns Ok, we log "registered", and the WM
+                // keeps delivering the key to itself — so the launcher never
+                // opens. A tester hit exactly this on XFCE with Super+Space.
+                //
+                // So also write the binding into the desktop's own settings,
+                // where we become the owner rather than a competing grabber.
+                // Cheap, idempotent, and it refuses to clobber a shortcut that
+                // belongs to something else.
+                match hotkey_de::register(&hotkey_str) {
+                    hotkey_de::Outcome::Registered => {
+                        app.state::<AppState>()
+                            .hotkey_registered
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        tracing::info!("[hotkey] {hotkey_str} bound in the desktop's settings");
+                    }
+                    hotkey_de::Outcome::Conflict(owner) => {
+                        tracing::warn!(
+                            "[hotkey] {hotkey_str} is already bound to {owner:?} — left alone. \
+                             Pick another key in Settings, or bind `lychi --toggle` yourself"
+                        );
+                    }
+                    hotkey_de::Outcome::Unsupported => {
+                        tracing::debug!(
+                            "[hotkey] no desktop-settings integration for this session; \
+                             relying on the X11 grab"
+                        );
+                    }
+                    hotkey_de::Outcome::Failed(e) => {
+                        tracing::warn!("[hotkey] could not write the desktop shortcut: {e}");
                     }
                 }
             }
