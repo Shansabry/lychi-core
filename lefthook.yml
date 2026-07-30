@@ -1,0 +1,74 @@
+# Git hooks — catch locally what CI would catch 10 minutes later.
+#
+# Scoped deliberately to fast, deterministic checks. A hook that takes minutes
+# gets bypassed with `--no-verify`, and a hook everyone bypasses is worse than no
+# hook: it creates the impression of a gate that is not actually there. So the
+# heavy work (full test suite, clippy over every target, the AppImage build)
+# stays in CI, and this covers the mistakes that are cheap to catch and annoying
+# to discover remotely.
+#
+# Install with `pnpm hooks` (lefthook install). Skip a single commit with
+# `LEFTHOOK=0 git commit` when you genuinely need to.
+
+pre-commit:
+  parallel: true
+  commands:
+    # Formatting first: it rewrites files, and `stage_fixed` re-stages what it
+    # touched so the commit contains the formatted version rather than failing
+    # and making you run it yourself.
+    rust-fmt:
+      glob: "*.rs"
+      run: cargo fmt --all
+      stage_fixed: true
+
+    frontend-fmt:
+      glob: "*.{ts,svelte,js,json,css}"
+      run: pnpm biome check --write --no-errors-on-unmatched {staged_files}
+      stage_fixed: true
+
+    # Type errors are the most common thing to push by accident, and `cargo
+    # check` is far cheaper than the clippy/test pass CI runs.
+    rust-check:
+      glob: "*.rs"
+      run: cargo check --workspace --all-targets
+
+    # Bindings are generated from the Rust command list and committed, so a new
+    # #[tauri::command] without a regenerate breaks the frontend build in CI.
+    # Cheap to verify here, where the fix is one command away.
+    #
+    # ~2s warm. It can take much longer on the first run after a release build,
+    # because that leaves the debug profile cold and this is the step that has to
+    # rebuild it — measured at 116s once. That is a cold-cache artifact, not the
+    # steady-state cost, and not a reason to move this to CI-only.
+    bindings-current:
+      glob: "src-tauri/src/**/*.rs"
+      run: |
+        cargo test -p lychi-app export_bindings --quiet
+        if ! git diff --quiet src/lib/bindings.ts; then
+          echo "src/lib/bindings.ts was stale and has been regenerated — stage it and commit again"
+          exit 1
+        fi
+
+pre-push:
+  parallel: true
+  commands:
+    # The suite is ~2s, so it belongs on push rather than in CI-only. Pushing a
+    # red main is the thing this exists to prevent.
+    tests:
+      run: cargo test --workspace --quiet
+
+    # Lints only what CI lints, so a green hook means a green CI job.
+    clippy:
+      run: cargo clippy --workspace --all-targets -- -D warnings
+
+    frontend-check:
+      run: pnpm check
+
+commit-msg:
+  commands:
+    # Conventional Commits, matching what this repo already does: 26 feat, 10
+    # fix, 7 ci, 5 chore across recent history. The point is consistency for
+    # changelog generation, not ceremony — so the type list below is exactly the
+    # set in use, plus the standard ones, and nothing aspirational.
+    commitlint:
+      run: pnpm exec commitlint --edit {1}
