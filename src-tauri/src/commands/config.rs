@@ -408,6 +408,34 @@ pub async fn set_hotkey(
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    // Move the desktop-settings binding too, not just the X11 grab.
+    //
+    // On XFCE the accelerator is part of the config property path, so writing a
+    // new one without removing the old leaves BOTH bound to Lychi — the user
+    // rebinds Super+Space to Ctrl+Space and finds the old key still works, with
+    // nothing in the UI explaining why. Order matters: unregister the previous
+    // combination first, then claim the new one.
+    #[cfg(target_os = "linux")]
+    {
+        let old_hotkey = {
+            let config = state.config.read().await;
+            config.general.hotkey.clone()
+        };
+        if old_hotkey != hotkey {
+            crate::hotkey_de::unregister(&old_hotkey);
+        }
+        match crate::hotkey_de::register(&hotkey) {
+            crate::hotkey_de::Outcome::Conflict(owner) => {
+                // Surfaced as an error so the Settings UI can tell the user,
+                // rather than silently persisting a hotkey that won't fire.
+                return Err(LychiError::Config(format!(
+                    "{hotkey} is already used by {owner} — pick another combination"
+                )));
+            }
+            outcome => tracing::debug!(?outcome, "[hotkey] desktop binding for {hotkey}"),
+        }
+    }
+
     // Persist to config
     let mut config = state.config.write().await;
     config.general.hotkey = hotkey.clone();

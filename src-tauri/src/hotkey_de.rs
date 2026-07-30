@@ -157,10 +157,51 @@ pub fn register(accel: &str) -> Outcome {
     }
 }
 
+/// Remove a binding we previously wrote for `accel`.
+///
+/// Must be called before writing a new one when the user changes their hotkey in
+/// Settings. Without it, the OLD combination stays in the desktop's config and
+/// keeps launching Lychi — so a user who rebinds `Super+Space` to `Ctrl+Space`
+/// ends up with both working and no way to tell why.
+///
+/// Only ever removes a binding whose command is ours; a shortcut that has since
+/// been repointed at something else is left alone.
+pub fn unregister(accel: &str) {
+    let Some(desktop) = detect() else { return };
+    let Some(gtk) = to_gtk_accel(accel) else {
+        return;
+    };
+    match desktop {
+        Desktop::Xfce => {
+            let prop = format!("/commands/custom/{gtk}");
+            // Confirm it is still ours before deleting.
+            let owned = Command::new("xfconf-query")
+                .args(["-c", "xfce4-keyboard-shortcuts", "-p", &prop])
+                .output()
+                .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("lychi"))
+                .unwrap_or(false);
+            if owned {
+                let _ = Command::new("xfconf-query")
+                    .args(["-c", "xfce4-keyboard-shortcuts", "-p", &prop, "-r"])
+                    .output();
+            }
+        }
+        // GNOME/Cinnamon reuse one fixed path (`.../lychi/`) rather than a
+        // per-accelerator one, so changing the hotkey overwrites the `binding`
+        // key in place — there is no stale entry to clean up.
+        Desktop::Gnome | Desktop::Cinnamon => {}
+        Desktop::Kde | Desktop::Mate => {}
+    }
+}
+
 /// XFCE: `xfce4-keyboard-shortcuts` channel, `/commands/custom/<accel>`.
 ///
 /// xfconf applies changes live — `xfsettingsd` watches the channel — so the
 /// binding works without a logout.
+///
+/// Note the accelerator is part of the property PATH here, unlike the gsettings
+/// desktops: each combination is its own key, so rebinding leaves the old one
+/// behind unless [`unregister`] removes it.
 fn xfce(accel: &str) -> Outcome {
     let Some(gtk) = to_gtk_accel(accel) else {
         return Outcome::Failed(format!("could not translate accelerator {accel:?}"));
