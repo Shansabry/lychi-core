@@ -1,8 +1,8 @@
-name: Release builds
+name: Release build (AppImage)
 
-# Builds the Linux bundles (AppImage, deb, rpm) on Ubuntu 22.04 so the
-# AppImage keeps a glibc 2.35 baseline — do NOT build release artifacts on
-# newer distros or they won't run on older LTS systems.
+# Builds the release AppImage in an Ubuntu 22.04 container so it keeps a
+# glibc 2.35 baseline — do NOT build release artifacts on newer distros or
+# they won't run on older LTS systems.
 #
 # glibc is backward- but not forward-compatible: a binary linked against 2.39
 # refuses to start on a host with 2.35, while one linked against 2.35 runs on
@@ -94,12 +94,18 @@ jobs:
           mkdir -p src-tauri/binaries
           cp target/release/lychi src-tauri/binaries/lychi-x86_64-unknown-linux-gnu
 
-      - name: Build bundles (AppImage, deb, rpm)
-        # --features local-ai bakes the bundled llama.cpp CPU-inference engine
-        # into the release (statically linked; runtime AI-mode switching is pure
-        # config). The AVX2 baseline (crates/lychi-core/.cargo/config.toml) keeps
-        # it portable across x86-64.
-        run: pnpm exec tauri build --verbose --features local-ai
+      # AppImage only, deliberately. deb/rpm are not part of the distribution
+      # story yet (packaging is future work) and nobody has verified them, so
+      # building them bought three formats to test and one shared failure mode:
+      # any bundler erroring loses ALL artifacts, which is how an icon error in
+      # the deb path produced zero downloads including the AppImage.
+      #
+      # --features local-ai bakes the bundled llama.cpp CPU-inference engine
+      # into the release (statically linked; runtime AI-mode switching is pure
+      # config). The AVX2 baseline (crates/lychi-core/.cargo/config.toml) keeps
+      # it portable across x86-64.
+      - name: Build AppImage
+        run: pnpm exec tauri build --verbose --bundles appimage --features local-ai
 
       # linuxdeploy recursively bundles WebKitGTK's GStreamer codec/crypto stack
       # (mp3lame, mpg123, gsm, nettle/hogweed, pulse, ...). Those bundled copies'
@@ -111,11 +117,9 @@ jobs:
       - name: Strip over-bundled codec libs from the AppImage
         run: bash scripts/fix-appimage-codecs.sh
 
-      - name: Upload artifacts
+      - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: lychi-linux-bundles
-          path: |
-            target/release/bundle/appimage/*.AppImage
-            target/release/bundle/deb/*.deb
-            target/release/bundle/rpm/*.rpm
+          name: lychi-appimage
+          path: target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
