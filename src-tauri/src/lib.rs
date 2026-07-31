@@ -4,6 +4,7 @@ mod hotkey_de;
 mod hotkey_portal;
 #[cfg(unix)]
 mod ipc_server;
+mod launcher_state;
 mod logging;
 mod platform;
 mod reactors;

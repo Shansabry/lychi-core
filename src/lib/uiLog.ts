@@ -27,6 +27,21 @@ function send(level: "error" | "warn" | "info", message: string, stack?: string)
 	void commands.logFrontend({ level, message, stack: stack ?? null }).catch(() => {});
 }
 
+/**
+ * Deliberately record a frontend event in the backend log.
+ *
+ * Distinct from the `console.*` mirroring below, which catches things that went
+ * wrong. This is for tracing a flow that is *working* but whose decisions are
+ * invisible from the Rust side — the blur-dismiss path being the case that
+ * motivated it: the backend logs that it asked for a dismiss, and only the
+ * frontend knows whether it honoured it, declined it, or did something else.
+ */
+export const uiLog = {
+	info: (message: string) => send("info", message),
+	warn: (message: string) => send("warn", message),
+	error: (message: string) => send("error", message),
+};
+
 /** Best-effort stringify — an Error, a DOM event, or whatever a library threw. */
 function describe(value: unknown): { message: string; stack?: string } {
 	if (value instanceof Error) {

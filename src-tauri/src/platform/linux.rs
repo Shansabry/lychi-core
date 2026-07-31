@@ -786,21 +786,60 @@ pub fn setup_dismiss_on_blur(
     use gtk::prelude::WidgetExt;
     use std::sync::atomic::Ordering;
 
+    // Session counters, shared by the handlers below purely for diagnostics —
+    // nothing branches on them. They exist so the log answers "how many focus
+    // events did this window get, and how many keys did the user actually
+    // type?" directly, instead of leaving it to be inferred from timestamps.
+    let keypress_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let focusout_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let focusin_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // focus-IN, logged for one reason: a spurious focus-out on Mutter is
+    // followed by focus coming straight back, whereas a genuine one (the user
+    // switched window) is not. Without this line the two are indistinguishable
+    // in the log, and that distinction is the whole question on GNOME.
+    {
+        let ins = focusin_count.clone();
+        let seq = summon_seq.clone();
+        let handle = window.app_handle().clone();
+        gtk_win.connect_focus_in_event(move |_, _| {
+            let n = ins.fetch_add(1, Ordering::SeqCst) + 1;
+            let s = seq.load(Ordering::SeqCst);
+            // Focus-in is what promotes Showing -> Visible. Until it arrives,
+            // no focus-out can be a dismiss, because focus was never held.
+            handle.state::<crate::state::AppState>().launcher.apply(
+                crate::launcher_state::Event::FocusIn,
+                &format!("focus-IN #{n} seq={s}"),
+            );
+            glib::Propagation::Proceed
+        });
+    }
+
     // key-press: user typed → arm dismiss, stamped with the current summon
     // cycle (Escape handled separately)
     {
         let armed = dismiss_armed.clone();
         let seq = summon_seq.clone();
         let stamp = armed_seq.clone();
+        let keys = keypress_count.clone();
         gtk_win.connect_key_press_event(move |_, event| {
             use gdk::keys::constants as key;
             let keyval = event.keyval();
-            // Don't arm on Escape (handled by setup_escape_handler)
+            // EVERY keystroke is counted, and the count is logged. The old
+            // handler logged only the FIRST key (the `!armed` guard swallowed
+            // the rest), which is why a report of "it closes after about three
+            // characters" could not be checked against the log at all: there
+            // was one key-press line and no way to tell if a second key ever
+            // arrived. The count is the difference between reading a user's
+            // recollection and reading what happened.
+            let n = keys.fetch_add(1, Ordering::SeqCst) + 1;
             if keyval != key::Escape && !armed.load(Ordering::SeqCst) {
                 let current = seq.load(Ordering::SeqCst);
                 stamp.store(current, Ordering::SeqCst);
                 armed.store(true, Ordering::SeqCst);
-                tracing::info!("[dismiss] seq={current} key-press → armed=true");
+                tracing::info!("[dismiss] seq={current} key-press #{n} → armed=true");
+            } else {
+                tracing::debug!("[dismiss] key-press #{n} (already armed)");
             }
             glib::Propagation::Proceed // let key propagate to WebView
         });
@@ -826,21 +865,78 @@ pub fn setup_dismiss_on_blur(
     // cycle — a stale focus-out arriving after a re-summon must not close
     // the fresh window.
     let handle = window.app_handle().clone();
-    gtk_win.connect_focus_out_event(move |_, _| {
+    let blurs = focusout_count.clone();
+    let keys_seen = keypress_count.clone();
+    let started = std::time::Instant::now();
+    gtk_win.connect_focus_out_event(move |w, _| {
         let seq = summon_seq.load(Ordering::SeqCst);
-        let armed = dismiss_armed.load(Ordering::SeqCst);
-        let stamped = armed_seq.load(Ordering::SeqCst);
-        if armed && stamped == seq {
-            tracing::info!("[dismiss] seq={seq} focus-out (armed, current cycle) → DISMISS");
+
+        // Diagnostics attached to EVERY focus-out, dismissing or not.
+        //
+        // A tester on GNOME/Wayland reported the launcher "crashing" when he
+        // typed. It had not crashed — it dismissed. His log showed the decision
+        // and nothing else, so the interesting facts had to be reconstructed by
+        // hand from timestamps: that his window emitted THREE focus-outs before
+        // he ever pressed a key, i.e. that on Mutter this window bleeds focus
+        // roughly twice a second unprompted, and the dismissing focus-out was
+        // simply the first one to arrive after arming.
+        //
+        // That is the fact that reframes the bug, and it should be legible
+        // without arithmetic. So: how many focus-outs this window has seen, how
+        // many keys the user actually typed, and how long the window had been up.
+        let n = blurs.fetch_add(1, Ordering::SeqCst) + 1;
+        let keys = keys_seen.load(Ordering::SeqCst);
+        let up_ms = started.elapsed().as_millis();
+        use gtk::prelude::{GtkWindowExt, WidgetExt};
+        let is_active = w.is_active();
+        let has_focus = w.has_toplevel_focus();
+
+        // THE AUTHORITATIVE SIGNAL: GdkWindowState::FOCUSED.
+        //
+        // GDK sets this bit straight from the Wayland `wl_keyboard` enter/leave
+        // events, so it is the protocol's own notion of keyboard focus rather
+        // than a GTK-level approximation of it. Measured on KDE Wayland, it is
+        // exactly inverted from the two properties tried before it:
+        //
+        //   FOCUS-IN   is_active=false toplevel_focus=false  FOCUSED=true
+        //   FOCUS-OUT  is_active=true  toplevel_focus=true   FOCUSED=false
+        //
+        // That inversion is why `is_active()`/`has_toplevel_focus()` failed:
+        // on Wayland they lag by one event, so at focus-out time they still
+        // describe the PREVIOUS state. A predicate built on them reads `true`
+        // on every focus-out — including a genuine click-away — which silently
+        // disables dismiss-on-blur rather than fixing anything.
+        //
+        // This also replaces a 1200ms "wait and see if focus comes back" timer.
+        // That worked, but it inferred from behaviour what the protocol states
+        // outright, and it made every genuine dismiss lag by over a second.
+        let focus_lost = w
+            .window()
+            .map(|gw| !gw.state().contains(gdk::WindowState::FOCUSED))
+            .unwrap_or(false);
+
+        // `is_active`/`toplevel_focus` stay in the log — not as inputs, but so a
+        // future report can be checked against the inversion documented above
+        // rather than re-derived from scratch.
+        let ctx = format!(
+            "blur#{n} keys={keys} up={up_ms}ms focus_lost={focus_lost} \
+             (is_active={is_active} toplevel_focus={has_focus}) visible={}",
+            w.is_visible()
+        );
+
+        // Report, don't decide. The handler's only job is to say what the
+        // protocol reported; the state machine owns what to do about it. Having
+        // three places each decide this independently is what produced the
+        // original bug.
+        let action = handle.state::<crate::state::AppState>().launcher.apply(
+            crate::launcher_state::Event::FocusOut { focus_lost },
+            &format!("{ctx} seq={seq}"),
+        );
+        if matches!(action, crate::launcher_state::Action::EmitDismiss) {
+            tracing::info!("[dismiss] seq={seq} → DISMISS  {ctx}");
             dismiss_armed.store(false, Ordering::SeqCst);
             use tauri::Emitter;
             let _ = handle.emit("lychi://dismiss", ());
-        } else if armed {
-            tracing::info!(
-                "[dismiss] focus-out from stale cycle (armed_seq={stamped}, seq={seq}) → ignored"
-            );
-        } else {
-            tracing::info!("[dismiss] seq={seq} focus-out (not armed) → ignored");
         }
         glib::Propagation::Proceed
     });

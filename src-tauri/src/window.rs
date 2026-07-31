@@ -43,21 +43,30 @@ pub fn toggle_window(window: &WebviewWindow) {
 
     let win = window.clone();
     glib::MainContext::default().invoke(move || {
-        let visible = win
-            .gtk_window()
-            .map(|g| {
-                use gtk::prelude::WidgetExt;
-                g.is_visible()
-            })
-            .unwrap_or(false);
-        tracing::info!("[toggle] decision on GTK thread: visible={visible}");
-        if visible {
-            // Disarm dismiss so focus-out during hide doesn't re-trigger.
-            let state = win.app_handle().state::<AppState>();
+        // Ask the state machine, do not poll GTK. `gtk_window.is_visible()` is a
+        // widget flag that changes asynchronously with the compositor, so it is
+        // transiently wrong on Wayland — and when the dismiss path polled it
+        // too, the two disagreed microseconds apart:
+        //
+        //   [toggle]  decision on GTK thread: visible=true
+        //   [dismiss] focus-out ... visible=false
+        //
+        // Decide and act under ONE lock on the GTK thread, which is the
+        // property the original inline hide was protecting (see the "press the
+        // hotkey twice" note above); the state machine preserves it rather than
+        // reintroducing a read-then-act round-trip.
+        let state = win.app_handle().state::<AppState>();
+        let action = state
+            .launcher
+            .apply(crate::launcher_state::Event::ToggleRequested, "toggle");
+        if matches!(action, crate::launcher_state::Action::Hide) {
             state.dismiss_armed.store(false, Ordering::SeqCst);
             // On the GTK thread this executes inline — the widget flag is
             // updated synchronously, so a follow-up toggle decides correctly.
             let _ = win.hide();
+            state
+                .launcher
+                .apply(crate::launcher_state::Event::HideCompleted, "toggle-hide");
         } else {
             // show_window does blocking context work (KWin D-Bus snapshot) —
             // it must not run on the GTK thread. Hand it to a worker; its own
@@ -85,6 +94,16 @@ pub fn show_window(window: &WebviewWindow) {
         state.summon_seq.fetch_add(1, Ordering::SeqCst) + 1
     };
     tracing::info!("[show] === show_window BEGIN (seq={seq}, t={}) ===", tid());
+    // Record the show even when it did not come from a toggle (startup, tray,
+    // `--show`), so the machine is never left in Hidden while a window is up.
+    // Idempotent for the toggle path, which has already moved to Showing.
+    {
+        let state = window.app_handle().state::<AppState>();
+        state.launcher.apply(
+            crate::launcher_state::Event::ShowRequested,
+            &format!("show_window seq={seq}"),
+        );
+    }
 
     // Reset dismiss armed — will be re-armed by user interaction (key/click).
     {

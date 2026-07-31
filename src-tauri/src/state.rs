@@ -140,10 +140,16 @@ pub struct AppState {
     /// wrong query.
     pub live_search: Arc<lychi_core::file_search::live::LiveSearch>,
     pub timer_state: TimerState,
-    /// Dismiss-on-blur armed flag. Set true when the user interacts with the
-    /// launcher (key press, pointer click). Reset on hide. Focus-out only
-    /// dismisses if this is true, avoiding KWin's automatic focus revoke
-    /// (~9ms after show) from triggering a false dismiss.
+    /// The single owner of "is the launcher open?" — see [`crate::launcher_state`].
+    ///
+    /// Every show/hide/focus decision goes through this. It replaces the
+    /// previous arrangement where `toggle_window`, the focus-out handler, and
+    /// `hide_launcher` each polled GTK independently and could disagree.
+    pub launcher: Arc<crate::launcher_state::LauncherStateMachine>,
+    /// Dismiss-on-blur armed flag. Retained for log correlation only — it no
+    /// longer gates dismissal. Arming never made focus-out trustworthy; it only
+    /// postponed the first spurious dismiss until after the first keystroke,
+    /// which is why the bug presented as "it closes when I type".
     pub dismiss_armed: Arc<AtomicBool>,
     /// Monotonic summon sequence. Incremented at the start of each show_window().
     /// Focus handlers check this to ignore stale events from previous summon
@@ -401,6 +407,7 @@ impl AppState {
                 lychi_core::file_search::corpus::CorpusStore::default(),
             ))),
             timer_state,
+            launcher: Arc::new(crate::launcher_state::LauncherStateMachine::new()),
             dismiss_armed: Arc::new(AtomicBool::new(false)),
             summon_seq: Arc::new(AtomicU64::new(0)),
             armed_seq: Arc::new(AtomicU64::new(0)),

@@ -59,7 +59,7 @@ import { context } from "$lib/stores/context.svelte";
 import { media } from "$lib/stores/media.svelte";
 import { ui } from "$lib/stores/ui.svelte";
 import { decideSubmit, presetDisplay, type RouteDecision, renderPreset } from "$lib/submit-router";
-import { installUiLogging } from "$lib/uiLog";
+import { installUiLogging, uiLog } from "$lib/uiLog";
 
 let inputValue = $state("");
 let isExecuting = $state(false);
@@ -629,6 +629,15 @@ onMount(() => {
 
 /** Full summon reset: pristine launcher, fresh chat/context, focus the input. */
 function handleSummon() {
+	// A per-summon heartbeat, so frontend SILENCE becomes meaningful.
+	//
+	// Without it the log cannot separate "the UI is fine and had nothing to
+	// report" from "the UI died after startup" — both look like an absence of
+	// `[ui]` lines. That ambiguity is the whole reason a tester's blank window
+	// was misread as a crash: the backend kept logging happily while the
+	// frontend was the part in trouble. One line per open means a summon with
+	// no matching `[ui] summon` is now a fact, not a guess.
+	uiLog.info("[ui] summon — launcher surface ready");
 	launcherReady = true;
 	inputValue = "";
 	lastResult = null;
@@ -673,11 +682,25 @@ function handleSummon() {
 /** Blur-dismiss (lychi://dismiss): respect hide-on-blur; an open Settings/Notes
  *  panel just closes instead of hiding the window. */
 function handleBlurDismiss() {
-	if (!hideOnBlur) return;
+	// Logged because the backend's DISMISS decision is not the same thing as the
+	// window closing: this function can decline (hide-on-blur off) or redirect
+	// (close a panel instead). Previously none of those outcomes reached the log,
+	// so "[dismiss] → DISMISS" was the last thing anyone could see and the three
+	// possible endings were indistinguishable.
+	uiLog.info(
+		`[dismiss] frontend received dismiss (hideOnBlur=${hideOnBlur}, ` +
+			`settings=${ui.panelVisible("settings")}, notes=${ui.panelVisible("notes")})`,
+	);
+	if (!hideOnBlur) {
+		uiLog.info("[dismiss] ignored — hide-on-blur is off");
+		return;
+	}
 	if (ui.panelVisible("settings") || ui.panelVisible("notes")) {
+		uiLog.info("[dismiss] closing open panel instead of hiding window");
 		ui.closePanel();
 		return;
 	}
+	uiLog.info("[dismiss] hiding window");
 	hideWindow().then(() => {
 		if (completions.searchMode) {
 			cancelFileSearch();
@@ -1626,6 +1649,12 @@ function handleArrowDown() {
 }
 
 async function hide() {
+	// Logged because this is the OTHER way the window closes, and it used to be
+	// silent. The backend records `[hide] window hidden`, but with no cause
+	// attached an Escape press and a blur-dismiss are indistinguishable in the
+	// log — which is exactly the ambiguity that made "it vanished while I typed"
+	// take so long to pin down. `handleBlurDismiss` names itself; so should this.
+	uiLog.info("[hide] user dismissed (escape/keybinding)");
 	launcherReady = false;
 	await hideWindow();
 }

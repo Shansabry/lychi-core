@@ -360,13 +360,34 @@ pub fn get_hotkey_status(state: State<'_, AppState>) -> HotkeyStatus {
 #[tauri::command]
 #[specta::specta]
 pub fn hide_launcher(app: AppHandle) {
-    // Disarm dismiss so focus-out during hide doesn't re-trigger
+    // Logged because this is the moment the window actually disappears, and it
+    // used to be silent. `show_window` logs nine lines; this logged nothing, so
+    // a report of "it vanished while I typed" could be traced as far as the
+    // DISMISS decision and no further — we could not tell whether the frontend
+    // honoured it, whether hide() was even reached, or whether it succeeded.
+    // Show and hide must be equally visible or the log only tells half the story.
     let state = app.state::<AppState>();
-    state
+    let was_armed = state
         .dismiss_armed
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-    if let Some(win) = app.get_webview_window("main") {
-        let _ = win.hide();
+        .swap(false, std::sync::atomic::Ordering::SeqCst);
+    match app.get_webview_window("main") {
+        Some(win) => {
+            // The Result was previously discarded; a failed hide would leave the
+            // window on screen with nothing in the log to say so.
+            match win.hide() {
+                Ok(()) => {
+                    tracing::info!("[hide] window hidden (was_armed={was_armed})");
+                    // Close the loop: without this the machine stays in Hiding
+                    // and the next toggle would try to hide an already-hidden
+                    // window — the "stopped summoning" failure, reintroduced.
+                    state
+                        .launcher
+                        .apply(crate::launcher_state::Event::HideCompleted, "hide_launcher");
+                }
+                Err(e) => tracing::error!("[hide] window.hide() FAILED: {e}"),
+            }
+        }
+        None => tracing::error!("[hide] no 'main' window to hide"),
     }
 }
 
