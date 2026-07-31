@@ -113,15 +113,17 @@ pub async fn setup(app: tauri::AppHandle, configured_hotkey: String) {
                 } else {
                     // WARN, not DEBUG. A retry logs "[portal] registered host
                     // app-id" on the way in, so at default level the user sees
-                    // that line repeat on a 1/2/4/8/15s backoff with no reason
-                    // attached — which reads as the app malfunctioning when the
-                    // usual cause is mundane: another Lychi (autostart) already
-                    // holds the shortcut, so this instance's CreateSession is
-                    // refused. The symptom was visible and the cause was not.
+                    // that line repeat on a 1/2/4/8/15s backoff, and without a
+                    // reason attached that reads as the app malfunctioning.
+                    //
+                    // This message used to assert the cause was another running
+                    // Lychi holding the shortcut. That guess was wrong and it
+                    // cost real debugging time: the actual failure was our own
+                    // connection bug (see `register_host_app_id`), and the
+                    // confident-but-false explanation in the log actively
+                    // pointed away from it. Report the error; don't speculate.
                     tracing::warn!(
-                        "[portal] attempt {}/{} failed ({e}) — retrying. If another \
-                         Lychi is already running (autostart), it owns the hotkey and \
-                         this one does not need it.",
+                        "[portal] attempt {}/{} failed ({e}) — retrying",
                         attempt + 1,
                         RETRY_SCHEDULE_SECS.len()
                     );
@@ -152,12 +154,28 @@ const APP_ID: &str = "app.lychi";
 /// CreateSession without a registered app-id would be a guaranteed reject.
 /// A genuine `UnknownMethod` (older portal that never had Register) returns Ok:
 /// there's nothing to register and the legacy path still works.
-async fn register_host_app_id() -> Result<(), String> {
+///
+/// CRITICAL — the connection is the identity. The interface XML is explicit:
+/// "lets unsandboxed applications register their **D-Bus connections**" and
+/// "Register a **D-Bus peer**". The app-id is bound to the peer that called
+/// `Register`, NOT to the process. Registering on a throwaway connection and
+/// then creating the session on a different one leaves the session's peer
+/// anonymous, and the portal rejects it with the exact
+/// `NotAllowed: An app id is required` this function exists to prevent.
+/// That was a real bug: we opened `Connection::session()` here, registered,
+/// dropped it at the end of the scope, and let ashpd open its own — so every
+/// attempt logged a successful registration followed by a rejected
+/// CreateSession, nine times, and the hotkey silently never bound.
+///
+/// So the caller owns ONE connection, registers it here, and hands that same
+/// connection to `GlobalShortcuts::with_connection`. Also note the spec's
+/// "Registering can only [be] done at most once; any subsequent call will
+/// result in an error" — a fresh connection per retry keeps that true.
+async fn register_host_app_id(conn: &ashpd::zbus::Connection) -> Result<(), String> {
     use ashpd::zbus;
     let attempt = async {
-        let conn = zbus::Connection::session().await?;
         let proxy = zbus::Proxy::new(
-            &conn,
+            conn,
             "org.freedesktop.portal.Desktop",
             "/org/freedesktop/portal/desktop",
             "org.freedesktop.host.portal.Registry",
@@ -192,17 +210,28 @@ async fn register_host_app_id() -> Result<(), String> {
 }
 
 async fn run(app: &tauri::AppHandle, configured_hotkey: &str) -> ashpd::Result<()> {
+    // ONE connection, used for both the handshake and the session — the portal
+    // binds the app-id to the calling peer, so these cannot be separate
+    // connections. See `register_host_app_id` for what happens when they are.
+    //
+    // Built per attempt rather than cached process-wide: `Register` is
+    // once-per-peer, so a retry after a failure needs a peer that has not
+    // already registered.
+    let conn = ashpd::zbus::Connection::session()
+        .await
+        .map_err(ashpd::Error::from)?;
+
     // Identify ourselves to the portal FIRST (required on xdg-desktop-portal
     // ≥1.21, otherwise CreateSession is rejected with "An app id is required").
     // If this fails (portal not up yet at autostart), bail so the retry loop
     // tries again — rather than proceeding to a guaranteed CreateSession reject.
-    if let Err(e) = register_host_app_id().await {
+    if let Err(e) = register_host_app_id(&conn).await {
         return Err(ashpd::Error::Portal(ashpd::PortalError::Failed(format!(
             "host app-id registration not ready: {e}"
         ))));
     }
 
-    let shortcuts = GlobalShortcuts::new().await?;
+    let shortcuts = GlobalShortcuts::with_connection(conn).await?;
     let session = shortcuts.create_session(Default::default()).await?;
 
     // Bindings persist per app-id. Bind only if absent: BindShortcuts may
