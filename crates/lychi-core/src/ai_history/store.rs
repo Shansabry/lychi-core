@@ -44,7 +44,7 @@ impl AiHistoryStore {
                 updated_at: conv.updated_at,
             });
         }
-        out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        out.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         Ok(out)
     }
 

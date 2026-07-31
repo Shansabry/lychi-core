@@ -179,7 +179,7 @@ impl HistoryStore {
 
         // Sort by nucleo score descending before taking top-N, so frecency boost
         // only affects items that are already strong fuzzy matches.
-        scored.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        scored.sort_unstable_by_key(|b| std::cmp::Reverse(b.1));
 
         // Blend with frecency
         let frecency_scores = frecency::get_scores(db);
@@ -209,7 +209,7 @@ impl HistoryStore {
             })
             .collect();
 
-        items.sort_by(|a, b| b.score.cmp(&a.score));
+        items.sort_by_key(|b| std::cmp::Reverse(b.score));
         items.truncate(5);
         items
     }

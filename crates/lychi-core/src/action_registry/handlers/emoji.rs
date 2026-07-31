@@ -177,7 +177,7 @@ impl ActionHandler for EmojiHandler {
             }
         }
 
-        results.sort_by(|a, b| b.3.cmp(&a.3));
+        results.sort_by_key(|b| std::cmp::Reverse(b.3));
         results.truncate(20);
 
         results

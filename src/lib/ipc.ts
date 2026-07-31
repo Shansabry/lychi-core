@@ -724,8 +724,20 @@ export async function agentChatStart(
 	display: MessageDisplay | null = null,
 ): Promise<void> {
 	if (!isTauri()) return;
+	// The command now takes a named object (see AgentChatStart in the backend):
+	// four of these are bool/number/string, so a transposed pair used to compile
+	// and fail at runtime. This wrapper keeps its positional signature because
+	// every caller already uses it and the names are bound right here.
 	unwrap(
-		await commands.agentChatStart(system, user, fresh, withTools, generation, images, display),
+		await commands.agentChatStart({
+			system,
+			user,
+			fresh,
+			withTools,
+			generation,
+			images,
+			display,
+		}),
 	);
 }
 

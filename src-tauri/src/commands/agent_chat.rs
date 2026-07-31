@@ -428,23 +428,50 @@ async fn encode_images(paths: Vec<String>) -> Vec<ImageSource> {
     .unwrap_or_default()
 }
 
+/// Everything the caller supplies to start a turn.
+///
+/// Grouped into a struct because the flat argument list had grown to seven
+/// caller-supplied values, four of them `bool`/`u64`/`String` — the shape where
+/// a transposed pair of arguments still compiles and fails at runtime. Naming
+/// them at the call site removes that class of mistake, and specta turns this
+/// into a TypeScript object so the frontend gains the same protection.
+#[derive(serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentChatStart {
+    pub system: String,
+    pub user: String,
+    /// Start a new conversation rather than continuing the current one.
+    pub fresh: bool,
+    /// Expose the tool set to the model (plain chat when false).
+    pub with_tools: bool,
+    /// Monotonic turn id; a stale stream's tokens are dropped by the frontend.
+    pub generation: u64,
+    #[serde(default)]
+    pub images: Vec<String>,
+    /// How the turn renders when that differs from its content (a preset that
+    /// folded a large payload into a chip). Persisted with the message so a
+    /// RECALLED conversation renders identically, keeping the sender the only
+    /// decider of that split. Never sent to a provider.
+    #[serde(default)]
+    pub display: Option<lychi_core::providers::MessageDisplay>,
+}
+
 #[tauri::command]
 #[specta::specta]
-// `display` carries how the turn renders when that differs from its content (a
-// preset that folded a large payload into a chip). It is persisted with the
-// message so a RECALLED conversation renders identically, keeping the sender the
-// only decider of that split. Never sent to a provider.
 pub async fn agent_chat_start(
-    system: String,
-    user: String,
-    fresh: bool,
-    with_tools: bool,
-    generation: u64,
-    images: Vec<String>,
-    display: Option<lychi_core::providers::MessageDisplay>,
+    params: AgentChatStart,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), LychiError> {
+    let AgentChatStart {
+        system,
+        user,
+        fresh,
+        with_tools,
+        generation,
+        images,
+        display,
+    } = params;
     // Entry marker for the AI path. Lengths and counts only — never prompt text,
     // which would put user content in the log file. Earns its place because
     // "the AI never responded" is otherwise indistinguishable from "the request

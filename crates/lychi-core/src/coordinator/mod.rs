@@ -14,7 +14,7 @@
 //!   raw stream) — the UI subscribes to this and never sees wire details.
 //! - **`Session`** is the append-only message array (serializable → free history
 //!   + persistence). Executed tool results are appended BEFORE suspending, so
-//!   resume never re-runs a completed tool (the key HITL invariant).
+//!     resume never re-runs a completed tool (the key HITL invariant).
 //! - **`Outcome::AwaitingApproval`** is a caller-driven suspend (not a callback):
 //!   the coordinator is policy-agnostic and merely reacts to a tool result that
 //!   `needs_confirmation` (the Rules Engine decides which tools do).

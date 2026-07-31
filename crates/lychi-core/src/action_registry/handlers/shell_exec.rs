@@ -415,12 +415,9 @@ pub fn terminal_binary_for_class(wm_class: &str) -> Option<String> {
         lower.clone(),
         lower.rsplit('.').next().unwrap_or(&lower).to_string(),
     ];
-    for cand in candidates {
-        if which::which(&cand).is_ok() {
-            return Some(cand);
-        }
-    }
-    None
+    candidates
+        .into_iter()
+        .find(|cand| which::which(cand).is_ok())
 }
 
 /// Argument style a terminal uses to run a command with arguments. The two

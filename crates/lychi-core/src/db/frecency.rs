@@ -572,7 +572,7 @@ mod tests {
             "out-of-phase command stays neutral"
         );
         // A command from a different workspace must not leak in.
-        assert!(aff.get("npm run dev").is_none());
+        assert!(!aff.contains_key("npm run dev"));
     }
 
     #[test]

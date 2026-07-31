@@ -63,6 +63,24 @@ jobs:
           mkdir -p src-tauri/binaries
           cp target/release/lychi src-tauri/binaries/lychi-x86_64-unknown-linux-gnu
 
+      # tauri.conf.json bundles THIRD-PARTY-NOTICES.html as a resource, and the
+      # file is gitignored because it is generated — so a clean checkout has no
+      # copy and the build script aborts with:
+      #
+      #   resource path `../THIRD-PARTY-NOTICES.html` doesn't exist
+      #
+      # Same shape as the sidecar above: a generated artefact that anything
+      # compiling lychi-app needs to already be on disk.
+      #
+      # A placeholder rather than the real thing, deliberately. Generating it
+      # needs `cargo install cargo-about`, which costs minutes on every run of
+      # this job — and nothing here reads the contents. The licence audit that
+      # DOES care runs in the `licenses` job, and the release workflow generates
+      # the real file for the artefact users actually receive.
+      - name: Stub bundled notices
+        run: |
+          echo '<!-- placeholder; real notices come from the release workflow -->' > THIRD-PARTY-NOTICES.html
+
       - name: Format
         run: cargo fmt --all --check
 
@@ -90,21 +108,54 @@ jobs:
     name: Dependency licences
     runs-on: ubuntu-latest
     steps:
+      # Full history for the diff below — the default shallow checkout cannot
+      # compare against the base commit.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Gate the expensive part on the dependency graph having actually moved.
+      #
+      # `cargo install cargo-about` is a from-source compile costing minutes,
+      # and this job can only ever fail when a dependency changes. Measured on
+      # this repo: 6 of the last 49 commits touched Cargo.lock, so ~88% of runs
+      # were rebuilding the tool to re-check an unchanged graph.
+      #
+      # GitHub has no per-job `paths:` filter (that is workflow-level, and this
+      # workflow must keep running for everything else), so the filter lives
+      # here as an explicit diff.
+      - name: Did the dependency graph change?
+        id: changed
+        run: |
+          base='${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}'
+          # First push to a branch, or a force-push with no usable base: check.
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git diff --quiet "$base" HEAD -- Cargo.toml Cargo.lock about.toml 'crates/**/Cargo.toml' src-tauri/Cargo.toml; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No manifest or lockfile change — the licence graph cannot have moved."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.changed.outputs.run == 'true'
 
       # Fails on any dependency whose licence is not in about.toml's accepted
       # list. Lychi is GPL-3.0-only, so a crate under GPL-2.0-only, AGPL, SSPL,
       # BUSL, CDDL or EPL would be a real distribution problem — and one added
       # transitively is invisible until someone audits by hand. This is the
-      # audit, run per PR.
+      # audit, run whenever the graph moves.
       #
       # Deliberately NOT building the AppImage: the check is about the graph, so
       # it needs the manifests and nothing else.
       - name: Install cargo-about
+        if: steps.changed.outputs.run == 'true'
         run: cargo install cargo-about --locked --features cli
 
       - name: Check licences and generate notices
+        if: steps.changed.outputs.run == 'true'
         run: cargo about generate about.hbs --features local-ai -o /dev/null
 
   frontend:

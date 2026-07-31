@@ -463,12 +463,12 @@ impl ActionHandler for SshHandler {
                 let haystack = format!("{} {}", h.alias, h.display_description());
                 let haystack_chars: Vec<char> = haystack.chars().collect();
                 let utf32 = nucleo_matcher::Utf32Str::Unicode(&haystack_chars);
-                let score = pattern.score(utf32, matcher).map(|s| s);
+                let score = pattern.score(utf32, matcher);
                 score.map(|s| (s, h))
             })
             .collect();
 
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|b| std::cmp::Reverse(b.0));
 
         scored
             .into_iter()

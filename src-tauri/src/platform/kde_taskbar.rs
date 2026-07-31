@@ -15,10 +15,10 @@
 //!   → bind once per process, cache it.
 //! - only ONE plasma surface may exist per wl_surface
 //!   → satisfied by GTK3 itself: gdk_wayland_window_hide_surface() calls
-//!     wl_surface_destroy() on hide, so every map has a FRESH wl_surface
-//!     (and the old plasma surface died with the old wl_surface). Apply on
-//!     every map, no dedup — pointer-based dedup would misfire when the
-//!     allocator reuses an address for a genuinely new surface.
+//!   wl_surface_destroy() on hide, so every map has a FRESH wl_surface
+//!   (and the old plasma surface died with the old wl_surface). Apply on
+//!   every map, no dedup — pointer-based dedup would misfire when the
+//!   allocator reuses an address for a genuinely new surface.
 
 use std::cell::RefCell;
 

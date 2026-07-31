@@ -582,7 +582,7 @@ impl ActionHandler for TimeHandler {
         }
 
         // Deduplicate by label
-        items.sort_by(|a, b| b.score.cmp(&a.score));
+        items.sort_by_key(|b| std::cmp::Reverse(b.score));
         items.dedup_by(|a, b| a.label == b.label);
         items.truncate(20);
         items

@@ -173,7 +173,7 @@ pub fn list_path_completions_sync(partial: String) -> Result<Vec<CompletionItem>
         .collect();
 
     // Sort by score descending (dirs first due to 1000+ boost, then by match quality)
-    entries.sort_by(|a, b| b.score.cmp(&a.score));
+    entries.sort_by_key(|b| std::cmp::Reverse(b.score));
 
     entries.truncate(15);
     Ok(entries)
