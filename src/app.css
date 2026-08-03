@@ -205,3 +205,113 @@ body {
 ::selection {
 	background: color-mix(in srgb, var(--fg-muted) 35%, transparent);
 }
+
+/* ---------------------------------------------------------------------------
+   Markdown body — ONE definition, shared by every markdown surface.
+   Lifted out of AiAnswer.svelte, where it was component-scoped and therefore
+   unreusable: the result panel needed the same rendering and would otherwise
+   have grown a second copy that drifted. Any surface rendering `renderMarkdown`
+   output applies `.md-body`, so a code block looks the same whether it came
+   from the AI panel or a command result.
+   --------------------------------------------------------------------------- */
+
+.md-body pre {
+	position: relative;
+}
+.md-body pre::after {
+	content: "copy";
+	position: absolute;
+	top: 4px;
+	right: 6px;
+	font-family: var(--font-sans);
+	font-size: 10px;
+	color: var(--fg-muted);
+	opacity: 0;
+	transition: opacity 120ms ease;
+	pointer-events: none;
+}
+.md-body pre:hover::after {
+	opacity: 0.6;
+}
+.md-body.turn {
+	display: block;
+	margin-bottom: 6px;
+}
+.md-body {
+	display: inline;
+}
+.md-body p {
+	margin: 0 0 0.7em;
+}
+.md-body p:last-child {
+	margin-bottom: 0;
+	display: inline;
+}
+.md-body pre {
+	position: relative;
+	background: var(--bg-secondary);
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	padding: 11px 13px;
+	overflow-x: auto;
+	font-family: var(--font-mono);
+	font-size: 12.5px;
+	line-height: 1.5;
+	margin: 0.7em 0;
+}
+.md-body pre[data-lang]::before {
+	content: attr(data-lang);
+	position: absolute;
+	top: 0;
+	right: 0;
+	padding: 2px 7px;
+	font-size: 9.5px;
+	text-transform: uppercase;
+	letter-spacing: 0.4px;
+	color: var(--fg-muted);
+	background: color-mix(in srgb, var(--fg) 6%, transparent);
+	border-bottom-left-radius: 6px;
+}
+.md-body pre code {
+	display: block;
+	padding-top: 2px;
+}
+.md-body code {
+	font-family: var(--font-output);
+	font-size: 0.9em;
+	background: var(--bg-secondary);
+	padding: 0.1em 0.35em;
+	border-radius: 4px;
+}
+.md-body pre code {
+	background: none;
+	padding: 0;
+}
+.md-body ul,
+.md-body ol {
+	margin: 0.4em 0;
+	padding-left: 1.4em;
+}
+.md-body li {
+	margin: 0.2em 0;
+}
+.md-body a {
+	color: var(--accent);
+	text-decoration: none;
+}
+.md-body a:hover {
+	text-decoration: underline;
+}
+.md-body h1,
+.md-body h2,
+.md-body h3 {
+	font-size: 1.05em;
+	font-weight: 600;
+	margin: 0.6em 0 0.3em;
+}
+.md-body blockquote {
+	border-left: 3px solid var(--border);
+	margin: 0.5em 0;
+	padding-left: 0.8em;
+	color: var(--fg-muted);
+}

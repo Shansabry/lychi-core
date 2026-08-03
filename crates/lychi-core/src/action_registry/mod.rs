@@ -89,6 +89,17 @@ pub enum OutputType {
     Terminal,
     /// Natural language text (AI answers, notes) — clean readable sans-serif.
     Text,
+    /// CommonMark, rendered as formatted rich text.
+    ///
+    /// Distinct from `Text`, which is prose with no structure: a model that
+    /// emits a numbered list, a table, `**bold**`, or a fenced code block was
+    /// already producing markup, and `Text` threw the structure away and
+    /// displayed the source characters. That is most visible on the AI surface,
+    /// where the agent's answers are markdown by nature.
+    ///
+    /// Rendered with a strict sanitiser rather than raw HTML — the content is
+    /// model output or third-party API text, so it is untrusted by default.
+    Markdown,
     /// Short status message (e.g. "Launched Firefox") — compact, muted.
     Status,
     /// Structured weather card — JSON data rendered as a rich card.
@@ -98,6 +109,151 @@ pub enum OutputType {
     /// text blurs module edges); SVG modules stay perfectly square (research
     /// 2026-07: vector is the correct format for on-screen QR).
     Svg,
+}
+
+/// Semantic state for a badge. Fixed set on purpose: a failed systemd unit, a
+/// failed conversion and an expired timer must look the same, which they cannot
+/// if each handler picks its own colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "lowercase")]
+pub enum BadgeTone {
+    Ok,
+    Warn,
+    Error,
+    Muted,
+}
+
+/// A short state chip on a row.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct Badge {
+    pub text: String,
+    pub tone: BadgeTone,
+}
+
+/// Right-aligned metadata on a row.
+///
+/// A typed vocabulary rather than a pre-formatted `String`, because formatting
+/// is the frontend's job: a handler computing "3 days ago" is the same mistake
+/// as a handler padding columns to align them. `Relative` carries a unix
+/// timestamp and the renderer phrases it, so ages read identically across
+/// timers, notes, clipboard and history.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Accessory {
+    /// Literal text (a version, a size already in human units).
+    Text { value: String },
+    /// Unix seconds, rendered relative to now ("now", "3d").
+    Relative { at: i64 },
+}
+
+/// One action a row supports, declared by the handler that produced the row.
+///
+/// **Declarative, never executable.** The handler names an `id` and the `target`
+/// it applies to; it does NOT ship a command string for the frontend to run.
+/// That distinction is the safety property: if actions carried commands, then
+/// anything able to populate a row could propose arbitrary execution, and the
+/// rules engine would see something indistinguishable from user input. Instead
+/// the producing handler maps `(id, target)` back to a command — and because it
+/// enumerated the rows in the first place, it can reject a `target` it never
+/// emitted, which is what stops injection through the argument.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct RowAction {
+    /// Verb, resolved by the producing handler (e.g. `"restart"`).
+    pub id: String,
+    /// Human label for the ⌘K menu.
+    pub label: String,
+    /// Which row this acts on (e.g. the unit name). Echoed back on invocation
+    /// and validated by the handler against what it produced.
+    pub target: String,
+    /// Per-action risk, so `stop` can confirm while `logs` does not. Finer than
+    /// the handler-wide `default_risk`; the rules engine remains the gate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk: Option<RiskLevel>,
+}
+
+/// A single row in a `Rows` result.
+///
+/// Deliberately the same vocabulary as `CompletionItem` (title/subtitle/icon),
+/// because a list of things is a list of things whether it came from a
+/// suggestion pass or an execution. Two divergent row shapes would be two
+/// renderers that drift.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct Row {
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub badge: Option<Badge>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accessories: Vec<Accessory>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<RowAction>,
+}
+
+impl Row {
+    pub fn new(title: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            subtitle: None,
+            badge: None,
+            accessories: Vec::new(),
+            actions: Vec::new(),
+        }
+    }
+    pub fn subtitle(mut self, s: impl Into<String>) -> Self {
+        let s = s.into();
+        if !s.is_empty() {
+            self.subtitle = Some(s);
+        }
+        self
+    }
+    pub fn badge(mut self, text: impl Into<String>, tone: BadgeTone) -> Self {
+        self.badge = Some(Badge {
+            text: text.into(),
+            tone,
+        });
+        self
+    }
+    /// Right-aligned literal text (a version, an app-id, a size).
+    pub fn accessory_text(mut self, value: impl Into<String>) -> Self {
+        let value = value.into();
+        if !value.is_empty() {
+            self.accessories.push(Accessory::Text { value });
+        }
+        self
+    }
+    /// Right-aligned age, rendered relative to now by the frontend.
+    pub fn accessory_at(mut self, at: i64) -> Self {
+        self.accessories.push(Accessory::Relative { at });
+        self
+    }
+    pub fn action(mut self, id: &str, label: &str, target: &str, risk: Option<RiskLevel>) -> Self {
+        self.actions.push(RowAction {
+            id: id.into(),
+            label: label.into(),
+            target: target.into(),
+            risk,
+        });
+        self
+    }
+}
+
+/// A titled group of rows. Grouping is explicit rather than implied by sort
+/// order, so "failed" units can lead without a handler encoding that in a
+/// string.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct Section {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub rows: Vec<Row>,
+    /// Which handler produced these rows.
+    ///
+    /// Row actions are resolved by their producer, so the frontend has to say
+    /// who that was when invoking one. It cannot be inferred from the envelope:
+    /// `routed_by` records HOW the command was routed ("explicit"/"pattern"/
+    /// "ai"), not WHO handled it. Carrying it on the section keeps the action
+    /// resolvable without the frontend guessing.
+    pub handler: String,
 }
 
 /// The payload a handler produces — a sum type of the mutually-exclusive result
@@ -111,6 +267,14 @@ pub enum Output {
     None,
     /// Rendered text/terminal/status/weather/svg output.
     Text { body: String, kind: OutputType },
+    /// A list of things, optionally grouped, each optionally actionable.
+    ///
+    /// Crosses IPC **typed**, unlike the weather card, which smuggles JSON
+    /// through the string `output` field and is parsed back out with
+    /// `JSON.parse` frontend-side. That works exactly once; a second handler
+    /// wanting structure has to copy the hack. Here specta generates the
+    /// TypeScript from this type, so producer and renderer cannot drift.
+    Rows { sections: Vec<Section> },
     /// The frontend should open this URL. `auto_open` = opening it IS the result
     /// (navigate + dismiss, no card); false = show a card with a link.
     Navigate { url: String, auto_open: bool },
@@ -253,6 +417,10 @@ pub struct CommandResultDto {
     pub focus_app: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_open: bool,
+    /// Structured rows, when the handler produced them. Typed all the way to
+    /// TypeScript rather than serialised into `output` — see `Output::Rows`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sections: Option<Vec<Section>>,
 }
 
 /// The executor-owned envelope: fields the executor/rules populate around a
@@ -291,6 +459,7 @@ impl CommandResultDto {
                 dto.open_url = Some(url);
                 dto.auto_open = auto_open;
             }
+            Output::Rows { sections } => dto.sections = Some(sections),
             Output::LaunchDesktop { path } => dto.launch_desktop = Some(path),
             Output::FocusApp { wm_class } => dto.focus_app = Some(wm_class),
         }

@@ -16,6 +16,7 @@ import NotesPanel from "$lib/components/NotesPanel.svelte";
 import ResultPanel from "$lib/components/ResultPanel.svelte";
 import SettingsPanel from "$lib/components/SettingsPanel.svelte";
 import StatusBar from "$lib/components/StatusBar.svelte";
+import { defaultMatchIndex, isFallbackKind } from "$lib/defaultMatch";
 import { attachTauriEvents } from "$lib/events/bridge.svelte";
 import type { AgentPlan, CommandResult, CompletionItem } from "$lib/ipc";
 import {
@@ -46,11 +47,13 @@ import {
 	openUri,
 	readSelection,
 	revealPath,
+	runRowAction,
 	saveGeneralConfig,
 	saveWindowPosition,
 	startFileSearch,
 } from "$lib/ipc";
 import { getComboString, loadKeybindings } from "$lib/keybindings";
+import { hasVisibleOutput, resolveOutput } from "$lib/output";
 import { preloadAll } from "$lib/preloadCache";
 import { attachments } from "$lib/stores/attachments.svelte";
 import { type AiTurn, chat, type UserAttachment } from "$lib/stores/chat.svelte";
@@ -510,25 +513,6 @@ const NON_ACTIONABLE_ICONS = new Set([
 	"__context_stale__",
 	"__warning__",
 ]);
-function defaultMatchIndex(results: CompletionItem[], input: string): number {
-	if (!input.trim()) return -1;
-	return results.findIndex(
-		(c) =>
-			// Fallbacks ("Ask AI" / "Search web") are always present as an escape
-			// hatch but must NEVER be Enter's default. Auto-selecting them is
-			// precisely why they were removed once before: Enter on a question ran
-			// whichever fallback frecency floated up, competing with the single
-			// input classifier. Present, last, never preselected.
-			!isFallbackKind(c.kind) && (!c.icon_path || !NON_ACTIONABLE_ICONS.has(c.icon_path)),
-	);
-}
-
-/** Rows that are escape hatches rather than results. Mirrors the Rust
- *  `CompletionKind::is_fallback`. */
-function isFallbackKind(kind: string | null | undefined): boolean {
-	return kind === "ask-ai" || kind === "search-web";
-}
-
 onMount(() => {
 	// First thing in onMount: an uncaught error thrown before this runs is
 	// invisible to the log file, and a frontend crash otherwise leaves a log
@@ -612,7 +596,13 @@ onMount(() => {
 		windowMoved: (x, y) => saveWindowPosition(x, y),
 		keyEffects: {
 			hasInlineUrl: () => !!lastResult?.open_url,
-			isSvgResult: () => lastResult?.output_type === "svg",
+			// Asks the decider whether this result can be copied as an image,
+			// rather than re-deriving it from `output_type` here. The previous
+			// `output_type === "svg"` was a second site matching the same field
+			// ResultPanel matched, so adding an image-ish output type would have
+			// needed both updated — and only one of them would have been.
+			isSvgResult: () =>
+				!!lastResult && resolveOutput(lastResult).actions.some((a) => a.id === "copy_image"),
 			openInlineUrl,
 			copyQr: () => resultPanelRef?.copyQr(),
 			screenshot: quickScreenshot,
@@ -808,6 +798,7 @@ async function quickWebSearch() {
 
 async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 	if (isExecuting || !backendReady) return;
+	beginSubmit();
 
 	// Fork card shortcuts (quick-AI answer is on screen and idle):
 	//   Enter        → escalate to full chat
@@ -1017,6 +1008,27 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 	}
 }
 
+/**
+ * What the user had typed when the current submit began.
+ *
+ * Set ONCE, at the top of the submit flow, because the branches below clear
+ * `inputValue` at different points — some before calling `runCommand`, some
+ * after — so reading it later gives a different answer depending on which path
+ * ran. Consumed and cleared by `runCommand`.
+ *
+ * Deliberately one variable rather than a `query` argument on all eight
+ * `runCommand` call sites: an argument every caller must remember to pass is a
+ * rule that lives in eight places, and the ones that forget fail silently — the
+ * launcher just stops learning, with nothing to notice. This is the same
+ * "one decider" shape as `suggestions::rank` on the backend.
+ */
+let pendingQuery: string | undefined;
+
+/** Begin a submit: record what was typed, for `runCommand` to learn from. */
+function beginSubmit() {
+	pendingQuery = inputValue.trim() || undefined;
+}
+
 async function runCommand(command: string, opts?: { runInline?: boolean }) {
 	if (isExecuting) return;
 	isExecuting = true;
@@ -1033,7 +1045,16 @@ async function runCommand(command: string, opts?: { runInline?: boolean }) {
 			await hide();
 			await new Promise((r) => setTimeout(r, 180));
 		}
-		const result = await executeCommand(command, undefined, opts?.runInline);
+		// Consume the query for this submit. Taken (not copied) so a later
+		// programmatic `runCommand` — a panel action, a retry — cannot re-learn
+		// from a query the user has moved on from.
+		const query = pendingQuery;
+		pendingQuery = undefined;
+		// A command identical to what was typed teaches nothing: the query was
+		// its own answer. Filtered HERE rather than at the call sites so the
+		// rule holds for every path.
+		const learnFrom = query && query !== command.trim() ? query : undefined;
+		const result = await executeCommand(command, undefined, opts?.runInline, learnFrom);
 		// If this command was cancelled (Escape) while awaiting, a newer command
 		// started, ignore its stale result entirely.
 		if (generation !== executeGeneration) return;
@@ -1078,7 +1099,7 @@ async function runCommand(command: string, opts?: { runInline?: boolean }) {
 			completions.atStart = 0;
 			lastResult = null;
 			fetchAtCompletions(dir);
-		} else if (lastResult.success && !lastResult.output) {
+		} else if (lastResult.success && !hasVisibleOutput(lastResult)) {
 			await hide();
 		}
 	} catch (err) {
@@ -1117,7 +1138,7 @@ async function handleConfirm() {
 		if (lastResult.open_url && (lastResult.auto_open || !lastResult.output)) {
 			await hide();
 			await openUri(lastResult.open_url);
-		} else if (lastResult.success && !lastResult.output) {
+		} else if (lastResult.success && !hasVisibleOutput(lastResult)) {
 			await hide();
 		}
 	} catch (err) {
@@ -1225,6 +1246,24 @@ let selectedCompletion = $derived.by(() => {
 	const item = completions.items[completions.index];
 	if (!item || item.icon_path === "__separator__") return undefined;
 	return item;
+});
+
+/**
+ * Is a modal awaiting a yes/no decision?
+ *
+ * ONE value for both prompts — the command confirm panel (`ResultPanel`) and
+ * the AI tool-call approval (`AiAnswer`). They are separate components with
+ * separate key handling, which is precisely how I-016 happened: the exemption
+ * in `ALLOWED_SHARED_BINDINGS` that lets `approve_action` share Ctrl+Enter with
+ * `web_search` was reasoned about for the AI prompt (which owns the keyboard)
+ * and silently covered the confirm panel (which does not).
+ *
+ * Derived rather than passed per-modal: a prop each new modal must remember to
+ * set is the kind that fails silently when the next one forgets.
+ */
+let decisionPending: boolean = $derived.by(() => {
+	const r: CommandResult | null = lastResult;
+	return !!r?.needs_confirmation || !!chat.approval;
 });
 
 /** Build the applicable actions for the currently-selected result. */
@@ -1380,6 +1419,10 @@ function runPanelAction(id: string) {
 }
 
 function handleCompletionSelect(label: string, forceOpen?: boolean) {
+	// Also an entry point: a CLICK on a row reaches here without passing through
+	// `handleSubmit`. Calling it twice on the Enter path is harmless — both read
+	// the same still-unchanged `inputValue`.
+	beginSubmit();
 	// An AI-chat recall row (empty-box recents) → open the conversation.
 	const clicked = completions.items.find((c) => c.label === label);
 	if (clicked?.run?.startsWith(CHAT_RUN_PREFIX)) {
@@ -1648,6 +1691,24 @@ function handleArrowDown() {
 	}
 }
 
+/**
+ * Run an action declared on a result row.
+ *
+ * The row supplied `{handler, id, target}` — never a command. The backend
+ * resolves that triple against the handler that produced the row, so the
+ * frontend cannot invent a verb or smuggle one through the target, and the
+ * resolved command still passes through the executor's normal validation.
+ */
+async function handleRowAction(handler: string, id: string, target: string) {
+	try {
+		const result = await runRowAction(handler, id, target);
+		lastResult = result;
+		lastCommand = `${id} ${target}`;
+	} catch (err) {
+		uiLog.error(`[row-action] ${handler}/${id} failed: ${err}`);
+	}
+}
+
 async function hide() {
 	// Logged because this is the OTHER way the window closes, and it used to be
 	// silent. The backend records `[hide] window hidden`, but with no cause
@@ -1761,6 +1822,7 @@ async function handleDismiss() {
 			ontogglesettings={handleToggleSettings}
 			ontogglenotes={handleToggleNotes}
 			disabled={isExecuting || isRouting}
+			{decisionPending}
 			routing={isRouting}
 			executing={isExecuting}
 			contextPill={context.pill}
@@ -1949,7 +2011,8 @@ async function handleDismiss() {
 				<ResultPanel bind:this={resultPanelRef} result={lastResult} command={lastCommand}
 				onconfirm={handleConfirm} ondismiss={handleConfirmDismiss}
 				onopenurl={openInlineUrl}
-				onopenfile={(path) => runCommand(`file ${path}`)} />
+				onopenfile={(path) => runCommand(`file ${path}`)}
+				onrowaction={handleRowAction} />
 			{/if}
 		{/if}
 		<StatusBar

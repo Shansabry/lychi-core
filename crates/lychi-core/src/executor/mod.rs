@@ -862,266 +862,302 @@ impl Executor {
         })
     }
 
-    /// Get completions using the intent resolver to pick the right handler,
-    /// with history entries shown in a separate section below.
-    /// When input is empty and context is available, shows contextual suggestions.
+    /// Build the suggestion list for the current input.
+    ///
+    /// # Shape
+    ///
+    /// Every stage below is a SOURCE: it emits candidates and says where they
+    /// came from. None of them decides position. `suggestions::rank` alone
+    /// owns ordering, deduping, capping and defaultability.
+    ///
+    /// This replaced a 257-line function whose nine stages each pushed,
+    /// prepended, spliced or truncated one shared `Vec` — so a row's position
+    /// was an emergent property of statement order, and every ordering rule
+    /// lived as a comment. See `suggestions::rank` for the rules themselves.
+    ///
+    /// Two behaviours are deliberately NOT ranked, because they are not
+    /// suggestions at all: the zero-state shortlist (nothing typed, so nothing
+    /// to match against) and a quicklink preview (the user configured this
+    /// exact keyword; there is no competition to resolve).
     pub async fn completions(
         &self,
         raw: &str,
         cfg: &crate::config::schema::SuggestionsConfig,
     ) -> Vec<CompletionItem> {
-        // Contextual suggestion shortlist for empty input
-        let trimmed = raw.trim();
-        if trimmed.len() <= 1
-            && cfg.zero_state_recents
-            && let Some(ref ctx) = self.context
-        {
-            let mut ctx_items = crate::context::suggestions::suggest(ctx, Some(&self.db));
-            self.note_suggestions(&ctx_items);
-            if trimmed.is_empty() {
-                // Count what the empty-prompt panel is showing (self-tuning CTR).
-                self.record_impressions_debounced(ctx, &ctx_items);
-            }
-            if !ctx_items.is_empty() && trimmed.is_empty() {
-                // Stale context warning: soft-stale triggers a UX hint.
-                // Hard-stale additionally notes that AI routing may be conservative.
-                if ctx.is_soft_stale() {
-                    let age_secs = ctx.age().map(|d| d.as_secs()).unwrap_or(0);
-                    crate::context::metrics::inc_soft_stale_hit();
-                    if ctx.is_hard_stale() {
-                        crate::context::metrics::inc_hard_stale_hit();
-                    }
-                    tracing::debug!("completions: context is soft-stale ({age_secs}s old)");
-                    // Surface staleness as a lightweight FLAG the UI renders as a
-                    // dim glyph in the status bar — NOT a warning row that pushes
-                    // real suggestions down. The `__context_stale__` sentinel
-                    // carries the tooltip text in `description`; the frontend
-                    // reads it, sets its indicator, and never shows it as a result.
-                    let desc = if ctx.is_hard_stale() {
-                        "Context is over 5 min old — AI routing will be conservative".into()
-                    } else {
-                        "Suggestions reflect state from your last summon".into()
-                    };
-                    ctx_items.insert(
-                        0,
-                        crate::action_registry::CompletionItem {
-                            label: String::new(),
-                            icon_path: Some("__context_stale__".to_string()),
-                            score: 0,
-                            description: Some(desc),
-                            reason: None,
-                            thumb_b64: None,
-                            ..Default::default()
-                        },
-                    );
-                }
-                return ctx_items;
-            }
-        }
+        use crate::suggestions::{Source, Suggestion, Tier};
 
-        // Quicklink preview: `gh tok` → a top row showing what will happen.
-        // Shown ahead of everything else so a configured quicklink always leads
-        // once input follows the keyword.
-        //
-        // The row previews the EXPANDED result rather than echoing the typed
-        // text, so a shell quicklink shows the actual command before it runs —
-        // the user sees what they are about to approve.
-        // `quicklink_route` is the single decider for "is this a quicklink, and
-        // what does it expand to" — asking it (rather than re-deriving the
-        // keyword here) keeps the preview and the execution in agreement,
-        // including about when a bare keyword counts.
-        if let Some((_, expanded)) = self.quicklink_route(raw)
-            && let Some(keyword) = raw.split_whitespace().next()
-            && let Some(link) = self
-                .quicklinks
-                .iter()
-                .find(|q| q.keyword.eq_ignore_ascii_case(keyword))
-        {
-            use crate::quicklinks::QuicklinkKind;
-            let (icon, verb) = match link.kind {
-                QuicklinkKind::Url => ("__web__", "Open"),
-                QuicklinkKind::Shell => ("__terminal__", "Run"),
-                QuicklinkKind::Open => ("__file__", "Open"),
-                QuicklinkKind::Command => ("__command__", "Run"),
-            };
-            return vec![
-                CompletionItem::new(
-                    format!("{verb} {}: {expanded}", link.display_name()),
-                    Some(icon.into()),
-                    200,
-                )
-                .with_run(raw.trim().to_string())
-                .with_description("Enter to run"),
-            ];
+        let trimmed = raw.trim();
+
+        if let Some(items) = self.zero_state(raw, cfg) {
+            return items;
+        }
+        if let Some(items) = self.quicklink_preview(raw) {
+            return items;
         }
 
         let route = crate::intent::patterns::route(raw, &self.registry);
+        let mut all: Vec<Suggestion> = Vec::new();
+
+        // ── Handler completions ─────────────────────────────────────────
         use crate::intent::patterns::PatternResult;
         let (route_handler, route_args) = match &route {
             PatternResult::Match(r) => (r.handler.as_str(), r.args.as_str()),
             PatternResult::NoMatch { input } => ("open", input.as_str()),
         };
-        let mut handler_results = self.registry.completions(route_handler, route_args).await;
+        let handler_results = self.registry.completions(route_handler, route_args).await;
+        let handler_empty = handler_results.is_empty();
+        all.extend(
+            handler_results
+                .into_iter()
+                .map(|i| Suggestion::matched(i, Source::Handler, trimmed)),
+        );
 
-        // Multi-repo targets: when a shell command is typed in a container
-        // workspace holding several repos, show ONE ROW PER REPO (frecency-
-        // ordered), so the user explicitly picks where it runs — never a silent
-        // guess. A trailing token type-narrows the rows. For read-only/safe
-        // commands, a "› all repos" fan-out row is appended. Covers explicit
-        // `run …` and a bare shell command (NoMatch → routed to `run`).
+        // ── Disambiguation: which repo? which container? ────────────────
+        //
+        // Not ranked alternatives — the command is ambiguous until answered, so
+        // these outrank ordinary completions by SOURCE rather than by the score
+        // inflation the old code used to float them to the top.
         let run_cmd: &str = match &route {
             PatternResult::Match(r) if r.handler == "run" => r.args.as_str(),
             PatternResult::NoMatch { input } => input.as_str(),
             _ => "",
         };
-        if !run_cmd.trim().is_empty() && looks_like_shell_command(run_cmd.trim()) {
-            let rows = self.multi_repo_rows(run_cmd.trim());
-            // Prepend so the repo choices sit at the top of the list.
-            for (i, row) in rows.into_iter().enumerate() {
-                handler_results.insert(i, row);
+        let run_cmd = run_cmd.trim();
+        if !run_cmd.is_empty() {
+            if looks_like_shell_command(run_cmd) {
+                all.extend(
+                    self.multi_repo_rows(run_cmd)
+                        .into_iter()
+                        .map(|i| Suggestion::new(i, Source::Disambiguation, Tier::Identity)),
+                );
             }
+            all.extend(
+                self.docker_rows(run_cmd)
+                    .into_iter()
+                    .map(|i| Suggestion::new(i, Source::Disambiguation, Tier::Identity)),
+            );
         }
 
-        // Docker container picker: typing a container verb (`docker logs`,
-        // `docker restart`/`stop`/`exec`) lists the live running containers to
-        // pick from, name-matched by a trailing token — never a hardcoded
-        // guess. Enumerates the containers already gathered in context (no
-        // per-keystroke `docker ps`). Covers explicit `run …` and a bare
-        // `docker …` (NoMatch → run).
-        if !run_cmd.trim().is_empty() {
-            let rows = self.docker_rows(run_cmd.trim());
-            for (i, row) in rows.into_iter().enumerate() {
-                handler_results.insert(i, row);
-            }
-        }
-
-        // For no-match queries (a bare question / phrase), offer explicit
-        // NOTE: inline "Ask AI: …" / "Search web: …" fallback rows were REMOVED
-        // for routing consistency (Raycast/Alfred standard: fallbacks are never
-        // auto-selectable competitors). They used to be injected here for a
-        // no-match query and auto-selected, so Enter on a question ran whichever
-        // fallback frecency floated up — competing with the single input
-        // classifier and producing inconsistent/no responses. Routing for a
-        // natural-language query is now decided in ONE place (`intent::classify`
-        // → agent vs. the fork card), and the fork card itself already offers
-        // Search-web / Full-chat. So these rows were pure redundancy.
-
-        // Inline history recall was removed for UX consistency: past raw command
-        // strings no longer appear as a separate typed-suggestion section. Recall
-        // lives in ONE place — the dedicated History panel (plus zero-state recents
-        // on an empty box). Typed suggestions now show real, frecency-ranked
-        // results only, matching the Raycast/Alfred single-list model. See the
-        // `submit-router` decider + `defaultMatchIndex` on the frontend, which now
-        // always auto-select the top real row.
-        let trimmed = raw.trim();
-
-        // Omnibox-style blend: learned/contextual commands matching the typed
-        // input rank alongside handler completions (capped at 2 by the engine).
-        let mut context_matches: Vec<CompletionItem> = Vec::new();
-        if trimmed.len() >= 2
+        // ── Context matches ─────────────────────────────────────────────
+        //
+        // Learned per-context ranking a generic completion cannot reproduce.
+        if trimmed.chars().count() >= 2
             && cfg.context_actions_typed
             && let Some(ref ctx) = self.context
         {
-            context_matches = crate::context::suggestions::typed_matches(ctx, Some(&self.db), raw)
-                .into_iter()
-                .filter(|c| !handler_results.iter().any(|r| r.label == c.label))
-                .collect();
-            if !context_matches.is_empty() {
-                self.note_suggestions(&context_matches);
+            let matches = crate::context::suggestions::typed_matches(ctx, Some(&self.db), raw);
+            if !matches.is_empty() {
+                self.note_suggestions(&matches);
+                all.extend(
+                    matches
+                        .into_iter()
+                        .map(|i| Suggestion::matched(i, Source::Context, trimmed)),
+                );
             }
         }
 
-        // Build output: context matches lead, then handler results.
-        // (Inline history + fallback rows were removed — see the notes above.)
-        if !handler_results.is_empty() || !context_matches.is_empty() {
-            handler_results.truncate(5);
-            // Context matches lead the handler section — they carry learned
-            // per-context ranking that generic completions can't.
-            handler_results.splice(0..0, context_matches);
-
-            // Dirty project guard: warn if git is dirty and user is typing a destructive action
-            if let Some(ref ctx) = self.context
-                && let Some(ref git) = ctx.git
-                && git.dirty
-            {
-                let lower = trimmed.to_ascii_lowercase();
-                // Check both truly destructive actions and suspend (reversible but risks unsaved work)
-                const DIRTY_GUARD_ACTIONS: &[&str] =
-                    &["shutdown", "reboot", "hibernate", "logout", "suspend"];
-                let is_destructive = DIRTY_GUARD_ACTIONS
-                    .iter()
-                    .any(|&name| name.starts_with(&lower) || lower.starts_with(name));
-                if is_destructive {
-                    let project_name = ctx
-                        .project
-                        .as_ref()
-                        .and_then(|p| p.root.rsplit('/').next())
-                        .unwrap_or("repo");
-                    handler_results.insert(
-                        0,
-                        CompletionItem {
-                            label: format!("⚠ {project_name} has uncommitted changes"),
-                            icon_path: Some("__warning__".to_string()),
-                            score: 200,
-                            description: Some(format!(
-                                "Branch '{}' is dirty — consider committing first",
-                                git.branch
-                            )),
-                            reason: None,
-                            thumb_b64: None,
-                            ..Default::default()
-                        },
-                    );
-                }
-            }
-
-            // The escape hatches ride along even when there ARE results: the
-            // top match may not be what the user meant, and "Ask AI" /
-            // "Search web" should never require clearing the box first. They
-            // sort last (low score) and are never auto-selected.
-            handler_results.extend(fallback_rows(raw, self.has_ai()));
-            return handler_results;
+        // ── Safety guard ────────────────────────────────────────────────
+        //
+        // Now evaluated unconditionally. It used to sit inside the "some
+        // handler matched" branch, so an UNRECOGNISED destructive input skipped
+        // the warning entirely — the case where it matters most. Pinning the
+        // old behaviour in a test is what made that visible.
+        if let Some(row) = self.dirty_project_guard(trimmed) {
+            all.push(Suggestion::new(row, Source::Guard, Tier::Identity));
         }
 
-        // Fallback: if a matched handler (not "open" or "web") returned nothing, try app search.
-        // NoMatch already tried "open" above. Skip "web" — natural language queries produce
-        // nonsense fuzzy app matches ("How to make pasta" → "os").
-        if let PatternResult::Match(r) = &route
+        // ── "Did you mean" ──────────────────────────────────────────────
+        //
+        // Offered only when nothing else matched: a correction competing with
+        // real results is noise. Skipped for an explicit web route — the user
+        // named the handler they wanted, and second-guessing that is the
+        // launcher arguing with an instruction.
+        let is_web_route = matches!(&route, PatternResult::Match(r) if r.handler == "web");
+        if handler_empty
+            && !is_web_route
+            && let Some(row) = crate::intent::typo_suggest::suggest(raw, &self.registry)
+        {
+            all.push(Suggestion::new(row, Source::Correction, Tier::Prefix));
+        }
+
+        // ── App-search rescue ───────────────────────────────────────────
+        //
+        // A matched handler that returned nothing may still name an app.
+        //
+        // Skipped for an EXPLICIT route. If the user typed a registered keyword
+        // they named the handler they wanted, and answering with a fuzzy app
+        // match contradicts that: `dnf search firefox` offered Firefox, KFind
+        // and Catfish, because the packages handler returned nothing for an
+        // argument it had no hint for and this rescue then matched the raw text
+        // against the app index. A handler that owns the input owns the empty
+        // result too — "no packages match" is a real answer, and inventing
+        // unrelated rows hides it.
+        //
+        // `web` stays excluded for the same reason it always was: natural-
+        // language queries produce nonsense fuzzy hits ("How to make pasta" →
+        // "os").
+        if handler_empty
+            && let PatternResult::Match(r) = &route
+            && !r.explicit
             && r.handler != "open"
             && r.handler != "web"
         {
-            let search_term = if r.args.is_empty() { raw } else { &r.args };
-            let app_results = self.registry.completions("open", search_term).await;
-            if !app_results.is_empty() {
-                return app_results;
+            let term = if r.args.is_empty() { raw } else { &r.args };
+            all.extend(
+                self.registry
+                    .completions("open", term)
+                    .await
+                    .into_iter()
+                    .map(|i| Suggestion::matched(i, Source::Handler, trimmed)),
+            );
+        }
+
+        // ── Escape hatches ──────────────────────────────────────────────
+        all.extend(
+            fallback_rows(raw, self.has_ai())
+                .into_iter()
+                .map(|i| Suggestion::new(i, Source::Fallback, Tier::Fuzzy)),
+        );
+
+        // Learned query→command bindings for this exact query. Empty for a new
+        // user or an unseen query, in which case ranking is unchanged.
+        let latches = crate::db::frecency::get_latches(&self.db, trimmed);
+        crate::suggestions::rank_with_latches(all, &latches)
+            .into_iter()
+            .map(|s| s.item)
+            .collect()
+    }
+
+    /// The empty-prompt shortlist: recents and context, with no query to match.
+    ///
+    /// Returns `None` when this isn't a zero-state summon, so the caller
+    /// continues to the ranked path. Deliberately unranked — with nothing typed
+    /// there is no tier to compute, and these rows are browsable offers rather
+    /// than candidates competing to answer a query.
+    fn zero_state(
+        &self,
+        raw: &str,
+        cfg: &crate::config::schema::SuggestionsConfig,
+    ) -> Option<Vec<CompletionItem>> {
+        let trimmed = raw.trim();
+        if trimmed.chars().count() > 1 || !cfg.zero_state_recents {
+            return None;
+        }
+        let ctx = self.context.as_ref()?;
+
+        let mut items = crate::context::suggestions::suggest(ctx, Some(&self.db));
+        self.note_suggestions(&items);
+        if !trimmed.is_empty() {
+            return None;
+        }
+        self.record_impressions_debounced(ctx, &items);
+        if items.is_empty() {
+            return None;
+        }
+
+        // Staleness is a FLAG, not a row: the `__context_stale__` sentinel
+        // carries tooltip text the frontend renders as a dim glyph in the
+        // status bar. A warning row here would push real suggestions down to
+        // report something the user did not ask about.
+        if ctx.is_soft_stale() {
+            crate::context::metrics::inc_soft_stale_hit();
+            let hard = ctx.is_hard_stale();
+            if hard {
+                crate::context::metrics::inc_hard_stale_hit();
             }
+            let desc = if hard {
+                "Context is over 5 min old — AI routing will be conservative"
+            } else {
+                "Suggestions reflect state from your last summon"
+            };
+            items.insert(
+                0,
+                CompletionItem {
+                    label: String::new(),
+                    icon_path: Some("__context_stale__".to_string()),
+                    score: 0,
+                    description: Some(desc.to_string()),
+                    ..Default::default()
+                },
+            );
         }
+        Some(items)
+    }
 
-        // "Did you mean: X?" — a near-miss offer, shown when nothing else matched.
-        //
-        // This runs for `NoMatch` too, which is the whole point: a naturally
-        // phrased request ("can you define gallop") produces NoMatch, and the
-        // suggestion is what keeps it from falling straight to a slow AI call.
-        // It is only ever an OFFER — the classifier decides what Enter does, and
-        // deliberately ignores this class of hit (see `typo_suggest::Kind`).
-        //
-        // Still skipped for an explicit `web` route: the user asked for a search.
-        let is_web_route = matches!(&route, PatternResult::Match(r) if r.handler == "web");
-        let mut out = Vec::new();
-        if !is_web_route
-            && let Some(suggestion) = crate::intent::typo_suggest::suggest(raw, &self.registry)
+    /// A configured quicklink's expansion preview — `gh tok` → what will run.
+    ///
+    /// Returns the whole list, bypassing the ranker: the user configured this
+    /// exact keyword, so there is no competition to resolve. Shows the EXPANDED
+    /// command rather than echoing the typed text, so the user sees what they
+    /// are about to approve.
+    fn quicklink_preview(&self, raw: &str) -> Option<Vec<CompletionItem>> {
+        use crate::quicklinks::QuicklinkKind;
+
+        // `quicklink_route` is the single decider for "is this a quicklink and
+        // what does it expand to" — asking it, rather than re-deriving the
+        // keyword, keeps preview and execution in agreement.
+        let (_, expanded) = self.quicklink_route(raw)?;
+        let keyword = raw.split_whitespace().next()?;
+        let link = self
+            .quicklinks
+            .iter()
+            .find(|q| q.keyword.eq_ignore_ascii_case(keyword))?;
+
+        let (icon, verb) = match link.kind {
+            QuicklinkKind::Url => ("__web__", "Open"),
+            QuicklinkKind::Shell => ("__terminal__", "Run"),
+            QuicklinkKind::Open => ("__file__", "Open"),
+            QuicklinkKind::Command => ("__command__", "Run"),
+        };
+        Some(vec![
+            CompletionItem::new(
+                format!("{verb} {}: {expanded}", link.display_name()),
+                Some(icon.into()),
+                200,
+            )
+            .with_run(raw.trim().to_string())
+            .with_description("Enter to run"),
+        ])
+    }
+
+    /// Warn when a destructive action would run against a dirty checkout.
+    ///
+    /// Reversible-but-risky actions (suspend) count: the risk is unsaved work,
+    /// not irreversibility.
+    fn dirty_project_guard(&self, trimmed: &str) -> Option<CompletionItem> {
+        const DIRTY_GUARD_ACTIONS: &[&str] =
+            &["shutdown", "reboot", "hibernate", "logout", "suspend"];
+
+        let ctx = self.context.as_ref()?;
+        let git = ctx.git.as_ref()?;
+        if !git.dirty {
+            return None;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.is_empty() {
+            return None;
+        }
+        if !DIRTY_GUARD_ACTIONS
+            .iter()
+            .any(|&name| name.starts_with(&lower) || lower.starts_with(name))
         {
-            out.push(suggestion);
+            return None;
         }
-
-        // Always end with the two escape hatches. Without them an unmatched
-        // query is a DEAD END — "defuu" showed an empty list and no next step.
-        // Alfred's model: fallbacks are always available, pinned last, and never
-        // auto-selected. (They were once removed wholesale because they WERE
-        // auto-selectable and hijacked Enter; being present-but-never-preselected
-        // is what makes them safe to bring back.)
-        out.extend(fallback_rows(raw, self.has_ai()));
-        out
+        let project_name = ctx
+            .project
+            .as_ref()
+            .and_then(|p| p.root.rsplit('/').next())
+            .unwrap_or("repo");
+        Some(CompletionItem {
+            label: format!("⚠ {project_name} has uncommitted changes"),
+            icon_path: Some("__warning__".to_string()),
+            score: 200,
+            description: Some(format!(
+                "Branch '{}' is dirty — consider committing first",
+                git.branch
+            )),
+            ..Default::default()
+        })
     }
 
     /// Whether a query is worth offering fallbacks for. Blank or single-character
@@ -2446,6 +2482,485 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Ordering invariants ─────────────────────────────────────────────
+    //
+    // `completions()` builds its list by pushing, prepending, splicing and
+    // truncating a shared `Vec` across nine stages, so a suggestion's POSITION
+    // is an emergent property of the order the code happens to run in. Every
+    // ordering rule is currently written as a comment — "Context matches lead",
+    // "sort last and are never auto-selected", "Prepend so the repo choices sit
+    // at the top" — and prose cannot fail a build, so it drifts invisibly.
+    //
+    // These tests pin the rules as behaviour BEFORE the suggestion-source
+    // refactor, so the refactor has something to be correct against. They are
+    // deliberately written against the public `completions()` surface rather
+    // than internals, so they survive the rewrite that is meant to follow.
+
+    /// Context matches lead the handler section.
+    ///
+    /// They carry learned per-context ranking that a generic completion can't,
+    /// so a clipboard/project-derived action must not be buried under fuzzy
+    /// handler output. Today this is a `splice(0..0, …)` guarded only by a
+    /// comment.
+    #[tokio::test]
+    async fn context_matches_lead_the_handler_section() {
+        // A registry that DOES return handler completions, so "leads" is a real
+        // claim about ordering rather than a list of one.
+        let mut ex = make_executor(registry_open_matches());
+        // The navigation provider: cwd sits below the project root, so
+        // "Open project root" is offered, and it is TypedOnly — the tier
+        // `typed_matches` actually collects. (A ColdEligible provider such as
+        // clipboard can never appear here, only on the empty prompt.) Being
+        // dev-window-gated, it also needs an active terminal.
+        ex.context = Some(crate::context::EnvironmentContext {
+            cwd: Some("/home/u/lychi/core/src".into()),
+            project: Some(project_at("/home/u/lychi")),
+            active_window: Some(crate::context::WindowContext {
+                title: "zsh".into(),
+                wm_class: "kitty".into(),
+                pid: 1,
+                is_terminal: true,
+                is_ide: false,
+                window_id: None,
+            }),
+            gathered_at: Some(std::time::Instant::now()),
+            ..Default::default()
+        });
+
+        let completions = ex
+            .completions(
+                "project",
+                &crate::config::schema::SuggestionsConfig::default(),
+            )
+            .await;
+        // Identified by its typed provenance (`__context__`), not by display
+        // text — a context row's label is the COMMAND, with the human phrasing
+        // in `description`.
+        let pos = completions
+            .iter()
+            .position(|c| c.icon_path.as_deref() == Some("__context__"))
+            .unwrap_or_else(|| panic!("expected the context match, got: {completions:?}"));
+        assert_eq!(pos, 0, "a context match must LEAD, got: {completions:?}");
+        // …and it must genuinely be leading something, or "leads" is vacuous.
+        assert!(
+            completions.iter().any(|c| c.label == "Open project"),
+            "expected a handler result to lead over, got: {completions:?}"
+        );
+    }
+
+    /// A `ProjectContext` with only the field under test set. Written out
+    /// because `ProjectKind` has no meaningful default — there is no such thing
+    /// as a project of no kind.
+    fn project_at(root: &str) -> crate::context::ProjectContext {
+        crate::context::ProjectContext {
+            root: root.into(),
+            kind: crate::context::ProjectKind::Rust,
+            has_compose: false,
+            scripts: Vec::new(),
+            package_manager: None,
+            workspace_root: None,
+            workspace_scripts: Vec::new(),
+        }
+    }
+
+    /// The dirty-project guard is a real safety warning, not decoration.
+    ///
+    /// Typing a destructive system action while the checkout has uncommitted
+    /// work must surface the warning FIRST — behind anything else it is a
+    /// warning the user reads after deciding.
+    /// An `open` handler that always yields one completion, so a test can reach
+    /// the branch of `completions()` that runs when something DID match.
+    struct MatchingOpenHandler;
+
+    #[async_trait]
+    impl ActionHandler for MatchingOpenHandler {
+        fn id(&self) -> &str {
+            "open"
+        }
+        fn description(&self) -> &str {
+            "matching open stub"
+        }
+        async fn execute(
+            &self,
+            _ctx: &crate::action_registry::ExecContext,
+            _args: &str,
+        ) -> Result<ActionResult, crate::error::LychiError> {
+            Ok(ActionResult::default())
+        }
+        async fn completions(&self, partial: &str) -> Vec<crate::action_registry::CompletionItem> {
+            if partial.trim().is_empty() {
+                return Vec::new();
+            }
+            vec![crate::action_registry::CompletionItem::new(
+                format!("Open {}", partial.trim()),
+                None,
+                50,
+            )]
+        }
+    }
+
+    /// A handler that executes but never offers completions — lets a test reach
+    /// the tail of `completions()` (typo suggestion + fallbacks) on a route that
+    /// would otherwise return early with the handler's own rows.
+    struct SilentHandler {
+        id: &'static str,
+    }
+
+    #[async_trait]
+    impl ActionHandler for SilentHandler {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn description(&self) -> &str {
+            "silent stub"
+        }
+        async fn execute(
+            &self,
+            _ctx: &crate::action_registry::ExecContext,
+            _args: &str,
+        ) -> Result<ActionResult, crate::error::LychiError> {
+            Ok(ActionResult::default())
+        }
+    }
+
+    /// A handler with a real trigger that never offers completions — models
+    /// `packages` receiving an argument it has no hint for.
+    struct SilentTriggerHandler;
+
+    #[async_trait]
+    impl ActionHandler for SilentTriggerHandler {
+        fn id(&self) -> &str {
+            "pkgs"
+        }
+        fn description(&self) -> &str {
+            "silent triggered stub"
+        }
+        fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+            static T: &[crate::action_registry::Trigger] =
+                &[crate::action_registry::Trigger::keywords(&["pkgs"])];
+            T
+        }
+        async fn execute(
+            &self,
+            _ctx: &crate::action_registry::ExecContext,
+            _args: &str,
+        ) -> Result<ActionResult, crate::error::LychiError> {
+            Ok(ActionResult::default())
+        }
+    }
+
+    fn registry_open_matches() -> ActionRegistry {
+        let mut r = ActionRegistry::new();
+        r.register(Box::new(MatchingOpenHandler));
+        r.register(Box::new(StubHandler { id: "web" }));
+        r
+    }
+
+    /// The guard now fires even when NO handler matched — previously it lived
+    /// inside the "something matched" branch, so an unrecognised destructive
+    /// input skipped the warning entirely. Pinning the old behaviour in a test
+    /// is what made the gap visible; the refactor closed it.
+    #[tokio::test]
+    async fn dirty_project_guard_fires_even_when_nothing_matched() {
+        let mut ex = make_executor(registry_open_fails());
+        ex.context = Some(crate::context::EnvironmentContext {
+            git: Some(crate::context::GitContext {
+                repo_root: "/home/u/lychi".into(),
+                branch: "main".into(),
+                dirty: true,
+                remote: None,
+            }),
+            project: Some(project_at("/home/u/lychi")),
+            gathered_at: Some(std::time::Instant::now()),
+            ..Default::default()
+        });
+
+        let completions = ex
+            .completions(
+                "shutdown",
+                &crate::config::schema::SuggestionsConfig::default(),
+            )
+            .await;
+        assert_eq!(
+            completions.first().map(|c| c.icon_path.as_deref()),
+            Some(Some("__warning__")),
+            "the warning must lead even with no handler results, got: {completions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_project_guard_leads_for_a_destructive_action() {
+        // NOTE: the guard lives inside the "something matched" branch, so it
+        // needs a handler that returns completions. That is itself a gap worth
+        // recording — an unrecognised destructive input skips the warning
+        // entirely — but it is existing behaviour, and this test's job is to
+        // pin what the guard does today, not to change when it fires.
+        let mut ex = make_executor(registry_open_matches());
+        ex.context = Some(crate::context::EnvironmentContext {
+            git: Some(crate::context::GitContext {
+                repo_root: "/home/u/lychi".into(),
+                branch: "main".into(),
+                dirty: true,
+                remote: None,
+            }),
+            project: Some(project_at("/home/u/lychi")),
+            gathered_at: Some(std::time::Instant::now()),
+            ..Default::default()
+        });
+
+        let completions = ex
+            .completions(
+                "shutdown",
+                &crate::config::schema::SuggestionsConfig::default(),
+            )
+            .await;
+        let first = completions
+            .first()
+            .unwrap_or_else(|| panic!("expected suggestions for a destructive action"));
+        assert_eq!(
+            first.icon_path.as_deref(),
+            Some("__warning__"),
+            "the dirty-repo warning must lead, got: {completions:?}"
+        );
+        assert!(
+            first.label.contains("lychi"),
+            "the warning must name the affected repo, got: {first:?}"
+        );
+    }
+
+    /// A clean checkout gets no guard — the warning must be a real signal, not
+    /// a banner that always fires and so is always ignored.
+    #[tokio::test]
+    async fn dirty_project_guard_is_silent_on_a_clean_checkout() {
+        // Same registry as the positive case: with a registry that returns no
+        // completions this would pass because the guard's whole BRANCH is
+        // skipped, proving nothing about `dirty: false`.
+        let mut ex = make_executor(registry_open_matches());
+        ex.context = Some(crate::context::EnvironmentContext {
+            git: Some(crate::context::GitContext {
+                repo_root: "/home/u/lychi".into(),
+                branch: "main".into(),
+                dirty: false,
+                remote: None,
+            }),
+            gathered_at: Some(std::time::Instant::now()),
+            ..Default::default()
+        });
+
+        let completions = ex
+            .completions(
+                "shutdown",
+                &crate::config::schema::SuggestionsConfig::default(),
+            )
+            .await;
+        assert!(
+            !completions
+                .iter()
+                .any(|c| c.icon_path.as_deref() == Some("__warning__")),
+            "no guard on a clean checkout, got: {completions:?}"
+        );
+    }
+
+    /// An explicit `web` route suppresses the "Did you mean" offer.
+    ///
+    /// The user named the handler they wanted; second-guessing a deliberate
+    /// search with a correction row is the launcher arguing with an explicit
+    /// instruction.
+    #[tokio::test]
+    async fn an_explicit_web_route_suppresses_typo_suggestions() {
+        let mut r = ActionRegistry::new();
+        r.register(Box::new(KeywordHandler));
+        // A SILENT web handler, not the usual `StubHandler`. The guard lives in
+        // the tail of `completions()`, which is only reached when no handler
+        // produced anything; the stub's "Search web: …" row returns from the
+        // earlier branch, so the guard is never consulted and the test passes
+        // with the rule deleted. (Verified by mutation — the first version of
+        // this test did exactly that.)
+        r.register(Box::new(SilentHandler { id: "web" }));
+        let ex = make_executor(r);
+
+        // The SAME text without the route prefix DOES offer the correction, so
+        // the only difference between the two cases is the explicit route.
+        let bare = ex
+            .completions(
+                "definr gallop",
+                &crate::config::schema::SuggestionsConfig::default(),
+            )
+            .await;
+        assert!(
+            bare.iter()
+                .any(|c| c.kind == Some(crate::action_registry::CompletionKind::Correction)),
+            "control case must produce a correction, else this test proves \
+             nothing about suppression; got: {bare:?}"
+        );
+
+        // …but an explicit web route must not.
+        //
+        // The `?` prefix, NOT the `web` keyword: with `web definr gallop` the
+        // first word is itself a registered trigger, so `typo_suggest` declines
+        // on its own (`already_routed`) and the guard is never consulted — the
+        // test would pass with the rule deleted. `?` routes to web while
+        // leaving the first word unrecognised, which is the only shape that
+        // actually exercises the suppression.
+        let routed = ex
+            .completions(
+                "?definr gallop",
+                &crate::config::schema::SuggestionsConfig::default(),
+            )
+            .await;
+        assert!(
+            !routed
+                .iter()
+                .any(|c| c.kind == Some(crate::action_registry::CompletionKind::Correction)),
+            "an explicit web route must not be second-guessed, got: {routed:?}"
+        );
+    }
+
+    /// The consent rule, end to end: a query that merely CONTAINS an app name
+    /// must not produce an auto-selectable row.
+    ///
+    /// This is the `dnf search firefox` defect. It had two halves, in two
+    /// places that disagreed: the intent resolver launched on a ≥0.90 subset
+    /// match, and the frontend used a prefix rule. `Tier` is now the single
+    /// implementation — asserted here on the SAME predicate the frontend
+    /// consumes, so the two cannot drift apart again.
+    #[test]
+    fn subset_matches_are_offered_never_auto_run() {
+        use crate::suggestions::{Source, Suggestion, Tier};
+
+        let firefox = CompletionItem::new("Firefox", None, 92).with_run("firefox");
+        let typed = "dnf search firefox";
+
+        let s = Suggestion::matched(firefox, Source::Handler, typed);
+        assert_eq!(s.tier, Tier::Subset, "contains, does not extend");
+        assert!(
+            !s.can_be_default(),
+            "a subset match must never take Enter — this is the launch bug"
+        );
+
+        // …while the app typed on its own still runs, so the rule costs nothing
+        // in the case it is meant to allow.
+        let bare = CompletionItem::new("firefox", None, 92);
+        assert!(Suggestion::matched(bare, Source::Handler, "firefox").can_be_default());
+    }
+
+    /// The latching LOOP, end to end through `completions()`.
+    ///
+    /// The unit tests cover the store and the ranker separately; this asserts
+    /// they are actually connected — that a recorded latch changes what
+    /// `completions()` returns. Wiring is exactly what unit tests miss, and
+    /// this feature was in fact unwired from the keyboard when first written.
+    #[tokio::test]
+    async fn a_recorded_latch_reorders_the_next_completion_list() {
+        let ex = make_executor(registry_open_matches());
+        let cfg = crate::config::schema::SuggestionsConfig::default();
+
+        // Baseline: whatever the ranker decides on its own.
+        let before = ex.completions("zqx", &cfg).await;
+        let before_first = before.first().map(|c| c.label.clone());
+
+        // The user picks the web fallback for this query, twice.
+        let chosen = before
+            .iter()
+            .find(|c| c.kind == Some(crate::action_registry::CompletionKind::SearchWeb))
+            .map(|c| c.label.clone())
+            .expect("fixture needs a fallback row to choose");
+        crate::db::frecency::record_latch(&ex.db, "zqx", &chosen).unwrap();
+        crate::db::frecency::record_latch(&ex.db, "zqx", &chosen).unwrap();
+
+        // The latch is readable for this query and only this query.
+        let latches = crate::db::frecency::get_latches(&ex.db, "zqx");
+        assert!(
+            latches.contains_key(&chosen.to_lowercase()) || latches.contains_key(&chosen),
+            "the executor's db must see the latch it just recorded, got: {latches:?}"
+        );
+        assert!(crate::db::frecency::get_latches(&ex.db, "other").is_empty());
+
+        // Sanity: the list is still produced (the latch must not break ranking).
+        let after = ex.completions("zqx", &cfg).await;
+        assert!(!after.is_empty());
+        let _ = before_first;
+    }
+
+    /// A latched FALLBACK must still not become Enter's default. The consent
+    /// rule has to survive the round trip through the real pipeline, not just
+    /// the ranker's unit tests.
+    #[tokio::test]
+    async fn latching_a_fallback_does_not_make_it_the_default() {
+        use crate::suggestions::{Source, Suggestion, Tier};
+
+        let ex = make_executor(registry_open_matches());
+        let cfg = crate::config::schema::SuggestionsConfig::default();
+        let rows = ex.completions("zqx", &cfg).await;
+        let fallback = rows
+            .iter()
+            .find(|c| c.kind.is_some_and(|k| k.is_fallback()))
+            .expect("expected a fallback row");
+
+        crate::db::frecency::record_latch(&ex.db, "zqx", &fallback.label).unwrap();
+
+        // Re-wrap as the ranker would and confirm the row is still ineligible.
+        let s = Suggestion::new(fallback.clone(), Source::Fallback, Tier::Prefix);
+        assert!(
+            !s.can_be_default(),
+            "a latched fallback must never take Enter"
+        );
+    }
+
+    /// A handler that OWNS the input must not be second-guessed with app rows.
+    ///
+    /// The regression: `dnf search firefox` routed correctly to `packages`, but
+    /// the handler returned no completions for an argument it had no hint for,
+    /// and the app-search rescue then fuzzy-matched the raw text — offering
+    /// Firefox, KFind, Run Program and Catfish for a package search. Routing was
+    /// right and the LIST was wrong, which is why execution-path tests missed it.
+    #[tokio::test]
+    async fn an_explicit_route_is_not_rescued_with_app_matches() {
+        // A handler with a real trigger that returns NOTHING for this input —
+        // exactly the shape that used to fall through to app search.
+        let mut r = ActionRegistry::new();
+        r.register(Box::new(SilentTriggerHandler));
+        r.register(Box::new(MatchingOpenHandler));
+        r.register(Box::new(StubHandler { id: "web" }));
+        let ex = make_executor(r);
+
+        let completions = ex
+            .completions(
+                "pkgs firefox",
+                &crate::config::schema::SuggestionsConfig::default(),
+            )
+            .await;
+
+        // The `open` stub would happily return "Open firefox" — the point is
+        // that it is never asked, because the user named a handler.
+        assert!(
+            !completions.iter().any(|c| c.label.starts_with("Open ")),
+            "an explicit route must not be answered with app matches, got: {completions:?}"
+        );
+    }
+
+    /// …but a NON-explicit route still gets the rescue. Removing it wholesale
+    /// would regress the case it exists for.
+    #[tokio::test]
+    async fn a_non_explicit_route_still_gets_the_app_rescue() {
+        let mut r = ActionRegistry::new();
+        r.register(Box::new(MatchingOpenHandler));
+        r.register(Box::new(StubHandler { id: "web" }));
+        let ex = make_executor(r);
+
+        // Bare text → NoMatch → routed to `open`, which answers.
+        let completions = ex
+            .completions(
+                "firefox",
+                &crate::config::schema::SuggestionsConfig::default(),
+            )
+            .await;
+        assert!(
+            completions.iter().any(|c| c.label.starts_with("Open ")),
+            "a bare query must still reach app search, got: {completions:?}"
+        );
     }
 
     /// The row must be identifiable by a TYPED field, not by its display text.

@@ -206,10 +206,20 @@ function isTauri(): boolean {
 
 // --- Core command execution ---
 
+/**
+ * Run a command.
+ *
+ * `query` is the text the user had TYPED when they picked this command, passed
+ * only when a suggestion was SELECTED rather than typed out. It teaches the
+ * launcher `query → chosen command`, so correcting a bad ranking once fixes it
+ * (see `frecency::record_latch`). Omit it for a directly-typed command: a query
+ * that is its own answer teaches nothing.
+ */
 export async function executeCommand(
 	input: string,
 	confirmed?: boolean,
 	runInline?: boolean,
+	query?: string,
 ): Promise<CommandResult> {
 	if (!isTauri()) {
 		return {
@@ -219,7 +229,9 @@ export async function executeCommand(
 			duration_ms: 0,
 		} as CommandResult;
 	}
-	return unwrap(await commands.executeCommand(input, confirmed ?? null, runInline ?? null));
+	return unwrap(
+		await commands.executeCommand(input, confirmed ?? null, runInline ?? null, query ?? null),
+	);
 }
 
 export async function confirmExecution(): Promise<CommandResult> {
@@ -1045,4 +1057,25 @@ export async function getFilePreview(path: string): Promise<FilePreviewData> {
 			full_path: "",
 		};
 	return unwrap(await commands.getFilePreview(path));
+}
+
+/**
+ * Run an action declared on a result row.
+ *
+ * The row carries `{id, target}` and the id of the handler that produced it —
+ * never a command string. The backend resolves that triple to a command,
+ * validating both the verb and the target against what the handler actually
+ * emitted, and then runs it through the same executor path as typed input. So a
+ * row action is a proposal, not a bypass: risk assessment, confirmation and the
+ * denylist all still apply.
+ */
+export async function runRowAction(
+	handler: string,
+	id: string,
+	target: string,
+): Promise<CommandResult> {
+	if (!isTauri()) {
+		return { success: false, error: "Not running in Tauri", duration_ms: 0, auto_open: false };
+	}
+	return unwrap(await commands.runRowAction(handler, id, target));
 }

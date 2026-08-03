@@ -1,6 +1,7 @@
 <script lang="ts">
 import { LoaderCircle } from "lucide-svelte";
 import { matchesAction, normalizeKey } from "$lib/keybindings";
+import { inputOwnsKey } from "$lib/modalKeys";
 
 let {
 	value = $bindable(""),
@@ -31,6 +32,7 @@ let {
 	onpastefiles = async () => false,
 	onremovelastattachment = () => {},
 	hasAttachments = false,
+	decisionPending = false,
 	contextPill = "",
 	contextLoading = false,
 	searchGhost = "",
@@ -65,6 +67,8 @@ let {
 	onpastefiles?: () => Promise<boolean>;
 	onremovelastattachment?: () => void;
 	hasAttachments?: boolean;
+	/** A modal is awaiting a yes/no; the shortcut table stands down while true. */
+	decisionPending?: boolean;
 	contextPill?: string;
 	contextLoading?: boolean;
 	searchGhost?: string;
@@ -300,6 +304,22 @@ function handlePaste(e: ClipboardEvent) {
 }
 
 function handleKeydown(e: KeyboardEvent) {
+	// A modal is awaiting a yes/no — it owns the keyboard, so stand down.
+	//
+	// Keydown bubbles element → window, and this handler is on the input while
+	// the approval prompt's is on `window`. So without this guard the input
+	// ALWAYS runs first: Ctrl+Enter matched `web_search` here, called
+	// preventDefault(), and ran a web search while a confirmation prompt sat on
+	// screen advertising Ctrl+Enter as "Approve" (docs/issues.md I-016).
+	//
+	// Standing down wholesale rather than exempting Ctrl+Enter: every other
+	// binding here (⌘K, run_inline, the Tab family) is equally wrong to fire
+	// while a destructive command awaits a decision. Enumerating the safe ones
+	// would leave the same latent bug for whichever binding is added next.
+	// Typing still works — this only gates the shortcut table, and printable
+	// keys never reach it.
+	if (!inputOwnsKey(decisionPending)) return;
+
 	if (matchesAction(e, "tab_back")) {
 		e.preventDefault();
 		onshifttabback();

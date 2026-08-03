@@ -12,12 +12,20 @@ use crate::state::AppState;
 /// Action IDs that mutate panel data (notes, todos, reminders).
 const PANEL_MUTATION_ACTIONS: &[&str] = &["note", "todo", "reminder"];
 
+/// Execute a command.
+///
+/// `query` is what the user had TYPED when they chose this command, when it
+/// differs from `input`. Supplied only when a suggestion was SELECTED, so the
+/// launcher can learn `query → chosen command` (see `frecency::record_latch`).
+/// `None` for a directly-typed command — a query that is its own answer teaches
+/// nothing.
 #[tauri::command]
 #[specta::specta]
 pub async fn execute_command(
     input: String,
     confirmed: Option<bool>,
     run_inline: Option<bool>,
+    query: Option<String>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CommandResultDto, LychiError> {
@@ -54,6 +62,16 @@ pub async fn execute_command(
             let _ = frecency::record_acceptance(&state.db, &context_key, trimmed);
         }
         drop(executor_r);
+
+        // Query→command latching. Deliberately OUTSIDE the block above, which
+        // needs both a matching context and a previously-shown suggestion: a
+        // latch is keyed by the query itself, so it must also be learned when
+        // there is no project or focused app — the case where per-context
+        // learning records nothing at all.
+        if let Some(q) = query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+            tracing::debug!("[latch] '{q}' → '{trimmed}'");
+            let _ = frecency::record_latch(&state.db, q, trimmed);
+        }
 
         // Learn the user's fallback preference: running an `ask …`/`web …` on a
         // free-text query is choosing that escape hatch. Frecency then orders the
@@ -421,4 +439,38 @@ pub async fn get_trigger_catalog(
 ) -> Result<Vec<CommandInfo>, LychiError> {
     let executor = state.executor.read().await;
     Ok(executor.registry.trigger_catalog())
+}
+
+/// Resolve a row action into the command it stands for, then run it.
+///
+/// Row actions are declarative — a row carries `{id, label, target}`, never a
+/// command string. This is where that pays off: resolution happens **here**,
+/// against the handler that produced the row, so the frontend can only ask for
+/// verbs a handler declared and targets it can validate. Shipping commands on
+/// the action instead would make the frontend a command source, and the rules
+/// engine would then see something indistinguishable from typed input.
+///
+/// The resolved string goes through `execute_command` like anything the user
+/// types, so risk assessment, confirmation and the denylist all still apply —
+/// one execution path, not a privileged side door.
+#[tauri::command]
+#[specta::specta]
+pub async fn run_row_action(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    handler: String,
+    id: String,
+    target: String,
+) -> Result<CommandResultDto, LychiError> {
+    let command = match handler.as_str() {
+        "services" => lychi_core::action_registry::handlers::services::resolve_action(&id, &target),
+        "packages" => lychi_core::action_registry::handlers::packages::resolve_action(&id, &target),
+        // Unknown producers are refused rather than guessed at: a handler that
+        // has not opted in cannot have its rows actioned.
+        other => Err(format!("Handler '{other}' does not support row actions")),
+    }
+    .map_err(LychiError::ExecutionFailed)?;
+
+    tracing::info!("[row-action] {handler}/{id} target={target} → {command}");
+    execute_command(command, None, None, None, app, state).await
 }

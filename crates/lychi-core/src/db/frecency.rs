@@ -461,6 +461,294 @@ pub fn clear(db: &Arc<Database>) -> Result<usize, LychiError> {
     Ok(removed)
 }
 
+// ── Query→result latching ───────────────────────────────────────────────
+//
+// Every other store in this file is keyed **item → count**: how often was this
+// command run, in this context. That answers "what does this user use a lot",
+// and it is the wrong question for ranking a specific query.
+//
+// The failure it produces: a popular app outranks everything for ANY query that
+// merely mentions it. Typing `dnf search firefox` offered Firefox first, because
+// Firefox is genuinely the user's most-run app. No amount of per-item learning
+// fixes that — the signal needed is "for THIS query, the user chose THAT".
+//
+// So latching keys **query → command**. Correct `dnf search firefox` once and
+// the launcher stops offering Firefox for it, without any rule mentioning the
+// word "dnf". That is the [[feedback_dynamic_over_hardcoded]] property: usage-
+// driven and name-agnostic by construction.
+//
+// Modelled on Alfred's knowledge store, including the part that is easy to skip:
+// a rolling window. Habits you drop must stop shaping results, so a latch decays
+// and expires rather than accumulating for the life of the install.
+
+/// Rolling window for latches, matching Alfred's documented ~4 weeks.
+///
+/// Not a half-life but a hard horizon: past this, a latch scores 0.0 and is
+/// treated as absent. A latch is a statement about current intent, and a
+/// month-old intent is not evidence about today.
+const LATCH_WINDOW_DAYS: f64 = 28.0;
+
+/// Longest query prefix used as a latch key.
+///
+/// Latching on the WHOLE query would almost never hit twice — real input varies
+/// by a trailing word. Latching on too little would bind unrelated queries
+/// together. This is a cap, not a fixed length: shorter queries key on
+/// themselves.
+const LATCH_PREFIX_LEN: usize = 24;
+
+/// The latch key for a query: normalised, capped prefix.
+///
+/// Case and surrounding whitespace are noise. Truncation is by CHARACTER, not
+/// byte — slicing a multi-byte character mid-sequence panics, and search queries
+/// are exactly where non-ASCII input shows up.
+fn latch_prefix(query: &str) -> String {
+    query
+        .trim()
+        .to_lowercase()
+        .chars()
+        .take(LATCH_PREFIX_LEN)
+        .collect()
+}
+
+/// Record that, for this query, the user chose this command.
+///
+/// Called on acceptance. Unlike the other learning stores this needs NO context
+/// key: the query itself is the context. That also means it still learns when
+/// there is no project or focused app — the case where per-context learning
+/// records nothing at all.
+pub fn record_latch(db: &Arc<Database>, query: &str, command: &str) -> Result<(), LychiError> {
+    let prefix = latch_prefix(query);
+    if prefix.is_empty() || command.trim().is_empty() {
+        return Ok(());
+    }
+    // A latch binding a query to ITSELF teaches nothing — the user typed a
+    // command and it ran. Latching is for when the chosen row differs from the
+    // literal input.
+    if prefix == command.trim().to_lowercase() {
+        return Ok(());
+    }
+    record(db, &format!("latch:{prefix}\u{1}{command}"))
+}
+
+/// Commands this user has chosen for this query, as `command -> strength`
+/// in 0.0..=1.0.
+///
+/// Uses `\u{1}` as the field separator rather than `:` because commands
+/// routinely contain colons (`https://…`, `run docker: …`), and splitting on a
+/// character that appears in the data silently truncates keys.
+pub fn get_latches(db: &Arc<Database>, query: &str) -> HashMap<String, f64> {
+    let prefix = latch_prefix(query);
+    let mut out = HashMap::new();
+    if prefix.is_empty() {
+        return out;
+    }
+    let now_ms = super::now_millis();
+    let want = format!("latch:{prefix}\u{1}");
+
+    let Ok(txn) = db.begin_read() else {
+        return out;
+    };
+    let Ok(table) = txn.open_table(FRECENCY) else {
+        return out;
+    };
+    let Ok(iter) = table.iter() else {
+        return out;
+    };
+
+    for (key, value) in iter.flatten() {
+        let Some(command) = key.value().strip_prefix(&want) else {
+            continue;
+        };
+        let Ok(entry) = postcard::from_bytes::<FrecencyEntry>(value.value()) else {
+            continue;
+        };
+        let strength = latch_strength(&entry, now_ms);
+        if strength > 0.0 {
+            out.insert(command.to_string(), strength);
+        }
+    }
+    out
+}
+
+/// Strength of a latch: how recently and how often it was chosen, 0.0 outside
+/// the window.
+///
+/// Deliberately saturating rather than linear in count. Alfred's stated
+/// behaviour is that two or three corrections re-learn an intention, so the
+/// curve must reach useful strength almost immediately — a scale where 20
+/// repetitions are needed would never fire in practice.
+fn latch_strength(entry: &FrecencyEntry, now_ms: u64) -> f64 {
+    let Some(&last) = entry.recent_timestamps.last() else {
+        return 0.0;
+    };
+    let age_days = (now_ms.saturating_sub(last)) as f64 / 86_400_000.0;
+    if age_days >= LATCH_WINDOW_DAYS {
+        return 0.0;
+    }
+    // Linear decay across the window: a fresh latch is full strength, one at
+    // the horizon is nothing.
+    let recency = 1.0 - (age_days / LATCH_WINDOW_DAYS);
+    // 1 pick → 0.5, 2 → 0.67, 3 → 0.75, saturating toward 1.0.
+    let repetition = entry.count as f64 / (entry.count as f64 + 1.0);
+    recency * repetition
+}
+
+#[cfg(test)]
+mod latch_tests {
+    use super::*;
+    use crate::db::open_test_database;
+
+    /// The headline case: correcting a query once stops the popular-but-wrong
+    /// item being the answer for it. No rule mentions "dnf".
+    #[test]
+    fn a_latch_binds_a_query_to_the_chosen_command() {
+        let db = open_test_database();
+        record_latch(&db, "dnf search firefox", "pkg search firefox").unwrap();
+
+        let latches = get_latches(&db, "dnf search firefox");
+        assert!(latches.contains_key("pkg search firefox"));
+        assert!(latches["pkg search firefox"] > 0.0);
+        // …and says nothing about the app that used to win.
+        assert!(!latches.contains_key("firefox"));
+    }
+
+    /// Keyed by QUERY, not by item — the whole point. A different query must
+    /// not inherit this binding.
+    #[test]
+    fn a_latch_does_not_leak_to_an_unrelated_query() {
+        let db = open_test_database();
+        record_latch(&db, "dnf search firefox", "pkg search firefox").unwrap();
+        assert!(get_latches(&db, "open my notes").is_empty());
+    }
+
+    /// Queries differing only AFTER the prefix cap share a latch — the same
+    /// intention typed with a different tail.
+    ///
+    /// Note the fixture: both inputs must be identical through 24 characters.
+    /// A first attempt used strings that diverged at character 19, which the
+    /// code correctly treated as two distinct queries.
+    #[test]
+    fn queries_sharing_a_prefix_share_the_latch() {
+        let db = open_test_database();
+        // The shared head must be at least LATCH_PREFIX_LEN so the two inputs
+        // are identical THROUGH the cap, not merely up to it.
+        let base = "dnf search firefox extended release "; // > 24 chars
+        assert!(base.len() > LATCH_PREFIX_LEN, "fixture must exceed the cap");
+        record_latch(&db, &format!("{base}stable"), "pkg search firefox").unwrap();
+        let latches = get_latches(&db, &format!("{base}nightly"));
+        assert!(
+            latches.contains_key("pkg search firefox"),
+            "queries identical through the cap must share a latch, got: {latches:?}"
+        );
+    }
+
+    /// …and queries that diverge WITHIN the cap must not.
+    #[test]
+    fn queries_diverging_inside_the_cap_do_not_share_a_latch() {
+        let db = open_test_database();
+        record_latch(&db, "dnf search firefox", "pkg search firefox").unwrap();
+        assert!(get_latches(&db, "dnf search chromium").is_empty());
+    }
+
+    #[test]
+    fn case_and_whitespace_do_not_split_a_latch() {
+        let db = open_test_database();
+        record_latch(&db, "  DNF Search Firefox ", "pkg search firefox").unwrap();
+        assert!(get_latches(&db, "dnf search firefox").contains_key("pkg search firefox"));
+    }
+
+    /// Repetition strengthens, as Alfred's "2 or 3 times" behaviour requires.
+    #[test]
+    fn repeated_choices_strengthen_the_latch() {
+        let db = open_test_database();
+        record_latch(&db, "q", "cmd").unwrap();
+        let once = get_latches(&db, "q")["cmd"];
+        record_latch(&db, "q", "cmd").unwrap();
+        record_latch(&db, "q", "cmd").unwrap();
+        assert!(get_latches(&db, "q")["cmd"] > once);
+    }
+
+    /// A latch to the literal input teaches nothing and would otherwise fill the
+    /// store with no-ops.
+    #[test]
+    fn a_query_latched_to_itself_is_not_stored() {
+        let db = open_test_database();
+        record_latch(&db, "firefox", "firefox").unwrap();
+        assert!(get_latches(&db, "firefox").is_empty());
+    }
+
+    #[test]
+    fn empty_input_is_ignored() {
+        let db = open_test_database();
+        record_latch(&db, "   ", "cmd").unwrap();
+        record_latch(&db, "q", "  ").unwrap();
+        assert!(get_latches(&db, "   ").is_empty());
+        assert!(get_latches(&db, "q").is_empty());
+    }
+
+    /// Commands contain colons routinely (`https://…`). Separating fields on
+    /// `:` would truncate the command half of the key.
+    #[test]
+    fn a_command_containing_colons_round_trips() {
+        let db = open_test_database();
+        record_latch(&db, "docs", "open https://lychi.app/docs").unwrap();
+        assert!(get_latches(&db, "docs").contains_key("open https://lychi.app/docs"));
+    }
+
+    /// Truncating a multi-byte character mid-sequence panics. Search queries
+    /// are exactly where non-ASCII arrives, and this codebase has fixed
+    /// char-boundary panics before.
+    #[test]
+    fn a_long_multibyte_query_does_not_panic() {
+        let db = open_test_database();
+        let q = "\u{e9}".repeat(40);
+        record_latch(&db, &q, "cmd").unwrap();
+        assert!(get_latches(&db, &q).contains_key("cmd"));
+    }
+
+    // ── Decay ───────────────────────────────────────────────────────────
+    //
+    // Tested on the pure scorer: the store has no clock injection, and
+    // back-dating a redb entry to prove decay would be testing the harness.
+
+    #[test]
+    fn a_fresh_latch_is_strong() {
+        let now = 1_000_000_000_000u64;
+        let entry = FrecencyEntry {
+            count: 3,
+            recent_timestamps: vec![now],
+        };
+        assert!(latch_strength(&entry, now) > 0.5);
+    }
+
+    /// The rolling window is the part most easily omitted, and omitting it is
+    /// what makes learned behaviour calcify.
+    #[test]
+    fn a_latch_past_the_window_is_dead() {
+        let now = 1_000_000_000_000u64;
+        let long_ago = now - ((LATCH_WINDOW_DAYS as u64 + 1) * 86_400_000);
+        let entry = FrecencyEntry {
+            count: 99,
+            recent_timestamps: vec![long_ago],
+        };
+        assert_eq!(
+            latch_strength(&entry, now),
+            0.0,
+            "a latch outside the window must not rank, however often it was used"
+        );
+    }
+
+    #[test]
+    fn strength_decays_with_age() {
+        let now = 1_000_000_000_000u64;
+        let mk = |days: u64| FrecencyEntry {
+            count: 3,
+            recent_timestamps: vec![now - days * 86_400_000],
+        };
+        assert!(latch_strength(&mk(1), now) > latch_strength(&mk(20), now));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

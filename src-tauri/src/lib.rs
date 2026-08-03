@@ -76,6 +76,7 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::config::get_hotkey_status,
         commands::config::get_autostart_enabled,
         commands::config::set_autostart_enabled,
+        commands::execute::run_row_action,
         commands::config::hide_launcher,
         commands::agent::get_agent_plan,
         commands::agent::store_agent_plan,

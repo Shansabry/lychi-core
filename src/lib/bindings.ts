@@ -5,9 +5,18 @@
 
 
 export const commands = {
-async executeCommand(input: string, confirmed: boolean | null, runInline: boolean | null) : Promise<Result<CommandResultDto, string>> {
+/**
+ * Execute a command.
+ * 
+ * `query` is what the user had TYPED when they chose this command, when it
+ * differs from `input`. Supplied only when a suggestion was SELECTED, so the
+ * launcher can learn `query → chosen command` (see `frecency::record_latch`).
+ * `None` for a directly-typed command — a query that is its own answer teaches
+ * nothing.
+ */
+async executeCommand(input: string, confirmed: boolean | null, runInline: boolean | null, query: string | null) : Promise<Result<CommandResultDto, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("execute_command", { input, confirmed, runInline }) };
+    return { status: "ok", data: await TAURI_INVOKE("execute_command", { input, confirmed, runInline, query }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -477,6 +486,28 @@ async getAutostartEnabled() : Promise<Result<boolean, string>> {
 async setAutostartEnabled(enabled: boolean) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("set_autostart_enabled", { enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Resolve a row action into the command it stands for, then run it.
+ * 
+ * Row actions are declarative — a row carries `{id, label, target}`, never a
+ * command string. This is where that pays off: resolution happens **here**,
+ * against the handler that produced the row, so the frontend can only ask for
+ * verbs a handler declared and targets it can validate. Shipping commands on
+ * the action instead would make the frontend a command source, and the rules
+ * engine would then see something indistinguishable from typed input.
+ * 
+ * The resolved string goes through `execute_command` like anything the user
+ * types, so risk assessment, confirmation and the denylist all still apply —
+ * one execution path, not a privileged side door.
+ */
+async runRowAction(handler: string, id: string, target: string) : Promise<Result<CommandResultDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("run_row_action", { handler, id, target }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1096,6 +1127,24 @@ async cloudGetCredits() : Promise<Result<CreditBalance, string>> {
 /** user-defined types **/
 
 /**
+ * Right-aligned metadata on a row.
+ * 
+ * A typed vocabulary rather than a pre-formatted `String`, because formatting
+ * is the frontend's job: a handler computing "3 days ago" is the same mistake
+ * as a handler padding columns to align them. `Relative` carries a unix
+ * timestamp and the renderer phrases it, so ages read identically across
+ * timers, notes, clipboard and history.
+ */
+export type Accessory = 
+/**
+ * Literal text (a version, a size already in human units).
+ */
+{ kind: "text"; value: string } | 
+/**
+ * Unix seconds, rendered relative to now ("now", "3d").
+ */
+{ kind: "relative"; at: number }
+/**
  * Everything the caller supplies to start a turn.
  * 
  * Grouped into a struct because the flat argument list had grown to seven
@@ -1230,6 +1279,16 @@ export type AttachmentRoute =
  * We can't feed this to the model — `note` explains why.
  */
 "unsupported"
+/**
+ * A short state chip on a row.
+ */
+export type Badge = { text: string; tone: BadgeTone }
+/**
+ * Semantic state for a badge. Fixed set on purpose: a failed systemd unit, a
+ * failed conversion and an expired timer must look the same, which they cannot
+ * if each handler picks its own colour.
+ */
+export type BadgeTone = "ok" | "warn" | "error" | "muted"
 /**
  * One conversation turn. A `Tool`-role message carries the `tool_call_id` it
  * answers. An `Assistant` message that requested tools keeps those calls in
@@ -1380,7 +1439,12 @@ category_order: number }
  * builds this from an `ActionResult` plus the executor's envelope
  * (risk/confirmation/executed_args/routed_by).
  */
-export type CommandResultDto = { success: boolean; output?: string | null; error?: string | null; duration_ms: number; routed_by?: string | null; open_url?: string | null; needs_confirmation?: string | null; risk_level?: RiskLevel | null; output_type?: OutputType | null; executed_args?: string | null; launch_desktop?: string | null; focus_app?: string | null; auto_open: boolean }
+export type CommandResultDto = { success: boolean; output?: string | null; error?: string | null; duration_ms: number; routed_by?: string | null; open_url?: string | null; needs_confirmation?: string | null; risk_level?: RiskLevel | null; output_type?: OutputType | null; executed_args?: string | null; launch_desktop?: string | null; focus_app?: string | null; auto_open: boolean; 
+/**
+ * Structured rows, when the handler produced them. Typed all the way to
+ * TypeScript rather than serialised into `output` — see `Output::Rows`.
+ */
+sections?: Section[] | null }
 export type CommandsConfig = { default_search_engine: string; youtube_url: string; shell: string; 
 /**
  * Default terminal emulator for `run` commands (auto-detected if empty).
@@ -1831,6 +1895,19 @@ export type OutputType =
  */
 "text" | 
 /**
+ * CommonMark, rendered as formatted rich text.
+ * 
+ * Distinct from `Text`, which is prose with no structure: a model that
+ * emits a numbered list, a table, `**bold**`, or a fenced code block was
+ * already producing markup, and `Text` threw the structure away and
+ * displayed the source characters. That is most visible on the AI surface,
+ * where the agent's answers are markdown by nature.
+ * 
+ * Rendered with a strict sanitiser rather than raw HTML — the content is
+ * model output or third-party API text, so it is untrusted by default.
+ */
+"markdown" | 
+/**
  * Short status message (e.g. "Launched Firefox") — compact, muted.
  */
 "status" | 
@@ -2012,6 +2089,46 @@ export type RouteDecision =
  */
 { kind: "ai-disabled"; command: string; explicit: boolean }
 /**
+ * A single row in a `Rows` result.
+ * 
+ * Deliberately the same vocabulary as `CompletionItem` (title/subtitle/icon),
+ * because a list of things is a list of things whether it came from a
+ * suggestion pass or an execution. Two divergent row shapes would be two
+ * renderers that drift.
+ */
+export type Row = { title: string; subtitle?: string | null; badge?: Badge | null; accessories: Accessory[]; actions: RowAction[] }
+/**
+ * One action a row supports, declared by the handler that produced the row.
+ * 
+ * **Declarative, never executable.** The handler names an `id` and the `target`
+ * it applies to; it does NOT ship a command string for the frontend to run.
+ * That distinction is the safety property: if actions carried commands, then
+ * anything able to populate a row could propose arbitrary execution, and the
+ * rules engine would see something indistinguishable from user input. Instead
+ * the producing handler maps `(id, target)` back to a command — and because it
+ * enumerated the rows in the first place, it can reject a `target` it never
+ * emitted, which is what stops injection through the argument.
+ */
+export type RowAction = { 
+/**
+ * Verb, resolved by the producing handler (e.g. `"restart"`).
+ */
+id: string; 
+/**
+ * Human label for the ⌘K menu.
+ */
+label: string; 
+/**
+ * Which row this acts on (e.g. the unit name). Echoed back on invocation
+ * and validated by the handler against what it produced.
+ */
+target: string; 
+/**
+ * Per-action risk, so `stop` can confirm while `logs` does not. Finer than
+ * the handler-wide `default_risk`; the rules engine remains the gate.
+ */
+risk?: RiskLevel | null }
+/**
  * A single item in the unified Notes surface. A plain note has `done: None`;
  * a checklist line has `done: Some(true|false)`. The two are stored in
  * separate on-disk tables (NOTES / TODOS) for backwards compatibility, but are
@@ -2022,6 +2139,22 @@ export type ScratchItem = { id: string; text: string;
  * None = plain note; Some = checklist line (checked/unchecked).
  */
 done: boolean | null; created_at: number; updated_at: number }
+/**
+ * A titled group of rows. Grouping is explicit rather than implied by sort
+ * order, so "failed" units can lead without a handler encoding that in a
+ * string.
+ */
+export type Section = { title?: string | null; rows: Row[]; 
+/**
+ * Which handler produced these rows.
+ * 
+ * Row actions are resolved by their producer, so the frontend has to say
+ * who that was when invoking one. It cannot be inferred from the envelope:
+ * `routed_by` records HOW the command was routed ("explicit"/"pattern"/
+ * "ai"), not WHO handled it. Carrying it on the section keeps the action
+ * resolvable without the frontend guessing.
+ */
+handler: string }
 export type SnippetItem = { id: string; name: string; body: string; created_at: number; updated_at: number }
 /**
  * Serializable timer status sent to the frontend.

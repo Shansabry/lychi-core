@@ -49,6 +49,33 @@ fn result_text(res: &lychi_core::action_registry::ActionResult) -> String {
     }
     match &res.output {
         Output::Text { body, .. } => body.clone(),
+        // The model reads tool results as text, so structured rows are
+        // flattened HERE rather than by the handler. That is the point of the
+        // split: the handler emits data once, and each consumer renders it for
+        // its own medium — a card for the user, plain lines for the model.
+        Output::Rows { sections } => {
+            let mut out = String::new();
+            for section in sections {
+                if let Some(title) = &section.title {
+                    out.push_str(&format!("{title}:\n"));
+                }
+                for row in &section.rows {
+                    out.push_str(&row.title);
+                    if let Some(b) = &row.badge {
+                        out.push_str(&format!(" [{}]", b.text));
+                    }
+                    if let Some(s) = &row.subtitle {
+                        out.push_str(&format!(" — {s}"));
+                    }
+                    out.push('\n');
+                }
+            }
+            if out.is_empty() {
+                "No results.".to_string()
+            } else {
+                out.trim_end().to_string()
+            }
+        }
         Output::Navigate { url, .. } => format!("Opened: {url}"),
         Output::LaunchDesktop { path } => format!("Launched: {path}"),
         Output::FocusApp { wm_class } => format!("Focused: {wm_class}"),

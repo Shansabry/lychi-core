@@ -318,7 +318,7 @@ function onWindowKeydown(e: KeyboardEvent) {
 			</div>
 		{:else if text}
 			<!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized above -->
-			<div class="ai-md" role="presentation" onclick={onAnswerClick}>{@html html}</div>{#if streaming && !approval}<span class="cursor" aria-hidden="true"></span>{/if}
+			<div class="ai-md md-body" role="presentation" onclick={onAnswerClick}>{@html html}</div>{#if streaming && !approval}<span class="cursor" aria-hidden="true"></span>{/if}
 		{:else if streaming && !approval}
 			<div class="thinking"><span class="cursor" aria-hidden="true"></span></div>
 		{/if}
@@ -495,26 +495,8 @@ function onWindowKeydown(e: KeyboardEvent) {
 	/* Code blocks get a copy affordance in the top-right corner (handled by a
 	   delegated click, since the markdown is injected HTML). The label is CSS-only
 	   so no interactive markup is inserted into sanitized output. */
-	.ai-md :global(pre) {
-		position: relative;
-	}
 
-	.ai-md :global(pre::after) {
-		content: "copy";
-		position: absolute;
-		top: 4px;
-		right: 6px;
-		font-family: var(--font-sans);
-		font-size: 10px;
-		color: var(--fg-muted);
-		opacity: 0;
-		transition: opacity 120ms ease;
-		pointer-events: none;
-	}
 
-	.ai-md :global(pre:hover::after) {
-		opacity: 0.6;
-	}
 
 	.truncated-note {
 		margin-top: 10px;
@@ -631,10 +613,6 @@ function onWindowKeydown(e: KeyboardEvent) {
 		background: var(--bg-secondary);
 		border-radius: 8px;
 	}
-	.ai-md.turn {
-		display: block;
-		margin-bottom: 6px;
-	}
 
 	/* Footer: reply input / stop button, pinned below the scroll area. */
 	.ai-footer {
@@ -735,85 +713,7 @@ function onWindowKeydown(e: KeyboardEvent) {
 
 	/* The rendered markdown. `:global` because the HTML is injected, so scoped
 	   selectors wouldn't reach it. Scoped under .ai-md to avoid leaking. */
-	.ai-md {
-		display: inline;
-	}
-	.ai-md :global(p) {
-		margin: 0 0 0.7em;
-	}
-	.ai-md :global(p:last-child) {
-		margin-bottom: 0;
-		display: inline;
-	}
-	.ai-md :global(pre) {
-		position: relative;
-		background: var(--bg-secondary);
-		border: 1px solid var(--border);
-		border-radius: 8px;
-		padding: 11px 13px;
-		overflow-x: auto;
-		font-family: var(--font-mono);
-		font-size: 12.5px;
-		line-height: 1.5;
-		margin: 0.7em 0;
-	}
 	/* Language chip in the corner of a code block (from `data-lang`). */
-	.ai-md :global(pre[data-lang])::before {
-		content: attr(data-lang);
-		position: absolute;
-		top: 0;
-		right: 0;
-		padding: 2px 7px;
-		font-size: 9.5px;
-		text-transform: uppercase;
-		letter-spacing: 0.4px;
-		color: var(--fg-muted);
-		background: color-mix(in srgb, var(--fg) 6%, transparent);
-		border-bottom-left-radius: 6px;
-	}
-	.ai-md :global(pre code) {
-		display: block;
-		padding-top: 2px;
-	}
-	.ai-md :global(code) {
-		font-family: var(--font-output);
-		font-size: 0.9em;
-		background: var(--bg-secondary);
-		padding: 0.1em 0.35em;
-		border-radius: 4px;
-	}
-	.ai-md :global(pre code) {
-		background: none;
-		padding: 0;
-	}
-	.ai-md :global(ul),
-	.ai-md :global(ol) {
-		margin: 0.4em 0;
-		padding-left: 1.4em;
-	}
-	.ai-md :global(li) {
-		margin: 0.2em 0;
-	}
-	.ai-md :global(a) {
-		color: var(--accent);
-		text-decoration: none;
-	}
-	.ai-md :global(a:hover) {
-		text-decoration: underline;
-	}
-	.ai-md :global(h1),
-	.ai-md :global(h2),
-	.ai-md :global(h3) {
-		font-size: 1.05em;
-		font-weight: 600;
-		margin: 0.6em 0 0.3em;
-	}
-	.ai-md :global(blockquote) {
-		border-left: 3px solid var(--border);
-		margin: 0.5em 0;
-		padding-left: 0.8em;
-		color: var(--fg-muted);
-	}
 
 	/* Tool-call steps — a compact row per tool the agent ran. */
 	.tool-steps {

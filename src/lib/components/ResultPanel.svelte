@@ -2,7 +2,11 @@
 import AnsiToHtml from "ansi-to-html";
 import type { CommandResult } from "$lib/ipc";
 import { getComboString, matchesAction } from "$lib/keybindings";
+import { renderMarkdown } from "$lib/markdown";
+import { confirmIntent } from "$lib/modalKeys";
+import { resolveOutput } from "$lib/output";
 import { sanitizeSvg, sanitizeTerminal } from "$lib/sanitize";
+import RowsView from "./RowsView.svelte";
 import WeatherCard from "./WeatherCard.svelte";
 
 let {
@@ -12,6 +16,7 @@ let {
 	ondismiss,
 	onopenurl,
 	onopenfile,
+	onrowaction,
 }: {
 	result: CommandResult;
 	command?: string;
@@ -19,11 +24,21 @@ let {
 	ondismiss?: () => void;
 	onopenurl?: () => void;
 	onopenfile?: (path: string) => void;
+	/** A row action was chosen; the host resolves it through the executor. */
+	onrowaction?: (handler: string, id: string, target: string) => void;
 } = $props();
 
 let hasInlineUrl = $derived(!!result.output && !!result.open_url);
-let outputType = $derived(result.output_type ?? "status");
-let isTerminal = $derived(outputType === "terminal");
+
+// Which renderer to use is decided ONCE, in $lib/output, not by matching
+// `output_type` here. This component used to own that mapping in an `{#if}`
+// chain while `+page.svelte` separately matched the same field to decide
+// whether a copy shortcut applied — two places deriving related verdicts from
+// one field, which is how they drift. `resolved.actions` is the same decision
+// expressed as capabilities, so the ⌘K panel can be adaptive without any
+// surface knowing the type system.
+let resolved = $derived(resolveOutput(result));
+let isTerminal = $derived(resolved.renderer === "terminal");
 
 // QR "copy image" — rasterize the inline SVG to a PNG and put it on the clipboard.
 let svgWrap: HTMLDivElement | undefined = $state();
@@ -134,7 +149,14 @@ let errorHtml = $derived(result.error ? sanitizeTerminal(converter.toHtml(result
 
 // SVG output (e.g. a QR code) — embedded inline, crisp and scannable. Sanitized
 // to strip any scripts/handlers while keeping the vector shapes.
-let isSvg = $derived(outputType === "svg");
+// Markdown reuses the chat's renderer rather than a second one — same `marked`
+// + highlight.js + DOMPurify path, so a code block looks identical whether it
+// came from the AI panel or a command result. Its own header anticipated this
+// ("and any future markdown surface"); this is that surface.
+let isMarkdown = $derived(resolved.renderer === "markdown");
+let markdownHtml = $derived(isMarkdown && result.output ? renderMarkdown(result.output) : "");
+
+let isSvg = $derived(resolved.renderer === "svg");
 let svgHtml = $derived(isSvg && result.output ? sanitizeSvg(result.output) : "");
 
 // --- Clickable filenames in ls output ---
@@ -222,11 +244,17 @@ function autofocus(node: HTMLElement, shouldFocus: boolean = true) {
 }
 
 function handleKeydown(e: KeyboardEvent) {
-	if (e.key === "Enter" && onconfirm) {
+	// The approve/reject decision lives in $lib/modalKeys — one pure function
+	// shared with the AI prompt, testable without a component harness. This
+	// panel used to hardcode `e.key === "Enter"` and ignore the binding table,
+	// so the two confirmation surfaces disagreed about their own approve key
+	// (docs/issues.md I-016).
+	const intent = confirmIntent(e);
+	if (intent === "approve" && onconfirm) {
 		e.preventDefault();
 		e.stopPropagation();
 		onconfirm();
-	} else if (e.key === "Escape" && ondismiss) {
+	} else if (intent === "reject" && ondismiss) {
 		e.preventDefault();
 		e.stopPropagation();
 		ondismiss();
@@ -262,11 +290,11 @@ function handleKeydown(e: KeyboardEvent) {
 				Cancel <span class="kbd">Esc</span>
 			</button>
 			<button class="btn btn-confirm" class:high={isHighRisk} onmousedown={(e) => e.preventDefault()} onclick={onconfirm}>
-				Confirm <span class="kbd">Enter</span>
+				Confirm <span class="kbd">Enter</span> <span class="kbd">{getComboString("approve_action")}</span>
 			</button>
 		</div>
 	</div>
-{:else if result.output || result.error}
+{:else if result.output || result.error || resolved.renderer === "rows"}
 	<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 	<div class="result-panel" class:has-url={hasInlineUrl} onkeydown={hasInlineUrl ? handleKeydown : undefined}
 		tabindex={hasInlineUrl ? -1 : undefined} role={hasInlineUrl ? "region" : undefined}
@@ -276,7 +304,7 @@ function handleKeydown(e: KeyboardEvent) {
 				<span class="prompt">$</span> {command}
 			</div>
 		{/if}
-		{#if result.output}
+		{#if result.output || resolved.renderer === "rows"}
 			{#if isTerminal}
 				<pre class="output terminal" role={lsDirectory ? "button" : undefined} tabindex={lsDirectory ? 0 : undefined} onclick={lsDirectory ? handleTerminalClick : undefined} onkeydown={lsDirectory ? (e) => { if (e.key === 'Enter') handleTerminalClick(e); } : undefined}>{@html processedHtml}</pre>
 			{:else if isSvg}
@@ -288,10 +316,22 @@ function handleKeydown(e: KeyboardEvent) {
 						{#if !qrCopied}<span class="kbd">{getComboString("copy_path")}</span>{/if}
 					</button>
 				</div>
-			{:else if outputType === "text"}
+			{:else if isMarkdown}
+				<!-- Sanitized upstream by renderMarkdown (DOMPurify); the content is
+				     model or third-party output and is never trusted raw. -->
+				<div class="output markdown md-body">{@html markdownHtml}</div>
+			{:else if resolved.renderer === "text"}
 				<div class="output text">{result.output}</div>
-			{:else if outputType === "weather"}
-				<WeatherCard data={JSON.parse(result.output)} />
+			{:else if resolved.renderer === "rows"}
+				<RowsView sections={result.sections ?? []} onaction={onrowaction} />
+			{:else if resolved.renderer === "weather"}
+				<!-- The legacy structured-output path: JSON smuggled through the
+				     string field and parsed back out here. It is the reason
+				     `Output::Rows` crosses IPC typed instead — this pattern works
+				     exactly once and cannot be reused without copying the hack.
+				     Owed a migration onto a typed variant; guarded meanwhile so a
+				     missing/!JSON payload cannot throw during render. -->
+				<WeatherCard data={JSON.parse(result.output ?? "{}")} />
 			{:else}
 				<div class="output status">{result.output}</div>
 			{/if}
