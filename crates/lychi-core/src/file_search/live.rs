@@ -18,7 +18,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use super::corpus::{CorpusStore, PathCorpus};
+use super::corpus::{CorpusStore, PathCorpus, now_ms};
 use super::session::{Generation, ScopeMatcher, SearchResults};
 
 /// Owns the in-flight search and hands out only fresh results.
@@ -32,7 +32,31 @@ pub struct LiveSearch {
     /// Monotonic, bumped per accepted search. A result carrying anything else is
     /// by definition from a superseded query.
     generation: std::sync::atomic::AtomicU64,
+    /// When the matcher was last touched, for [`Self::release_if_idle`].
+    ///
+    /// Milliseconds on the same monotonic clock the corpus uses, or `None`
+    /// before the first search. An `Option` rather than a zero sentinel: the
+    /// clock starts near zero, so "never used" and "used at t=0" are genuinely
+    /// different states that a sentinel would merge — and it merged them in a
+    /// way that refused to release, which is the failure that hides.
+    last_used_ms: Mutex<Option<u64>>,
 }
+
+/// How long the matcher may sit unused before it is dropped.
+///
+/// The matcher is the single largest thing this process holds after a search:
+/// nucleo keeps its own normalised copy of every injected path (a `Utf32String`
+/// per item) plus a worker pool, measured at ~27MB and 12 threads for a
+/// 162k-path scope. It is retained between keystrokes on purpose — that is what
+/// makes a keystroke a reparse rather than a re-injection — but "between
+/// keystrokes" and "for the rest of the session" are different claims, and the
+/// code only ever made the first one.
+///
+/// Five minutes is chosen against what re-acquiring it costs: re-injection was
+/// measured at ~18-25ms, once, on the next search. A user who searches again
+/// within five minutes keeps the warm path; one who does not gets 25ms back on
+/// a keystroke they were about to wait for anyway.
+const MATCHER_IDLE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
 impl LiveSearch {
     pub fn new(corpora: Arc<CorpusStore>) -> Self {
@@ -40,7 +64,57 @@ impl LiveSearch {
             corpora,
             matcher: Mutex::new(None),
             generation: std::sync::atomic::AtomicU64::new(0),
+            last_used_ms: Mutex::new(None),
         }
+    }
+
+    /// Drop the matcher if nothing has used it for [`MATCHER_IDLE_TIMEOUT_MS`].
+    ///
+    /// Returns whether it was dropped. Safe to call at any time from any thread:
+    /// the next search rebuilds transparently (`begin` already handles a `None`
+    /// matcher — it is the cold-start path), so this can only ever cost latency,
+    /// never correctness.
+    ///
+    /// Deliberately a *poll* rather than a timer armed at the end of each
+    /// search. A timer would need cancelling and re-arming on every keystroke,
+    /// which is a lifecycle to get wrong for no benefit; releasing 27MB a minute
+    /// late costs nothing.
+    pub fn release_if_idle(&self) -> bool {
+        self.release_if_idle_for(MATCHER_IDLE_TIMEOUT_MS)
+    }
+
+    /// [`Self::release_if_idle`] with an explicit timeout.
+    ///
+    /// Exists because `now_ms()` counts from process start: in a test binary it
+    /// is a few tens of milliseconds, so no arithmetic on the stamp can fake
+    /// five minutes having passed. Passing the threshold in tests the real rule
+    /// (elapsed vs threshold) against a clock that has genuinely advanced,
+    /// rather than testing a mocked clock.
+    fn release_if_idle_for(&self, timeout_ms: u64) -> bool {
+        // Matcher lock first, then the stamp — the same order `begin` takes, so
+        // the two can never deadlock against each other.
+        let mut guard = self.matcher.lock().unwrap();
+        if guard.is_none() {
+            return false;
+        }
+        let mut last = self.last_used_ms.lock().unwrap();
+        let Some(used_at) = *last else {
+            // A matcher with no recorded use should not happen, but treating it
+            // as "release it" would race a search that is mid-`begin`.
+            return false;
+        };
+        if now_ms().saturating_sub(used_at) < timeout_ms {
+            return false;
+        }
+        *guard = None;
+        *last = None;
+        tracing::debug!("[search] matcher released after idle timeout");
+        true
+    }
+
+    /// True when a matcher is currently held. For tests and diagnostics.
+    pub fn has_matcher(&self) -> bool {
+        self.matcher.lock().unwrap().is_some()
     }
 
     /// The corpus for `scope`, building it on first use.
@@ -82,6 +156,11 @@ impl LiveSearch {
         );
 
         let mut guard = self.matcher.lock().unwrap();
+        // Stamped on every search, including plain keystrokes, so "idle" means
+        // no search activity rather than no matcher rebuild. Taken while
+        // holding the matcher lock so the reaper cannot observe a matcher
+        // without its refreshed stamp.
+        *self.last_used_ms.lock().unwrap() = Some(now_ms());
         // Rebuild only when the scope changed or the corpus was re-walked.
         // A plain keystroke hits neither branch — it is just a reparse.
         let needs_build = match guard.as_ref() {
@@ -222,6 +301,97 @@ mod tests {
 
     fn noop() -> Arc<dyn Fn() + Send + Sync> {
         Arc::new(|| {})
+    }
+
+    /// Release as if the idle timeout had elapsed.
+    ///
+    /// A zero threshold rather than a backdated stamp: `now_ms` counts from
+    /// process start, so in a test binary it is tens of milliseconds and
+    /// `stamp - 5min` saturates to 0 — which reads as "used 40ms ago", not
+    /// "used 5 minutes ago". This exercises the real comparison instead.
+    fn release_now(live: &LiveSearch) -> bool {
+        live.release_if_idle_for(0)
+    }
+
+    /// The matcher must survive an idle period shorter than the timeout — this
+    /// is the property that makes a keystroke a reparse rather than a 162k-item
+    /// re-injection, and releasing eagerly would destroy it.
+    #[test]
+    fn an_active_matcher_is_not_released() {
+        let t = tree(&["a/readme.md"]);
+        let (live, scope) = live(&t);
+        live.begin(&scope, "readme", noop());
+        assert!(live.has_matcher());
+
+        assert!(!live.release_if_idle(), "released while recently used");
+        assert!(live.has_matcher(), "matcher must survive a recent search");
+    }
+
+    /// The fix: after the idle timeout, nucleo's per-path copy and worker pool
+    /// are dropped rather than held for the process lifetime.
+    #[test]
+    fn an_idle_matcher_is_released() {
+        let t = tree(&["a/readme.md"]);
+        let (live, scope) = live(&t);
+        live.begin(&scope, "readme", noop());
+        assert!(live.has_matcher());
+
+        // Backdate the last-use stamp past the timeout.
+        assert!(release_now(&live), "should have released");
+        assert!(!live.has_matcher());
+    }
+
+    /// Releasing must be invisible to the user: the next search rebuilds. If it
+    /// were not, this would trade memory for broken search.
+    #[test]
+    fn a_search_after_release_still_returns_results() {
+        let t = tree(&["a/readme.md", "b/other.rs"]);
+        let (live, scope) = live(&t);
+
+        let g1 = live.begin(&scope, "readme", noop());
+        let before = live.results(g1, 10).map(|r| r.items.len()).unwrap_or(0);
+        assert!(before > 0, "baseline search found nothing");
+
+        assert!(release_now(&live));
+
+        let g2 = live.begin(&scope, "readme", noop());
+        let after = live.results(g2, 10).map(|r| r.items.len()).unwrap_or(0);
+        assert_eq!(
+            after, before,
+            "a rebuilt matcher must find what the warm one found"
+        );
+    }
+
+    /// Nothing to release before the first search — and no panic for trying.
+    #[test]
+    fn releasing_without_a_matcher_is_a_no_op() {
+        let live = Arc::new(LiveSearch::new(Arc::new(CorpusStore::default())));
+        assert!(!live.release_if_idle());
+        assert!(!live.has_matcher());
+    }
+
+    /// A keystroke stamps use even though it does not rebuild the matcher, so
+    /// "idle" means no searching rather than no rebuilding. Stamping only on
+    /// rebuild would release the matcher out from under an active typist.
+    #[test]
+    fn a_plain_keystroke_counts_as_use() {
+        let t = tree(&["a/readme.md"]);
+        let (live, scope) = live(&t);
+        live.begin(&scope, "read", noop());
+        let first = live.last_used_ms.lock().unwrap().expect("stamped");
+
+        // Type another character. Same scope and a live corpus, so this is a
+        // reparse on the existing matcher — it does NOT rebuild.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        live.begin(&scope, "readm", noop());
+        let second = live.last_used_ms.lock().unwrap().expect("stamped");
+
+        assert!(
+            second > first,
+            "a keystroke must refresh the idle clock ({first} -> {second}); \
+             stamping only on matcher REBUILD would let the reaper release the \
+             matcher out from under someone who is actively typing"
+        );
     }
 
     /// The rule this type exists for: once a newer search starts, the older one

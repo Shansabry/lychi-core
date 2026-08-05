@@ -59,9 +59,11 @@ const MIN_REWALK_INTERVAL_MS: u64 = 30_000;
 /// Milliseconds since an arbitrary fixed point, for interval comparisons only.
 ///
 /// Monotonic: `Instant`-based, so a wall-clock adjustment (NTP, DST, suspend)
-/// cannot make the interval check see time move backwards and refuse rebuilds
-/// forever.
-fn now_ms() -> u64 {
+/// cannot make an interval check see time move backwards and stall forever.
+///
+/// Shared with `live` (the matcher's idle timeout) rather than duplicated —
+/// two clocks that must agree about "how long since" is one clock.
+pub(super) fn now_ms() -> u64 {
     use std::sync::OnceLock;
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_millis() as u64

@@ -121,10 +121,33 @@ fn read_resources() -> ResourceSnapshot {
     snap
 }
 
+/// Periodic upkeep that has nowhere better to live: cheap, idempotent, and
+/// tolerant of running late.
+///
+/// One tick thread rather than one per chore. Each of these could arm its own
+/// timer, but then each owns a lifecycle to get wrong, and none of them needs
+/// that precision — the whole point is that being a minute late costs nothing.
+/// A task that needs to run *promptly*, or that can block, does not belong
+/// here; give it its own thread.
+/// How often [`Upkeep::tick`] runs, independent of the health-log interval.
+///
+/// Shorter than any task's own deadline so a task with an N-minute timeout
+/// resolves within roughly N, not 2N.
+const UPKEEP_TICK: std::time::Duration = std::time::Duration::from_secs(60);
+
+pub trait Upkeep: Send + Sync {
+    /// Short name for the log line when this reports doing something.
+    fn name(&self) -> &'static str;
+    /// Run one pass. Returns true if it actually did work, so the tick can say
+    /// so — silent housekeeping is housekeeping nobody can debug.
+    fn tick(&self) -> bool;
+}
+
 /// Spawn a low-priority thread that logs a health snapshot (resources + context
-/// metrics) every `interval`. Cheap (~a few /proc reads) and off the hot path.
-/// The returned thread runs for the process lifetime.
-pub fn spawn_health_monitor(interval: std::time::Duration) {
+/// metrics) every `interval` and runs each registered [`Upkeep`] task.
+/// Cheap (~a few /proc reads) and off the hot path. Runs for the process
+/// lifetime.
+pub fn spawn_health_monitor(interval: std::time::Duration, upkeep: Vec<Box<dyn Upkeep>>) {
     std::thread::Builder::new()
         .name("lychi-health".into())
         .spawn(move || {
@@ -152,7 +175,21 @@ pub fn spawn_health_monitor(interval: std::time::Duration) {
                     ctx_refreshes = m.stale_refresh_triggered,
                     "[health] resource snapshot"
                 );
-                std::thread::sleep(interval);
+                // Upkeep runs on a shorter cadence than the health log: a
+                // 5-minute idle timeout checked every 5 minutes resolves in up
+                // to 10, so the sleep is subdivided. Each pass is an atomic
+                // load unless a task's deadline has actually passed.
+                let mut slept = std::time::Duration::ZERO;
+                while slept < interval {
+                    let step = UPKEEP_TICK.min(interval - slept);
+                    std::thread::sleep(step);
+                    slept += step;
+                    for task in &upkeep {
+                        if task.tick() {
+                            tracing::debug!(task = task.name(), "[upkeep] released resources");
+                        }
+                    }
+                }
             }
         })
         .expect("failed to spawn health monitor thread");

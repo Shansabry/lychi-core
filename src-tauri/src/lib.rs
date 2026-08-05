@@ -172,17 +172,45 @@ fn export_bindings() {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Releases the file-search matcher once searching has gone quiet.
+///
+/// nucleo keeps its own normalised copy of every injected path plus a worker
+/// pool — measured at ~27MB and 12 threads for a 162k-path scope — and it was
+/// held for the rest of the process once a single search had run. Staying warm
+/// *between keystrokes* is the point of it, and that stays; staying warm for
+/// hours after the user stopped searching is a leak with a justification
+/// attached.
+///
+/// Safe by construction: `begin` already rebuilds from a `None` matcher (it is
+/// the cold-start path), so releasing can only ever cost the next search a
+/// re-injection (~18-25ms, once), never a wrong result.
+struct MatcherReaper(std::sync::Arc<lychi_core::file_search::live::LiveSearch>);
+
+impl logging::Upkeep for MatcherReaper {
+    fn name(&self) -> &'static str {
+        "search-matcher"
+    }
+    fn tick(&self) -> bool {
+        self.0.release_if_idle()
+    }
+}
+
 pub fn run() {
     // Kept alive for the whole program — dropping it flushes and stops the
     // non-blocking file-log worker, so buffered logs would be lost on exit.
     let _log_guard = logging::init();
-    // Periodic resource/health snapshot (memory, threads, fds) to the log, so
-    // beta reports of sluggishness/RAM growth have data behind them.
-    logging::spawn_health_monitor(std::time::Duration::from_secs(300));
-
     platform::init_app();
 
     let app_state = AppState::new();
+
+    // Periodic resource/health snapshot (memory, threads, fds) to the log, so
+    // beta reports of sluggishness/RAM growth have data behind them — plus the
+    // upkeep tasks that ride the same tick. Spawned after `AppState` so those
+    // tasks can hold the things they release.
+    logging::spawn_health_monitor(
+        std::time::Duration::from_secs(300),
+        vec![Box::new(MatcherReaper(app_state.live_search.clone()))],
+    );
     let (hotkey, window_strategy, shell_path, project_dirs) = {
         let config = app_state.config.blocking_read();
         // Apply all context-detection config (extra terminals/IDEs/markers +
