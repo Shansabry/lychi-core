@@ -177,10 +177,28 @@ fn wants_fullscreen() -> bool {
 /// behaviour lives in the shell's compositing path, not in a protocol we can
 /// feature-detect.
 fn is_gnome_like() -> bool {
-    is_wayland_session()
-        && ["GNOME", "UNITY", "PANTHEON", "BUDGIE"]
-            .iter()
-            .any(|d| desktop_contains(d))
+    let s = lychi_core::context::session::session();
+    is_mutter_family(s.is_wayland(), &s.desktops)
+}
+
+/// The rule, as a pure function of the session facts.
+///
+/// Split out so it can be tested: the previous version read the environment
+/// inline, and once session detection became cached (correctly — env vars do
+/// not change) the env-mutating tests around it stopped being able to affect
+/// the answer at all. They then passed or failed depending on which test in the
+/// binary ran first.
+///
+/// Wayland-gated because the black-fullscreen behaviour is in Mutter's Wayland
+/// compositing path. Note `GnomeClassic`/`GnomeFlashback` are X11-only sessions,
+/// so they never reach this — which is correct, and previously obscured by
+/// matching them in a list that could not fire.
+fn is_mutter_family(wayland: bool, desktops: &[lychi_core::context::session::Desktop]) -> bool {
+    use lychi_core::context::session::Desktop;
+    wayland
+        && desktops.iter().any(|d| {
+            d.is_gnome_family() || matches!(d, Desktop::Unity | Desktop::Pantheon | Desktop::Budgie)
+        })
 }
 
 /// Whether the X11 screen has a compositor. Without one (xfwm4/Marco with
@@ -1321,80 +1339,22 @@ mod strategy_tests {
 mod tests {
     use super::*;
 
-    /// These helpers read process-global env vars, so the tests mutate shared
-    /// state and must not run concurrently. Cargo runs tests in one process on
-    /// multiple threads, so a mutex is the guard; one test function per concern
-    /// would race even with `--test-threads=1` on other crates' tests.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Set the session vars, run `f`, restore. Restoring matters because a
-    /// leaked XDG_CURRENT_DESKTOP would silently change later tests.
-    ///
-    /// `WAYLAND_DISPLAY` is part of the fixture, not incidental: session
-    /// detection treats a live Wayland socket as decisive (see
-    /// `context::is_wayland` — `XDG_SESSION_TYPE` is routinely absent under
-    /// autostart, so it cannot be the only signal). Leaving the developer's real
-    /// `WAYLAND_DISPLAY` in place made `with_session("x11", …)` describe a
-    /// session that does not exist, and the test asserting GNOME-on-X11 failed
-    /// on a KDE Wayland dev box for reasons having nothing to do with GNOME.
-    fn with_session<T>(session_type: &str, desktop: &str, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let saved = [
-            ("XDG_SESSION_TYPE", std::env::var_os("XDG_SESSION_TYPE")),
-            (
-                "XDG_SESSION_DESKTOP",
-                std::env::var_os("XDG_SESSION_DESKTOP"),
-            ),
-            (
-                "XDG_CURRENT_DESKTOP",
-                std::env::var_os("XDG_CURRENT_DESKTOP"),
-            ),
-            ("WAYLAND_DISPLAY", std::env::var_os("WAYLAND_DISPLAY")),
-        ];
-        // SAFETY: single-threaded within the ENV_LOCK critical section.
-        unsafe {
-            std::env::set_var("XDG_SESSION_TYPE", session_type);
-            std::env::set_var("XDG_SESSION_DESKTOP", desktop);
-            std::env::remove_var("XDG_CURRENT_DESKTOP");
-            // Make the socket agree with the declared session type.
-            if session_type == "wayland" {
-                std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
-            } else {
-                std::env::remove_var("WAYLAND_DISPLAY");
-            }
-        }
-        let out = f();
-        unsafe {
-            for (k, v) in saved {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-        out
-    }
-
     /// The regression this guards: asking Mutter for fullscreen makes it paint
     /// an opaque black backdrop, so the transparent monitor-covering window
     /// that the whole toplevel design depends on renders as a solid panel.
     #[test]
     fn gnome_wayland_never_requests_fullscreen() {
-        for desktop in [
-            "GNOME",
-            "gnome",
-            "ubuntu:GNOME",
-            "Unity",
-            "Pantheon",
-            "Budgie",
+        use lychi_core::context::session::Desktop;
+        for chain in [
+            vec![Desktop::Gnome],
+            vec![Desktop::Other, Desktop::Gnome], // "ubuntu:GNOME"
+            vec![Desktop::Unity],
+            vec![Desktop::Pantheon],
+            vec![Desktop::Budgie, Desktop::Gnome],
         ] {
             assert!(
-                with_session("wayland", desktop, is_gnome_like),
-                "{desktop} should be detected as Mutter-based"
-            );
-            assert!(
-                !with_session("wayland", desktop, wants_fullscreen),
-                "{desktop} must not request fullscreen"
+                is_mutter_family(true, &chain),
+                "{chain:?} should be detected as Mutter-based"
             );
         }
     }
@@ -1403,36 +1363,52 @@ mod tests {
     /// sanctioned way to pin a surface to a monitor when move_() is ignored.
     #[test]
     fn unknown_wayland_still_requests_fullscreen() {
-        assert!(with_session("wayland", "sway", wants_fullscreen));
-        assert!(!with_session("wayland", "sway", is_gnome_like));
+        use lychi_core::context::session::Desktop;
+        assert!(!is_mutter_family(true, &[Desktop::Sway]));
+        assert!(!is_mutter_family(true, &[Desktop::Hyprland]));
     }
 
-    /// GNOME detection is Wayland-gated: the black-fullscreen behaviour is in
-    /// Mutter's Wayland compositing path, and the X11 branch never reaches
-    /// wants_fullscreen() anyway.
+    /// Mutter's black-fullscreen behaviour is in its WAYLAND compositing path,
+    /// so an X11 GNOME session must not take the workaround.
+    ///
+    /// Note this is why `GNOME-Classic`/`GNOME-Flashback` never reach here:
+    /// both are X11-only sessions. Matching them by name in a Wayland-gated
+    /// check (as the previous version did) was unreachable code that read like
+    /// deliberate coverage.
     #[test]
     fn gnome_on_x11_is_not_treated_as_mutter_wayland() {
-        assert!(!with_session("x11", "GNOME", is_gnome_like));
+        use lychi_core::context::session::Desktop;
+        assert!(!is_mutter_family(false, &[Desktop::Gnome]));
+        assert!(!is_mutter_family(
+            false,
+            &[Desktop::GnomeFlashback, Desktop::Gnome]
+        ));
     }
 
-    /// Substring matching must not fire on unrelated names that merely contain
-    /// a desktop word — "GNOME Flashback" is Mutter, "gnome-ish" is nobody.
+    /// The compound-name case, now handled by the spec'd chain rather than by
+    /// substring matching: "GNOME-Flashback:GNOME" parses to two components and
+    /// either one identifies the family.
     #[test]
     fn detection_is_case_insensitive_and_matches_compound_names() {
-        assert!(with_session(
-            "wayland",
-            "GNOME-Flashback:GNOME",
-            is_gnome_like
+        use lychi_core::context::session::Desktop;
+        assert!(is_mutter_family(
+            true,
+            &[Desktop::GnomeFlashback, Desktop::Gnome]
         ));
-        assert!(!with_session("wayland", "KDE", is_gnome_like));
-        assert!(!with_session("wayland", "", is_gnome_like));
+        assert!(!is_mutter_family(true, &[Desktop::Kde]));
+        assert!(!is_mutter_family(true, &[]));
     }
 
     /// KDE goes down the move_() branch, so it must not be misdetected as
     /// GNOME — and it keeps its own non-fullscreen path for I-001 (blur/dim).
+    ///
+    /// Asserted against the pure rule rather than by setting env vars: session
+    /// detection is cached on first use, so an env-mutating version of this
+    /// passed on a KDE machine and proved nothing anywhere else.
     #[test]
     fn kde_wayland_is_distinct_from_gnome() {
-        assert!(with_session("wayland", "KDE", is_kde_wayland));
-        assert!(!with_session("wayland", "KDE", is_gnome_like));
+        use lychi_core::context::session::Desktop;
+        assert!(!is_mutter_family(true, &[Desktop::Kde]));
+        assert!(is_mutter_family(true, &[Desktop::Gnome]));
     }
 }

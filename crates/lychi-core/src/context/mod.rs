@@ -9,10 +9,12 @@
 
 pub mod active_window;
 pub mod cache;
+pub mod capabilities;
 pub mod clipboard_detect;
 pub mod config;
 pub mod cwd;
 pub mod docker;
+pub mod doctor;
 pub mod git;
 pub mod ide;
 pub mod ide_config;
@@ -22,6 +24,7 @@ pub mod multi_repo;
 pub mod network;
 pub mod pin;
 pub mod project;
+pub mod session;
 pub mod suggestions;
 pub mod terminal_probe;
 pub mod window_stack;
@@ -389,16 +392,7 @@ impl std::fmt::Display for TerminalSource {
 /// says.
 #[cfg(target_os = "linux")]
 pub fn is_wayland() -> bool {
-    if std::env::var("XDG_SESSION_TYPE")
-        .map(|v| v == "wayland")
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    // Fallback: the Wayland display socket is set on any real Wayland session.
-    std::env::var("WAYLAND_DISPLAY")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
+    session::session().is_wayland()
 }
 
 /// Compositor family the session runs under. Cached — env vars don't change
@@ -417,16 +411,35 @@ pub enum Compositor {
 pub fn compositor() -> Compositor {
     static COMPOSITOR: std::sync::OnceLock<Compositor> = std::sync::OnceLock::new();
     *COMPOSITOR.get_or_init(|| {
-        if !is_wayland() {
+        let s = session::session();
+        if !s.is_wayland() {
             return Compositor::X11;
         }
-        let desktop = std::env::var("XDG_SESSION_DESKTOP")
-            .or_else(|_| std::env::var("XDG_CURRENT_DESKTOP"))
-            .map(|v| v.to_uppercase())
-            .unwrap_or_default();
-        if desktop.contains("KDE") {
+
+        // Identified by what answers on the bus, not by what the session is
+        // called. The previous version read `XDG_SESSION_DESKTOP` first and
+        // asked whether it contained "KDE" — but that variable holds the
+        // session FILE NAME, which on this very machine is `plasma`
+        // (`plasma.desktop` declaring `DesktopNames=KDE`). Distros that follow
+        // the filename convention export "plasma", the substring check missed,
+        // and KWin sessions were classified `OtherWayland` — which dispatches
+        // window detection to the wlr-foreign-toplevel backend KWin does not
+        // implement. Silent, total loss of window context, invisible on any
+        // machine where both variables happen to read "KDE".
+        //
+        // `NameHasOwner` cannot be spelled wrong by a distro.
+        if capabilities::dbus_name_present("org.kde.KWin") {
+            return Compositor::KdeWayland;
+        }
+        if capabilities::dbus_name_present("org.gnome.Shell") {
+            return Compositor::GnomeWayland;
+        }
+
+        // Fall back to the spec'd name when nothing claims the bus — a
+        // compositor may simply not offer a scripting interface.
+        if s.is(session::Desktop::Kde) {
             Compositor::KdeWayland
-        } else if desktop.contains("GNOME") {
+        } else if s.primary().is_gnome_family() {
             Compositor::GnomeWayland
         } else {
             Compositor::OtherWayland
@@ -798,93 +811,20 @@ pub fn gather(pre_captured: Option<WindowContext>) -> EnvironmentContext {
 mod wayland_detection_tests {
     use super::*;
 
-    /// `is_wayland` reads process-global env vars, so these must not run
-    /// concurrently with each other.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Run `f` with the two session vars set to the given values, then restore
-    /// whatever the real session had. Restoring matters: leaking a fake
-    /// `WAYLAND_DISPLAY` into later tests would silently change what they see.
-    fn with_session(session_type: Option<&str>, wayland_display: Option<&str>, f: impl FnOnce()) {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old_type = std::env::var("XDG_SESSION_TYPE").ok();
-        let old_display = std::env::var("WAYLAND_DISPLAY").ok();
-
-        // SAFETY: single-threaded within the lock; restored below.
-        unsafe {
-            match session_type {
-                Some(v) => std::env::set_var("XDG_SESSION_TYPE", v),
-                None => std::env::remove_var("XDG_SESSION_TYPE"),
-            }
-            match wayland_display {
-                Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
-                None => std::env::remove_var("WAYLAND_DISPLAY"),
-            }
-        }
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-
-        unsafe {
-            match old_type {
-                Some(v) => std::env::set_var("XDG_SESSION_TYPE", v),
-                None => std::env::remove_var("XDG_SESSION_TYPE"),
-            }
-            match old_display {
-                Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
-                None => std::env::remove_var("WAYLAND_DISPLAY"),
-            }
-        }
-        if let Err(p) = result {
-            std::panic::resume_unwind(p);
-        }
-    }
-
-    /// **The autostart case, and the whole reason the fallback exists.**
+    /// Session detection moved to `session::SessionInfo`, which caches on first
+    /// use — so the env-mutating tests that used to live here could no longer
+    /// affect the answer, and were passing or failing on whatever the developer
+    /// happened to be running under.
     ///
-    /// The session launches us through D-Bus activation, whose environment may
-    /// not carry `XDG_SESSION_TYPE`. Detection must not conclude "X11" from its
-    /// absence: on KDE that routed the window strategy to layer-shell, which
-    /// I-008 says cannot receive keyboard focus on KWin — an autostarted
-    /// launcher you cannot type into.
+    /// The RULES they encoded (missing XDG_SESSION_TYPE under autostart, empty
+    /// WAYLAND_DISPLAY, a live socket beating a stale label) are now tested in
+    /// `session::tests` against a pure function, where env mutation is not
+    /// needed at all. What is left worth asserting here is that this wrapper
+    /// still delegates rather than growing a second opinion — the duplicate
+    /// definition was the original bug.
     #[test]
-    fn wayland_detected_when_session_type_is_missing() {
-        with_session(None, Some("wayland-0"), || {
-            assert!(
-                is_wayland(),
-                "WAYLAND_DISPLAY must be enough on its own — XDG_SESSION_TYPE \
-                 is routinely absent under autostart"
-            );
-        });
-    }
-
-    #[test]
-    fn wayland_detected_from_session_type() {
-        with_session(Some("wayland"), None, || assert!(is_wayland()));
-    }
-
-    #[test]
-    fn x11_session_is_not_wayland() {
-        with_session(Some("x11"), None, || assert!(!is_wayland()));
-    }
-
-    /// An empty `WAYLAND_DISPLAY` is not a Wayland session — some environments
-    /// export the name with no value.
-    #[test]
-    fn empty_wayland_display_is_not_wayland() {
-        with_session(None, Some(""), || assert!(!is_wayland()));
-        with_session(None, None, || assert!(!is_wayland()));
-    }
-
-    /// X11 sessions can still have WAYLAND_DISPLAY set (XWayland-adjacent
-    /// setups, nested compositors). The socket is the stronger evidence.
-    #[test]
-    fn wayland_display_wins_over_a_stale_session_type() {
-        with_session(Some("x11"), Some("wayland-1"), || {
-            assert!(
-                is_wayland(),
-                "a live Wayland socket means Wayland regardless of the label"
-            );
-        });
+    fn is_wayland_delegates_to_the_one_session_detector() {
+        assert_eq!(is_wayland(), session::session().is_wayland());
     }
 }
 

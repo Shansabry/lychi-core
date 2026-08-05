@@ -12,6 +12,15 @@ fn main() {
     // and launched a second GUI, which is the opposite of what was asked.
     #[cfg(unix)]
     if let Some(cmd) = cli_command(&std::env::args().collect::<Vec<_>>()) {
+        // `doctor` is answered HERE, not forwarded over the socket: it exists
+        // to diagnose a launcher that will not start or will not bind a
+        // hotkey, so requiring a running instance would make it useless in
+        // exactly the case it is for.
+        if cmd == "--doctor" {
+            unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+            print!("{}", lychi_core::context::doctor::report());
+            return;
+        }
         if cmd == "--help" {
             // Rust ignores SIGPIPE so `println!` returns an error instead of
             // exiting — which makes `lychi --help | head` print a panic. Every
@@ -72,6 +81,7 @@ fn cli_command(args: &[String]) -> Option<String> {
         "--screenshot" | "screenshot" => Some(format!("screenshot {arg}\n")),
         "--ai" | "ai" => Some(format!("ai {arg}\n")),
         "--help" | "-h" => Some("--help".to_string()),
+        "doctor" | "--doctor" => Some("--doctor".to_string()),
         // `start` / `--hidden` are NOT socket commands — they mean "run the
         // app". Listed explicitly so the intent is obvious at the call site and
         // so `start` can't be mistaken for a missing verb.
@@ -90,9 +100,10 @@ fn print_cli_help() {
     println!("  --screenshot area|window      Capture a region / the active window");
     println!("  ai, --ai [preset]             Run AI on the selected text");
     println!("  start, --start                Start Lychi (no-op if running)");
+    println!("  doctor, --doctor              Report desktop + capabilities (no app needed)");
     println!("  --hidden                      Start in the background (autostart)");
     println!();
-    println!("Every verb except start/--hidden needs Lychi already running.");
+    println!("Every verb except start/doctor/--hidden needs Lychi already running.");
 }
 
 #[cfg(all(unix, test))]
