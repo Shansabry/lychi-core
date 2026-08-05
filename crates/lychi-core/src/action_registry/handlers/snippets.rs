@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use redb::Database;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, Output, OutputType,
+    RiskLevel, Row, Section,
 };
 use crate::error::LychiError;
 use crate::snippets::store::SnippetsStore;
@@ -21,6 +22,38 @@ const SNIP_SUBCOMMANDS: &[(&str, &str)] = &[
         "Edit a snippet (e.g. snip edit email-intro New body...)",
     ),
 ];
+
+/// Resolve a snippet row action into the command it stands for.
+///
+/// Unlike `ssh::resolve_action` this cannot allowlist characters: snippet names
+/// are user-authored free text and legitimately contain spaces, punctuation and
+/// non-ASCII. Nothing here reaches a shell either — every snippet verb is a
+/// store lookup by name or id.
+///
+/// The real hazard is argument splitting. `snip delete my note` parses as verb
+/// `delete` + rest `my note`, which happens to work, but a name whose leading
+/// word collides with a verb (a snippet literally called "delete foo") would
+/// re-enter the parser as a different command. Names containing a newline are
+/// worse: `rest` is matched verbatim, so the tail would be silently ignored.
+///
+/// So: reject control characters (a name can never legitimately contain one),
+/// and pass everything else through unchanged.
+pub fn resolve_action(id: &str, target: &str) -> Result<String, String> {
+    if !matches!(id, "copy" | "delete") {
+        return Err(format!("Unknown snippet action '{id}'"));
+    }
+    if target.trim().is_empty() {
+        return Err("Snippet name is empty".to_string());
+    }
+    if target.chars().any(char::is_control) {
+        return Err("Snippet name contains a control character".to_string());
+    }
+    // `copy` is the bare form — `snip <name>` copies to the clipboard.
+    Ok(match id {
+        "copy" => format!("snip {target}"),
+        _ => format!("snip delete {target}"),
+    })
+}
 
 pub struct SnippetsHandler {
     db: Arc<Database>,
@@ -111,15 +144,32 @@ impl ActionHandler for SnippetsHandler {
                             .with_duration(start.elapsed().as_millis() as u64),
                     );
                 }
-                let lines: Vec<String> = snippets
+                // Rows rather than a joined string. `updated_at` was being
+                // dropped entirely by the text form — the frontend renders it
+                // as a relative age, so "edited 2d ago" comes for free and
+                // reads identically to every other aged list.
+                let rows: Vec<Row> = snippets
                     .iter()
-                    .map(|s| format!("  {} — {}", s.name, Self::truncate_body(&s.body, 50)))
+                    .map(|s| {
+                        Row::new(&s.name)
+                            .subtitle(Self::truncate_body(&s.body, 50))
+                            .accessory_at(s.updated_at as i64)
+                            .action("copy", "Copy", &s.name, None)
+                            .action("delete", "Delete", &s.name, Some(RiskLevel::Medium))
+                    })
                     .collect();
-                Ok(ActionResult::ok(
-                    format!("Snippets ({}):\n{}", snippets.len(), lines.join("\n")),
-                    OutputType::Text,
-                )
-                .with_duration(start.elapsed().as_millis() as u64))
+                Ok(ActionResult {
+                    success: true,
+                    output: Output::Rows {
+                        sections: vec![Section {
+                            title: Some(format!("Snippets ({})", rows.len())),
+                            rows,
+                            handler: "snippets".to_string(),
+                        }],
+                    },
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                })
             }
             "delete" | "del" | "rm" | "remove" => {
                 if rest.is_empty() {
@@ -250,5 +300,51 @@ mod tests {
         let t = SnippetsHandler::truncate_body(&s, 40);
         assert!(t.len() <= 40 && s.is_char_boundary(t.len()));
         assert_eq!(SnippetsHandler::truncate_body("one\ntwo", 50), "one");
+    }
+
+    mod row_actions {
+        use super::super::resolve_action;
+
+        #[test]
+        fn copy_is_the_bare_form_and_delete_is_explicit() {
+            assert_eq!(
+                resolve_action("copy", "email-intro").unwrap(),
+                "snip email-intro"
+            );
+            assert_eq!(
+                resolve_action("delete", "email-intro").unwrap(),
+                "snip delete email-intro"
+            );
+        }
+
+        #[test]
+        fn real_snippet_names_survive_unchanged() {
+            // Names are user-authored free text. A validator that allowlisted
+            // characters (as the ssh one does) would break these, which is why
+            // this handler validates a different property.
+            for name in ["my note", "café ☕", "TODO: fix (#42)", "a/b", "50% off"] {
+                assert_eq!(
+                    resolve_action("copy", name).unwrap(),
+                    format!("snip {name}"),
+                    "must pass through: {name}"
+                );
+            }
+        }
+
+        #[test]
+        fn control_characters_are_refused() {
+            // A newline is the one that actually bites: `rest` is matched
+            // verbatim, so everything after it would be silently dropped.
+            assert!(resolve_action("copy", "note\nrm -rf /").is_err());
+            assert!(resolve_action("copy", "note\rx").is_err());
+            assert!(resolve_action("copy", "note\0x").is_err());
+        }
+
+        #[test]
+        fn empty_and_unknown_are_refused() {
+            assert!(resolve_action("copy", "").is_err());
+            assert!(resolve_action("copy", "   ").is_err());
+            assert!(resolve_action("exec", "email-intro").is_err());
+        }
     }
 }

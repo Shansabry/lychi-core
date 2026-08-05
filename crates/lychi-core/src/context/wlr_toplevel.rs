@@ -111,6 +111,26 @@ mod imp {
                 state.toplevels.entry(toplevel.id()).or_default();
             }
         }
+
+        // REQUIRED, not optional: the `toplevel` event (opcode 0) CREATES a new
+        // protocol object, and wayland-client cannot know what `UserData` to
+        // attach to it. The default implementation panics rather than guess:
+        //
+        //   Missing event_created_child specialization for event opcode 0
+        //   of zwlr_foreign_toplevel_manager_v1
+        //
+        // That panic is unwind-unsafe across the C Wayland callback, so it
+        // became `fatal runtime error: failed to initiate panic` → SIGABRT.
+        // Lychi aborted on startup and never showed a window.
+        //
+        // It only fires on compositors that actually implement this protocol —
+        // wlroots-based ones (Sway, Hyprland, river, Wayfire). GNOME and KDE do
+        // not advertise the global, so the manager is never bound and the code
+        // path is dead there. The dev box is KDE; the crash was invisible on it
+        // and total on Berin's Sway (2026-08-03).
+        wayland_client::event_created_child!(State, ZwlrForeignToplevelManagerV1, [
+            zwlr_foreign_toplevel_manager_v1::EVT_TOPLEVEL_OPCODE => (ZwlrForeignToplevelHandleV1, ()),
+        ]);
     }
 
     /// Per-toplevel events: title/app_id/state accumulate; `closed` marks the
@@ -265,4 +285,36 @@ pub fn activate(_app_id: &str, _title: &str) -> Result<(), String> {
 #[cfg(not(target_os = "linux"))]
 pub fn close(_app_id: &str, _title: &str) -> Result<(), String> {
     Err("Not supported on this platform".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    /// Regression guard for the Sway startup abort (Berin, 2026-08-03).
+    ///
+    /// `zwlr_foreign_toplevel_manager_v1`'s `toplevel` event CREATES a protocol
+    /// object, so `Dispatch` must supply an `event_created_child!` mapping for
+    /// its opcode. Without one, wayland-client panics on the first window the
+    /// compositor announces:
+    ///
+    ///   Missing event_created_child specialization for event opcode 0
+    ///   of zwlr_foreign_toplevel_manager_v1
+    ///
+    /// and because that panic crosses a C callback it cannot unwind —
+    /// `fatal runtime error: failed to initiate panic` → SIGABRT. Lychi never
+    /// drew a window.
+    ///
+    /// This asserts the opcode we bind against is the one that panicked. It is
+    /// deliberately a value check rather than a behavioural one: exercising the
+    /// real path needs a live wlroots compositor, which no CI runner and
+    /// neither developer machine (KDE) provides — the reason the bug shipped.
+    #[test]
+    fn toplevel_event_opcode_is_the_one_we_specialize() {
+        use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1;
+        assert_eq!(
+            zwlr_foreign_toplevel_manager_v1::EVT_TOPLEVEL_OPCODE,
+            0,
+            "the crash named opcode 0; if this constant moves, the \
+             event_created_child! mapping above must move with it"
+        );
+    }
 }

@@ -46,6 +46,27 @@ const MAX_WATCHED_SUBTREE: usize = 1000;
 /// Quiet period after a filesystem event before rebuilding a scope's paths.
 const REBUILD_DEBOUNCE: Duration = Duration::from_secs(2);
 
+/// Floor on how often a full re-walk may run, independent of the debounce.
+///
+/// The debounce answers "has the filesystem been quiet for 2s?" — under a build
+/// or an `npm install` that is satisfied continuously, so on its own it permits
+/// a full re-walk every 2s indefinitely. This answers the different question of
+/// how often the walk may run at all. 30s is comfortably longer than a walk of a
+/// large home directory, so a busy filesystem costs one walk per 30s rather than
+/// a permanent treadmill.
+const MIN_REWALK_INTERVAL_MS: u64 = 30_000;
+
+/// Milliseconds since an arbitrary fixed point, for interval comparisons only.
+///
+/// Monotonic: `Instant`-based, so a wall-clock adjustment (NTP, DST, suspend)
+/// cannot make the interval check see time move backwards and refuse rebuilds
+/// forever.
+fn now_ms() -> u64 {
+    use std::sync::OnceLock;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 /// Total paths currently held across every live corpus.
 ///
 /// Read by the health monitor, which runs on its own thread with no access to
@@ -250,6 +271,26 @@ pub struct PathCorpus {
     published: AtomicU64,
     /// False until the first walk has finished.
     complete: AtomicBool,
+    /// A walk thread is running right now. At most one may be in flight.
+    ///
+    /// Without this, `rebuild` spawned a thread per call and the debounce only
+    /// bounded how *bursty* the calls were, not how many ran at once. Each walk
+    /// accumulates its own `Vec` of up to the whole scope before publishing, so N
+    /// concurrent walks meant N copies of the corpus resident simultaneously.
+    /// Superseded walks do quit, but only when they next reach the generation
+    /// check — after they have already allocated.
+    ///
+    /// Same guard the app-index watcher has always had (`desktop_apps/watcher.rs`).
+    walking: AtomicBool,
+    /// When the last walk finished, as millis since process start. Pairs with
+    /// [`MIN_REWALK_INTERVAL`] to put a floor on the re-walk *rate* — the
+    /// debounce only ever governed the quiet period before one.
+    last_walk_ms: AtomicU64,
+    /// A change arrived while a walk was in flight, so re-walk when it lands.
+    /// Without this a guarded rebuild would simply drop changes that arrive
+    /// mid-walk, leaving the corpus silently stale — trading a memory bug for a
+    /// correctness one.
+    dirty: AtomicBool,
     /// Called whenever a new snapshot is published, so live searches re-run.
     on_change: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
 }
@@ -273,14 +314,21 @@ impl PathCorpus {
             generation: AtomicU64::new(0),
             published: AtomicU64::new(0),
             complete: AtomicBool::new(false),
+            walking: AtomicBool::new(false),
+            last_walk_ms: AtomicU64::new(0),
+            dirty: AtomicBool::new(false),
             on_change: Mutex::new(Vec::new()),
         })
     }
 
     /// Start the background walk. Idempotent per corpus by construction — only
     /// `new`/`CorpusStore::start` call it, each exactly once.
+    ///
+    /// Goes through `begin_walk` rather than `spawn_walk` so the very first walk
+    /// claims the in-flight flag like any other. Bypassing it would let a watcher
+    /// event during the initial walk start a second concurrent one.
     pub fn start_walk(self: &Arc<Self>) {
-        self.spawn_walk();
+        self.begin_walk();
     }
 
     pub fn scope(&self) -> &str {
@@ -369,20 +417,80 @@ impl PathCorpus {
                 });
 
                 if me.generation.load(Ordering::Acquire) != my_gen {
-                    return; // superseded; the newer walk owns the corpus
+                    // Superseded; the newer walk owns the corpus. Still release
+                    // the in-flight flag — an early return that skipped it would
+                    // wedge the corpus permanently un-rebuildable.
+                    me.finish_walk();
+                    return;
                 }
                 let items = collected.into_inner().unwrap();
                 me.publish(items);
                 me.complete.store(true, Ordering::Relaxed);
+                me.finish_walk();
+            })
+            .ok();
+    }
+
+    /// Release the in-flight flag and re-walk if changes arrived meanwhile.
+    ///
+    /// The re-walk is scheduled on a short timer rather than started inline: a
+    /// dirty flag set during a walk usually means the filesystem is still busy,
+    /// and starting immediately would reproduce the every-2s treadmill this
+    /// guard exists to stop. Waiting out `MIN_REWALK_INTERVAL_MS` lets the burst
+    /// settle and collapses many changes into one walk.
+    fn finish_walk(self: &Arc<Self>) {
+        self.last_walk_ms.store(now_ms(), Ordering::Release);
+        self.walking.store(false, Ordering::Release);
+
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let me = self.clone();
+        std::thread::Builder::new()
+            .name("lychi-corpus-redo".into())
+            .spawn(move || {
+                std::thread::sleep(Duration::from_millis(MIN_REWALK_INTERVAL_MS));
+                // Re-check rather than force: the watcher may have already
+                // started one while we slept.
+                if !me.begin_walk() {
+                    // Refused because a walk is running — that walk will observe
+                    // `dirty` itself, so the change is not lost.
+                    tracing::debug!("[corpus] deferred re-walk folded into a running one");
+                }
             })
             .ok();
     }
 
     /// Re-walk and republish (called after filesystem changes).
-    fn rebuild(self: &Arc<Self>) {
+    ///
+    /// Returns `false` when the request was absorbed rather than started: either
+    /// a walk is already running, or the last one finished too recently. In both
+    /// cases the corpus is marked dirty and the walk happens when it can, so a
+    /// refused rebuild delays the refresh — it never drops it.
+    fn rebuild(self: &Arc<Self>) -> bool {
+        // Rate floor. The watcher's debounce governs the quiet period BEFORE a
+        // rebuild; it says nothing about how often rebuilds may happen. Under
+        // sustained churn (a build, an npm install) the debounce is satisfied
+        // every 2s forever, so without this a full re-walk ran every 2s.
+        let since_last = now_ms().saturating_sub(self.last_walk_ms.load(Ordering::Acquire));
+        if since_last < MIN_REWALK_INTERVAL_MS {
+            self.dirty.store(true, Ordering::Release);
+            return false;
+        }
+        self.begin_walk()
+    }
+
+    /// Start a walk if none is running. The single place `walking` is claimed.
+    fn begin_walk(self: &Arc<Self>) -> bool {
+        if self.walking.swap(true, Ordering::AcqRel) {
+            // Already walking — record that the result will be out of date.
+            self.dirty.store(true, Ordering::Release);
+            return false;
+        }
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.complete.store(false, Ordering::Relaxed);
         self.spawn_walk();
+        true
     }
 }
 
@@ -555,8 +663,17 @@ impl CorpusStore {
                     }
                     if pending && last_event.elapsed() >= REBUILD_DEBOUNCE {
                         pending = false;
-                        tracing::info!("[corpus] rebuilding {scope_owned} after fs change");
-                        corpus.rebuild();
+                        if corpus.rebuild() {
+                            tracing::info!("[corpus] rebuilding {scope_owned} after fs change");
+                        } else {
+                            // Absorbed, not dropped: the corpus is marked dirty
+                            // and will re-walk once the in-flight walk finishes
+                            // or the rate floor elapses.
+                            tracing::debug!(
+                                "[corpus] rebuild of {scope_owned} deferred (walk in flight \
+                                 or within rate floor)"
+                            );
+                        }
                     }
                 }
                 // Keep the watcher alive for the thread's lifetime.
@@ -639,6 +756,123 @@ mod tests {
     fn dot_components_are_not_hidden() {
         assert!(is_indexable(Path::new("../sibling/file.txt")));
         assert!(is_indexable(Path::new("./file.txt")));
+    }
+
+    /// A corpus on a path that cannot be walked, so `spawn_walk` finishes
+    /// immediately and the tests observe only the guard logic.
+    fn test_corpus() -> Arc<PathCorpus> {
+        PathCorpus::new_unstarted("/nonexistent-scope-for-tests")
+    }
+
+    /// Move the corpus past the rate floor, so the IN-FLIGHT guard is the only
+    /// control under test.
+    ///
+    /// `now_ms()` counts from first call, which in a test binary is near zero —
+    /// so leaving `last_walk_ms` at its default puts the corpus permanently
+    /// *inside* the floor and the rate check refuses before the in-flight guard
+    /// is ever reached. An earlier draft of these tests did exactly that and
+    /// passed with the in-flight guard deleted.
+    fn move_past_rate_floor(c: &PathCorpus) {
+        c.last_walk_ms.store(
+            now_ms().saturating_sub(MIN_REWALK_INTERVAL_MS + 1),
+            Ordering::Release,
+        );
+    }
+
+    /// The bug: `rebuild` spawned a walk thread per call, so sustained
+    /// filesystem churn stacked N concurrent walks, each accumulating its own
+    /// full copy of the corpus. Only one may be in flight.
+    #[test]
+    fn a_second_walk_is_refused_while_one_is_in_flight() {
+        let c = test_corpus();
+        move_past_rate_floor(&c);
+        // Claim the flag the way a running walk does, without spawning one.
+        assert!(!c.walking.swap(true, Ordering::AcqRel));
+
+        assert!(
+            !c.begin_walk(),
+            "a walk must be refused while another is in flight"
+        );
+        assert!(
+            c.dirty.load(Ordering::Acquire),
+            "a refused walk must mark the corpus dirty, not drop the change"
+        );
+    }
+
+    /// Same guard, reached through the watcher's entry point rather than
+    /// directly — the path that actually stacked the concurrent walks.
+    #[test]
+    fn rebuild_is_refused_while_a_walk_is_in_flight() {
+        let c = test_corpus();
+        move_past_rate_floor(&c);
+        c.walking.store(true, Ordering::Release);
+
+        assert!(
+            !c.rebuild(),
+            "rebuild must be refused while a walk is in flight, even past the rate floor"
+        );
+    }
+
+    /// The other half: refusing forever would trade a memory bug for a stale
+    /// corpus. `finish_walk` must consume the deferred change, not discard it.
+    #[test]
+    fn a_refused_walk_is_deferred_not_dropped() {
+        let c = test_corpus();
+        move_past_rate_floor(&c);
+        c.walking.store(true, Ordering::Release);
+        c.begin_walk();
+        assert!(c.dirty.load(Ordering::Acquire), "the change is remembered");
+
+        c.finish_walk();
+        assert!(
+            !c.walking.load(Ordering::Acquire),
+            "finish_walk must release the in-flight flag"
+        );
+        assert!(
+            !c.dirty.load(Ordering::Acquire),
+            "finish_walk must consume the dirty flag it acts on"
+        );
+    }
+
+    /// The rate floor is a SEPARATE control from the watcher's debounce. The
+    /// debounce asks "has the tree been quiet for 2s?", which sustained churn
+    /// satisfies over and over; this asks "may a walk run at all yet?".
+    #[test]
+    fn rebuilds_within_the_rate_floor_are_refused() {
+        let c = test_corpus();
+        c.last_walk_ms.store(now_ms(), Ordering::Release);
+        assert!(!c.walking.load(Ordering::Acquire), "no walk in flight");
+
+        assert!(
+            !c.rebuild(),
+            "a rebuild within the rate floor must be refused even with no walk running"
+        );
+        assert!(c.dirty.load(Ordering::Acquire), "and must be remembered");
+    }
+
+    /// A superseded walk returns early. If that path skipped `finish_walk`, the
+    /// flag would stay set and the corpus would never rebuild again.
+    #[test]
+    fn finish_walk_releases_the_flag_so_the_next_walk_can_start() {
+        let c = test_corpus();
+        c.walking.store(true, Ordering::Release);
+        c.finish_walk();
+        move_past_rate_floor(&c);
+
+        assert!(
+            c.begin_walk(),
+            "after finish_walk, a new walk must be able to start"
+        );
+    }
+
+    /// The interval must be long enough to outlast a walk, or the floor cannot
+    /// stop the treadmill it exists to stop.
+    #[test]
+    fn rate_floor_is_longer_than_the_debounce() {
+        assert!(
+            MIN_REWALK_INTERVAL_MS > REBUILD_DEBOUNCE.as_millis() as u64,
+            "a floor shorter than the debounce would never bind"
+        );
     }
 
     #[test]

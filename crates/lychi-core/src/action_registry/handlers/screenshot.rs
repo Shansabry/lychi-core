@@ -370,14 +370,19 @@ fn copy_file_to_clipboard(copy: &ClipboardCopy, path: &str) {
 /// Fire a desktop notification confirming the capture, using the saved image
 /// as the notification icon (a thumbnail). Best-effort — failure is non-fatal.
 fn notify_saved(path: &str, mode: Mode) {
-    let _ = notify_rust::Notification::new()
-        .summary("Screenshot saved")
-        .body(&format!("{} — copied to clipboard", mode.label()))
+    // Via `crate::notify`, NOT `notify_rust` directly: this runs inside an
+    // async handler on a tokio worker, and notify-rust's D-Bus call panics
+    // there ("Cannot start a runtime from within a runtime"). Calling it
+    // directly is what made bare `screenshot` fail after a successful capture.
+    crate::notify::show(
+        crate::notify::Toast::new(
+            "Screenshot saved",
+            format!("{} — copied to clipboard", mode.label()),
+        )
         // Absolute path → notification servers render it as the icon/thumbnail.
         .icon(path)
-        .appname("Lychi")
-        .timeout(notify_rust::Timeout::Milliseconds(4000))
-        .show();
+        .appname("Lychi"),
+    );
 }
 
 /// Outcome of the portal attempt, so the caller knows whether to fall back.
@@ -853,5 +858,30 @@ mod tests {
         let name = p.file_name().unwrap().to_string_lossy();
         assert!(name.starts_with("Screenshot_"), "name: {name}");
         assert!(name.ends_with(".png"), "name: {name}");
+    }
+
+    /// Repro for the `screenshot` panic seen 2026-08-03:
+    ///
+    ///   Cannot start a runtime from within a runtime … `block_on` attempted to
+    ///   block the current thread while the thread is being used to drive
+    ///   asynchronous tasks.  (thread: tokio-rt-worker)
+    ///
+    /// Bare `screenshot` (Mode::Full) is portal-FIRST, so it reaches the D-Bus
+    /// path; `screenshot area` tries a native tool first and does not, which is
+    /// exactly what the log showed. The executor drives handlers on a
+    /// multi-thread runtime, so the flavor here is load-bearing — a
+    /// current-thread runtime does not reproduce it.
+    ///
+    /// Ignored by default: it talks to the real session portal, so it is a
+    /// developer repro, not CI. Run with:
+    ///   cargo test -p lychi-core screenshot_full -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "touches the live D-Bus portal; developer repro only"]
+    async fn screenshot_full_does_not_panic_on_a_tokio_worker() {
+        let h = ScreenshotHandler::new();
+        let ctx = crate::action_registry::ExecContext::default();
+        // Any outcome is acceptable (no portal, cancelled, captured) EXCEPT a
+        // panic — the assertion is that this returns at all.
+        let _ = h.execute(&ctx, "").await;
     }
 }

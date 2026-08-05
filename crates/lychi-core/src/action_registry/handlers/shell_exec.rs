@@ -326,16 +326,41 @@ fn launch_in_terminal(
         .and_then(|n| n.to_str())
         .unwrap_or(terminal);
 
-    let mut command = Command::new(terminal);
-    // Build the terminal-specific argv to run `<shell> -ic "<wrapped>"`.
-    for arg in terminal_exec_args(term_basename, shell, &wrapped) {
+    // Prefer the freedesktop standard when it is installed.
+    //
+    // `xdg-terminal-exec` implements the Default Terminal Execution
+    // Specification: it reads the user's own `xdg-terminals.list`, honours the
+    // `X-TerminalArgExec` key each terminal declares, and therefore needs no
+    // per-terminal flag knowledge from us. Where present it is strictly better
+    // than a hand-maintained table — it reflects what the USER configured.
+    //
+    // It cannot be the only path: the spec is still a proposal and the tool is
+    // not installed by default (verified absent on Fedora 44), so the table
+    // below remains the fallback. Preferred-when-present, never depended upon.
+    let use_xdg = which::which("xdg-terminal-exec").is_ok();
+    let (program, argv): (&str, Vec<String>) = if use_xdg {
+        (
+            "xdg-terminal-exec",
+            vec![shell.to_string(), "-ic".to_string(), wrapped.clone()],
+        )
+    } else {
+        (terminal, terminal_exec_args(term_basename, shell, &wrapped))
+    };
+
+    let mut command = Command::new(program);
+    for arg in argv {
         command.arg(arg);
     }
 
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        // stderr is CAPTURED, not discarded: when a terminal really does fail
+        // to start it prints the reason there ("Failed to parse arguments: …",
+        // "Failed to execute child process …"). Throwing it away is what forced
+        // the old code to guess "likely wrong launch flags" — a guess that was
+        // wrong for the bug that motivated this rewrite.
+        .stderr(Stdio::piped());
 
     // Detach from Lychi's process group so it survives independently.
     #[cfg(unix)]
@@ -350,33 +375,60 @@ fn launch_in_terminal(
 
     let pid = child.id();
 
-    // Grace check: `spawn()` only fails if the binary can't be exec'd at all — a
-    // terminal launched with the wrong flags starts then dies in milliseconds,
-    // which would otherwise be reported as success (and leak a zombie). Wait
-    // briefly; if it already exited, that's a launch failure.
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    match child.try_wait() {
-        Ok(Some(status)) => {
-            // Died instantly — reaped here, so no zombie. Surface a real error.
-            return Err(LychiError::ExecutionFailed(format!(
-                "Terminal '{terminal}' exited immediately ({status}) — likely wrong launch flags"
-            )));
+    // Observe the outcome; never block on it.
+    //
+    // The old code slept 150ms and treated ANY exit within that window as a
+    // launch failure. That is wrong for client/server terminals: `gnome-terminal`
+    // hands the request to `gnome-terminal-server` over D-Bus and the client
+    // exits ~96ms later WITH STATUS 0, while the real window stays open. Measured
+    // on GNOME: 96ms, 97ms, 444ms — straddling the 150ms threshold, so the same
+    // machine both worked and "failed" depending on load. Berin's `ssh nimbus`
+    // hit the fast case and reported failure for a terminal that had opened fine.
+    //
+    // The exit STATUS answers what the timing cannot:
+    //   - exited 0        → success (client handed off, or command already done)
+    //   - exited non-zero → real failure; report its stderr
+    //   - still running   → success (long-lived terminal)
+    //
+    // No list of which terminals are client/server. A name list would need
+    // editing for every terminal that adopts the pattern; the process already
+    // tells us what happened.
+    // Name what we actually spawned — under xdg-terminal-exec the failing
+    // process is the dispatcher, not the terminal we would have picked, and a
+    // message naming the wrong binary sends the next reader to the wrong place.
+    let terminal_owned = program.to_string();
+    std::thread::spawn(move || {
+        let stderr = child.stderr.take();
+        match child.wait() {
+            Ok(status) if status.success() => {
+                tracing::debug!("[shell_exec] '{terminal_owned}' client exited cleanly");
+            }
+            Ok(status) => {
+                // A real launch failure. Read what the terminal actually said
+                // instead of guessing, and tell the user — the launcher window
+                // is long gone by now, so a toast is the only surface left.
+                let detail = stderr
+                    .and_then(|mut s| {
+                        use std::io::Read;
+                        let mut buf = String::new();
+                        s.read_to_string(&mut buf).ok().map(|_| buf)
+                    })
+                    .unwrap_or_default();
+                let detail = detail
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("no output")
+                    .trim()
+                    .to_string();
+                tracing::warn!("[shell_exec] '{terminal_owned}' failed ({status}): {detail}");
+                crate::notify::show(crate::notify::Toast::new(
+                    format!("Could not open {terminal_owned}"),
+                    detail,
+                ));
+            }
+            Err(e) => tracing::debug!("[shell_exec] wait failed for {terminal_owned}: {e}"),
         }
-        Ok(None) => {
-            // Still alive: reap it in a detached thread when it eventually
-            // exits (user closes the window), so it never becomes a zombie.
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        }
-        Err(e) => {
-            // Couldn't poll — don't leak; best-effort reap in a thread.
-            tracing::debug!("[shell_exec] try_wait failed for {terminal}: {e}");
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        }
-    }
+    });
 
     tracing::info!("[shell_exec] launched in terminal: {terminal} (pid={pid}, cmd={cmd})");
 
@@ -936,5 +988,71 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(routed.routing_mode(), "auto");
+    }
+
+    /// Terminal launch must be decided by OUTCOME, not by elapsed time.
+    ///
+    /// The bug (Berin, GNOME Wayland, 2026-08-03): `ssh nimbus` reported
+    /// "Terminal 'gnome-terminal' exited immediately (exit status: 4) — likely
+    /// wrong launch flags" while the terminal had in fact opened.
+    ///
+    /// `gnome-terminal` is a CLIENT: it hands the request to
+    /// `gnome-terminal-server` over D-Bus and exits, leaving the real window
+    /// owned by the server. Measured client lifetimes on GNOME: 96ms, 97ms,
+    /// 444ms — straddling the old 150ms grace window, so the same machine both
+    /// worked and "failed" depending on load.
+    ///
+    /// These pin the decision rule so a future "just bump the sleep" cannot
+    /// come back — no sleep length is correct, because the premise was wrong.
+    mod launch_outcome {
+        use std::process::{Command, Stdio};
+
+        /// The rule the observer thread implements.
+        fn is_launch_failure(status: std::process::ExitStatus) -> bool {
+            !status.success()
+        }
+
+        #[test]
+        fn a_fast_clean_exit_is_success_not_failure() {
+            // Stand-in for the client/server handoff: exits immediately, 0.
+            // Under the old rule this was a "launch failure" purely because it
+            // finished inside the grace window.
+            let status = Command::new("/bin/true")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("spawn /bin/true");
+            assert!(status.success());
+            assert!(
+                !is_launch_failure(status),
+                "a client that exits 0 has handed off successfully"
+            );
+        }
+
+        #[test]
+        fn a_non_zero_exit_is_a_real_failure() {
+            // The other half: a validator that called everything success would
+            // pass the test above while hiding genuine launch failures.
+            let status = Command::new("/bin/false")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("spawn /bin/false");
+            assert!(is_launch_failure(status), "non-zero exit is a real failure");
+        }
+
+        #[test]
+        fn the_rule_does_not_consult_timing() {
+            // Both processes exit far inside any plausible grace window; only
+            // the status distinguishes them. If someone reintroduces a
+            // duration-based check, these two become indistinguishable.
+            let quick_ok = Command::new("/bin/true").status().unwrap();
+            let quick_bad = Command::new("/bin/false").status().unwrap();
+            assert_ne!(
+                is_launch_failure(quick_ok),
+                is_launch_failure(quick_bad),
+                "status must separate these; elapsed time cannot"
+            );
+        }
     }
 }

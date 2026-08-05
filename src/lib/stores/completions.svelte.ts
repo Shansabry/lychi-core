@@ -63,6 +63,32 @@ class Completions {
 		return this.mountPoints[this.scopeIndex]?.path ?? "";
 	}
 
+	/**
+	 * An output is on screen (a result card, an AI answer, a plan). The launcher
+	 * shows ONE surface at a time: suggestions while you're choosing what to run,
+	 * output once something has run.
+	 *
+	 * Set by the page from whatever it is currently rendering, and read back here
+	 * by `visible` — so "is the list allowed to show" is decided in one place
+	 * rather than by each execution path remembering to clear `items`. Those
+	 * ~30 scattered `completions.items = []` calls were that missing rule spelled
+	 * out once per caller, which is why the paths that forgot (a recents row
+	 * running a command, then `afterContextReady` refilling the list under the
+	 * result) showed both surfaces at once.
+	 */
+	outputShown = $state(false);
+
+	/**
+	 * Whether the completion list may render. The ONE gate.
+	 *
+	 * `/`-search and `@`-browse are exempt: they're interactive pickers driven by
+	 * the input, so a stale result behind them must not blank them out.
+	 */
+	get visible(): boolean {
+		if (this.atMode || this.searchMode) return true;
+		return !this.outputShown;
+	}
+
 	/** Replace the list + reset selection (common little operation). */
 	setItems = (items: CompletionItem[], index = -1): void => {
 		this.items = items;

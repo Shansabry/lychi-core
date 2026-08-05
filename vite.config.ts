@@ -1,5 +1,9 @@
 import { sveltekit } from '@sveltejs/kit/vite';
-import { defineConfig, type Plugin } from 'vite';
+import { svelteTesting } from '@testing-library/svelte/vite';
+import type { Plugin } from 'vite';
+// Vitest's `defineConfig`, not Vite's — the latter has no `test` key in its
+// types, so the config would type-error despite being valid at runtime.
+import { defineConfig } from 'vitest/config';
 
 // SvelteKit still passes optimizeDeps.esbuildOptions, which Vite 8 (Rolldown)
 // deprecates with a startup warning at config-merge time. The only thing
@@ -30,7 +34,12 @@ async function sveltekitWithoutEsbuildOptions(): Promise<Plugin[]> {
 }
 
 export default defineConfig({
-	plugins: [sveltekitWithoutEsbuildOptions()],
+	// `svelteTesting` no-ops outside VITEST, so it costs the dev server nothing.
+	// It handles three things a hand-written `resolve.conditions` does not:
+	// inserting `browser` BEFORE `node` (order matters — otherwise `mount()`
+	// still resolves to Svelte's server stub), registering auto-cleanup, and
+	// adding the library to `ssr.noExternal` so the Svelte plugin compiles it.
+	plugins: [sveltekitWithoutEsbuildOptions(), svelteTesting()],
 	clearScreen: false,
 	server: {
 		port: 42352,
@@ -53,5 +62,21 @@ export default defineConfig({
 			'lucide-svelte',
 			'marked',
 		]
+	},
+	test: {
+		// A DOM only where a DOM is needed. `environmentMatchGlobs` is gone in
+		// Vitest 4, so the per-file `@vitest-environment jsdom` docblock is the
+		// supported way to opt in: the ~117 pure-function tests keep running in
+		// node (fast, no jsdom construction) and only `*.svelte.test.ts` files
+		// pay for a document.
+		//
+		// Why a real DOM at all: `svelte/server` renders components without one,
+		// but it renders to a STRING and never runs the client keyed-each
+		// reconciler — the thing that throws `each_key_duplicate`. Verified by
+		// restoring the original buggy `(row.title)` keying, under which every
+		// SSR test still passed. A harness that cannot fail on the bug it exists
+		// to catch is worse than none.
+		environment: 'node',
+		setupFiles: ['./src/lib/test-setup.ts'],
 	}
 });

@@ -347,6 +347,13 @@ function handleInput(val: string) {
 	if (ui.aiExists && val.trim().length > 0) {
 		chat.reset();
 	}
+	// Same rule for a result card: typing a new query means the previous output is
+	// no longer what you're looking at, so it yields the surface back to the
+	// suggestions. Without this the output gate (see `completions.outputShown`)
+	// would keep the list hidden while you typed the next command.
+	if (lastResult && val.trim().length > 0) {
+		lastResult = null;
+	}
 	clearTimeout(completions.debounceTimer);
 	completions.atNoResults = false;
 
@@ -1266,6 +1273,22 @@ let decisionPending: boolean = $derived.by(() => {
 	return !!r?.needs_confirmation || !!chat.approval;
 });
 
+/**
+ * Tell the completions store when an output surface is on screen, so it can gate
+ * the suggestion list. Mirrors the three template branches below (AI answer,
+ * agent plan, result panel) — the surfaces that OWN the area under the input.
+ *
+ * An effect rather than a call at each execution site: every path that produces
+ * output already sets one of these three, so deriving from them means a new
+ * output path is covered the moment it renders. The alternative — clearing
+ * `completions.items` wherever a command runs — is what we had, and a single
+ * missed site (a recents row running a command, then `afterContextReady`
+ * repopulating the list beneath the result) showed both surfaces stacked.
+ */
+$effect(() => {
+	completions.outputShown = ui.aiVisible || !!pendingPlan || !!lastResult;
+});
+
 /** Build the applicable actions for the currently-selected result. */
 let panelActions = $derived.by((): PanelAction[] => {
 	const item = selectedCompletion;
@@ -1972,7 +1995,7 @@ async function handleDismiss() {
 			/>
 		{:else if !ui.anyPanelOpen}
 			<CompletionsList
-				items={completions.items}
+				items={completions.visible ? completions.items : []}
 				selectedIndex={completions.index}
 				onselect={handleCompletionSelect}
 				pathContext={completions.searchMode ? searchPathContext : (completions.atMode ? atPathContext : "")}

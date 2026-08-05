@@ -465,6 +465,10 @@ pub async fn run_row_action(
     let command = match handler.as_str() {
         "services" => lychi_core::action_registry::handlers::services::resolve_action(&id, &target),
         "packages" => lychi_core::action_registry::handlers::packages::resolve_action(&id, &target),
+        "ssh" => lychi_core::action_registry::handlers::ssh::resolve_action(&id, &target),
+        "snippets" => lychi_core::action_registry::handlers::snippets::resolve_action(&id, &target),
+        "notes" => lychi_core::action_registry::handlers::notes::resolve_note_action(&id, &target),
+        "todos" => lychi_core::action_registry::handlers::notes::resolve_todo_action(&id, &target),
         // Unknown producers are refused rather than guessed at: a handler that
         // has not opted in cannot have its rows actioned.
         other => Err(format!("Handler '{other}' does not support row actions")),

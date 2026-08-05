@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use redb::Database;
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, BadgeTone, CommandCategory, CompletionItem, ExecContext, Output,
+    OutputType, RiskLevel, Row, Section,
 };
 use crate::error::LychiError;
 use crate::notes::store::{MAX_NOTES, NotesStore};
@@ -16,6 +17,44 @@ const NOTE_SUBCOMMANDS: &[(&str, &str)] = &[
     ("read", "List all saved notes"),
     ("delete", "Delete a note by ID (e.g. note delete abc)"),
 ];
+
+/// Whether `s` is a store-generated item id.
+///
+/// Note and todo ids come from `db::new_id()` — a UUIDv7 — so unlike snippet
+/// names (user-authored free text) this can be validated strictly. Anything
+/// that is not a well-formed UUID did not come from the store, so it cannot
+/// name a real row and is refused rather than passed to a lookup.
+fn is_valid_item_id(s: &str) -> bool {
+    uuid::Uuid::parse_str(s).is_ok()
+}
+
+/// Resolve a note row action into the command it stands for.
+pub fn resolve_note_action(id: &str, target: &str) -> Result<String, String> {
+    if id != "delete" {
+        return Err(format!("Unknown note action '{id}'"));
+    }
+    if !is_valid_item_id(target) {
+        return Err(format!("Invalid note id '{target}'"));
+    }
+    Ok(format!("note delete {target}"))
+}
+
+/// Resolve a todo row action into the command it stands for.
+///
+/// `toggle` maps to the `done` verb because the store operation IS a toggle —
+/// there is no separate un-done path, and pretending otherwise in the action id
+/// would invent a distinction the backend does not have.
+pub fn resolve_todo_action(id: &str, target: &str) -> Result<String, String> {
+    let verb = match id {
+        "toggle" => "done",
+        "delete" => "delete",
+        other => return Err(format!("Unknown todo action '{other}'")),
+    };
+    if !is_valid_item_id(target) {
+        return Err(format!("Invalid todo id '{target}'"));
+    }
+    Ok(format!("todo {verb} {target}"))
+}
 
 pub struct NotesHandler {
     db: Arc<Database>,
@@ -84,21 +123,30 @@ impl ActionHandler for NotesHandler {
                         .with_duration(start.elapsed().as_millis() as u64),
                 );
             }
-            let lines: Vec<String> = notes
+            // The id was being printed as visible text purely so the user could
+            // retype it into `note delete <id>`. A row carries it invisibly as
+            // the action target, so the id leaves the display entirely and the
+            // age it never showed takes that space instead.
+            let rows: Vec<Row> = notes
                 .iter()
-                .enumerate()
-                .map(|(i, n)| format!("{}. {} ({})", i + 1, Self::note_title(&n.text), n.id))
+                .map(|n| {
+                    Row::new(Self::note_title(&n.text))
+                        .accessory_at(n.updated_at as i64)
+                        .action("delete", "Delete", &n.id, Some(RiskLevel::Medium))
+                })
                 .collect();
-            return Ok(ActionResult::ok(
-                format!(
-                    "Notes ({}/{}):\n{}",
-                    notes.len(),
-                    MAX_NOTES,
-                    lines.join("\n")
-                ),
-                OutputType::Text,
-            )
-            .with_duration(start.elapsed().as_millis() as u64));
+            return Ok(ActionResult {
+                success: true,
+                output: Output::Rows {
+                    sections: vec![Section {
+                        title: Some(format!("Notes ({}/{})", rows.len(), MAX_NOTES)),
+                        rows,
+                        handler: "notes".to_string(),
+                    }],
+                },
+                duration_ms: start.elapsed().as_millis() as u64,
+                ..Default::default()
+            });
         }
 
         // "delete <id>" → delete a note
@@ -231,15 +279,43 @@ impl ActionHandler for TodoHandler {
                     return Ok(ActionResult::ok("No todos".to_string(), OutputType::Status)
                         .with_duration(start.elapsed().as_millis() as u64));
                 }
-                let lines: Vec<String> = todos
+                // `[x]`/`[ ]` was ASCII standing in for state a badge expresses
+                // directly, and the id was shown only so it could be retyped
+                // into `todo done <id>` — which is now the row's own action.
+                let rows: Vec<Row> = todos
                     .iter()
                     .map(|t| {
-                        let check = if t.done { "x" } else { " " };
-                        format!("[{check}] {} ({})", t.text, t.id)
+                        let row = Row::new(&t.text)
+                            // One id, not done/undone: the store verb is a
+                            // TOGGLE, so inventing two action ids would imply a
+                            // distinction the backend does not have. Only the
+                            // label changes with current state.
+                            .action(
+                                "toggle",
+                                if t.done { "Mark undone" } else { "Mark done" },
+                                &t.id,
+                                None,
+                            )
+                            .action("delete", "Delete", &t.id, Some(RiskLevel::Medium));
+                        if t.done {
+                            row.badge("done", BadgeTone::Ok)
+                        } else {
+                            row
+                        }
                     })
                     .collect();
-                Ok(ActionResult::ok(lines.join("\n"), OutputType::Text)
-                    .with_duration(start.elapsed().as_millis() as u64))
+                Ok(ActionResult {
+                    success: true,
+                    output: Output::Rows {
+                        sections: vec![Section {
+                            title: Some(format!("Todos ({})", rows.len())),
+                            rows,
+                            handler: "todos".to_string(),
+                        }],
+                    },
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                })
             }
             "summary" => {
                 let notes = store.get_notes(&self.db)?;
@@ -355,5 +431,57 @@ mod tests {
         assert!(t.chars().all(|c| c == 'x'));
         // First line only.
         assert_eq!(NotesHandler::note_title("hello\nworld"), "hello");
+    }
+
+    mod row_actions {
+        use super::super::{resolve_note_action, resolve_todo_action};
+
+        /// A real store id, so the tests exercise the same shape production does.
+        fn an_id() -> String {
+            crate::db::new_id()
+        }
+
+        #[test]
+        fn note_delete_resolves() {
+            let id = an_id();
+            assert_eq!(
+                resolve_note_action("delete", &id).unwrap(),
+                format!("note delete {id}")
+            );
+        }
+
+        #[test]
+        fn todo_toggle_maps_to_the_done_verb() {
+            // The store operation is a toggle; `done` is the verb that performs
+            // it. If this ever splits into two verbs, this test is the thing
+            // that should fail.
+            let id = an_id();
+            assert_eq!(
+                resolve_todo_action("toggle", &id).unwrap(),
+                format!("todo done {id}")
+            );
+            assert_eq!(
+                resolve_todo_action("delete", &id).unwrap(),
+                format!("todo delete {id}")
+            );
+        }
+
+        #[test]
+        fn a_non_uuid_target_is_refused() {
+            // Ids are store-generated UUIDs. Anything else did not come from a
+            // row, so it must not reach a store lookup — this is what stops the
+            // row-action channel being a way to name arbitrary strings.
+            for bad in ["", "1", "../../x", "note delete x", "'; drop --"] {
+                assert!(resolve_note_action("delete", bad).is_err(), "note: {bad}");
+                assert!(resolve_todo_action("toggle", bad).is_err(), "todo: {bad}");
+            }
+        }
+
+        #[test]
+        fn unknown_action_ids_are_refused() {
+            let id = an_id();
+            assert!(resolve_note_action("toggle", &id).is_err());
+            assert!(resolve_todo_action("archive", &id).is_err());
+        }
     }
 }

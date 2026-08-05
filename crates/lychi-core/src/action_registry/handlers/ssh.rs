@@ -7,7 +7,8 @@ use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher};
 
 use crate::action_registry::{
-    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
+    ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, Output, OutputType,
+    Row, Section,
 };
 use crate::error::LychiError;
 
@@ -328,6 +329,41 @@ fn backpatch_multi_alias(hosts: &mut [SshHost]) {
     }
 }
 
+/// Resolve an SSH row action into the command it stands for.
+///
+/// Mirrors `packages::resolve_action`: the frontend sends back an action id and
+/// a target, never a command string, so a row can never smuggle an arbitrary
+/// invocation through the row-action channel. The alias is validated against
+/// the same rules `~/.ssh/config` itself allows.
+pub fn resolve_action(id: &str, target: &str) -> Result<String, String> {
+    if id != "connect" {
+        return Err(format!("Unknown SSH action '{id}'"));
+    }
+    if !is_valid_host_alias(target) {
+        return Err(format!("Invalid SSH host '{target}'"));
+    }
+    Ok(format!("ssh {target}"))
+}
+
+/// Whether `s` is a plausible SSH host alias.
+///
+/// Allowlist rather than denylist, for the same reason as package names: the
+/// set of legal aliases is small and describable, whereas enumerating dangerous
+/// bytes invites omissions. Aliases in `~/.ssh/config` are hostnames or
+/// hostname-like labels, optionally `user@host`, so alphanumerics plus
+/// `-_.@` covers real configs.
+///
+/// The resolved string is passed as an argument and never interpolated into a
+/// shell, but this still matters: without it a crafted alias could reach
+/// `open_in_terminal` carrying `UserConfirmed` clearance.
+fn is_valid_host_alias(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 255
+        && !s.contains("..")
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@'))
+}
+
 pub struct SshHandler;
 
 impl Default for SshHandler {
@@ -372,14 +408,37 @@ impl ActionHandler for SshHandler {
                     OutputType::Text,
                 ));
             }
-            let list: Vec<String> = hosts
+            // Rows, not a joined string. The alias/description split was already
+            // there — it was just being flattened into "  alias — desc" with
+            // hand-written padding that no other handler agreed on, and the
+            // result could not be acted on. Same data, one renderer, and each
+            // host now carries its own Connect action.
+            let rows: Vec<Row> = hosts
                 .iter()
-                .map(|h| format!("  {} — {}", h.alias, h.display_description()))
+                .map(|h| {
+                    let row = Row::new(&h.alias)
+                        .subtitle(h.display_description())
+                        .action("connect", "Connect", &h.alias, None);
+                    // ProxyJump is the one field worth surfacing on the row: it
+                    // means the connection is indirect, which changes what a
+                    // failure means. The rest stays in the subtitle.
+                    match h.proxy_jump {
+                        Some(ref j) => row.accessory_text(format!("via {j}")),
+                        None => row,
+                    }
+                })
                 .collect();
-            return Ok(ActionResult::ok(
-                format!("SSH hosts:\n{}", list.join("\n")),
-                OutputType::Text,
-            ));
+            return Ok(ActionResult {
+                success: true,
+                output: Output::Rows {
+                    sections: vec![Section {
+                        title: Some(format!("SSH hosts ({})", rows.len())),
+                        rows,
+                        handler: "ssh".to_string(),
+                    }],
+                },
+                ..Default::default()
+            });
         }
 
         let hosts = load_ssh_hosts();
@@ -674,5 +733,64 @@ Host beta gamma
         let gamma = hosts.iter().find(|h| h.alias == "gamma").unwrap();
         assert_eq!(gamma.hostname.as_deref(), Some("shared.example.com"));
         assert_eq!(gamma.user.as_deref(), Some("deploy"));
+    }
+
+    /// Row actions arrive from the frontend as (id, target) pairs, so this
+    /// resolver is a trust boundary: whatever it returns is executed with
+    /// `UserConfirmed` clearance. These pin that it refuses anything it does
+    /// not recognise rather than passing it through.
+    mod row_actions {
+        use super::super::{is_valid_host_alias, resolve_action};
+
+        #[test]
+        fn connect_resolves_to_a_plain_ssh_invocation() {
+            assert_eq!(resolve_action("connect", "prod").unwrap(), "ssh prod");
+            // user@host is a legal alias form and must survive.
+            assert_eq!(
+                resolve_action("connect", "deploy@web1.example.com").unwrap(),
+                "ssh deploy@web1.example.com"
+            );
+        }
+
+        #[test]
+        fn an_unknown_action_id_is_refused() {
+            // The failure mode this prevents: a new row action added to the UI
+            // without a resolver arm silently resolving to something else.
+            assert!(resolve_action("delete", "prod").is_err());
+            assert!(resolve_action("", "prod").is_err());
+        }
+
+        #[test]
+        fn shell_metacharacters_never_reach_the_command() {
+            // The alias is not interpolated into a shell today, but it is
+            // executed with user clearance — so the validator, not the caller's
+            // current implementation, is what keeps this safe.
+            for hostile in [
+                "prod; rm -rf /",
+                "prod && curl evil.sh",
+                "prod$(whoami)",
+                "prod`id`",
+                "prod|tee /tmp/x",
+                "prod\nssh other",
+                "../../etc/passwd",
+                "prod' -oProxyCommand=evil",
+            ] {
+                assert!(
+                    resolve_action("connect", hostile).is_err(),
+                    "must reject: {hostile}"
+                );
+            }
+        }
+
+        #[test]
+        fn real_aliases_are_accepted() {
+            // The other half: a validator that rejected everything would pass
+            // the test above while breaking the feature.
+            for ok in ["prod", "web-1", "db_2", "host.example.com", "u@h", "a1"] {
+                assert!(is_valid_host_alias(ok), "must accept: {ok}");
+            }
+            assert!(!is_valid_host_alias(""));
+            assert!(!is_valid_host_alias(&"a".repeat(256)));
+        }
     }
 }
