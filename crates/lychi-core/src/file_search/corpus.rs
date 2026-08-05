@@ -81,8 +81,19 @@ pub fn indexed_path_count() -> usize {
     INDEXED_PATHS.load(Ordering::Relaxed)
 }
 
-/// The payload stored per indexed path — everything the UI needs to render a
-/// result without touching disk again.
+/// The payload stored per indexed path.
+///
+/// Deliberately does NOT carry size or mtime. Getting those means a `statx` per
+/// entry during the walk, and the walk visits every path in the scope while
+/// only a few hundred are ever ranked and ten or so rendered. Measured warm on
+/// a 373k-path scope: **1.71s readdir-only vs 5.77s with metadata, a 3.4× tax**
+/// on every rebuild, paid for data almost none of which is read.
+///
+/// `is_dir` stays because it is free — it comes from `d_type` in the
+/// `getdents64` the walk already did, with no extra syscall.
+///
+/// Size and mtime are fetched by [`stat_now`] for the ranked pool instead
+/// (`RANK_POOL` = 400 per query, measured at ~1ms warm).
 #[derive(Clone)]
 pub struct PathData {
     pub full_path: String,
@@ -91,8 +102,22 @@ pub struct PathData {
     /// scheme bonuses tail/filename characters (fzf "path scheme").
     pub rel_path: String,
     pub is_dir: bool,
-    pub size_bytes: Option<u64>,
-    pub modified_secs: Option<u64>,
+}
+
+/// Size and modification time for one path, read on demand.
+///
+/// Returns `(None, None)` when the path has gone away between indexing and
+/// ranking — a stale corpus entry is normal and must not fail the search.
+pub fn stat_now(full_path: &str) -> (Option<u64>, Option<u64>) {
+    let Ok(meta) = std::fs::metadata(full_path) else {
+        return (None, None);
+    };
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    (Some(meta.len()), modified)
 }
 
 /// The traversal rules that define what "indexed" means.
@@ -497,14 +522,9 @@ impl PathCorpus {
 /// Build the stored payload for one walk entry.
 fn to_path_data(entry: &ignore::DirEntry, scope: &str) -> Option<PathData> {
     let file_name = entry.file_name().to_str()?.to_string();
+    // `file_type()` is free — `d_type` from the getdents64 the walk already did.
+    // `metadata()` is NOT: it is a statx per entry. See `PathData`.
     let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
-    let meta = entry.metadata().ok();
-    let size_bytes = meta.as_ref().map(|m| m.len());
-    let modified_secs = meta
-        .as_ref()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs());
     let full_path = entry.path().to_string_lossy().into_owned();
     let rel_path = entry
         .path()
@@ -516,8 +536,6 @@ fn to_path_data(entry: &ignore::DirEntry, scope: &str) -> Option<PathData> {
         file_name,
         rel_path,
         is_dir,
-        size_bytes,
-        modified_secs,
     })
 }
 

@@ -228,9 +228,9 @@ fn emit_ranked_results(
     let home = dirs::home_dir();
 
     let ranked = rank::rank(&results.query, results.items, |d| {
-        frecency_recency_bonus(
+        lychi_core::file_search::ranking_bonus(
+            d,
             frecency_scores.get(&d.full_path).copied(),
-            d.modified_secs,
             now_secs,
         )
     });
@@ -254,6 +254,12 @@ fn emit_ranked_results(
             }
             out.push(section_header(label, &mut next_score));
             for r in group {
+                // Size and mtime are read here, for rows that are actually being
+                // rendered, rather than carried on every indexed path. See
+                // `PathData`: statting during the walk cost 3.4x on a 373k-path
+                // scope, for data only these few rows display.
+                let (size_bytes, modified_secs) =
+                    lychi_core::file_search::corpus::stat_now(&r.data.full_path);
                 out.push(finalize_row(
                     FileSearchResult {
                         label: rank::display_label(&r.data, home.as_deref()),
@@ -261,8 +267,8 @@ fn emit_ranked_results(
                         is_dir: r.data.is_dir,
                         score: 0, // set by finalize_row from the display rank
                         description: r.description,
-                        size_bytes: r.data.size_bytes,
-                        modified_secs: r.data.modified_secs,
+                        size_bytes,
+                        modified_secs,
                     },
                     &mut next_score,
                 ));

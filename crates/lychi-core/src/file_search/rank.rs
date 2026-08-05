@@ -123,8 +123,6 @@ mod tests {
             file_name: name.to_string(),
             rel_path: rel.to_string(),
             is_dir,
-            size_bytes: None,
-            modified_secs: None,
         })
     }
 
