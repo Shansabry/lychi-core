@@ -74,6 +74,43 @@ pub fn harden_webview(window: &WebviewWindow) {
             tracing::warn!("[webview] no WebKitSettings — media stays enabled");
             return;
         };
+        // Tell WebKit it is not a browser.
+        //
+        // The default cache model is `WEB_BROWSER`, which sizes page/memory
+        // caches for someone with thirty tabs and a back/forward history to keep
+        // warm. Lychi has one document that never navigates, and WebKitGTK's docs
+        // say an application without a browsing interface "can reduce memory
+        // usage substantially" with `DOCUMENT_VIEWER`. wry does not set it, so
+        // every Tauri app on Linux inherits the browser sizing.
+        //
+        // MEASURED: it changes nothing here. Idle PSS with and without, on
+        // WebKitGTK 2.50 / Fedora 44: WebProcess 136 MB -> 135 MB, whole tree
+        // 296 MB -> 295 MB. The log line below confirms the call ran, so this is
+        // WebKit declining to act on the hint rather than the hint being missed
+        // — the caches it governs are evidently not what a Tauri WebProcess is
+        // holding at rest.
+        //
+        // Kept because it is a correct declaration of intent (this genuinely is
+        // a document viewer, and a future WebKit may honour it), and because
+        // deleting it would invite someone to "discover" the same idea again in
+        // six months and re-measure it. The numbers above are the point of the
+        // comment.
+        //
+        // The other documented lever, `WebKitMemoryPressureSettings` (default
+        // limit = system RAM capped at 3GB), is a WebContext CONSTRUCTION
+        // property. wry builds the context, so it cannot be reached from here
+        // without patching wry.
+        //
+        // The context is shared by the whole process, so this is set once here
+        // rather than per-view.
+        if let Some(ctx) = WebViewExt::context(&wv) {
+            use webkit2gtk::{CacheModel, WebContextExt};
+            ctx.set_cache_model(CacheModel::DocumentViewer);
+            tracing::info!("[webview] cache model = DOCUMENT_VIEWER (not a browser)");
+        } else {
+            tracing::warn!("[webview] no WebContext — cache model left at the browser default");
+        }
+
         settings.set_enable_media(false);
         // WebRTC and the media-stream APIs pull in the same GStreamer stack
         // (and a launcher has no business opening a camera or microphone).

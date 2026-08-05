@@ -35,7 +35,19 @@ Read `CLAUDE.md` in the repo root for the full picture. The essentials:
 ## Performance budgets (non-negotiable)
 
 - Launcher opens in < 100ms; no loading screens
-- < 150MB memory; idle-memory regressions > 10MB need justification
+- Memory, measured as **PSS** (not RSS — see below): **< 150MB for Lychi's own
+  process**, **< 350MB for the whole tree** including WebKit. Idle regressions
+  > 10MB need justification.
+  - Measure with `smem -k -P lychi`, or
+    `awk '/^Pss:/{s+=$2} END{print s/1024" MB"}' /proc/<pid>/smaps_rollup`.
+  - **Do not sum RSS across processes.** WebKit runs three, and RSS
+    double-counts every page they share: this app reads 734MB summed RSS but
+    448MB PSS. If you quote an RSS total you will overstate by roughly 2x.
+  - The two budgets are split because ~135MB of the tree is the WebKitGTK
+    WebProcess sitting idle before we allocate anything, and neither documented
+    lever moves it (`CacheModel::DocumentViewer` measured 296 → 295MB;
+    `WebKitMemoryPressureSettings` is a WebContext construction property that wry
+    owns). The engine floor is not ours to cut — the part we write is.
 - Never create/destroy DOM in hot paths — keep nodes alive and toggle `visibility` (WebKitGTK first-paint costs are severe; see existing patterns in `CompletionsList.svelte`)
 - AI calls are async/background only; everything must work offline
 
