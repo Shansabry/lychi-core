@@ -56,6 +56,14 @@ const REBUILD_DEBOUNCE: Duration = Duration::from_secs(2);
 /// a permanent treadmill.
 const MIN_REWALK_INTERVAL_MS: u64 = 30_000;
 
+/// How long a scope may go unsearched before its corpus and watcher are dropped.
+///
+/// Ten minutes: long enough that browsing back to a folder you were just in is
+/// still instant, short enough that an afternoon of drilling around does not
+/// leave a thread and tens of megabytes per directory visited. Rebuilding is a
+/// re-walk, which is 0.6s for a home directory and far less for a subfolder.
+const SCOPE_IDLE_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+
 /// Milliseconds since an arbitrary fixed point, for interval comparisons only.
 ///
 /// Monotonic: `Instant`-based, so a wall-clock adjustment (NTP, DST, suspend)
@@ -499,6 +507,15 @@ pub struct PathCorpus {
     /// [`MIN_REWALK_INTERVAL`] to put a floor on the re-walk *rate* — the
     /// debounce only ever governed the quiet period before one.
     last_walk_ms: AtomicU64,
+    /// Set when the corpus is evicted; the watcher thread checks it and exits.
+    ///
+    /// Without this the thread lives for the process: its loop only breaks on
+    /// channel disconnect, and it owns the sender, so disconnect never happens.
+    /// It also holds an `Arc<PathCorpus>`, so the arena could not drop either.
+    shutdown: AtomicBool,
+    /// When this scope was last searched, for eviction. Same monotonic clock as
+    /// the rate floor.
+    last_used_ms: AtomicU64,
     /// A change arrived while a walk was in flight, so re-walk when it lands.
     /// Without this a guarded rebuild would simply drop changes that arrive
     /// mid-walk, leaving the corpus silently stale — trading a memory bug for a
@@ -524,6 +541,8 @@ impl PathCorpus {
             generation: AtomicU64::new(0),
             published: AtomicU64::new(0),
             complete: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            last_used_ms: AtomicU64::new(now_ms()),
             walking: AtomicBool::new(false),
             last_walk_ms: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
@@ -543,6 +562,22 @@ impl PathCorpus {
 
     pub fn scope(&self) -> &str {
         &self.scope
+    }
+
+    /// Mark this scope as just used, for eviction.
+    pub fn touch(&self) {
+        self.last_used_ms.store(now_ms(), Ordering::Release);
+    }
+
+    /// Milliseconds since this scope was last searched.
+    fn idle_ms(&self) -> u64 {
+        now_ms().saturating_sub(self.last_used_ms.load(Ordering::Acquire))
+    }
+
+    /// Stop the watcher thread. The corpus itself drops when the last `Arc` to
+    /// it does — an in-flight search keeps its snapshot until it finishes.
+    fn begin_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
     }
 
     /// The current paths. Cheap: clones an `Arc`, never the path list.
@@ -743,6 +778,7 @@ impl CorpusStore {
         // believe they were first, double-subscribing).
         let mut map = self.by_scope.lock().unwrap();
         if let Some(existing) = map.get(scope) {
+            existing.touch();
             return (existing.clone(), false);
         }
         let fresh = PathCorpus::new_unstarted(scope);
@@ -763,7 +799,61 @@ impl CorpusStore {
 
     /// Already-built corpus for `scope`, if any. Never builds.
     pub fn peek(&self, scope: &str) -> Option<Arc<PathCorpus>> {
-        self.by_scope.lock().unwrap().get(scope).cloned()
+        let found = self.by_scope.lock().unwrap().get(scope).cloned();
+        if let Some(ref c) = found {
+            c.touch();
+        }
+        found
+    }
+
+    /// [`Self::evict_idle`] with an explicit threshold, for tests.
+    ///
+    /// `now_ms()` counts from process start, so in a test binary it is tens of
+    /// milliseconds and no arithmetic on a stamp can fake ten minutes elapsing.
+    /// Passing the threshold exercises the real comparison instead of a mock.
+    pub fn evict_idle_for(&self, timeout_ms: u64) -> usize {
+        self.evict_idle_impl(timeout_ms)
+    }
+
+    /// Drop scopes nobody has searched for [`SCOPE_IDLE_TIMEOUT_MS`].
+    ///
+    /// The store was insert-only, and a scope is not just its arena: every
+    /// `/`-search into a subdirectory (`/Documents/foo/`) created one, each
+    /// holding 15-39MB of paths AND a watcher thread AND its inotify watches,
+    /// for the life of the process. Browsing ten folders leaked ten of each.
+    ///
+    /// Returns how many were evicted. Rebuilding is transparent — the next
+    /// search for that scope walks it again — so this can only cost latency.
+    ///
+    /// The home scope is never evicted: it is pre-warmed at startup precisely so
+    /// the first search is instant, and dropping it would undo that.
+    pub fn evict_idle(&self) -> usize {
+        self.evict_idle_impl(SCOPE_IDLE_TIMEOUT_MS)
+    }
+
+    fn evict_idle_impl(&self, timeout_ms: u64) -> usize {
+        let home = dirs::home_dir().map(|p| p.to_string_lossy().into_owned());
+        let mut map = self.by_scope.lock().unwrap();
+        let doomed: Vec<String> = map
+            .iter()
+            .filter(|(scope, corpus)| {
+                Some(scope.as_str()) != home.as_deref() && corpus.idle_ms() >= timeout_ms
+            })
+            .map(|(scope, _)| scope.clone())
+            .collect();
+        for scope in &doomed {
+            if let Some(corpus) = map.remove(scope) {
+                // Stops the watcher thread and releases its inotify watches.
+                // The arena drops with the last Arc, so a search still holding a
+                // snapshot finishes against the paths it started with.
+                corpus.begin_shutdown();
+            }
+            self.watched.lock().unwrap().remove(scope);
+        }
+        if !doomed.is_empty() {
+            tracing::debug!("[corpus] evicted {} idle scope(s)", doomed.len());
+        }
+        doomed.len()
     }
 
     /// Start a filesystem watcher for `scope` (once). On any create/delete/
@@ -859,6 +949,13 @@ impl CorpusStore {
                         Ok(Err(e)) => tracing::warn!("[corpus] watch error: {e}"),
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                    // Checked here rather than only on disconnect: this thread
+                    // owns the sender, so the channel never disconnects on its
+                    // own and the loop would otherwise run for the process.
+                    if corpus.shutdown.load(Ordering::Acquire) {
+                        tracing::debug!("[corpus] watcher for {scope_owned} shutting down");
+                        break;
                     }
                     if pending && last_event.elapsed() >= REBUILD_DEBOUNCE {
                         pending = false;
@@ -1147,6 +1244,66 @@ mod tests {
     #[test]
     fn empty_arena_has_no_paths() {
         assert!(arena_from("/s", &[]).is_empty());
+    }
+
+    /// The bug: the store was insert-only, so every `/`-search into a
+    /// subdirectory leaked an arena, a watcher thread and its inotify watches
+    /// for the life of the process.
+    #[test]
+    fn idle_scopes_are_evicted() {
+        let store = Arc::new(CorpusStore::default());
+        let c = store.get_or_build("/nonexistent-scope-a");
+        assert!(store.peek("/nonexistent-scope-a").is_some());
+
+        // Nothing is idle yet, so nothing goes.
+        assert_eq!(store.evict_idle_for(u64::MAX), 0);
+        assert!(store.peek("/nonexistent-scope-a").is_some());
+
+        // Past the threshold it is dropped, and the watcher is told to stop.
+        assert_eq!(store.evict_idle_for(0), 1);
+        assert!(store.peek("/nonexistent-scope-a").is_none());
+        assert!(
+            c.shutdown.load(Ordering::Acquire),
+            "eviction must signal the watcher thread, or it runs forever"
+        );
+    }
+
+    /// Searching a scope refreshes it — otherwise the reaper would drop a
+    /// corpus out from under someone actively browsing it.
+    ///
+    /// Asserted by AGEING the scope first and then using it: a threshold that
+    /// refuses everything (`u64::MAX`) would pass whether or not `touch` did
+    /// anything, which is what a first draft of this test did.
+    #[test]
+    fn using_a_scope_keeps_it() {
+        let store = Arc::new(CorpusStore::default());
+        let c = store.get_or_build("/nonexistent-scope-b");
+
+        // Backdate it well past any threshold.
+        c.last_used_ms.store(0, Ordering::Release);
+        // ...then use it. `peek` counts as use, exactly as a search would.
+        let _ = store.peek("/nonexistent-scope-b");
+
+        assert_eq!(
+            store.evict_idle_for(1),
+            0,
+            "a scope used just now must survive, however long it was idle before"
+        );
+        assert!(store.peek("/nonexistent-scope-b").is_some());
+    }
+
+    /// Home is pre-warmed at startup precisely so the first search is instant.
+    /// Evicting it would undo that on every idle period.
+    #[test]
+    fn the_home_scope_is_never_evicted() {
+        let Some(home) = dirs::home_dir() else { return };
+        let store = Arc::new(CorpusStore::default());
+        store.get_or_build(&home.to_string_lossy());
+        assert_eq!(
+            store.evict_idle_for(0),
+            0,
+            "home must survive even when idle past the threshold"
+        );
     }
 
     #[test]

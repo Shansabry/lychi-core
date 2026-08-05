@@ -112,6 +112,14 @@ impl LiveSearch {
         true
     }
 
+    /// Drop path corpora for scopes nobody has searched recently.
+    ///
+    /// Exposed here because `LiveSearch` owns the store; the caller is the
+    /// upkeep tick, which should not need to know the store exists.
+    pub fn evict_idle_scopes(&self) -> usize {
+        self.corpora.evict_idle()
+    }
+
     /// True when a matcher is currently held. For tests and diagnostics.
     pub fn has_matcher(&self) -> bool {
         self.matcher.lock().unwrap().is_some()

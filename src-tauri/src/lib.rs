@@ -186,6 +186,22 @@ fn export_bindings() {
 /// re-injection (~18-25ms, once), never a wrong result.
 struct MatcherReaper(std::sync::Arc<lychi_core::file_search::live::LiveSearch>);
 
+/// Drops file-search corpora for scopes nobody has searched recently.
+///
+/// The store was insert-only, and each scope costs an arena (15-39MB), a
+/// watcher thread, and its inotify watches — permanently. Every `/`-search into
+/// a subdirectory creates one, so browsing folders leaked all three per folder.
+struct ScopeReaper(std::sync::Arc<lychi_core::file_search::live::LiveSearch>);
+
+impl logging::Upkeep for ScopeReaper {
+    fn name(&self) -> &'static str {
+        "search-scopes"
+    }
+    fn tick(&self) -> bool {
+        self.0.evict_idle_scopes() > 0
+    }
+}
+
 impl logging::Upkeep for MatcherReaper {
     fn name(&self) -> &'static str {
         "search-matcher"
@@ -209,7 +225,10 @@ pub fn run() {
     // tasks can hold the things they release.
     logging::spawn_health_monitor(
         std::time::Duration::from_secs(300),
-        vec![Box::new(MatcherReaper(app_state.live_search.clone()))],
+        vec![
+            Box::new(MatcherReaper(app_state.live_search.clone())),
+            Box::new(ScopeReaper(app_state.live_search.clone())),
+        ],
     );
     let (hotkey, window_strategy, shell_path, project_dirs) = {
         let config = app_state.config.blocking_read();
