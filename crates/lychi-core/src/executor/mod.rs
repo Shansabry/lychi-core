@@ -1022,9 +1022,22 @@ impl Executor {
         // Learned query→command bindings for this exact query. Empty for a new
         // user or an unseen query, in which case ranking is unchanged.
         let latches = crate::db::frecency::get_latches(&self.db, trimmed);
+        // Stamp the ranker's verdict onto the item before the `Suggestion`
+        // wrapper (and with it `Source` and `Tier`) is dropped. This is the only
+        // point where all three inputs to `can_be_default` exist together, so
+        // anything downstream that needs the answer has to be told it rather
+        // than left to infer it from display text.
         crate::suggestions::rank_with_latches(all, &latches)
             .into_iter()
-            .map(|s| s.item)
+            .map(|s| {
+                // `Suggestion::can_be_default` is the rule; `default_index`
+                // applies it to a ranked list. Both stay in the ranker — the
+                // frontend receives the answer.
+                let can_be_default = s.can_be_default();
+                let mut item = s.item;
+                item.can_be_default = can_be_default;
+                item
+            })
             .collect()
     }
 
@@ -2332,6 +2345,33 @@ mod tests {
         assert!(
             completions.iter().all(|c| c.score >= web.score),
             "the fallback must rank last, got: {completions:?}"
+        );
+        // And it carries the ranker's verdict across IPC. The frontend selects
+        // Enter's target by reading this flag, so a fallback marked defaultable
+        // would hijack Enter on an unmatched query — the exact bug that once got
+        // fallbacks removed wholesale.
+        assert!(
+            !web.can_be_default,
+            "a fallback must never be stamped defaultable, got: {web:?}"
+        );
+    }
+
+    /// The verdict must be STAMPED, not merely computable.
+    ///
+    /// `Source` and `Tier` are dropped at this boundary — the frontend receives
+    /// `CompletionItem`, not `Suggestion` — so if the executor forgot to copy
+    /// the answer onto the item, every row would arrive with the `false` default
+    /// and Enter would stop auto-selecting anything. A test that only checks the
+    /// rule in `suggestions` cannot see that.
+    #[tokio::test]
+    async fn a_real_match_is_stamped_defaultable() {
+        let ex = make_executor(registry_open_succeeds());
+        let completions = ex
+            .completions("open", &crate::config::schema::SuggestionsConfig::default())
+            .await;
+        assert!(
+            completions.iter().any(|c| c.can_be_default),
+            "no row was stamped defaultable, so Enter would select nothing: {completions:?}"
         );
     }
 

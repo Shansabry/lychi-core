@@ -16,7 +16,6 @@ import NotesPanel from "$lib/components/NotesPanel.svelte";
 import ResultPanel from "$lib/components/ResultPanel.svelte";
 import SettingsPanel from "$lib/components/SettingsPanel.svelte";
 import StatusBar from "$lib/components/StatusBar.svelte";
-import { defaultMatchIndex, isFallbackKind } from "$lib/defaultMatch";
 import { attachTauriEvents } from "$lib/events/bridge.svelte";
 import type { AgentPlan, CommandResult, CompletionItem } from "$lib/ipc";
 import {
@@ -491,12 +490,17 @@ function handleInput(val: string) {
 			completions.pending = false;
 			const results = context.extractStale(rawResults);
 			completions.items = results;
-			// Raycast/Alfred single-list model: the top real result is always
-			// auto-selected, so plain Enter runs it. Results are already
-			// frecency-ranked by the backend, and inline history was removed —
-			// recall lives in the History panel — so there's no non-actionable
-			// row to guard Enter against beyond separators/flags/info.
-			completions.index = defaultMatchIndex(results, trimmed);
+			// Raycast/Alfred single-list model: the top real result is
+			// auto-selected, so plain Enter runs it.
+			//
+			// WHICH row may be auto-selected is the backend's verdict, not a
+			// judgement made here. `can_be_default` is stamped by the ranker,
+			// which is the only place that knows the row's Source (a fallback or
+			// a guard may never be Enter's target) and its Tier (only an
+			// identity or prefix match may). This used to be re-derived from
+			// display text with a `startsWith` check, which reimplemented one of
+			// those three conditions and dropped the other two.
+			completions.index = results.findIndex((c) => c.can_be_default === true);
 		})
 		.catch((err) => {
 			if (gen === completions.completionGen) completions.pending = false;
@@ -504,22 +508,6 @@ function handleInput(val: string) {
 		});
 }
 
-/**
- * Index of the row that Enter selects by default — the first ACTIONABLE result,
- * or -1 if none. Raycast/Alfred model: results are frecency-ranked, so the top
- * real row is what the user means; auto-select it and let plain Enter run it.
- *
- * Non-actionable rows are skipped: separators, info rows, and the sentinel flag
- * rows the backend injects (a stale-context indicator, a dirty-git warning).
- * These render but must never become Enter's target. Empty input still selects
- * nothing — those are zero-state recents, not a query result the user chose.
- */
-const NON_ACTIONABLE_ICONS = new Set([
-	"__separator__",
-	"__info__",
-	"__context_stale__",
-	"__warning__",
-]);
 onMount(() => {
 	// First thing in onMount: an uncaught error thrown before this runs is
 	// invisible to the log file, and a frontend crash otherwise leaves a log

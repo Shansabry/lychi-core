@@ -483,6 +483,42 @@ mod tests {
         );
     }
 
+    /// The verdict that crosses IPC must equal the rule.
+    ///
+    /// `can_be_default` is stamped onto `CompletionItem` in the executor,
+    /// because `Source` and `Tier` are dropped at that boundary and the frontend
+    /// cannot recompute them. It previously did try — with a `startsWith` check
+    /// over display text, which reimplemented the Tier condition and lost Source
+    /// entirely, so a guard row could become Enter's target.
+    ///
+    /// This pins the two together: for a ranked list, the row `default_index`
+    /// picks must be the first whose stamped flag is true.
+    #[test]
+    fn the_stamped_flag_agrees_with_the_rule() {
+        let ranked = rank(vec![
+            sugg("⚠ dirty", Source::Guard, Tier::Prefix, 200),
+            sugg("ask ai", Source::Fallback, Tier::Prefix, 150),
+            sugg("real", Source::Handler, Tier::Prefix, 50),
+            sugg("fuzzy", Source::Handler, Tier::Fuzzy, 40),
+        ]);
+        let stamped: Vec<bool> = ranked.iter().map(|s| s.can_be_default()).collect();
+
+        // The first `true` is exactly what default_index returns.
+        assert_eq!(
+            stamped.iter().position(|b| *b),
+            default_index(&ranked),
+            "the stamped flag and the index rule must not disagree"
+        );
+        // And it is the actionable row, not the guard that sorts above it.
+        assert_eq!(ranked[default_index(&ranked).unwrap()].item.label, "real");
+        // A guard and a fallback are both refused however well they match.
+        for (i, sug) in ranked.iter().enumerate() {
+            if matches!(sug.item.label.as_str(), "⚠ dirty" | "ask ai" | "fuzzy") {
+                assert!(!stamped[i], "{} must never be defaultable", sug.item.label);
+            }
+        }
+    }
+
     #[test]
     fn nothing_defaultable_means_run_what_was_typed() {
         let ranked = rank(vec![

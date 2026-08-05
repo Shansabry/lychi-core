@@ -559,6 +559,27 @@ pub struct CompletionItem {
     /// Base64-encoded PNG thumbnail for image clipboard entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumb_b64: Option<String>,
+    /// May Enter select this row without the user arrowing to it?
+    ///
+    /// The VERDICT of `suggestions::Suggestion::can_be_default`, carried across
+    /// IPC rather than recomputed. That rule is three conditions — the row's
+    /// `Source` (a fallback or a guard may never be the default), its `Tier`
+    /// (only an identity or prefix match may), and its `CompletionKind` — and
+    /// the ranker is the only place that knows the first two.
+    ///
+    /// It used to be dropped at the boundary (`.map(|s| s.item)`), so the
+    /// frontend re-derived it from `label`/`run` with a `startsWith` check. That
+    /// reimplemented one of the three conditions and lost `Source` entirely,
+    /// which is how a guard row could become Enter's target. Same shape as the
+    /// bug the suggestions module documents having fixed: "the rule existed
+    /// twice… they disagreed, which is precisely how `dnf search firefox`
+    /// launched Firefox."
+    ///
+    /// Defaults to `false` for hand-built items that never went through the
+    /// ranker: refusing to auto-select is the safe direction — the user's own
+    /// text runs instead.
+    #[serde(default)]
+    pub can_be_default: bool,
     /// The exact command to execute when this completion is chosen, when it
     /// differs from `label`. `label` is the human-facing display text (e.g.
     /// "Search YouTube: cats"); `run` is what the executor receives (e.g.
