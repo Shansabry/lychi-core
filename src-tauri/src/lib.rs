@@ -378,6 +378,20 @@ pub fn run() {
             tauri::async_runtime::spawn_blocking(|| {
                 lychi_core::history::HistoryStore::warmup();
             });
+            // Drop tombstones written by versions before 2026-08-05, which
+            // soft-deleted history and so made every push scan a table that only
+            // ever grew. New writes no longer create them, but an existing
+            // database still carries whatever the old code left. Off the
+            // critical path: a background pass, and a no-op after the first run.
+            {
+                let hist_db = app.state::<AppState>().db.clone();
+                let hist = app.state::<AppState>().history.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    if let Err(e) = hist.purge_tombstones(&hist_db) {
+                        tracing::warn!("[history] tombstone purge failed: {e}");
+                    }
+                });
+            }
             tauri::async_runtime::spawn_blocking(|| {
                 lychi_core::context::network::warmup();
             });
