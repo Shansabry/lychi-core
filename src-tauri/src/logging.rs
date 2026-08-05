@@ -33,7 +33,25 @@ pub fn init() -> WorkerGuard {
 
     // Daily-rotating file appender (lychi.log.YYYY-MM-DD), wrapped in a
     // non-blocking writer backed by a dedicated worker thread.
-    let file_appender = tracing_appender::rolling::daily(&dir, "lychi.log");
+    //
+    // Built rather than `rolling::daily(..)`, which is the same appender with no
+    // retention: it rotates forever and never deletes. On the dev machine that
+    // had reached 167MB across 12 files, one of them 51MB from a single day —
+    // an unbounded write to a user's disk that nothing ever reclaimed.
+    //
+    // A week is the useful window: long enough that a bug reported "a few days
+    // ago" still has its evidence, short enough that a chatty day cannot
+    // accumulate. Falls back to the unbounded appender if the builder rejects
+    // the directory, since losing logs entirely would be the worse failure.
+    let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("lychi.log")
+        .max_log_files(LOG_RETENTION_DAYS)
+        .build(&dir)
+        .unwrap_or_else(|e| {
+            eprintln!("[lychi] log retention unavailable ({e}); logs will not be pruned");
+            tracing_appender::rolling::daily(&dir, "lychi.log")
+        });
     let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
 
     // Each layer gets its own env filter (they can't share one instance).
@@ -129,6 +147,18 @@ fn read_resources() -> ResourceSnapshot {
 /// that precision — the whole point is that being a minute late costs nothing.
 /// A task that needs to run *promptly*, or that can block, does not belong
 /// here; give it its own thread.
+/// Daily log files to keep. The appender deletes the excess on rotation.
+///
+/// A week: long enough that a bug reported "a few days ago" still has its
+/// evidence, short enough that one chatty day cannot accumulate.
+///
+/// Note the appender orders candidates by file **creation time**, falling back
+/// to the date in the filename. That is right for files it rotated itself, but
+/// logs copied or restored out of order are pruned by when they were copied,
+/// not by the day they describe. Verified against the real crate rather than
+/// assumed: with equal ctimes the retained set is arbitrary.
+const LOG_RETENTION_DAYS: usize = 7;
+
 /// How often [`Upkeep::tick`] runs, independent of the health-log interval.
 ///
 /// Shorter than any task's own deadline so a task with an N-minute timeout
