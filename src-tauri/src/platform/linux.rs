@@ -18,10 +18,24 @@ pub fn is_kde_wayland() -> bool {
     is_wayland_session() && desktop_contains("KDE")
 }
 
+/// Is this a Wayland session?
+///
+/// Delegates to `lychi_core::context::is_wayland` rather than re-reading the
+/// environment. This file used to carry its own copy that tested only
+/// `XDG_SESSION_TYPE == "wayland"` — but that variable is **frequently absent
+/// under autostart**, which the core function documents (it was found and fixed
+/// there, once, after it misrouted the hotkey path on boot).
+///
+/// The copy here still had the bug, and it decides more than the hotkey. With
+/// `XDG_SESSION_TYPE` unset on a KDE Wayland session, `resolve_strategy`'s auto
+/// branch saw `is_kde_wayland() == false`, then `gtk_layer_shell::is_supported()
+/// == true` on KWin, and selected `LayerShell` — the one configuration I-008
+/// says cannot receive keyboard focus on KWin. An autostarted launcher would
+/// come up unable to type.
+///
+/// One definition, in the crate that already reasoned about it.
 fn is_wayland_session() -> bool {
-    std::env::var("XDG_SESSION_TYPE")
-        .map(|v| v == "wayland")
-        .unwrap_or(false)
+    lychi_core::context::is_wayland()
 }
 
 fn desktop_contains(name: &str) -> bool {
@@ -202,21 +216,38 @@ pub fn active_strategy() -> WindowStrategy {
         .unwrap_or(WindowStrategy::X11)
 }
 
-/// Resolve the configured strategy string to a concrete strategy for this session.
-fn resolve_strategy(strategy: &str) -> WindowStrategy {
+/// What the session looks like, as the strategy decision sees it.
+///
+/// Split out so [`decide_strategy`] is a pure function of these facts. The
+/// decision used to read the environment and probe GTK inline, which made the
+/// autostart bug (see [`is_wayland_session`]) unreachable by any test — the
+/// failing combination could only be produced by actually booting into it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SessionFacts {
+    pub wayland: bool,
+    pub kde: bool,
+    pub layer_shell: bool,
+}
+
+impl SessionFacts {
+    fn probe() -> Self {
+        Self {
+            wayland: is_wayland_session(),
+            kde: desktop_contains("KDE"),
+            layer_shell: gtk_layer_shell::is_supported(),
+        }
+    }
+}
+
+/// The strategy rule, as a pure function of the session facts.
+pub(crate) fn decide_strategy(strategy: &str, f: SessionFacts) -> WindowStrategy {
     match strategy {
         "layer-shell" => {
-            if gtk_layer_shell::is_supported() {
+            if f.layer_shell {
                 WindowStrategy::LayerShell
-            } else if is_wayland_session() {
-                tracing::warn!(
-                    "layer-shell strategy requested but not supported — falling back to toplevel"
-                );
+            } else if f.wayland {
                 WindowStrategy::Toplevel
             } else {
-                tracing::warn!(
-                    "layer-shell strategy requested but not supported — falling back to x11"
-                );
                 WindowStrategy::X11
             }
         }
@@ -224,19 +255,42 @@ fn resolve_strategy(strategy: &str) -> WindowStrategy {
         "x11" => WindowStrategy::X11,
         _ => {
             // "auto"
-            if is_kde_wayland() {
-                // layer-shell focus is unreliable on KWin (I-008)
+            //
+            // KDE is checked on `kde && wayland` rather than a combined helper
+            // so the Wayland fact has exactly one source. When that fact was
+            // wrong (XDG_SESSION_TYPE unset under autostart) this branch fell
+            // through to layer-shell ON KWIN, which I-008 says cannot take
+            // keyboard focus.
+            if f.wayland && f.kde {
                 WindowStrategy::Toplevel
-            } else if gtk_layer_shell::is_supported() {
+            } else if f.layer_shell {
                 WindowStrategy::LayerShell
-            } else if is_wayland_session() {
-                // GNOME (Mutter has no layer-shell) and unknown Wayland compositors
+            } else if f.wayland {
+                // GNOME (Mutter has no layer-shell) and unknown compositors
                 WindowStrategy::Toplevel
             } else {
                 WindowStrategy::X11
             }
         }
     }
+}
+
+/// Resolve the configured strategy string to a concrete strategy for this session.
+fn resolve_strategy(strategy: &str) -> WindowStrategy {
+    let facts = SessionFacts::probe();
+    let resolved = decide_strategy(strategy, facts);
+    if strategy == "layer-shell" && !facts.layer_shell {
+        tracing::warn!(
+            "layer-shell strategy requested but not supported — falling back to {resolved:?}"
+        );
+    }
+    tracing::info!(
+        "window strategy: {resolved:?} (wayland={} kde={} layer_shell={})",
+        facts.wayland,
+        facts.kde,
+        facts.layer_shell
+    );
+    resolved
 }
 
 /// Strip ANSI escape codes from kscreen-doctor output.
@@ -1174,6 +1228,96 @@ fn gdk_keyval_to_tauri_name(keyval: gdk::keys::Key) -> String {
 }
 
 #[cfg(test)]
+mod strategy_tests {
+    use super::*;
+
+    fn facts(wayland: bool, kde: bool, layer_shell: bool) -> SessionFacts {
+        SessionFacts {
+            wayland,
+            kde,
+            layer_shell,
+        }
+    }
+
+    /// The autostart bug, as a test.
+    ///
+    /// KDE Wayland with a working layer-shell. If the Wayland fact is WRONG
+    /// (which it was, whenever `XDG_SESSION_TYPE` was absent — routine under
+    /// autostart), auto-mode selects LayerShell on KWin: the configuration
+    /// I-008 says cannot receive keyboard focus. The launcher comes up unable
+    /// to type, only when started at login, which is the hardest way to notice.
+    #[test]
+    fn kde_wayland_never_gets_layer_shell() {
+        assert_eq!(
+            decide_strategy("auto", facts(true, true, true)),
+            WindowStrategy::Toplevel,
+            "KDE Wayland must never resolve to layer-shell (I-008)"
+        );
+        // The same session with the Wayland fact broken — what the bug produced.
+        assert_eq!(
+            decide_strategy("auto", facts(false, true, true)),
+            WindowStrategy::LayerShell,
+            "documents the failure mode: a wrong `wayland` fact routes KDE to \
+             the broken strategy, which is why is_wayland_session() must use \
+             the WAYLAND_DISPLAY fallback"
+        );
+    }
+
+    #[test]
+    fn wlroots_gets_layer_shell() {
+        // Not KDE, layer-shell present → the strategy it was built for.
+        assert_eq!(
+            decide_strategy("auto", facts(true, false, true)),
+            WindowStrategy::LayerShell
+        );
+    }
+
+    #[test]
+    fn gnome_wayland_gets_toplevel() {
+        // Mutter offers no layer-shell.
+        assert_eq!(
+            decide_strategy("auto", facts(true, false, false)),
+            WindowStrategy::Toplevel
+        );
+    }
+
+    #[test]
+    fn x11_session_gets_x11() {
+        assert_eq!(
+            decide_strategy("auto", facts(false, false, false)),
+            WindowStrategy::X11
+        );
+        assert_eq!(
+            decide_strategy("auto", facts(false, true, false)),
+            WindowStrategy::X11,
+            "KDE on X11 is still X11"
+        );
+    }
+
+    /// An explicit choice is honored, except where the compositor cannot.
+    #[test]
+    fn explicit_strategies_are_honored() {
+        for f in [
+            facts(true, true, true),
+            facts(false, false, false),
+            facts(true, false, true),
+        ] {
+            assert_eq!(decide_strategy("toplevel", f), WindowStrategy::Toplevel);
+            assert_eq!(decide_strategy("x11", f), WindowStrategy::X11);
+        }
+        // Requested but unsupported degrades by session type, never to itself.
+        assert_eq!(
+            decide_strategy("layer-shell", facts(true, false, false)),
+            WindowStrategy::Toplevel
+        );
+        assert_eq!(
+            decide_strategy("layer-shell", facts(false, false, false)),
+            WindowStrategy::X11
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1185,6 +1329,14 @@ mod tests {
 
     /// Set the session vars, run `f`, restore. Restoring matters because a
     /// leaked XDG_CURRENT_DESKTOP would silently change later tests.
+    ///
+    /// `WAYLAND_DISPLAY` is part of the fixture, not incidental: session
+    /// detection treats a live Wayland socket as decisive (see
+    /// `context::is_wayland` — `XDG_SESSION_TYPE` is routinely absent under
+    /// autostart, so it cannot be the only signal). Leaving the developer's real
+    /// `WAYLAND_DISPLAY` in place made `with_session("x11", …)` describe a
+    /// session that does not exist, and the test asserting GNOME-on-X11 failed
+    /// on a KDE Wayland dev box for reasons having nothing to do with GNOME.
     fn with_session<T>(session_type: &str, desktop: &str, f: impl FnOnce() -> T) -> T {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved = [
@@ -1197,12 +1349,19 @@ mod tests {
                 "XDG_CURRENT_DESKTOP",
                 std::env::var_os("XDG_CURRENT_DESKTOP"),
             ),
+            ("WAYLAND_DISPLAY", std::env::var_os("WAYLAND_DISPLAY")),
         ];
         // SAFETY: single-threaded within the ENV_LOCK critical section.
         unsafe {
             std::env::set_var("XDG_SESSION_TYPE", session_type);
             std::env::set_var("XDG_SESSION_DESKTOP", desktop);
             std::env::remove_var("XDG_CURRENT_DESKTOP");
+            // Make the socket agree with the declared session type.
+            if session_type == "wayland" {
+                std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+            } else {
+                std::env::remove_var("WAYLAND_DISPLAY");
+            }
         }
         let out = f();
         unsafe {

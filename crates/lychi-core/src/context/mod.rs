@@ -795,6 +795,100 @@ pub fn gather(pre_captured: Option<WindowContext>) -> EnvironmentContext {
 }
 
 #[cfg(test)]
+mod wayland_detection_tests {
+    use super::*;
+
+    /// `is_wayland` reads process-global env vars, so these must not run
+    /// concurrently with each other.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `f` with the two session vars set to the given values, then restore
+    /// whatever the real session had. Restoring matters: leaking a fake
+    /// `WAYLAND_DISPLAY` into later tests would silently change what they see.
+    fn with_session(session_type: Option<&str>, wayland_display: Option<&str>, f: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old_type = std::env::var("XDG_SESSION_TYPE").ok();
+        let old_display = std::env::var("WAYLAND_DISPLAY").ok();
+
+        // SAFETY: single-threaded within the lock; restored below.
+        unsafe {
+            match session_type {
+                Some(v) => std::env::set_var("XDG_SESSION_TYPE", v),
+                None => std::env::remove_var("XDG_SESSION_TYPE"),
+            }
+            match wayland_display {
+                Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
+                None => std::env::remove_var("WAYLAND_DISPLAY"),
+            }
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+        unsafe {
+            match old_type {
+                Some(v) => std::env::set_var("XDG_SESSION_TYPE", v),
+                None => std::env::remove_var("XDG_SESSION_TYPE"),
+            }
+            match old_display {
+                Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
+                None => std::env::remove_var("WAYLAND_DISPLAY"),
+            }
+        }
+        if let Err(p) = result {
+            std::panic::resume_unwind(p);
+        }
+    }
+
+    /// **The autostart case, and the whole reason the fallback exists.**
+    ///
+    /// The session launches us through D-Bus activation, whose environment may
+    /// not carry `XDG_SESSION_TYPE`. Detection must not conclude "X11" from its
+    /// absence: on KDE that routed the window strategy to layer-shell, which
+    /// I-008 says cannot receive keyboard focus on KWin — an autostarted
+    /// launcher you cannot type into.
+    #[test]
+    fn wayland_detected_when_session_type_is_missing() {
+        with_session(None, Some("wayland-0"), || {
+            assert!(
+                is_wayland(),
+                "WAYLAND_DISPLAY must be enough on its own — XDG_SESSION_TYPE \
+                 is routinely absent under autostart"
+            );
+        });
+    }
+
+    #[test]
+    fn wayland_detected_from_session_type() {
+        with_session(Some("wayland"), None, || assert!(is_wayland()));
+    }
+
+    #[test]
+    fn x11_session_is_not_wayland() {
+        with_session(Some("x11"), None, || assert!(!is_wayland()));
+    }
+
+    /// An empty `WAYLAND_DISPLAY` is not a Wayland session — some environments
+    /// export the name with no value.
+    #[test]
+    fn empty_wayland_display_is_not_wayland() {
+        with_session(None, Some(""), || assert!(!is_wayland()));
+        with_session(None, None, || assert!(!is_wayland()));
+    }
+
+    /// X11 sessions can still have WAYLAND_DISPLAY set (XWayland-adjacent
+    /// setups, nested compositors). The socket is the stronger evidence.
+    #[test]
+    fn wayland_display_wins_over_a_stale_session_type() {
+        with_session(Some("x11"), Some("wayland-1"), || {
+            assert!(
+                is_wayland(),
+                "a live Wayland socket means Wayland regardless of the label"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
