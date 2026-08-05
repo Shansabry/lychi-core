@@ -115,7 +115,7 @@ impl ScopeMatcher {
         for item in &paths.items {
             // Refcount bump, not a deep copy — see `SharedPath`.
             injector.push(item.clone(), |d, cols| {
-                cols[0] = d.rel_path.as_str().into();
+                cols[0] = d.rel_path().into();
             });
         }
 
@@ -283,7 +283,7 @@ mod tests {
     }
 
     fn names(r: &SearchResults) -> Vec<String> {
-        r.items.iter().map(|p| p.file_name.clone()).collect()
+        r.items.iter().map(|p| p.file_name().to_string()).collect()
     }
 
     /// Changing the query must not re-inject: the same matcher answers a second,

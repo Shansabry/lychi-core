@@ -81,27 +81,193 @@ pub fn indexed_path_count() -> usize {
     INDEXED_PATHS.load(Ordering::Relaxed)
 }
 
-/// The payload stored per indexed path.
+/// The text of every indexed path in one allocation.
+///
+/// **Why an arena.** The corpus previously held three owned `String`s per path
+/// (`full_path`, `file_name`, `rel_path`), which on a 162k-path home directory
+/// is 52.9 MB across **649,128 separate heap blocks**. Those small scattered
+/// allocations are what fragment the glibc per-thread arenas, and fragmentation
+/// — not the byte total — is what made RSS ratchet upward and never come back.
+/// One `String` plus a 16-byte record per path is 15.5 MB in **2** blocks.
+///
+/// The three strings were also redundant: `full_path` is `scope + "/" + rel`,
+/// and `file_name` is the tail of `rel` after the last separator. Only `rel` is
+/// stored; the other two are derived. Verified against 162k/373k/745k real
+/// paths with zero mismatches.
+///
+/// **Why not go further.** Storing directory components once (a parent-pointer
+/// DAG) reaches 2.7 MB — 9.5 MB of this arena is repeated directory prefix that
+/// would collapse to 1.7 MB. But `classify()` and nucleo's injector both need a
+/// `&str`, and a DAG stores no contiguous path, so every access would have to
+/// rebuild one: measured 7.3ms vs 0.9ms to borrow 162k paths, plus an
+/// allocation per ranked candidate on every keystroke. That trades the exact
+/// property this arena exists to provide. If memory ever demands it, the way in
+/// is a two-phase matcher (match interned names, materialise only survivors),
+/// not a straight swap.
+pub struct PathArena {
+    /// Every `rel_path`, concatenated. Never mutated after the walk publishes.
+    text: String,
+    entries: Vec<PathEntry>,
+    /// The scope these paths are relative to, stored once instead of on every
+    /// path — the single largest redundancy in the old three-String layout.
+    scope: String,
+}
+
+/// One path, as offsets into [`PathArena::text`]. 16 bytes, no pointers.
+#[derive(Clone, Copy)]
+struct PathEntry {
+    off: u32,
+    len: u32,
+    /// Byte offset within the path where the file name starts (after the last
+    /// separator). Lets `file_name()` be a subslice rather than a second copy.
+    name_start: u32,
+    is_dir: bool,
+}
+
+impl PathArena {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    fn rel(&self, i: usize) -> &str {
+        let e = &self.entries[i];
+        &self.text[e.off as usize..(e.off + e.len) as usize]
+    }
+
+    /// Hand out a handle per path. The `Arc` is cloned per handle (a refcount
+    /// bump); the text itself is never copied.
+    fn handles(self: &Arc<Self>) -> Vec<SharedPath> {
+        (0..self.entries.len() as u32)
+            .map(|index| PathData {
+                arena: self.clone(),
+                index,
+            })
+            .collect()
+    }
+}
+
+/// Build a standalone arena from `(rel_path, is_dir)` pairs and hand out its
+/// handles. For tests and for callers that already have a path list.
+///
+/// Public because ranking tests live in a sibling module and constructing a
+/// corpus by walking a real directory would make them slow and machine-dependent.
+pub fn arena_from(scope: &str, paths: &[(&str, bool)]) -> Vec<SharedPath> {
+    let mut b = ArenaBuilder::new(scope);
+    for (rel, is_dir) in paths {
+        b.push(rel, *is_dir);
+    }
+    Arc::new(b.finish()).handles()
+}
+
+/// Accumulates paths during a walk, then freezes into a [`PathArena`].
+///
+/// Kept separate from the arena so the finished structure is immutable: a
+/// published snapshot must never grow under a reader.
+struct ArenaBuilder {
+    text: String,
+    entries: Vec<PathEntry>,
+    scope: String,
+}
+
+impl ArenaBuilder {
+    fn new(scope: &str) -> Self {
+        Self {
+            // Sized from measured shape (~80 bytes of rel_path per entry on a
+            // real home directory) so the walk does not spend its time growing
+            // and copying a multi-megabyte String.
+            text: String::with_capacity(8 << 20),
+            entries: Vec::with_capacity(4096),
+            scope: scope.to_string(),
+        }
+    }
+
+    fn push(&mut self, rel: &str, is_dir: bool) {
+        // u32 offsets cap the arena at 4GB of path text — ~50M paths at the
+        // measured mean length. Refuse rather than truncate: a silently
+        // half-indexed corpus is worse than a bounded one.
+        let Ok(off) = u32::try_from(self.text.len()) else {
+            return;
+        };
+        let Ok(len) = u32::try_from(rel.len()) else {
+            return;
+        };
+        let name_start = rel.rfind('/').map(|i| i + 1).unwrap_or(0) as u32;
+        self.text.push_str(rel);
+        self.entries.push(PathEntry {
+            off,
+            len,
+            name_start,
+            is_dir,
+        });
+    }
+
+    fn finish(mut self) -> PathArena {
+        // The walk over-allocates by design; give back what it did not use.
+        self.text.shrink_to_fit();
+        self.entries.shrink_to_fit();
+        PathArena {
+            text: self.text,
+            entries: self.entries,
+            scope: self.scope,
+        }
+    }
+}
+
+/// One indexed path: a handle into the arena that owns its text.
 ///
 /// Deliberately does NOT carry size or mtime. Getting those means a `statx` per
 /// entry during the walk, and the walk visits every path in the scope while
-/// only a few hundred are ever ranked and ten or so rendered. Measured warm on
-/// a 373k-path scope: **1.71s readdir-only vs 5.77s with metadata, a 3.4× tax**
-/// on every rebuild, paid for data almost none of which is read.
+/// only a few hundred are ever ranked and ten or so rendered. Measured warm,
+/// two passes each: `$HOME` 706-887ms readdir-only vs 1144-1229ms with
+/// `metadata()`; a 373k-path scope 1424-2068ms vs 2480-3384ms — **a 1.4-1.7×
+/// tax** on every rebuild, paid for data almost none of which is read.
 ///
-/// `is_dir` stays because it is free — it comes from `d_type` in the
-/// `getdents64` the walk already did, with no extra syscall.
+/// `is_dir` is free — `d_type` from the `getdents64` the walk already did.
 ///
 /// Size and mtime are fetched by [`stat_now`] for the ranked pool instead
 /// (`RANK_POOL` = 400 per query, measured at ~1ms warm).
 #[derive(Clone)]
 pub struct PathData {
-    pub full_path: String,
-    pub file_name: String,
+    arena: Arc<PathArena>,
+    index: u32,
+}
+
+impl PathData {
     /// Path relative to the search scope — the match column, so nucleo's path
     /// scheme bonuses tail/filename characters (fzf "path scheme").
-    pub rel_path: String,
-    pub is_dir: bool,
+    ///
+    /// Borrowed from the arena: no allocation, which is what makes this shape
+    /// viable for the matcher (see [`PathArena`]).
+    pub fn rel_path(&self) -> &str {
+        self.arena.rel(self.index as usize)
+    }
+
+    /// The final component. A subslice of [`Self::rel_path`], not a copy.
+    pub fn file_name(&self) -> &str {
+        let e = &self.arena.entries[self.index as usize];
+        &self.rel_path()[e.name_start as usize..]
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.arena.entries[self.index as usize].is_dir
+    }
+
+    /// The absolute path. **Allocates** — it is `scope + "/" + rel_path`, and
+    /// storing it would mean keeping the scope prefix ~162k times.
+    ///
+    /// Call it for rendered rows and for the frecency key, not in a loop over
+    /// candidates.
+    pub fn full_path(&self) -> String {
+        let scope = &self.arena.scope;
+        let rel = self.rel_path();
+        if scope.ends_with('/') {
+            format!("{scope}{rel}")
+        } else {
+            format!("{scope}/{rel}")
+        }
+    }
 }
 
 /// Size and modification time for one path, read on demand.
@@ -257,13 +423,18 @@ fn walk_watched_dirs(scope: &str) -> Vec<PathBuf> {
     kept
 }
 
-/// One indexed path, reference-counted.
+/// One indexed path, cheap to clone.
 ///
-/// Sessions share these rather than copying them. A `PathData` is six fields
-/// including three `String`s, so a per-session clone of a 162k-path corpus cost
-/// ~330MB of anonymous memory per search — measured, not estimated. An `Arc`
-/// clone is a refcount bump, so N concurrent sessions cost one copy of the data.
-pub type SharedPath = Arc<PathData>;
+/// [`PathData`] is now itself a handle — an `Arc` to the shared arena plus a
+/// `u32` index — so cloning one is a refcount bump and there is nothing left to
+/// wrap. The alias stays because every consumer names it and the distinction
+/// ("a shareable path") is still the useful one.
+///
+/// The history is worth keeping: sessions once held `Arc<PathData>` where
+/// `PathData` owned three `String`s, and before *that* they cloned the struct
+/// outright — which cost ~330MB per search on a 162k-path corpus. Both problems
+/// are gone for the same reason: the text has exactly one owner.
+pub type SharedPath = PathData;
 
 /// An immutable set of paths for one scope, plus the generation it was built at.
 ///
@@ -276,6 +447,21 @@ pub struct Paths {
     /// Bumped per rebuild. A search records this and can tell whether the corpus
     /// moved underneath it.
     pub generation: u64,
+    /// Keeps the arena the `items` borrow from alive for exactly as long as the
+    /// snapshot. Handles hold their own `Arc` too, so this is belt-and-braces —
+    /// but it makes the ownership legible: a snapshot owns its text.
+    _arena: Arc<PathArena>,
+}
+
+impl Paths {
+    /// The empty snapshot a corpus starts with, before its first walk.
+    fn empty(scope: &str) -> Self {
+        Self {
+            items: Vec::new(),
+            generation: 0,
+            _arena: Arc::new(ArenaBuilder::new(scope).finish()),
+        }
+    }
 }
 
 /// The shared, long-lived path store for one scope.
@@ -332,10 +518,7 @@ impl PathCorpus {
     pub fn new_unstarted(scope: &str) -> Arc<Self> {
         Arc::new(Self {
             scope: scope.to_string(),
-            paths: RwLock::new(Arc::new(Paths {
-                items: Vec::new(),
-                generation: 0,
-            })),
+            paths: RwLock::new(Arc::new(Paths::empty(scope))),
             generation: AtomicU64::new(0),
             published: AtomicU64::new(0),
             complete: AtomicBool::new(false),
@@ -396,10 +579,15 @@ impl PathCorpus {
     /// share a number with the first real one. It previously did — both were 0 —
     /// which made a search started before the walk finished decide it was already
     /// up to date and stay empty forever.
-    fn publish(&self, items: Vec<SharedPath>) {
-        INDEXED_PATHS.store(items.len(), Ordering::Relaxed);
+    fn publish(&self, arena: Arc<PathArena>) {
+        INDEXED_PATHS.store(arena.len(), Ordering::Relaxed);
         let generation = self.published.fetch_add(1, Ordering::AcqRel) + 1;
-        *self.paths.write().unwrap() = Arc::new(Paths { items, generation });
+        let items = arena.handles();
+        *self.paths.write().unwrap() = Arc::new(Paths {
+            items,
+            generation,
+            _arena: arena,
+        });
         self.notify_subscribers();
     }
 
@@ -415,9 +603,9 @@ impl PathCorpus {
         std::thread::Builder::new()
             .name("lychi-corpus-walk".into())
             .spawn(move || {
-                let collected: Mutex<Vec<SharedPath>> = Mutex::new(Vec::new());
+                let builder = Mutex::new(ArenaBuilder::new(&me.scope));
                 index_walker(&me.scope).build_parallel().run(|| {
-                    let collected = &collected;
+                    let builder = &builder;
                     let me = me.clone();
                     Box::new(move |result: Result<ignore::DirEntry, ignore::Error>| {
                         use ignore::WalkState;
@@ -431,12 +619,23 @@ impl PathCorpus {
                         if entry.depth() == 0 {
                             return WalkState::Continue; // skip the scope root
                         }
-                        if let Some(data) = to_path_data(&entry, &me.scope) {
-                            // Batched per walk thread would be faster, but the
-                            // parallel walk hands each thread its own closure
-                            // and this lock is held for a push, not a walk.
-                            collected.lock().unwrap().push(Arc::new(data));
-                        }
+                        // The relative path is the only text stored. Computed
+                        // here (borrowed) rather than allocated per entry: the
+                        // arena copies it in under the lock.
+                        let Ok(rel) = entry.path().strip_prefix(&me.scope) else {
+                            return WalkState::Continue;
+                        };
+                        let Some(rel) = rel.to_str() else {
+                            // Non-UTF-8 path: skipped rather than lossily
+                            // converted, since a mangled name would neither
+                            // match what the user types nor open afterwards.
+                            return WalkState::Continue;
+                        };
+                        let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+                        // Batched per walk thread would be faster, but the
+                        // parallel walk hands each thread its own closure
+                        // and this lock is held for a push, not a walk.
+                        builder.lock().unwrap().push(rel, is_dir);
                         WalkState::Continue
                     })
                 });
@@ -448,8 +647,8 @@ impl PathCorpus {
                     me.finish_walk();
                     return;
                 }
-                let items = collected.into_inner().unwrap();
-                me.publish(items);
+                let arena = Arc::new(builder.into_inner().unwrap().finish());
+                me.publish(arena);
                 me.complete.store(true, Ordering::Relaxed);
                 me.finish_walk();
             })
@@ -517,26 +716,6 @@ impl PathCorpus {
         self.spawn_walk();
         true
     }
-}
-
-/// Build the stored payload for one walk entry.
-fn to_path_data(entry: &ignore::DirEntry, scope: &str) -> Option<PathData> {
-    let file_name = entry.file_name().to_str()?.to_string();
-    // `file_type()` is free — `d_type` from the getdents64 the walk already did.
-    // `metadata()` is NOT: it is a statx per entry. See `PathData`.
-    let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
-    let full_path = entry.path().to_string_lossy().into_owned();
-    let rel_path = entry
-        .path()
-        .strip_prefix(scope)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| full_path.clone());
-    Some(PathData {
-        full_path,
-        file_name,
-        rel_path,
-        is_dir,
-    })
 }
 
 /// Per-scope corpora, built lazily and kept for the session.
@@ -891,6 +1070,81 @@ mod tests {
             MIN_REWALK_INTERVAL_MS > REBUILD_DEBOUNCE.as_millis() as u64,
             "a floor shorter than the debounce would never bind"
         );
+    }
+
+    #[test]
+    /// `full_path` and `file_name` are no longer stored — they are derived from
+    /// `rel_path` and the scope. If either derivation is wrong the corpus
+    /// silently points at files that do not exist, so this checks the shapes
+    /// that actually occur: nested, top-level, dotted, spaced, and unicode.
+    #[test]
+    fn derived_paths_match_what_was_indexed() {
+        let cases = [
+            ("docs/readme.md", "readme.md"),
+            ("top.txt", "top.txt"), // no separator at all
+            ("a/b/c/d/e/deep.rs", "deep.rs"),
+            (".config/nested/file", "file"),
+            ("with space/two words.txt", "two words.txt"),
+            ("ünïcode/файл.txt", "файл.txt"),
+            ("trailing.dots...", "trailing.dots..."),
+        ];
+        let paths: Vec<(&str, bool)> = cases.iter().map(|(rel, _)| (*rel, false)).collect();
+        let handles = arena_from("/home/u", &paths);
+        assert_eq!(handles.len(), cases.len());
+        for (h, (rel, name)) in handles.iter().zip(cases.iter()) {
+            assert_eq!(h.rel_path(), *rel);
+            assert_eq!(h.file_name(), *name, "file_name of {rel}");
+            assert_eq!(
+                h.full_path(),
+                format!("/home/u/{rel}"),
+                "full_path of {rel}"
+            );
+        }
+    }
+
+    /// A scope with a trailing slash must not produce a doubled separator —
+    /// `//` in a path is legal but makes the string a poor cache/frecency key,
+    /// since the same file would have two spellings.
+    #[test]
+    fn trailing_slash_scope_does_not_double_the_separator() {
+        let h = arena_from("/home/u/", &[("a/b.txt", false)]);
+        assert_eq!(h[0].full_path(), "/home/u/a/b.txt");
+    }
+
+    /// Handles are independent: index N must return path N regardless of the
+    /// order they are read in. A shared `off/len` bug would show up as
+    /// neighbouring paths bleeding into each other.
+    #[test]
+    fn handles_address_their_own_path() {
+        let rels = ["z/last.txt", "a/first.txt", "m/middle.txt"];
+        let paths: Vec<(&str, bool)> = rels.iter().map(|r| (*r, false)).collect();
+        let h = arena_from("/s", &paths);
+        // Read out of order, twice, to catch any cursor-style state.
+        assert_eq!(h[2].rel_path(), "m/middle.txt");
+        assert_eq!(h[0].rel_path(), "z/last.txt");
+        assert_eq!(h[1].rel_path(), "a/first.txt");
+        assert_eq!(h[2].rel_path(), "m/middle.txt");
+    }
+
+    #[test]
+    fn is_dir_survives_the_arena() {
+        let h = arena_from("/s", &[("adir", true), ("afile.txt", false)]);
+        assert!(h[0].is_dir());
+        assert!(!h[1].is_dir());
+    }
+
+    /// Cloning a handle must not copy the text — that was the original
+    /// ~330MB-per-search bug in a different costume.
+    #[test]
+    fn cloning_a_handle_shares_the_arena() {
+        let h = arena_from("/s", &[("a/b.txt", false)]);
+        let clone = h[0].clone();
+        assert_eq!(clone.rel_path().as_ptr(), h[0].rel_path().as_ptr());
+    }
+
+    #[test]
+    fn empty_arena_has_no_paths() {
+        assert!(arena_from("/s", &[]).is_empty());
     }
 
     #[test]

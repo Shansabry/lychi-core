@@ -259,9 +259,9 @@ mod tests {
         assert_eq!(r.query, "readme");
         assert_eq!(r.generation, g);
         assert!(
-            r.items.iter().all(|p| p.file_name.contains("readme")),
+            r.items.iter().all(|p| p.file_name().contains("readme")),
             "leaked another query's items: {:?}",
-            r.items.iter().map(|p| &p.file_name).collect::<Vec<_>>()
+            r.items.iter().map(|p| p.file_name()).collect::<Vec<_>>()
         );
     }
 
@@ -304,9 +304,9 @@ mod tests {
         assert_eq!(r.generation, g, "re-seed must keep the same generation");
         assert_eq!(r.query, "readme");
         assert!(
-            r.items.iter().all(|p| p.file_name.contains("readme")),
+            r.items.iter().all(|p| p.file_name().contains("readme")),
             "{:?}",
-            r.items.iter().map(|p| &p.file_name).collect::<Vec<_>>()
+            r.items.iter().map(|p| p.file_name()).collect::<Vec<_>>()
         );
 
         // Injection must not notify per item: nucleo calls the hook once per

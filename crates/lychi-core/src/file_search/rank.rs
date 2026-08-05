@@ -28,7 +28,7 @@ pub struct Ranked {
 
 impl Ranked {
     pub fn is_dir(&self) -> bool {
-        self.data.is_dir
+        self.data.is_dir()
     }
 }
 
@@ -54,7 +54,7 @@ where
     let mut rows: Vec<Ranked> = candidates
         .into_iter()
         .filter_map(|data| {
-            let score = classify(query, &data.file_name, &data.rel_path)?;
+            let score = classify(query, data.file_name(), data.rel_path())?;
             let bonus = bonus_for(&data);
             let description = describe(&data);
             Some(Ranked {
@@ -78,20 +78,20 @@ pub fn compare(a: &Ranked, b: &Ranked) -> std::cmp::Ordering {
         .then_with(|| a.score.name_len.cmp(&b.score.name_len))
         .then_with(|| a.score.depth.cmp(&b.score.depth))
         .then_with(|| b.bonus.cmp(&a.bonus)) // more used first
-        .then_with(|| a.data.full_path.cmp(&b.data.full_path)) // stable
+        .then_with(|| a.data.full_path().cmp(&b.data.full_path())) // stable
 }
 
 /// The UI's type hint: `Folder`, or the uppercased extension when it looks like
 /// one. Length- and self-guarded so `.gitignore` or `archive.tar.gz.part` don't
 /// produce nonsense labels.
 fn describe(d: &PathData) -> Option<String> {
-    if d.is_dir {
+    if d.is_dir() {
         return Some("Folder".to_string());
     }
-    d.file_name
+    d.file_name()
         .rsplit('.')
         .next()
-        .filter(|ext| !ext.is_empty() && ext.len() < 6 && *ext != d.file_name)
+        .filter(|ext| !ext.is_empty() && ext.len() < 6 && *ext != d.file_name())
         .map(|ext| ext.to_uppercase())
 }
 
@@ -110,24 +110,28 @@ pub fn split_groups(rows: Vec<Ranked>, per_group: usize) -> (Vec<Ranked>, Vec<Ra
 
 /// Display label for a result, `~`-relative when it is under home.
 pub fn display_label(d: &PathData, home: Option<&Path>) -> String {
-    super::search_display_label(Path::new(&d.full_path), d.is_dir, home)
+    super::search_display_label(Path::new(&d.full_path()), d.is_dir(), home)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Build one path under the `/h` scope. `full` and `name` are no longer
+    /// stored separately — the arena derives both from `rel` — so they are
+    /// asserted here instead, which keeps the old call sites readable and
+    /// checks the derivation on every test path.
     fn path(full: &str, name: &str, rel: &str, is_dir: bool) -> SharedPath {
-        std::sync::Arc::new(PathData {
-            full_path: full.to_string(),
-            file_name: name.to_string(),
-            rel_path: rel.to_string(),
-            is_dir,
-        })
+        let p = super::super::corpus::arena_from("/h", &[(rel, is_dir)])
+            .pop()
+            .expect("one path in, one out");
+        assert_eq!(p.full_path(), full, "full_path derivation");
+        assert_eq!(p.file_name(), name, "file_name derivation");
+        p
     }
 
     fn names(rows: &[Ranked]) -> Vec<&str> {
-        rows.iter().map(|r| r.data.file_name.as_str()).collect()
+        rows.iter().map(|r| r.data.file_name()).collect()
     }
 
     /// A filename match must outrank a path-only match regardless of usage —
@@ -147,7 +151,7 @@ mod tests {
             ],
             // Give the path-only hit maximum usage; it must still lose.
             |d| {
-                if d.file_name == "other.txt" {
+                if d.file_name() == "other.txt" {
                     u16::MAX
                 } else {
                     0
@@ -187,7 +191,7 @@ mod tests {
         let second = rank("readme", build(), |_| 0);
         let paths = |r: &[Ranked]| {
             r.iter()
-                .map(|x| x.data.full_path.clone())
+                .map(|x| x.data.full_path().clone())
                 .collect::<Vec<_>>()
         };
         assert_eq!(paths(&first), paths(&second));
@@ -203,7 +207,7 @@ mod tests {
                 path("/h/b/readme.md", "readme.md", "b/readme.md", false),
             ],
             |d| {
-                if d.full_path.starts_with("/h/b") {
+                if d.full_path().starts_with("/h/b") {
                     500
                 } else {
                     0
@@ -211,7 +215,7 @@ mod tests {
             },
         );
         assert_eq!(
-            rows.first().map(|r| r.data.full_path.as_str()),
+            rows.first().map(|r| r.data.full_path()).as_deref(),
             Some("/h/b/readme.md"),
             "more-used file should win an otherwise exact tie"
         );

@@ -230,7 +230,7 @@ fn emit_ranked_results(
     let ranked = rank::rank(&results.query, results.items, |d| {
         lychi_core::file_search::ranking_bonus(
             d,
-            frecency_scores.get(&d.full_path).copied(),
+            frecency_scores.get(&d.full_path()).copied(),
             now_secs,
         )
     });
@@ -247,33 +247,36 @@ fn emit_ranked_results(
     let mut out: Vec<FileSearchResult> = Vec::with_capacity(folders.len() + files.len() + 2);
     let mut next_score: u16 = (folders.len() + files.len() + 4) as u16;
 
-    let mut push_group =
-        |label: &str, group: Vec<rank::Ranked>, out: &mut Vec<FileSearchResult>| {
-            if group.is_empty() {
-                return;
-            }
-            out.push(section_header(label, &mut next_score));
-            for r in group {
-                // Size and mtime are read here, for rows that are actually being
-                // rendered, rather than carried on every indexed path. See
-                // `PathData`: statting during the walk cost 3.4x on a 373k-path
-                // scope, for data only these few rows display.
-                let (size_bytes, modified_secs) =
-                    lychi_core::file_search::corpus::stat_now(&r.data.full_path);
-                out.push(finalize_row(
-                    FileSearchResult {
-                        label: rank::display_label(&r.data, home.as_deref()),
-                        full_path: r.data.full_path.clone(),
-                        is_dir: r.data.is_dir,
-                        score: 0, // set by finalize_row from the display rank
-                        description: r.description,
-                        size_bytes,
-                        modified_secs,
-                    },
-                    &mut next_score,
-                ));
-            }
-        };
+    let mut push_group = |label: &str,
+                          group: Vec<rank::Ranked>,
+                          out: &mut Vec<FileSearchResult>| {
+        if group.is_empty() {
+            return;
+        }
+        out.push(section_header(label, &mut next_score));
+        for r in group {
+            // Size and mtime are read here, for rows that are actually being
+            // rendered, rather than carried on every indexed path. See
+            // `PathData`: statting during the walk cost 3.4x on a 373k-path
+            // scope, for data only these few rows display.
+            // One derivation, reused: full_path() builds a String from the
+            // arena, so calling it twice per row would allocate twice.
+            let full_path = r.data.full_path();
+            let (size_bytes, modified_secs) = lychi_core::file_search::corpus::stat_now(&full_path);
+            out.push(finalize_row(
+                FileSearchResult {
+                    label: rank::display_label(&r.data, home.as_deref()),
+                    full_path,
+                    is_dir: r.data.is_dir(),
+                    score: 0, // set by finalize_row from the display rank
+                    description: r.description,
+                    size_bytes,
+                    modified_secs,
+                },
+                &mut next_score,
+            ));
+        }
+    };
     push_group("folders", folders, &mut out);
     push_group("files", files, &mut out);
 

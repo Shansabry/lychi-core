@@ -217,7 +217,7 @@ pub fn fuzzy_path_completions(
     // The SAME ranker the `/` search uses — not a copy of it. Both surfaces
     // answer "which of these did you mean" identically by construction.
     let ranked = rank::rank(query, results.items, |d| {
-        ranking_bonus(d, frecency_scores.get(&d.full_path).copied(), now_secs)
+        ranking_bonus(d, frecency_scores.get(&d.full_path()).copied(), now_secs)
     });
 
     // Flat list (no folder/file sections): folders just sort first via the tier
@@ -230,7 +230,7 @@ pub fn fuzzy_path_completions(
             next_score = next_score.saturating_sub(1);
             CompletionItem {
                 label: rank::display_label(&r.data, home.as_deref()),
-                icon_path: if r.data.is_dir {
+                icon_path: if r.data.is_dir() {
                     Some("__folder__".into())
                 } else {
                     None
@@ -445,7 +445,7 @@ pub fn frecency_recency_bonus(
 /// this only to candidates that survived `classify`, so it runs for the ranked
 /// pool (a few hundred) instead of every path in the scope. See [`PathData`].
 pub fn ranking_bonus(data: &PathData, frecency: Option<f64>, now_secs: u64) -> u16 {
-    let (_, modified_secs) = corpus::stat_now(&data.full_path);
+    let (_, modified_secs) = corpus::stat_now(&data.full_path());
     frecency_recency_bonus(frecency, modified_secs, now_secs)
 }
 
