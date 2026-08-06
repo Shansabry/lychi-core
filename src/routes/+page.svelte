@@ -13,6 +13,7 @@ import FilePreview from "$lib/components/FilePreview.svelte";
 import HistoryPanel from "$lib/components/HistoryPanel.svelte";
 import MediaPanel from "$lib/components/MediaPanel.svelte";
 import NotesPanel from "$lib/components/NotesPanel.svelte";
+import OnboardingBanner from "$lib/components/OnboardingBanner.svelte";
 import ResultPanel from "$lib/components/ResultPanel.svelte";
 import SettingsPanel from "$lib/components/SettingsPanel.svelte";
 import StatusBar from "$lib/components/StatusBar.svelte";
@@ -52,6 +53,7 @@ import {
 	startFileSearch,
 } from "$lib/ipc";
 import { getComboString, loadKeybindings } from "$lib/keybindings";
+import { type BannerMode, bannerMode } from "$lib/onboarding";
 import { hasVisibleOutput, resolveOutput } from "$lib/output";
 import { preloadAll } from "$lib/preloadCache";
 import { attachments } from "$lib/stores/attachments.svelte";
@@ -168,9 +170,16 @@ $effect(() => {
 // stranded a tester on XFCE — marked onboarding complete and said nothing.
 let hotkeyBannerVisible = $state(false);
 let hotkeyBannerCopied = $state(false);
-/// "confirm" asks the user to press the key; "broken" tells them it won't work.
-let hotkeyBannerMode = $state<"confirm" | "broken">("broken");
+/// What the first-run banner is for:
+/// - "confirm": the hotkey grab is unproven — ask the user to press it.
+/// - "broken":  it cannot work here — offer a rebind and `lychi --toggle`.
+/// - "welcome": the hotkey is fine, so point at the Guide instead.
+///
+/// The third case is the H3 gap: a user whose hotkey worked previously had
+/// onboarding marked complete having been shown nothing at all.
+let hotkeyBannerMode = $state<BannerMode>("welcome");
 let hotkeyBannerText = $state("");
+let settingsPanel = $state<SettingsPanel | undefined>();
 let loadedGeneralConfig: import("$lib/ipc").GeneralConfig | null = null;
 
 function dismissHotkeyBanner() {
@@ -181,6 +190,16 @@ function dismissHotkeyBanner() {
 			console.error("[onboarding] failed to persist banner dismissal:", err);
 		});
 	}
+}
+
+/// Open Settings at a specific tab and treat that as having seen onboarding.
+///
+/// Dismisses first so the flag is persisted even if the panel fails to open —
+/// a banner that reappears every launch is worse than one shown once too few.
+function openSettingsFromBanner(tab: "general" | "guide") {
+	dismissHotkeyBanner();
+	settingsPanel?.showTab(tab);
+	if (!ui.panelVisible("settings")) handleToggleSettings();
 }
 
 async function copyToggleCommand() {
@@ -543,18 +562,18 @@ onMount(() => {
 			// First-run onboarding: on Wayland the in-app hotkey only fires over
 			// XWayland windows — point the user at a DE-bound `lychi --toggle`.
 			if (!settings.generalConfig.first_run_completed) {
+				// Every first run says something now: which thing is decided by
+				// `bannerMode`, not restated here.
 				getHotkeyStatus()
 					.then((status) => {
-						if (status.reliable) {
-							// Something owns the binding — mark onboarding done silently.
-							dismissHotkeyBanner();
-							return;
-						}
-						hotkeyBannerMode = status.needs_confirmation ? "confirm" : "broken";
+						hotkeyBannerMode = bannerMode(status);
 						hotkeyBannerText = status.explanation;
 						hotkeyBannerVisible = true;
 					})
-					.catch(() => {});
+					.catch(() => {
+						hotkeyBannerMode = bannerMode(null);
+						hotkeyBannerVisible = true;
+					});
 			}
 		})
 		.finally(() => {
@@ -1817,26 +1836,14 @@ async function handleDismiss() {
 	<div class="launcher-row" bind:this={launcherRowEl}>
 	<main>
 		{#if hotkeyBannerVisible}
-			<div class="hotkey-banner">
-				{#if hotkeyBannerMode === "confirm"}
-					<span class="hotkey-banner-text">
-						Close this and press your hotkey to check it opens Lychi. If nothing
-						happens, another app has claimed the key — bind
-						<code>lychi --toggle</code> in your desktop's keyboard settings instead.
-					</span>
-				{:else}
-					<span class="hotkey-banner-text">
-						{hotkeyBannerText}. Bind <code>lychi --toggle</code> to a shortcut in
-						your desktop's keyboard settings.
-					</span>
-				{/if}
-				<button class="hotkey-banner-btn" onclick={copyToggleCommand}>
-					{hotkeyBannerCopied ? "Copied" : "Copy command"}
-				</button>
-				<button class="hotkey-banner-btn dismiss" onclick={dismissHotkeyBanner}>
-					Got it
-				</button>
-			</div>
+			<OnboardingBanner
+				mode={hotkeyBannerMode}
+				text={hotkeyBannerText}
+				copied={hotkeyBannerCopied}
+				oncopy={copyToggleCommand}
+				onopensettings={openSettingsFromBanner}
+				ondismiss={dismissHotkeyBanner}
+			/>
 		{/if}
 		<CommandInput
 			bind:value={inputValue}
@@ -1962,7 +1969,7 @@ async function handleDismiss() {
 			<MediaPanel visible={ui.panelVisible("media")} ondismiss={ui.closePanel} players={media.players} />
 		</div>
 		<div class="settings-wrapper" class:panel-hidden={!ui.panelVisible("settings")}>
-			<SettingsPanel ondismiss={ui.closePanel} />
+			<SettingsPanel bind:this={settingsPanel} ondismiss={ui.closePanel} />
 		</div>
 		{#if ui.aiVisible}
 			<AiAnswer
@@ -2152,49 +2159,6 @@ async function handleDismiss() {
 	}
 
 	/* First-run Wayland hotkey tip — shown once, dismissed persistently */
-	.hotkey-banner {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		padding: 8px 12px;
-		font-size: 11px;
-		color: var(--fg-muted);
-		background: var(--bg-secondary);
-		border-bottom: 1px solid var(--border);
-	}
-
-	.hotkey-banner-text {
-		flex: 1;
-		line-height: 1.4;
-	}
-
-	.hotkey-banner-text code {
-		font-family: var(--font-mono);
-		background: var(--bg);
-		padding: 1px 4px;
-		border-radius: 3px;
-		user-select: all;
-	}
-
-	.hotkey-banner-btn {
-		background: transparent;
-		color: var(--accent);
-		border: 1px solid var(--border);
-		border-radius: 4px;
-		padding: 3px 8px;
-		font-size: 11px;
-		cursor: pointer;
-		flex-shrink: 0;
-		transition: background 100ms ease;
-	}
-
-	.hotkey-banner-btn:hover {
-		background: var(--border);
-	}
-
-	.hotkey-banner-btn.dismiss {
-		color: var(--fg-muted);
-	}
 
 	main {
 		width: 680px;

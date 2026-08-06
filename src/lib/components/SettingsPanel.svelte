@@ -17,10 +17,21 @@ import GuideTab from "./settings/GuideTab.svelte";
 import ProjectsTab from "./settings/ProjectsTab.svelte";
 import ShortcutsTab from "./settings/ShortcutsTab.svelte";
 
+type Tab = "general" | "ai" | "projects" | "shortcuts" | "guide" | "about";
+
 let { ondismiss, onpresetchange }: { ondismiss: () => void; onpresetchange?: () => void } =
 	$props();
 
-let activeTab: "general" | "ai" | "projects" | "shortcuts" | "guide" | "about" = $state("general");
+let activeTab: Tab = $state("general");
+
+/// Jump to a tab. Exported rather than taken as an `initialTab` prop: this
+/// panel is always mounted (hidden via CSS, per the first-render cost pattern),
+/// so a prop read at init would capture whatever the value was at startup and
+/// never see a later change. A `$derived` prop would be worse still — it would
+/// yank the user back whenever anything upstream re-rendered.
+export function showTab(tab: Tab) {
+	activeTab = tab;
+}
 let appVersion = $state("");
 let layerShellSupported = $state(false);
 let activeWindowStrategy = $state("auto");
