@@ -49,8 +49,12 @@ impl AiPresetsStore {
         let mut presets = Vec::new();
         for result in table.iter()? {
             let (key, val) = result?;
-            let entry: AiPresetEntry = postcard::from_bytes(val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            // One unreadable row must not hide the rest of the list.
+            let Some(entry) =
+                db::decode_row::<AiPresetEntry>("ai_presets", key.value(), val.value())
+            else {
+                continue;
+            };
             if entry.deleted_at.is_none() {
                 presets.push(AiPresetItem {
                     id: key.value().to_string(),
@@ -242,8 +246,11 @@ impl AiPresetsStore {
         let mut count = 0;
         for result in table.iter()? {
             let (_, val) = result?;
-            let entry: AiPresetEntry = postcard::from_bytes(val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            // One unreadable row must not hide the rest of the list.
+            let Some(entry) = db::decode_row::<AiPresetEntry>("ai_presets", "?", val.value())
+            else {
+                continue;
+            };
             if entry.deleted_at.is_none() {
                 count += 1;
             }

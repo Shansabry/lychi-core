@@ -224,6 +224,52 @@ pub fn table_stats(db: &Arc<Database>) -> Result<TableStats, LychiError> {
     })
 }
 
+/// Decode one row of a list, skipping it if it cannot be read.
+///
+/// **A list must not vanish because one row of it is unreadable.** Every
+/// `get_*` here used `?` inside the iteration, so a single undecodable row
+/// aborted the whole query and the user saw "all my notes are gone" rather
+/// than "one note is corrupt" — with the other 99 still perfectly intact on
+/// disk, and no way to reach them.
+///
+/// This matters most on **downgrade**: postcard is not self-describing, so a
+/// row written by a newer schema is not detectably different from garbage. A
+/// user who tries a new version and rolls back should lose the rows that
+/// changed shape, not the feature.
+///
+/// Returns `None` for a bad row and logs once with enough context to find it.
+/// Callers use it in a `filter_map`, so skipping is the default and aborting
+/// has to be spelled out.
+///
+/// `Config::load_or_default` follows the same principle at the file level: back
+/// up, log, carry on with what still works.
+///
+/// # Not for single-row lookups
+///
+/// `update_note(id)`, `delete_alias(name)` and friends deliberately keep `?`.
+/// There the user named one row, so "that row is corrupt" is both true and
+/// usefully scoped — silently succeeding on a row we could not read would be
+/// worse. The rule is about **lists**, where one bad row must not stand in for
+/// all the good ones.
+pub fn decode_row<'a, T: serde::Deserialize<'a>>(
+    table: &'static str,
+    key: &str,
+    bytes: &'a [u8],
+) -> Option<T> {
+    match postcard::from_bytes(bytes) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            // The key, not the value: the value may be user content, and this
+            // goes to a log file. The key is enough to find or delete the row.
+            tracing::warn!(
+                "[db] skipping undecodable row in `{table}` (key {key}): {e} — \
+                 the rest of the list is unaffected"
+            );
+            None
+        }
+    }
+}
+
 /// Generate a new UUID v7 string.
 pub fn new_id() -> String {
     uuid::Uuid::now_v7().to_string()

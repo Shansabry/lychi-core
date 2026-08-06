@@ -45,8 +45,12 @@ impl HistoryStore {
                 let mut to_delete = Vec::new();
                 for result in table.iter()? {
                     let (key, val) = result?;
-                    let existing: HistoryEntry = postcard::from_bytes(val.value())
-                        .map_err(|e| LychiError::Database(e.to_string()))?;
+                    // One unreadable row must not hide the rest of the list.
+                    let Some(existing) =
+                        db::decode_row::<HistoryEntry>("history", key.value(), val.value())
+                    else {
+                        continue;
+                    };
                     if existing.command == entry {
                         to_delete.push(key.value().to_string());
                     }
@@ -80,8 +84,10 @@ impl HistoryStore {
         let mut entries = Vec::new();
         for result in table.iter()? {
             let (_, val) = result?;
-            let entry: HistoryEntry = postcard::from_bytes(val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            // One unreadable row must not hide the rest of the list.
+            let Some(entry) = db::decode_row::<HistoryEntry>("history", "?", val.value()) else {
+                continue;
+            };
             // Still checked although nothing writes tombstones any more: an
             // existing database carries whatever the old soft-delete wrote until
             // `purge_tombstones` runs at startup, and a deleted command must not

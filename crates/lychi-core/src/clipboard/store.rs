@@ -37,8 +37,12 @@ impl ClipboardStore {
         // away, which is what made raising the cap expensive.
         for result in table.iter()?.rev().take(limit) {
             let (key, val) = result?;
-            let entry: ClipboardEntry = postcard::from_bytes(val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            // One unreadable row must not hide the rest of the list.
+            let Some(entry) =
+                db::decode_row::<ClipboardEntry>("clipboard", key.value(), val.value())
+            else {
+                continue;
+            };
             items.push(ClipboardItem {
                 id: key.value().to_string(),
                 text: entry.text,
@@ -64,10 +68,16 @@ impl ClipboardStore {
         let txn = db.begin_read()?;
         let table = txn.open_table(db::CLIPBOARD)?;
         if let Some(last) = table.iter()?.next_back() {
-            let (_key, val) = last?;
-            let entry: ClipboardEntry = postcard::from_bytes(val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
-            if entry.text == text && entry.image.is_none() {
+            let (key, val) = last?;
+            // If the newest row is unreadable we cannot tell whether this is a
+            // duplicate — so record it. Failing here instead would mean one bad
+            // row permanently stopped the clipboard from capturing ANYTHING,
+            // which is worse than one duplicated entry.
+            if let Some(entry) =
+                db::decode_row::<ClipboardEntry>("clipboard", key.value(), val.value())
+                && entry.text == text
+                && entry.image.is_none()
+            {
                 return Ok(false); // Duplicate of most recent
             }
         }
@@ -203,8 +213,12 @@ impl ClipboardStore {
         let mut paths = Vec::new();
         for result in table.iter()? {
             let (_key, val) = result?;
-            let entry: ClipboardEntry = postcard::from_bytes(val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            // One unreadable row must not hide the rest of the list.
+            let Some(entry) =
+                db::decode_row::<ClipboardEntry>("clipboard", _key.value(), val.value())
+            else {
+                continue;
+            };
             if let Some(img) = entry.image {
                 paths.push(img.path);
             }
@@ -221,8 +235,12 @@ fn prune_image_entries(
     let mut image_entries: Vec<(String, String)> = Vec::new(); // (key, path)
     for result in table.iter()? {
         let (key, val) = result?;
-        let entry: ClipboardEntry =
-            postcard::from_bytes(val.value()).map_err(|e| LychiError::Database(e.to_string()))?;
+        // A corrupt row here would abort pruning, so the cap would stop being
+        // enforced and every later image copy would fail on the same row.
+        let Some(entry) = db::decode_row::<ClipboardEntry>("clipboard", key.value(), val.value())
+        else {
+            continue;
+        };
         if let Some(img) = entry.image {
             image_entries.push((key.value().to_string(), img.path));
         }

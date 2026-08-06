@@ -36,11 +36,14 @@ impl NotesStore {
         let mut notes = Vec::new();
         for result in table.iter()? {
             let (key, val) = result?;
-            let entry: NoteEntry = postcard::from_bytes(val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            let key = key.value();
+            // One unreadable note must not hide every other note.
+            let Some(entry) = db::decode_row::<NoteEntry>("notes", key, val.value()) else {
+                continue;
+            };
             if entry.deleted_at.is_none() {
                 notes.push(NoteItem {
-                    id: key.value().to_string(),
+                    id: key.to_string(),
                     text: entry.text,
                     created_at: entry.created_at,
                     updated_at: entry.updated_at,
@@ -160,8 +163,10 @@ impl NotesStore {
         let mut count = 0;
         for result in table.iter()? {
             let (_, val) = result?;
-            let entry: NoteEntry = postcard::from_bytes(val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            // One unreadable row must not hide the rest of the list.
+            let Some(entry) = db::decode_row::<NoteEntry>("notes", "?", val.value()) else {
+                continue;
+            };
             if entry.deleted_at.is_none() {
                 count += 1;
             }
@@ -193,8 +198,10 @@ impl NotesStore {
         let table = txn.open_table(db::TODOS)?;
         for result in table.iter()? {
             let (key, val) = result?;
-            let entry: TodoEntry = postcard::from_bytes(val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            // One unreadable row must not hide the rest of the list.
+            let Some(entry) = db::decode_row::<TodoEntry>("todos", key.value(), val.value()) else {
+                continue;
+            };
             if entry.deleted_at.is_none() {
                 items.push(ScratchItem {
                     id: key.value().to_string(),
@@ -236,8 +243,10 @@ impl NotesStore {
         let mut todos = Vec::new();
         for result in table.iter()? {
             let (key, val) = result?;
-            let entry: TodoEntry = postcard::from_bytes(val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            // One unreadable row must not hide the rest of the list.
+            let Some(entry) = db::decode_row::<TodoEntry>("todos", key.value(), val.value()) else {
+                continue;
+            };
             if entry.deleted_at.is_none() {
                 todos.push(TodoItem {
                     id: key.value().to_string(),
@@ -341,8 +350,10 @@ impl NotesStore {
         let mut count = 0;
         for result in table.iter()? {
             let (_, val) = result?;
-            let entry: TodoEntry = postcard::from_bytes(val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            // One unreadable row must not hide the rest of the list.
+            let Some(entry) = db::decode_row::<TodoEntry>("todos", "?", val.value()) else {
+                continue;
+            };
             if entry.deleted_at.is_none() {
                 count += 1;
             }

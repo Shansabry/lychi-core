@@ -76,8 +76,12 @@ impl RemindersStore {
         let mut items = Vec::new();
         for result in table.iter()? {
             let (key, val) = result?;
-            let entry: ReminderEntry = postcard::from_bytes(val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            // One unreadable row must not hide the rest of the list.
+            let Some(entry) =
+                db::decode_row::<ReminderEntry>("reminders", key.value(), val.value())
+            else {
+                continue;
+            };
             if entry.deleted_at.is_none() {
                 items.push(ReminderItem {
                     id: key.value().to_string(),
@@ -126,8 +130,12 @@ impl RemindersStore {
         let mut pending = Vec::new();
         for result in table.iter()? {
             let (key, val) = result?;
-            let entry: ReminderEntry = postcard::from_bytes(val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            // One unreadable row must not hide the rest of the list.
+            let Some(entry) =
+                db::decode_row::<ReminderEntry>("reminders", key.value(), val.value())
+            else {
+                continue;
+            };
             if !entry.fired && entry.deleted_at.is_none() && entry.due_at <= now {
                 pending.push((key.value().to_string(), entry));
             }
@@ -162,8 +170,10 @@ impl RemindersStore {
         let mut count = 0;
         for result in table.iter()? {
             let (_, val) = result?;
-            let entry: ReminderEntry = postcard::from_bytes(val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            // One unreadable row must not hide the rest of the list.
+            let Some(entry) = db::decode_row::<ReminderEntry>("reminders", "?", val.value()) else {
+                continue;
+            };
             if entry.deleted_at.is_none() && !entry.fired {
                 count += 1;
             }

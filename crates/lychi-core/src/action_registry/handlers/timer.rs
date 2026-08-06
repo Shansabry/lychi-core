@@ -179,8 +179,14 @@ pub fn load_timers(db: &Arc<redb::Database>) -> HashMap<String, Timer> {
         let table = txn.open_table(crate::db::TIMERS)?;
         for result in table.iter()? {
             let (key, val) = result?;
-            let entry: crate::db::schema::TimerEntry = postcard::from_bytes(val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            // One unreadable row must not drop every running timer.
+            let Some(entry) = crate::db::decode_row::<crate::db::schema::TimerEntry>(
+                "timers",
+                key.value(),
+                val.value(),
+            ) else {
+                continue;
+            };
             let timer = Timer::from_entry(&entry);
             // Skip countdowns that already elapsed while the app was closed.
             if timer.is_done() {

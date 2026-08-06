@@ -113,8 +113,10 @@ impl AliasesStore {
         let mut aliases = Vec::new();
         for result in table.iter()? {
             let (_, val) = result?;
-            let entry: AliasEntry = postcard::from_bytes(val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            // One unreadable row must not hide the rest of the list.
+            let Some(entry) = db::decode_row::<AliasEntry>("aliases", "?", val.value()) else {
+                continue;
+            };
             if entry.deleted_at.is_none() {
                 aliases.push(AliasItem {
                     name: entry.name,
@@ -293,8 +295,10 @@ impl AliasesStore {
         let mut count = 0;
         for result in table.iter()? {
             let (_, val) = result?;
-            let entry: AliasEntry = postcard::from_bytes(val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            // One unreadable row must not hide the rest of the list.
+            let Some(entry) = db::decode_row::<AliasEntry>("aliases", "?", val.value()) else {
+                continue;
+            };
             if entry.deleted_at.is_none() {
                 count += 1;
             }

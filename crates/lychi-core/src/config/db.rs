@@ -40,8 +40,11 @@ pub fn load_syncable(db: &Arc<Database>) -> Result<HashMap<String, String>, Lych
     let mut settings = HashMap::new();
     for result in table.iter()? {
         let (key, val) = result?;
-        let entry: SettingEntry =
-            postcard::from_bytes(val.value()).map_err(|e| LychiError::Database(e.to_string()))?;
+        // One unreadable setting must not reset every other setting.
+        let Some(entry) = db::decode_row::<SettingEntry>("settings", key.value(), val.value())
+        else {
+            continue;
+        };
         settings.insert(key.value().to_string(), entry.value);
     }
     Ok(settings)

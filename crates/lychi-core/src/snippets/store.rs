@@ -27,8 +27,11 @@ impl SnippetsStore {
         let mut snippets = Vec::new();
         for result in table.iter()? {
             let (key, val) = result?;
-            let entry: SnippetEntry = postcard::from_bytes(val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            // One unreadable row must not hide the rest of the list.
+            let Some(entry) = db::decode_row::<SnippetEntry>("snippets", key.value(), val.value())
+            else {
+                continue;
+            };
             if entry.deleted_at.is_none() {
                 snippets.push(SnippetItem {
                     id: key.value().to_string(),
@@ -202,8 +205,10 @@ impl SnippetsStore {
         let mut count = 0;
         for result in table.iter()? {
             let (_, val) = result?;
-            let entry: SnippetEntry = postcard::from_bytes(val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            // One unreadable row must not hide the rest of the list.
+            let Some(entry) = db::decode_row::<SnippetEntry>("snippets", "?", val.value()) else {
+                continue;
+            };
             if entry.deleted_at.is_none() {
                 count += 1;
             }
