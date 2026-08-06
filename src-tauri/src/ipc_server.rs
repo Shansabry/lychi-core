@@ -144,8 +144,10 @@ pub async fn run(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Err
                                     .to_string();
                                 let cmd = format!("screenshot {mode}");
                                 let state = handle.state::<AppState>();
+                                // Config first, released before the executor
+                                // guard — see AppState's lock-discipline note.
+                                let privacy = state.config_snapshot(|c| c.privacy.clone()).await;
                                 let executor = state.executor.read().await;
-                                let privacy = state.config.read().await.privacy.clone();
                                 if let Err(e) = executor
                                     .run(
                                         cmd.trim(),

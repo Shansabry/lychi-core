@@ -39,8 +39,9 @@ pub async fn execute_agent_plan(
             .ok_or_else(|| LychiError::ExecutionFailed("No pending plan found".into()))?
     };
 
+    // Config first, released before the executor guard is taken.
+    let privacy = state.config_snapshot(|c| c.privacy.clone()).await;
     let executor = state.executor.read().await;
-    let privacy = state.config.read().await.privacy.clone();
 
     for (i, step) in plan.steps.iter().enumerate() {
         // Emit running status

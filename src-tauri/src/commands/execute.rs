@@ -127,9 +127,12 @@ pub async fn execute_command(
         }
     };
 
+    // Snapshot config FIRST and release it, then take the executor — the two
+    // guards must never overlap. See `AppState`'s lock-discipline note.
+    let privacy = state.config_snapshot(|c| c.privacy.clone()).await;
+
     // Run through executor pipeline: resolve → validate → execute
     let executor = state.executor.read().await;
-    let privacy = state.config.read().await.privacy.clone();
     let exec = executor
         .run(&input, confirmed.unwrap_or(false), &privacy, &inputs)
         .await?;
@@ -345,8 +348,9 @@ pub async fn confirm_execution(
         "[confirm] executing confirmed action (risk re-checked with fresh context before run)"
     );
 
+    // Config first, released before the executor guard is taken.
+    let privacy = state.config_snapshot(|c| c.privacy.clone()).await;
     let executor = state.executor.read().await;
-    let privacy = state.config.read().await.privacy.clone();
     let exec = executor
         .run_confirmed(pending.intent.clone(), &privacy, &inputs)
         .await?;

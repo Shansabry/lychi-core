@@ -100,9 +100,29 @@ impl PendingExecution {
 }
 
 pub struct AppState {
+    /// # Lock discipline: never hold `config` and `executor` at the same time
+    ///
+    /// Both nesting orders used to exist — `config`→`executor` in
+    /// `get_ai_status` and `completions`, `executor`→`config` in `execute`,
+    /// `confirm` and `run_plan`. That is a deadlock cycle, and tokio's `RwLock`
+    /// is **write-preferring**, so it is reachable with readers alone: a pending
+    /// writer blocks later readers, so two tasks each holding one lock and
+    /// waiting on the other never make progress. `reactors.rs` takes both with
+    /// `blocking_write`, which is what supplies the writer.
+    ///
+    /// It survived only by accident: the reactors happened to read config
+    /// through a *temporary* (`self.config.blocking_read().commands.clone()`),
+    /// which drops at the end of the statement. Binding that to a variable —
+    /// an ordinary, invisible refactor — would have completed the cycle.
+    ///
+    /// The rule is therefore not "always take config first" (an ordering
+    /// convention has to be remembered at ~40 sites) but **never hold both**.
+    /// Snapshot what you need from config, let the guard drop, then take the
+    /// executor. [`AppState::config_snapshot`] does exactly that; prefer it.
     pub executor: Arc<RwLock<Executor>>,
     pub db: Arc<Database>,
     pub history: HistoryStore,
+    /// See the lock-discipline note on [`AppState::executor`].
     pub config: Arc<RwLock<Config>>,
     /// The live AI provider, reachable from the streaming-chat command (which
     /// runs outside the executor). Today the provider lives inside the executor's
@@ -198,6 +218,23 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Read something out of the config and drop the guard before returning.
+    ///
+    /// Exists so the deadlock-free pattern is also the shortest one to write.
+    /// Because the guard cannot escape the closure, a caller physically cannot
+    /// still be holding config when they go on to take the executor — the rule
+    /// is enforced by the signature rather than by remembering a convention.
+    ///
+    /// ```ignore
+    /// let privacy = state.config_snapshot(|c| c.privacy.clone()).await;
+    /// let executor = state.executor.read().await; // config already released
+    /// ```
+    ///
+    /// See the lock-discipline note on [`AppState::executor`].
+    pub async fn config_snapshot<T>(&self, f: impl FnOnce(&Config) -> T) -> T {
+        f(&*self.config.read().await)
+    }
+
     pub fn new() -> Self {
         let mut config = Config::load_or_default(&paths::config_file());
 

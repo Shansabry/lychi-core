@@ -95,13 +95,15 @@ fn set_api_key_sync(provider: &str, key: &str) -> Result<(), LychiError> {
 #[tauri::command]
 #[specta::specta]
 pub async fn get_ai_status(state: State<'_, AppState>) -> Result<AiStatus, LychiError> {
-    let config = state.config.read().await;
-    let executor = state.executor.read().await;
+    // Snapshot config and release it before touching the executor — never hold
+    // both. See `AppState`'s lock-discipline note.
+    let ai = state.config_snapshot(|c| c.ai.clone()).await;
+    let has_ai_router = state.executor.read().await.has_ai();
     Ok(AiStatus {
-        mode: config.ai.mode.clone(),
-        provider: config.ai.provider.clone(),
-        model: config.ai.model.clone(),
-        has_ai_router: executor.has_ai(),
+        mode: ai.mode,
+        provider: ai.provider,
+        model: ai.model,
+        has_ai_router,
     })
 }
 
