@@ -162,10 +162,21 @@ pub struct AppState {
     /// Whether the global shortcut plugin successfully registered the hotkey.
     /// Registration failure is non-fatal (common on Wayland); the frontend
     /// reads this via get_hotkey_status to guide users to `lychi --toggle`.
+    ///
+    /// Note this says the *call* succeeded, not that the key reaches us — see
+    /// `hotkey_verdict` for the question users actually care about.
     pub hotkey_registered: Arc<AtomicBool>,
     /// Whether the hotkey is bound through the XDG GlobalShortcuts portal —
     /// compositor-level and therefore reliable even on Wayland.
     pub portal_bound: Arc<AtomicBool>,
+    /// How the hotkey was bound and how much that proves.
+    ///
+    /// Written at the one place each binding is attempted and read unchanged
+    /// thereafter. The previous design logged the `hotkey_de` outcome, dropped
+    /// it, and re-derived a weaker answer in `get_hotkey_status` — which then
+    /// reported every X11 grab as reliable, exactly the case that silently
+    /// fails.
+    pub hotkey_verdict: Arc<std::sync::Mutex<lychi_core::hotkey::HotkeyVerdict>>,
     /// Shutdown signal for the clipboard monitor OS thread. Set to false on exit
     /// to stop the monitor before D-Bus/arboard teardown begins.
     pub clipboard_running: Arc<AtomicBool>,
@@ -413,6 +424,13 @@ impl AppState {
             armed_seq: Arc::new(AtomicU64::new(0)),
             hotkey_registered: Arc::new(AtomicBool::new(false)),
             portal_bound: Arc::new(AtomicBool::new(false)),
+            // Nothing has bound the key yet; setup overwrites this.
+            hotkey_verdict: Arc::new(std::sync::Mutex::new(
+                lychi_core::hotkey::HotkeyVerdict::assess(
+                    lychi_core::hotkey::Binding::None,
+                    lychi_core::context::is_wayland(),
+                ),
+            )),
             clipboard_running: Arc::new(AtomicBool::new(true)),
             timer_running: Arc::new(AtomicBool::new(true)),
             app_index_watcher_running: Arc::new(AtomicBool::new(true)),

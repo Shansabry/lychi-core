@@ -507,7 +507,15 @@ export async function getActiveWindowStrategy(): Promise<string> {
 }
 
 export async function getHotkeyStatus(): Promise<HotkeyStatus> {
-	if (!isTauri()) return { registered: false, session_type: "x11", desktop: "", reliable: false };
+	if (!isTauri())
+		return {
+			registered: false,
+			session_type: "x11",
+			desktop: "",
+			reliable: false,
+			needs_confirmation: false,
+			explanation: "not running under Tauri",
+		};
 	return commands.getHotkeyStatus();
 }
 

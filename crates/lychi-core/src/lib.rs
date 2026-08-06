@@ -16,6 +16,7 @@ pub mod file_search_score;
 pub mod files;
 pub mod fonts;
 pub mod history;
+pub mod hotkey;
 pub mod intent;
 #[cfg(feature = "mpris")]
 pub mod mpris;

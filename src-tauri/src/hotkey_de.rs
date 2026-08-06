@@ -55,30 +55,43 @@ pub enum Desktop {
     Mate,
 }
 
-/// Identify the running desktop from the XDG environment.
+/// Identify the running desktop, for the subset we can write a shortcut into.
 ///
-/// Matches on substrings of `XDG_CURRENT_DESKTOP`, which is colon-delimited and
-/// varies in case and composition (`XFCE`, `ubuntu:GNOME`, `KDE`, `X-Cinnamon`).
+/// Delegates to `context::session`, which is the one detector. This used to be
+/// a second implementation that matched substrings of `XDG_CURRENT_DESKTOP`
+/// *or* `XDG_SESSION_DESKTOP` — and the latter holds the systemd session **file
+/// name**, not a desktop name (`plasma`, not `KDE`), so it could answer for a
+/// variable that never carries the answer. It also matched "PLASMA", which no
+/// desktop sets. Both traps are documented in `context/session.rs`.
 pub fn detect() -> Option<Desktop> {
-    let raw = std::env::var("XDG_CURRENT_DESKTOP")
-        .or_else(|_| std::env::var("XDG_SESSION_DESKTOP"))
-        .ok()?
-        .to_ascii_uppercase();
-    // Order matters only in that each arm is checked against the whole string;
-    // no desktop legitimately reports two of these.
-    if raw.contains("XFCE") {
-        Some(Desktop::Xfce)
-    } else if raw.contains("CINNAMON") {
-        Some(Desktop::Cinnamon)
-    } else if raw.contains("MATE") {
-        Some(Desktop::Mate)
-    } else if raw.contains("KDE") || raw.contains("PLASMA") {
-        Some(Desktop::Kde)
-    } else if raw.contains("GNOME") || raw.contains("UNITY") || raw.contains("BUDGIE") {
-        Some(Desktop::Gnome)
-    } else {
-        None
+    from_desktops(&lychi_core::context::session::session().desktops)
+}
+
+/// Map a parsed `XDG_CURRENT_DESKTOP` chain onto the desktops we can write to.
+///
+/// Pure, and separate from [`detect`] on purpose: `session()` caches in a
+/// `OnceLock`, so a test that sets the environment and calls `detect` asserts
+/// nothing after the first call in the process. Taking the chain as an argument
+/// is the only way to test the mapping honestly.
+fn from_desktops(chain: &[lychi_core::context::session::Desktop]) -> Option<Desktop> {
+    use lychi_core::context::session::Desktop as D;
+    // In chain order: `Budgie:GNOME` means "I am Budgie, treat me as GNOME if
+    // you must", so the first component we recognise wins.
+    for d in chain {
+        match d {
+            D::Xfce => return Some(Desktop::Xfce),
+            D::Cinnamon => return Some(Desktop::Cinnamon),
+            D::Mate => return Some(Desktop::Mate),
+            D::Kde => return Some(Desktop::Kde),
+            // Budgie and Unity are GNOME shells; their settings live in the
+            // same GSettings path the GNOME writer uses.
+            D::Gnome | D::GnomeClassic | D::GnomeFlashback | D::Budgie | D::Unity => {
+                return Some(Desktop::Gnome);
+            }
+            _ => {}
+        }
     }
+    None
 }
 
 /// Translate a Tauri accelerator (`Super+Space`, `CmdOrCtrl+Alt+K`) into the
@@ -359,26 +372,42 @@ mod tests {
         assert_eq!(to_gtk_accel("Super+Shift"), None);
     }
 
-    /// Detection reads the colon-delimited, inconsistently-cased XDG variables.
+    /// The desktop chain maps onto the writers we have.
+    ///
+    /// Tests `from_desktops`, not `detect`: `session()` caches in a `OnceLock`,
+    /// so the previous version of this test set `XDG_CURRENT_DESKTOP` in a loop
+    /// and would have asserted the same cached answer six times.
     #[test]
-    fn desktops_are_detected_from_xdg_vars() {
-        // SAFETY: single-threaded test; the variable is restored below.
-        let saved = std::env::var("XDG_CURRENT_DESKTOP").ok();
-        let cases = [
-            ("XFCE", Some(Desktop::Xfce)),
-            ("ubuntu:GNOME", Some(Desktop::Gnome)),
-            ("X-Cinnamon", Some(Desktop::Cinnamon)),
-            ("KDE", Some(Desktop::Kde)),
-            ("Budgie:GNOME", Some(Desktop::Gnome)),
-            ("sway", None),
+    fn desktop_chains_map_to_the_right_writer() {
+        use lychi_core::context::session::Desktop as D;
+        let cases: [(&[D], Option<Desktop>); 7] = [
+            (&[D::Xfce], Some(Desktop::Xfce)),
+            (&[D::Gnome], Some(Desktop::Gnome)),
+            (&[D::Cinnamon], Some(Desktop::Cinnamon)),
+            (&[D::Kde], Some(Desktop::Kde)),
+            // "I am Budgie, treat me as GNOME if you must" — either component
+            // reaches the GNOME writer.
+            (&[D::Budgie, D::Gnome], Some(Desktop::Gnome)),
+            // A GNOME variant that does not literally say GNOME first.
+            (&[D::GnomeFlashback, D::Gnome], Some(Desktop::Gnome)),
+            // wlroots compositors have no settings store we can write to.
+            (&[D::Sway], None),
         ];
-        for (val, want) in cases {
-            unsafe { std::env::set_var("XDG_CURRENT_DESKTOP", val) };
-            assert_eq!(detect(), want, "for {val}");
+        for (chain, want) in cases {
+            assert_eq!(from_desktops(chain), want, "for {chain:?}");
         }
-        match saved {
-            Some(v) => unsafe { std::env::set_var("XDG_CURRENT_DESKTOP", v) },
-            None => unsafe { std::env::remove_var("XDG_CURRENT_DESKTOP") },
-        }
+    }
+
+    #[test]
+    fn the_first_recognised_component_wins() {
+        use lychi_core::context::session::Desktop as D;
+        // The chain is ordered specific→generic, so a session claiming both
+        // must be written where it primarily is.
+        assert_eq!(
+            from_desktops(&[D::Cinnamon, D::Gnome]),
+            Some(Desktop::Cinnamon)
+        );
+        // An unrecognised leading component must not stop the search.
+        assert_eq!(from_desktops(&[D::Other, D::Kde]), Some(Desktop::Kde));
     }
 }

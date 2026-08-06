@@ -11,8 +11,37 @@ mod reactors;
 mod state;
 mod window;
 
+use lychi_core::hotkey;
 use state::AppState;
 use tauri::Manager;
+
+/// Record how the hotkey ended up bound.
+///
+/// Called from each binding attempt so the verdict is decided once, where the
+/// facts are, instead of being reconstructed later from `registered` — which
+/// cannot distinguish "the grab worked" from "the WM kept the key".
+pub(crate) fn record_hotkey_binding(app: &tauri::AppHandle, binding: hotkey::Binding) {
+    let wayland = lychi_core::context::is_wayland();
+    let verdict = hotkey::HotkeyVerdict::assess(binding, wayland);
+    if let Ok(mut slot) = app.state::<AppState>().hotkey_verdict.lock() {
+        *slot = verdict;
+    }
+    tracing::info!("[hotkey] {:?} → {}", binding, verdict.explain());
+}
+
+/// A hotkey press reached us, which settles an unverified grab for good.
+///
+/// Idempotent and cheap: after the first press this is a lock and a compare.
+pub(crate) fn record_hotkey_press(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    let Ok(mut slot) = state.hotkey_verdict.lock() else {
+        return;
+    };
+    if slot.needs_confirmation() {
+        *slot = slot.confirmed();
+        tracing::info!("[hotkey] press received — binding confirmed working");
+    }
+}
 
 /// Socket path for the multi-call `--toggle` dispatch in main().
 #[cfg(unix)]
@@ -546,6 +575,9 @@ pub fn run() {
                         if event.state == ShortcutState::Pressed
                             && let Some(w) = app.get_webview_window("main")
                         {
+                            // The key reached us, which is the only proof an
+                            // X11 grab is not being swallowed by the WM.
+                            record_hotkey_press(app);
                             window::toggle_window(&w);
                         }
                     });
@@ -554,9 +586,17 @@ pub fn run() {
                         app.state::<AppState>()
                             .hotkey_registered
                             .store(true, std::sync::atomic::Ordering::SeqCst);
-                        tracing::info!("Global shortcut registered: {hotkey_str}");
+                        // Ok() means the grab call succeeded, which is NOT the
+                        // same as owning the key — record it as unproven and
+                        // let `hotkey_de` below upgrade it if it can.
+                        record_hotkey_binding(app.handle(), hotkey::Binding::X11Grab);
+                        tracing::info!(
+                            "Global shortcut grab succeeded: {hotkey_str} \
+                             (not yet proven to reach us)"
+                        );
                     }
                     Err(e) => {
+                        record_hotkey_binding(app.handle(), hotkey::Binding::None);
                         tracing::warn!(
                             "Global shortcut registration failed for {hotkey_str}: {e} — use `lychi --toggle` via a system shortcut"
                         );
@@ -578,9 +618,16 @@ pub fn run() {
                         app.state::<AppState>()
                             .hotkey_registered
                             .store(true, std::sync::atomic::Ordering::SeqCst);
+                        // We are the registered owner now, not a competing
+                        // grabber — this upgrades the X11Grab verdict above.
+                        record_hotkey_binding(app.handle(), hotkey::Binding::DesktopSettings);
                         tracing::info!("[hotkey] {hotkey_str} bound in the desktop's settings");
                     }
                     hotkey_de::Outcome::Conflict(owner) => {
+                        // The key demonstrably belongs to something else, so the
+                        // grab above cannot be reaching us. Downgrade rather
+                        // than leave it merely "unverified".
+                        record_hotkey_binding(app.handle(), hotkey::Binding::Conflict);
                         tracing::warn!(
                             "[hotkey] {hotkey_str} is already bound to {owner:?} — left alone. \
                              Pick another key in Settings, or bind `lychi --toggle` yourself"

@@ -126,6 +126,21 @@ pub fn report() -> String {
                 .into(),
         );
     }
+    if !s.is_wayland() {
+        // The X11 counterpart to the portal note above. An XGrabKey cannot
+        // override a combination the window manager already owns: the grab
+        // returns Ok, the log says "registered", and the key never arrives.
+        // Doctor has to say this out loud, because every other signal the user
+        // can see reports success.
+        notes.push(
+            "X11 session: a global-shortcut grab reports success even when the \
+             window manager keeps the key for itself (KDE's Super+Space → \
+             KRunner is the common case). If the hotkey does nothing, it is \
+             taken — pick another combination, or bind `lychi toggle` in your \
+             desktop's keyboard settings."
+                .into(),
+        );
+    }
     if !caps.portals.iter().any(|i| i == Portal::Screenshot.name()) {
         notes.push(
             "No Screenshot portal: screenshots fall back to whichever CLI tool is \

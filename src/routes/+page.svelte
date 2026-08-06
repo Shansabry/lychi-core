@@ -160,10 +160,17 @@ $effect(() => {
 		observer.disconnect();
 	};
 });
-// First-run Wayland onboarding: shown when the in-app hotkey can't work
-// system-wide and the user hasn't dismissed the tip yet.
+// First-run hotkey onboarding: shown when the hotkey is broken, or when it is
+// merely *unproven* and pressing it is the only way to find out.
+//
+// This used to be gated on `session_type === "wayland"`, so the X11 case where
+// the window manager silently swallows the key — the one that actually
+// stranded a tester on XFCE — marked onboarding complete and said nothing.
 let hotkeyBannerVisible = $state(false);
 let hotkeyBannerCopied = $state(false);
+/// "confirm" asks the user to press the key; "broken" tells them it won't work.
+let hotkeyBannerMode = $state<"confirm" | "broken">("broken");
+let hotkeyBannerText = $state("");
 let loadedGeneralConfig: import("$lib/ipc").GeneralConfig | null = null;
 
 function dismissHotkeyBanner() {
@@ -538,12 +545,14 @@ onMount(() => {
 			if (!settings.generalConfig.first_run_completed) {
 				getHotkeyStatus()
 					.then((status) => {
-						if (status.session_type === "wayland" && !status.reliable) {
-							hotkeyBannerVisible = true;
-						} else {
-							// Hotkey works — mark onboarding done silently
+						if (status.reliable) {
+							// Something owns the binding — mark onboarding done silently.
 							dismissHotkeyBanner();
+							return;
 						}
+						hotkeyBannerMode = status.needs_confirmation ? "confirm" : "broken";
+						hotkeyBannerText = status.explanation;
+						hotkeyBannerVisible = true;
 					})
 					.catch(() => {});
 			}
@@ -1809,10 +1818,18 @@ async function handleDismiss() {
 	<main>
 		{#if hotkeyBannerVisible}
 			<div class="hotkey-banner">
-				<span class="hotkey-banner-text">
-					Tip: global hotkeys are limited on Wayland. For reliable summoning, bind
-					<code>lychi --toggle</code> to a shortcut in your desktop's keyboard settings.
-				</span>
+				{#if hotkeyBannerMode === "confirm"}
+					<span class="hotkey-banner-text">
+						Close this and press your hotkey to check it opens Lychi. If nothing
+						happens, another app has claimed the key — bind
+						<code>lychi --toggle</code> in your desktop's keyboard settings instead.
+					</span>
+				{:else}
+					<span class="hotkey-banner-text">
+						{hotkeyBannerText}. Bind <code>lychi --toggle</code> to a shortcut in
+						your desktop's keyboard settings.
+					</span>
+				{/if}
 				<button class="hotkey-banner-btn" onclick={copyToggleCommand}>
 					{hotkeyBannerCopied ? "Copied" : "Copy command"}
 				</button>

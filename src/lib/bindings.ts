@@ -1818,11 +1818,23 @@ session_type: string;
  */
 desktop: string; 
 /**
- * True when the in-app shortcut fires system-wide. On Wayland the
- * X11-based plugin only fires while an XWayland window is focused,
- * so registration success there does not mean reliable.
+ * True only when something actually owns the binding on our behalf (a
+ * portal binding, a desktop-settings entry, or a press we observed).
+ * 
+ * Deliberately NOT `registered`: an X11 grab returns Ok even when the
+ * window manager keeps the key, so treating registration as reliability
+ * hid the failure from precisely the users hitting it.
  */
-reliable: boolean }
+reliable: boolean; 
+/**
+ * True when a grab succeeded but only a keypress can prove it works — the
+ * frontend asks the user to press the hotkey rather than warning them.
+ */
+needs_confirmation: boolean; 
+/**
+ * One line explaining the verdict, suitable for showing as-is.
+ */
+explanation: string }
 /**
  * A base64-encoded image attached to a `User` turn for vision models. `data` is
  * the raw base64 (no `data:` URI prefix); `media_type` is the MIME (`image/png`,

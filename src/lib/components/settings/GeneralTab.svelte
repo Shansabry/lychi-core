@@ -267,12 +267,13 @@ async function handleTerminalChange(val: string) {
 {/if}
 {#if hotkeyStatus && !hotkeyStatus.reliable}
 	<div class="field-hint">
-		{#if isWayland}
-			On Wayland this hotkey only works while X11 apps are focused. For a reliable
-			shortcut, bind <code>lychi --toggle</code> to a key in your desktop's shortcut settings.
+		<!-- The backend already decided why this is unreliable; restating that
+		     judgement from `isWayland` here is how the two answers drifted apart. -->
+		{hotkeyStatus.explanation}.
+		{#if hotkeyStatus.needs_confirmation}
+			Press it to check — this notice clears once a press reaches Lychi.
 		{:else}
-			The hotkey could not be registered (possibly taken by another app) — try a
-			different combo, or bind <code>lychi --toggle</code> in your desktop's shortcut settings.
+			Bind <code>lychi --toggle</code> to a key in your desktop's shortcut settings.
 		{/if}
 	</div>
 {/if}

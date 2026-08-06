@@ -335,27 +335,44 @@ pub struct HotkeyStatus {
     pub session_type: String,
     /// XDG_CURRENT_DESKTOP (e.g. "KDE", "GNOME"), empty if unset
     pub desktop: String,
-    /// True when the in-app shortcut fires system-wide. On Wayland the
-    /// X11-based plugin only fires while an XWayland window is focused,
-    /// so registration success there does not mean reliable.
+    /// True only when something actually owns the binding on our behalf (a
+    /// portal binding, a desktop-settings entry, or a press we observed).
+    ///
+    /// Deliberately NOT `registered`: an X11 grab returns Ok even when the
+    /// window manager keeps the key, so treating registration as reliability
+    /// hid the failure from precisely the users hitting it.
     pub reliable: bool,
+    /// True when a grab succeeded but only a keypress can prove it works — the
+    /// frontend asks the user to press the hotkey rather than warning them.
+    pub needs_confirmation: bool,
+    /// One line explaining the verdict, suitable for showing as-is.
+    pub explanation: String,
 }
 
 #[tauri::command]
 #[specta::specta]
 pub fn get_hotkey_status(state: State<'_, AppState>) -> HotkeyStatus {
+    use lychi_core::hotkey::{Binding, Confidence, HotkeyVerdict};
+
     let registered = state
         .hotkey_registered
         .load(std::sync::atomic::Ordering::SeqCst);
-    let portal_bound = state.portal_bound.load(std::sync::atomic::Ordering::SeqCst);
     let wayland = lychi_core::context::is_wayland();
+    // Read the verdict recorded where the binding happened — do not re-derive
+    // it here from weaker inputs, which is what made every X11 grab look fine.
+    let verdict = state
+        .hotkey_verdict
+        .lock()
+        .map(|v| *v)
+        .unwrap_or_else(|_| HotkeyVerdict::assess(Binding::None, wayland));
+
     HotkeyStatus {
         registered,
         session_type: if wayland { "wayland" } else { "x11" }.to_string(),
         desktop: std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
-        // X11 plugin registration is system-wide on X11; on Wayland only a
-        // portal binding counts as reliable.
-        reliable: registered && (!wayland || portal_bound),
+        reliable: verdict.confidence == Confidence::Reliable,
+        needs_confirmation: verdict.needs_confirmation(),
+        explanation: verdict.explain().to_string(),
     }
 }
 
