@@ -41,13 +41,54 @@ use crate::action_registry::{CompletionItem, CompletionKind};
 /// These two must agree. If a latch were keyed on the label while dedupe keyed
 /// on the command, a latched row could be the one dropped as a duplicate, and
 /// the learned preference would silently stop applying.
-fn command_key(s: &Suggestion) -> String {
-    s.item
-        .run
-        .as_deref()
-        .or(s.item.fill.as_deref())
-        .unwrap_or(&s.item.label)
-        .to_lowercase()
+///
+/// # Why `typed` is a parameter
+///
+/// A row without `run`/`fill` does not carry its own command: selecting it
+/// executes `{prefix} {label}`, reconstructed by the frontend from the typed
+/// input (`submit-router.ts`). So the key for such a row is only knowable in
+/// the context of what was typed.
+///
+/// This used to fall back to the bare lowercased label, which was wrong twice
+/// over. It keyed routing on **human display prose** — the thing
+/// `action_registry` forbids ("Label strings are for humans… routing that
+/// depends on them breaks silently"). And because latches are written under
+/// the *executed* text (`open firefox`), a key of `firefox` could never match
+/// one, so every latch on a `run`-less row was silently inert.
+fn command_key(s: &Suggestion, typed: &str) -> String {
+    if let Some(explicit) = s.item.run.as_deref().or(s.item.fill.as_deref()) {
+        return normalize_command(explicit);
+    }
+    // Mirror the frontend's inference. Only a command-prefixed input composes;
+    // otherwise the label stands alone, as it does there.
+    let trimmed = typed.trim();
+    match trimmed.split_once(' ') {
+        Some((prefix, _)) => {
+            let label = s.item.label.trim();
+            // "run htop" selecting a row labelled "run htop" must not double
+            // the prefix — the same guard the frontend applies.
+            if label
+                .to_lowercase()
+                .starts_with(&format!("{} ", prefix.to_lowercase()))
+            {
+                normalize_command(label)
+            } else {
+                normalize_command(&format!("{prefix} {label}"))
+            }
+        }
+        None => normalize_command(&s.item.label),
+    }
+}
+
+/// Fold the incidental differences that make two identical commands look
+/// distinct: case, surrounding space, and a trailing path separator.
+///
+/// The trailing slash is the concrete miss: `open /home/u/proj` and
+/// `open /home/u/proj/` are one command and rendered as two rows.
+fn normalize_command(s: &str) -> String {
+    let t = s.trim();
+    let t = t.strip_suffix('/').filter(|r| !r.is_empty()).unwrap_or(t);
+    t.to_lowercase()
 }
 
 /// Where a suggestion came from. Sets coarse ordering, ahead of score.
@@ -228,8 +269,10 @@ const MAX_ROWS: usize = 8;
 ///
 /// The sort is stable, so equal keys keep producer order — a source that
 /// already ranked its own output (frecency-ordered repos) keeps that order.
-pub fn rank(all: Vec<Suggestion>) -> Vec<Suggestion> {
-    rank_with_latches(all, &HashMap::new())
+/// Dedupe still needs the typed input to key `run`-less rows (see
+/// [`command_key`]); with no latches there is nothing to look up.
+pub fn rank(all: Vec<Suggestion>, typed: &str) -> Vec<Suggestion> {
+    rank_with_latches(all, &HashMap::new(), typed)
 }
 
 /// [`rank`], with the user's learned query→command bindings applied.
@@ -256,6 +299,7 @@ pub fn rank(all: Vec<Suggestion>) -> Vec<Suggestion> {
 pub fn rank_with_latches(
     mut all: Vec<Suggestion>,
     latches: &HashMap<String, f64>,
+    typed: &str,
 ) -> Vec<Suggestion> {
     // Resolve each row's latch strength once. Doing it inside the comparator
     // would recompute it O(n log n) times and, worse, make the sort's result
@@ -264,7 +308,7 @@ pub fn rank_with_latches(
         if latches.is_empty() {
             return 0.0;
         }
-        latches.get(&command_key(s)).copied().unwrap_or(0.0)
+        latches.get(&command_key(s, typed)).copied().unwrap_or(0.0)
     };
     let mut keyed: Vec<(f64, Suggestion)> = all.drain(..).map(|s| (strength(&s), s)).collect();
 
@@ -291,7 +335,7 @@ pub fn rank_with_latches(
     // whichever source happened to run earliest.
     let mut seen: Vec<String> = Vec::new();
     all.retain(|s| {
-        let key = command_key(s);
+        let key = command_key(s, typed);
         if seen.contains(&key) {
             false
         } else {
@@ -400,12 +444,15 @@ mod tests {
     /// The invariants that used to be comments, asserted as one ordering.
     #[test]
     fn sources_order_guard_context_handler_fallback() {
-        let ranked = rank(vec![
-            sugg("web", Source::Fallback, Tier::Fuzzy, 1),
-            sugg("handler", Source::Handler, Tier::Prefix, 90),
-            sugg("guard", Source::Guard, Tier::Fuzzy, 5),
-            sugg("context", Source::Context, Tier::Subset, 10),
-        ]);
+        let ranked = rank(
+            vec![
+                sugg("web", Source::Fallback, Tier::Fuzzy, 1),
+                sugg("handler", Source::Handler, Tier::Prefix, 90),
+                sugg("guard", Source::Guard, Tier::Fuzzy, 5),
+                sugg("context", Source::Context, Tier::Subset, 10),
+            ],
+            "",
+        );
         let labels: Vec<&str> = ranked.iter().map(|s| s.item.label.as_str()).collect();
         assert_eq!(labels, ["guard", "context", "handler", "web"]);
     }
@@ -415,28 +462,37 @@ mod tests {
     /// completion burying a learned, context-specific one.
     #[test]
     fn score_never_overrides_source() {
-        let ranked = rank(vec![
-            sugg("handler", Source::Handler, Tier::Identity, 999),
-            sugg("context", Source::Context, Tier::Fuzzy, 1),
-        ]);
+        let ranked = rank(
+            vec![
+                sugg("handler", Source::Handler, Tier::Identity, 999),
+                sugg("context", Source::Context, Tier::Fuzzy, 1),
+            ],
+            "",
+        );
         assert_eq!(ranked[0].item.label, "context");
     }
 
     #[test]
     fn within_a_source_a_stronger_tier_wins() {
-        let ranked = rank(vec![
-            sugg("subset", Source::Handler, Tier::Subset, 100),
-            sugg("prefix", Source::Handler, Tier::Prefix, 1),
-        ]);
+        let ranked = rank(
+            vec![
+                sugg("subset", Source::Handler, Tier::Subset, 100),
+                sugg("prefix", Source::Handler, Tier::Prefix, 1),
+            ],
+            "",
+        );
         assert_eq!(ranked[0].item.label, "prefix");
     }
 
     #[test]
     fn within_a_tier_a_higher_score_wins() {
-        let ranked = rank(vec![
-            sugg("low", Source::Handler, Tier::Prefix, 10),
-            sugg("high", Source::Handler, Tier::Prefix, 90),
-        ]);
+        let ranked = rank(
+            vec![
+                sugg("low", Source::Handler, Tier::Prefix, 10),
+                sugg("high", Source::Handler, Tier::Prefix, 90),
+            ],
+            "",
+        );
         assert_eq!(ranked[0].item.label, "high");
     }
 
@@ -452,14 +508,17 @@ mod tests {
             .collect();
         all.push(sugg("web", Source::Fallback, Tier::Fuzzy, 1));
 
-        let ranked = rank(all);
+        let ranked = rank(all, "");
         assert_eq!(ranked.len(), MAX_ROWS + 1, "body capped, fallback kept");
         assert_eq!(ranked.last().unwrap().item.label, "web");
     }
 
     #[test]
     fn a_fallback_is_never_the_default_even_if_it_prefix_matches() {
-        let ranked = rank(vec![sugg("web thing", Source::Fallback, Tier::Prefix, 1)]);
+        let ranked = rank(
+            vec![sugg("web thing", Source::Fallback, Tier::Prefix, 1)],
+            "",
+        );
         assert_eq!(
             default_index(&ranked),
             None,
@@ -471,10 +530,13 @@ mod tests {
     /// skip past it to the real suggestion.
     #[test]
     fn a_guard_leads_but_is_not_the_default() {
-        let ranked = rank(vec![
-            sugg("real", Source::Handler, Tier::Prefix, 50),
-            sugg("⚠ dirty", Source::Guard, Tier::Prefix, 200),
-        ]);
+        let ranked = rank(
+            vec![
+                sugg("real", Source::Handler, Tier::Prefix, 50),
+                sugg("⚠ dirty", Source::Guard, Tier::Prefix, 200),
+            ],
+            "",
+        );
         assert_eq!(ranked[0].item.label, "⚠ dirty", "the warning leads");
         assert_eq!(
             ranked[default_index(&ranked).unwrap()].item.label,
@@ -495,12 +557,15 @@ mod tests {
     /// picks must be the first whose stamped flag is true.
     #[test]
     fn the_stamped_flag_agrees_with_the_rule() {
-        let ranked = rank(vec![
-            sugg("⚠ dirty", Source::Guard, Tier::Prefix, 200),
-            sugg("ask ai", Source::Fallback, Tier::Prefix, 150),
-            sugg("real", Source::Handler, Tier::Prefix, 50),
-            sugg("fuzzy", Source::Handler, Tier::Fuzzy, 40),
-        ]);
+        let ranked = rank(
+            vec![
+                sugg("⚠ dirty", Source::Guard, Tier::Prefix, 200),
+                sugg("ask ai", Source::Fallback, Tier::Prefix, 150),
+                sugg("real", Source::Handler, Tier::Prefix, 50),
+                sugg("fuzzy", Source::Handler, Tier::Fuzzy, 40),
+            ],
+            "",
+        );
         let stamped: Vec<bool> = ranked.iter().map(|s| s.can_be_default()).collect();
 
         // The first `true` is exactly what default_index returns.
@@ -521,10 +586,13 @@ mod tests {
 
     #[test]
     fn nothing_defaultable_means_run_what_was_typed() {
-        let ranked = rank(vec![
-            sugg("a", Source::Handler, Tier::Subset, 90),
-            sugg("b", Source::Fallback, Tier::Fuzzy, 1),
-        ]);
+        let ranked = rank(
+            vec![
+                sugg("a", Source::Handler, Tier::Subset, 90),
+                sugg("b", Source::Fallback, Tier::Fuzzy, 1),
+            ],
+            "",
+        );
         assert_eq!(default_index(&ranked), None);
     }
 
@@ -544,6 +612,7 @@ mod tests {
                 sugg("chosen", Source::Handler, Tier::Fuzzy, 1),
             ],
             &latches(&[("chosen", 0.5)]),
+            "",
         );
         assert_eq!(
             ranked[0].item.label, "chosen",
@@ -559,6 +628,7 @@ mod tests {
         let ranked = rank_with_latches(
             vec![sugg("firefox", Source::Handler, Tier::Subset, 92)],
             &latches(&[("firefox", 1.0)]),
+            "",
         );
         assert_eq!(ranked[0].item.label, "firefox", "it still leads");
         assert_eq!(
@@ -582,6 +652,7 @@ mod tests {
                 sugg("handler", Source::Handler, Tier::Prefix, 99),
             ],
             &latches(&[("handler", 1.0)]),
+            "",
         );
         assert_eq!(
             ranked[0].item.label, "context",
@@ -599,6 +670,7 @@ mod tests {
                 sugg("web", Source::Fallback, Tier::Prefix, 1),
             ],
             &latches(&[("web", 1.0)]),
+            "",
         );
         assert_eq!(ranked.last().unwrap().item.label, "web");
         assert_eq!(
@@ -616,6 +688,7 @@ mod tests {
                 sugg("strong", Source::Handler, Tier::Prefix, 50),
             ],
             &latches(&[("weak", 0.2), ("strong", 0.9)]),
+            "",
         );
         assert_eq!(ranked[0].item.label, "strong");
     }
@@ -631,8 +704,11 @@ mod tests {
                 sugg("c", Source::Handler, Tier::Prefix, 5),
             ]
         };
-        let plain: Vec<String> = rank(mk()).iter().map(|s| s.item.label.clone()).collect();
-        let latched: Vec<String> = rank_with_latches(mk(), &HashMap::new())
+        let plain: Vec<String> = rank(mk(), "")
+            .iter()
+            .map(|s| s.item.label.clone())
+            .collect();
+        let latched: Vec<String> = rank_with_latches(mk(), &HashMap::new(), "")
             .iter()
             .map(|s| s.item.label.clone())
             .collect();
@@ -648,6 +724,7 @@ mod tests {
                 sugg("b", Source::Handler, Tier::Prefix, 10),
             ],
             &latches(&[("something else", 1.0)]),
+            "",
         );
         assert_eq!(ranked[0].item.label, "a");
     }
@@ -663,8 +740,47 @@ mod tests {
                 sugg("other", Source::Handler, Tier::Prefix, 90),
             ],
             &latches(&[("yt cats", 0.8)]),
+            "",
         );
         assert_eq!(ranked[0].item.label, "Search YouTube: cats");
+    }
+
+    /// The other half of that rule, which went unasserted: a row with NO `run`.
+    ///
+    /// An app row is labelled "Firefox" and carries no `run`, so selecting it
+    /// after typing `open fire` executes `open Firefox` (the frontend infers
+    /// `{prefix} {label}`) and the latch is written under `open firefox`.
+    /// `command_key` used to fall back to the bare lowercased label —
+    /// `firefox` — which no written latch key can ever equal. Every latch on a
+    /// `run`-less row was dead on arrival.
+    #[test]
+    fn a_latch_applies_to_a_row_that_has_no_run() {
+        let ranked = rank_with_latches(
+            vec![
+                sugg("Firefox", Source::Handler, Tier::Fuzzy, 1),
+                sugg("Firewall Settings", Source::Handler, Tier::Prefix, 99),
+            ],
+            &latches(&[("open firefox", 0.8)]),
+            "open fire",
+        );
+        assert_eq!(
+            ranked[0].item.label, "Firefox",
+            "the latched app row must lead despite a far lower score"
+        );
+    }
+
+    /// A latch must not leak across rows that merely share a label prefix.
+    #[test]
+    fn a_latch_on_one_row_does_not_lift_a_similar_one() {
+        let ranked = rank_with_latches(
+            vec![
+                sugg("Firewall Settings", Source::Handler, Tier::Prefix, 99),
+                sugg("Firefox", Source::Handler, Tier::Fuzzy, 1),
+            ],
+            &latches(&[("open firewall settings", 0.8)]),
+            "open fire",
+        );
+        assert_eq!(ranked[0].item.label, "Firewall Settings");
     }
 
     // ── Dedupe ──────────────────────────────────────────────────────────
@@ -673,21 +789,68 @@ mod tests {
     fn the_same_command_from_two_sources_appears_once() {
         let ctx = CompletionItem::new("Open project root", None, 91).with_run("open /home/u/l");
         let handler = CompletionItem::new("open /home/u/l", None, 50);
-        let ranked = rank(vec![
-            Suggestion::new(handler, Source::Handler, Tier::Prefix),
-            Suggestion::new(ctx, Source::Context, Tier::Prefix),
-        ]);
+        let ranked = rank(
+            vec![
+                Suggestion::new(handler, Source::Handler, Tier::Prefix),
+                Suggestion::new(ctx, Source::Context, Tier::Prefix),
+            ],
+            "",
+        );
         assert_eq!(ranked.len(), 1);
         // The stronger source is the one kept.
         assert_eq!(ranked[0].source, Source::Context);
     }
 
+    /// One command written two ways is one row. A context source offering the
+    /// directory with a trailing separator and a handler offering it without
+    /// used to render as two identical-looking rows.
+    #[test]
+    fn a_trailing_separator_does_not_make_a_second_row() {
+        let ctx = CompletionItem::new("Open project root", None, 91).with_run("open /home/u/proj/");
+        let handler = CompletionItem::new("open /home/u/proj", None, 50);
+        let ranked = rank(
+            vec![
+                Suggestion::new(handler, Source::Handler, Tier::Prefix),
+                Suggestion::new(ctx, Source::Context, Tier::Prefix),
+            ],
+            "",
+        );
+        assert_eq!(ranked.len(), 1, "one command must not render twice");
+        assert_eq!(ranked[0].source, Source::Context);
+    }
+
+    /// Root is not a trailing separator to be stripped — `/` is the path.
+    #[test]
+    /// Stripping the separator must never empty the key. A row whose command
+    /// is exactly `/` (the filesystem root) would otherwise normalise to `""`
+    /// and collide with every other row that normalises to nothing — one
+    /// unrelated row silently swallowing another.
+    fn the_root_path_survives_normalisation() {
+        let root = CompletionItem::new("Filesystem root", None, 50).with_run("/");
+        let other = CompletionItem::new("Something else", None, 50).with_run("   ");
+        let ranked = rank(
+            vec![
+                Suggestion::new(root, Source::Handler, Tier::Prefix),
+                Suggestion::new(other, Source::Handler, Tier::Prefix),
+            ],
+            "",
+        );
+        assert_eq!(
+            ranked.len(),
+            2,
+            "`/` must not normalise to the empty key and collide"
+        );
+    }
+
     #[test]
     fn different_commands_are_both_kept() {
-        let ranked = rank(vec![
-            sugg("open a", Source::Handler, Tier::Prefix, 50),
-            sugg("open b", Source::Handler, Tier::Prefix, 50),
-        ]);
+        let ranked = rank(
+            vec![
+                sugg("open a", Source::Handler, Tier::Prefix, 50),
+                sugg("open b", Source::Handler, Tier::Prefix, 50),
+            ],
+            "",
+        );
         assert_eq!(ranked.len(), 2);
     }
 }

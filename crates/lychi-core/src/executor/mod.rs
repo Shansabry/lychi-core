@@ -1027,7 +1027,7 @@ impl Executor {
         // point where all three inputs to `can_be_default` exist together, so
         // anything downstream that needs the answer has to be told it rather
         // than left to infer it from display text.
-        crate::suggestions::rank_with_latches(all, &latches)
+        crate::suggestions::rank_with_latches(all, &latches, trimmed)
             .into_iter()
             .map(|s| {
                 // `Suggestion::can_be_default` is the rule; `default_index`
