@@ -303,10 +303,15 @@ mod tests {
     /// `fatal runtime error: failed to initiate panic` → SIGABRT. Lychi never
     /// drew a window.
     ///
-    /// This asserts the opcode we bind against is the one that panicked. It is
-    /// deliberately a value check rather than a behavioural one: exercising the
-    /// real path needs a live wlroots compositor, which no CI runner and
-    /// neither developer machine (KDE) provides — the reason the bug shipped.
+    /// This asserts the opcode we bind against is the one that panicked — a
+    /// value check, and cheap enough to run everywhere.
+    ///
+    /// The *behavioural* check now exists too:
+    /// `tests/wlroots_toplevel_live.rs` runs this dispatch against a headless
+    /// Sway, which really does advertise the protocol (KDE and GNOME never do,
+    /// so on a developer machine every path below is dead code — the reason the
+    /// bug shipped). Deleting the specialization there reproduces the original
+    /// abort. Run it with `scripts/test-wlroots.sh`; CI runs it on every PR.
     #[test]
     fn toplevel_event_opcode_is_the_one_we_specialize() {
         use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1;

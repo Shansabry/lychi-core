@@ -19,9 +19,61 @@ env:
   # incremental cache is pure overhead here.
   CARGO_INCREMENTAL: "0"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Staged so the cheap, high-signal checks fail first.
+#
+#   stage 1  quick        formatting + frontend lint      ~30s, no compilation
+#   stage 2  build        one shared Rust compile         the expensive part
+#   stage 3  rust-checks  clippy / test / bindings        matrix, reuses stage 2
+#            env-tests    wlroots + X11                   matrix, own compile
+#            frontend     test + typecheck
+#   any      licenses     only when the dep graph moves
+#
+# The point of stage 1 is that a missing `cargo fmt` should cost 30 seconds, not
+# a full toolchain install and a workspace compile. Stage 3's matrices then fan
+# out over a warm cache, so clippy and test run concurrently rather than
+# serially in one job.
+# ─────────────────────────────────────────────────────────────────────────────
+
 jobs:
-  rust:
-    name: Rust
+  # ── Stage 1: fail fast on things that need no compilation ──────────────────
+  quick:
+    name: Quick checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustfmt only — no GTK/WebKit, no dependency compile. This is why it is
+      # a separate job: `cargo fmt --check` does not need the project to build.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Rust formatting
+        run: cargo fmt --all --check
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Frontend lint
+        run: pnpm lint
+
+  # ── Stage 2: the one expensive Rust compile ────────────────────────────────
+  #
+  # Everything in `rust-checks` needs the same dependency build. Doing it once
+  # here and letting the matrix restore it beats three jobs each compiling the
+  # workspace from scratch.
+  build:
+    name: Build (shared cache)
+    needs: quick
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,7 +96,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy
 
       # Keyed on the lockfile and rustc version by default. `save-if` means only
       # main writes the cache: PR branches read it but don't each push their own
@@ -52,6 +104,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: workspace
 
       # tauri.conf.json declares the CLI as an externalBin, so lychi-app's build
       # script refuses to run without it — and src-tauri/binaries/ is gitignored,
@@ -81,29 +134,196 @@ jobs:
         run: |
           echo '<!-- placeholder; real notices come from the release workflow -->' > THIRD-PARTY-NOTICES.html
 
-      - name: Format
-        run: cargo fmt --all --check
+      # Compile test and clippy artifacts here so the matrix below only has to
+      # run them. `--no-run` builds the test binaries without executing them.
+      - name: Warm the build cache
+        run: |
+          cargo test --workspace --no-run
+          cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets
+  # ── Stage 3a: Rust checks, fanned out over the warm cache ──────────────────
+  rust-checks:
+    name: Rust / ${{ matrix.check }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      # One failing check should not cancel the others — knowing whether BOTH
+      # clippy and the tests are broken is more useful than learning it twice.
+      fail-fast: false
+      matrix:
+        check: [test, clippy, bindings]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev libgtk-layer-shell-dev \
+            libssl-dev libdbus-1-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # Reads the cache `build` just populated. Never writes: these jobs add
+      # nothing a later run needs, and three concurrent writers would race.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+          shared-key: workspace
+
+      - name: Build CLI sidecar
+        run: |
+          cargo build --release -p lychi-cli
+          mkdir -p src-tauri/binaries
+          cp target/release/lychi src-tauri/binaries/lychi-x86_64-unknown-linux-gnu
+
+      - name: Stub bundled notices
+        run: echo '<!-- placeholder -->' > THIRD-PARTY-NOTICES.html
 
       # local-ai is deliberately excluded: it statically links llama.cpp, which
       # dominates CI time. The release workflow builds with it; correctness of
       # the AI plumbing is covered by tests that don't need the engine.
       - name: Test
+        if: matrix.check == 'test'
         run: cargo test --workspace
 
-      # The export_bindings test rewrote src/lib/bindings.ts above. If that
-      # differs from the committed copy, someone changed a #[tauri::command]
-      # without regenerating, and the frontend types are a lie. This is the
-      # guarantee that makes committing a generated file safe.
+      - name: Clippy
+        if: matrix.check == 'clippy'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The export_bindings test rewrites src/lib/bindings.ts. If that differs
+      # from the committed copy, someone changed a #[tauri::command] without
+      # regenerating, and the frontend types are a lie. This is the guarantee
+      # that makes committing a generated file safe.
       - name: Check bindings are up to date
+        if: matrix.check == 'bindings'
         run: |
+          cargo test -p lychi-app export_bindings
           if ! git diff --exit-code --stat -- src/lib/bindings.ts; then
             echo "::error::src/lib/bindings.ts is stale. Run: cargo test -p lychi-app export_bindings"
             exit 1
           fi
 
+  # ── Stage 3b: the two window backends no developer machine can test ────────
+  #
+  # `active_window::detect` dispatches to exactly three backends, and desktop
+  # environments collapse onto them — so this matrix is keyed on BACKEND, not on
+  # DE. Five DE jobs would be three copies of one test plus two that cover
+  # nothing:
+  #
+  #   wlroots   Sway, Hyprland, river, Wayfire, niri, COSMIC  → one job
+  #   x11       every X11 session on every desktop            → one job
+  #   KWin      needs a full Plasma session on a session bus; heavy and flaky
+  #             headless, and it is the backend both dev machines exercise daily
+  #   GNOME     `_ => None` by design — Mutter implements neither
+  #             wlr-foreign-toplevel nor a scripting interface, so there is no
+  #             detector and nothing to assert
+  #
+  # Add a job when a fourth BACKEND appears, not a fourth desktop.
+  #
+  # Both only need lychi-core, so they skip the WebKit/GTK stack entirely and
+  # use their own cache key.
+  env-tests:
+    name: Backend / ${{ matrix.backend }}
+    needs: quick
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Headless Sway really does advertise
+          # zwlr_foreign_toplevel_manager_v1 — KDE and GNOME never do, which is
+          # why the whole Dispatch state machine is dead code on a developer
+          # machine and how the Sway SIGABRT (I-011) shipped. A Wayland dispatch
+          # that panics does so inside a C callback, cannot unwind, and aborts
+          # the process: total startup failure, not a degraded feature.
+          #
+          # Verified by mutation: deleting the `event_created_child!`
+          # specialization reproduces the original
+          # "Missing event_created_child specialization for event opcode 0".
+          - backend: wlroots
+            packages: sway foot
+            script: ./scripts/test-wlroots.sh
+          # The X11 EWMH backend is the most widely used of the three and had no
+          # test at all. Its failure mode is silent: a wrong atom name or a
+          # misparsed property compiles fine and returns None, which is
+          # indistinguishable from "no window focused" — a legitimate result.
+          #
+          # Verified by mutation: typo'ing the `_NET_WM_PID` atom fails it.
+          - backend: x11
+            packages: xvfb openbox xterm
+            script: ./scripts/test-x11.sh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ${{ matrix.backend }} and build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.packages }} \
+            libdbus-1-dev libssl-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Separate cache from the workspace one: these compile lychi-core only,
+      # without the Tauri stack, so sharing a key would thrash both.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: core-only
+
+      # The runner has no session bus and no XDG_RUNTIME_DIR; Sway needs one to
+      # put its socket in, and it must be 0700 or wlroots refuses to start.
+      # Harmless for the X11 job.
+      - name: Run ${{ matrix.backend }} tests
+        run: |
+          export XDG_RUNTIME_DIR="$(mktemp -d)"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          ${{ matrix.script }}
+
+  # ── Stage 3c: frontend ─────────────────────────────────────────────────────
+  frontend:
+    name: Frontend
+    needs: quick
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No Rust toolchain here on purpose. src/lib/bindings.ts is committed, so
+      # the frontend is checkable with Node alone — which is also what a
+      # frontend-only contributor needs locally. The rust-checks matrix verifies
+      # the committed copy is current.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # svelte-check re-resolves every dependency's types on a cold run. The
+      # .svelte-kit dir is generated (sync) and safe to reuse for a given
+      # config + lockfile; a miss just regenerates it.
+      - name: Cache SvelteKit artifacts
+        uses: actions/cache@v4
+        with:
+          path: .svelte-kit
+          key: svelte-kit-${{ hashFiles('pnpm-lock.yaml', 'svelte.config.js', 'vite.config.ts', 'tsconfig.json') }}
+
+      - name: Test
+        run: pnpm test:fe
+
+      # svelte-check runs last: it's the slowest, and it runs SvelteKit's own
+      # sync to generate the $app/* types it needs.
+      - name: Type check
+        run: pnpm check
+
+  # ── Independent: only runs when the dependency graph actually moves ────────
   licenses:
     name: Dependency licences
     runs-on: ubuntu-latest
@@ -158,43 +378,23 @@ jobs:
         if: steps.changed.outputs.run == 'true'
         run: cargo about generate about.hbs --features local-ai -o /dev/null
 
-  frontend:
-    name: Frontend
+  # A single required-status target for branch protection. Without this, adding
+  # a matrix leg means editing the protected-branch rules by hand, and a
+  # forgotten one silently stops gating.
+  ci:
+    name: CI
+    if: always()
+    needs: [quick, rust-checks, env-tests, frontend, licenses]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      # No Rust toolchain here on purpose. src/lib/bindings.ts is committed, so
-      # the frontend is checkable with Node alone — which is also what a
-      # frontend-only contributor needs locally. The rust job verifies the
-      # committed copy is current.
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      # svelte-check re-resolves every dependency's types on a cold run. The
-      # .svelte-kit dir is generated (sync) and safe to reuse for a given
-      # config + lockfile; a miss just regenerates it.
-      - name: Cache SvelteKit artifacts
-        uses: actions/cache@v4
-        with:
-          path: .svelte-kit
-          key: svelte-kit-${{ hashFiles('pnpm-lock.yaml', 'svelte.config.js', 'vite.config.ts', 'tsconfig.json') }}
-
-      - name: Lint
-        run: pnpm lint
-
-      - name: Test
-        run: pnpm test:fe
-
-      # svelte-check runs last: it's the slowest, and it runs SvelteKit's own
-      # sync to generate the $app/* types it needs.
-      - name: Type check
-        run: pnpm check
+      - name: Verify every job succeeded
+        run: |
+          results='${{ join(needs.*.result, " ") }}'
+          echo "job results: $results"
+          for r in $results; do
+            # `skipped` is legitimate — the licences job self-gates.
+            if [ "$r" != "success" ] && [ "$r" != "skipped" ]; then
+              echo "::error::a required job did not pass ($r)"
+              exit 1
+            fi
+          done

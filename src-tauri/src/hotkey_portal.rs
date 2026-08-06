@@ -280,7 +280,7 @@ async fn run(app: &tauri::AppHandle, configured_hotkey: &str) -> ashpd::Result<(
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
     // The compositor routes the key to us; nothing further needs proving.
-    crate::record_hotkey_binding(&app, lychi_core::hotkey::Binding::Portal);
+    crate::record_hotkey_binding(app, lychi_core::hotkey::Binding::Portal);
     tracing::info!("[portal] global shortcut active: {trigger}");
 
     // Service activations for the app's lifetime. The session must stay

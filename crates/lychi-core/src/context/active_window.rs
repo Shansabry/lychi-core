@@ -631,6 +631,16 @@ pub async fn run_kwin_watcher(push_focus: impl Fn(WindowContext) + Send + 'stati
 
 // ── X11 ─────────────────────────────────────────────────────────────────
 
+/// Test-only accessor for the X11 backend.
+///
+/// `detect()` dispatches on `compositor()`, which is `OnceLock`-cached from the
+/// environment — so on a Wayland dev box it can never reach `detect_x11`, no
+/// matter what `DISPLAY` says. The integration test must call the backend
+/// directly or it would silently test nothing.
+pub fn detect_x11_for_test() -> Option<WindowContext> {
+    detect_x11()
+}
+
 #[cfg(target_os = "linux")]
 fn detect_x11() -> Option<WindowContext> {
     use x11rb::connection::Connection;
