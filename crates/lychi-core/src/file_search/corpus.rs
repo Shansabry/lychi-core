@@ -1171,7 +1171,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// `full_path` and `file_name` are no longer stored — they are derived from
     /// `rel_path` and the scope. If either derivation is wrong the corpus
     /// silently points at files that do not exist, so this checks the shapes

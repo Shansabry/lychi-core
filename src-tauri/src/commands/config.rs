@@ -219,6 +219,10 @@ pub async fn save_privacy_config(
     config.privacy = privacy;
     config.save(&paths::config_file())?;
     config_db::save_config_to_db(&state.db, &config)?;
+    // The clipboard monitor runs on its own OS thread and cannot read this
+    // async lock; republish so a toggle takes effect on the next poll rather
+    // than at the next restart.
+    lychi_core::clipboard::sensitive::publish_policy(&config.privacy.clipboard);
     Ok(())
 }
 

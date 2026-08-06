@@ -501,6 +501,31 @@ async function handleTerminalChange(val: string) {
 	</button>
 </div>
 <div class="field-hint">sysinfo net/ip via ifconfig.me</div>
+<div class="field">
+	<label for="clipboard-sensitive">Skip passwords in clipboard history</label>
+	<button
+		id="clipboard-sensitive"
+		class="checkbox"
+		class:checked={privacyConfig.clipboard.respect_sensitive_hint}
+		onclick={async () => {
+			privacyConfig.clipboard.respect_sensitive_hint =
+				!privacyConfig.clipboard.respect_sensitive_hint;
+			await savePrivacyConfig(privacyConfig);
+		}}
+		role="checkbox"
+		aria-checked={privacyConfig.clipboard.respect_sensitive_hint}
+	>
+		{#if privacyConfig.clipboard.respect_sensitive_hint}
+			<svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+				<path d="M2 6L5 9L10 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+			</svg>
+		{/if}
+	</button>
+</div>
+<div class="field-hint">
+	Don't record copies that a password manager marked secret. Only works for apps
+	that set the marker.
+</div>
 
 <style>
 	.field {

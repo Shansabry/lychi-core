@@ -21,6 +21,7 @@ pub fn read_context_source(
     }
 }
 pub mod selection;
+pub mod sensitive;
 pub mod store;
 
 use serde::{Deserialize, Serialize};

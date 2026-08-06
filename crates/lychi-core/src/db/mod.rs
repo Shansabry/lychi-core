@@ -55,11 +55,51 @@ pub const AI_CONVERSATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new(
 /// stops re-sending requests a model has already rejected.
 pub const MODEL_CAPS: TableDefinition<&str, &[u8]> = TableDefinition::new("model_caps");
 
+/// Owner-only permissions for anything holding user content.
+///
+/// This one file holds clipboard clips, notes, command history and AI
+/// conversations. `Database::create` uses the process umask, which on a typical
+/// distro yields `0644` — world-readable, so any other local user or any daemon
+/// running as another uid can read the lot. Measured `0644` on a real install
+/// before this was added.
+#[cfg(unix)]
+const OWNER_ONLY_FILE: u32 = 0o600;
+#[cfg(unix)]
+const OWNER_ONLY_DIR: u32 = 0o700;
+
+/// Narrow `path` to owner-only. Applied to files we already created, so it
+/// repairs existing installs rather than only protecting fresh ones.
+///
+/// Best-effort and non-fatal: on a filesystem that cannot represent the mode
+/// (a FAT-formatted `$HOME`, some network mounts) refusing to start would be a
+/// worse outcome than a warning.
+#[cfg(unix)]
+fn restrict(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(md) if md.permissions().mode() & 0o777 == mode => {}
+        Ok(_) => {
+            if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+                tracing::warn!(
+                    "[db] could not restrict {} to {mode:o}: {e}",
+                    path.display()
+                );
+            }
+        }
+        Err(e) => tracing::warn!("[db] could not stat {}: {e}", path.display()),
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict(_path: &Path, _mode: u32) {}
+
 /// Open (or create) the redb database at the given path.
 /// If the file exists but uses an older format version, back it up and recreate.
 pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        restrict(parent, OWNER_ONLY_DIR);
     }
     let db = match Database::create(path) {
         Ok(db) => db,
@@ -67,10 +107,15 @@ pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
             tracing::warn!("[db] cannot open database ({e}), backing up and recreating");
             let backup = path.with_extension("redb.bak");
             let _ = std::fs::rename(path, &backup);
+            // The backup is a full copy of the same user content.
+            #[cfg(unix)]
+            restrict(&backup, OWNER_ONLY_FILE);
             Database::create(path)?
         }
         Err(e) => return Err(e.into()),
     };
+    #[cfg(unix)]
+    restrict(path, OWNER_ONLY_FILE);
 
     // Ensure all tables exist by opening them in a write transaction.
     let txn = db.begin_write()?;
@@ -190,4 +235,45 @@ pub fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(all(test, unix))]
+mod permission_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn a_new_database_is_not_readable_by_other_users() {
+        // This file holds clipboard clips, notes and history. The default umask
+        // produced 0644 on a real install, which is what this pins shut.
+        let dir = std::env::temp_dir().join(format!("lychi-perm-{}", new_id()));
+        let path = dir.join("lychi.redb");
+        let _db = open_database(&path).unwrap();
+
+        assert_eq!(mode_of(&path), 0o600, "database must be owner-only");
+        assert_eq!(mode_of(&dir), 0o700, "data dir must be owner-only");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_existing_world_readable_database_is_repaired_on_open() {
+        // Installs created before this existed are already 0644 on disk; opening
+        // must fix them, not just protect fresh ones.
+        let dir = std::env::temp_dir().join(format!("lychi-perm-{}", new_id()));
+        let path = dir.join("lychi.redb");
+        drop(open_database(&path).unwrap());
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(mode_of(&path), 0o644, "precondition: loosened");
+
+        let _db = open_database(&path).unwrap();
+        assert_eq!(mode_of(&path), 0o600, "reopening must repair permissions");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

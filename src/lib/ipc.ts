@@ -455,7 +455,7 @@ export async function getAllSettings(): Promise<AllSettings> {
 				extra_soft_markers: [],
 				pinned_workspace: null,
 			},
-			privacy: { allow_ip_geolocation: false, allow_public_ip: false },
+			privacy: structuredClone(PRIVACY_DEFAULTS),
 			// One source of truth — this literal used to be a second copy that had
 			// to be updated in lockstep whenever a binding was added.
 			keybindings: { ...KEYBINDINGS_DEFAULTS },
@@ -603,8 +603,17 @@ export async function saveProjectsConfig(projects: ProjectsConfig): Promise<void
 
 // --- Privacy ---
 
+/// Mirrors `PrivacyConfig::default()` in Rust. Network consents default off;
+/// clipboard exclusions default *on*, because a secret that reaches the history
+/// is already leaked (C6).
+export const PRIVACY_DEFAULTS: PrivacyConfig = {
+	allow_ip_geolocation: false,
+	allow_public_ip: false,
+	clipboard: { respect_sensitive_hint: true, excluded_apps: [] },
+};
+
 export async function getPrivacyConfig(): Promise<PrivacyConfig> {
-	if (!isTauri()) return { allow_ip_geolocation: false, allow_public_ip: false };
+	if (!isTauri()) return structuredClone(PRIVACY_DEFAULTS);
 	return unwrap(await commands.getPrivacyConfig());
 }
 

@@ -1365,6 +1365,22 @@ export type ClipboardContentType =
  */
 { type: "Plain" }
 /**
+ * Clipboard capture exclusions. Unlike the flags above these default to *on*:
+ * a secret that reaches the history is already leaked, so the safe default is
+ * to skip it and let the user opt out, not opt in.
+ */
+export type ClipboardPrivacyConfig = { 
+/**
+ * Honour the `x-kde-passwordManagerHint` / `--sensitive` marker that
+ * password managers put on the selection alongside the text.
+ */
+respect_sensitive_hint: boolean; 
+/**
+ * Normalised `wm_class` values whose copies are never recorded.
+ * Matched against the window that owned focus when the copy happened.
+ */
+excluded_apps: string[] }
+/**
  * The family a command belongs to, for grouping in the Guide. Each handler
  * declares its own via `ActionHandler::category` (default `General`), so the
  * grouping is generated from the live registry and never hardcoded frontend-side.
@@ -1961,7 +1977,11 @@ allow_ip_geolocation: boolean;
 /**
  * Allow public IP lookup (sysinfo net via ifconfig.me)
  */
-allow_public_ip: boolean }
+allow_public_ip: boolean; 
+/**
+ * What the clipboard monitor refuses to record.
+ */
+clipboard: ClipboardPrivacyConfig }
 export type ProjectContext = { root: string; kind: ProjectKind; 
 /**
  * Whether a `docker-compose.yml` or `compose.yml` exists in the project root.

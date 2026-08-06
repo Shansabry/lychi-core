@@ -29,10 +29,13 @@ impl ClipboardStore {
     ) -> Result<Vec<ClipboardItem>, LychiError> {
         let txn = db.begin_read()?;
         let table = txn.open_table(db::CLIPBOARD)?;
-        let mut items = Vec::new();
-        // UUID v7 keys are time-ordered, so iterating gives chronological order.
-        // Reverse for most-recent-first.
-        for result in table.iter()? {
+        let mut items = Vec::with_capacity(limit.min(64));
+        // UUID v7 keys are time-ordered, so iterating in reverse gives
+        // most-recent-first directly. Taking `limit` from that end means we
+        // deserialize only what we return — the old version decoded every row
+        // (including base64 image thumbnails) and then threw all but `limit`
+        // away, which is what made raising the cap expensive.
+        for result in table.iter()?.rev().take(limit) {
             let (key, val) = result?;
             let entry: ClipboardEntry = postcard::from_bytes(val.value())
                 .map_err(|e| LychiError::Database(e.to_string()))?;
@@ -47,8 +50,6 @@ impl ClipboardStore {
                 }),
             });
         }
-        items.reverse();
-        items.truncate(limit);
         Ok(items)
     }
 
@@ -335,12 +336,53 @@ fn clipboard_monitor_loop(db: &Arc<Database>, running: &Arc<std::sync::atomic::A
         if current_hash == last_text_hash {
             continue;
         }
+        // Advance the hash before the privacy check, not after: a skipped
+        // secret must not be re-examined every 500ms for as long as it sits on
+        // the clipboard. We decline to *record* it, we don't keep inspecting it.
         last_text_hash = current_hash;
+
+        if let Some(reason) = skip_reason(is_wayland) {
+            // Log the reason but never the text — a privacy skip that leaks the
+            // secret into the log has achieved nothing.
+            tracing::debug!("[clipboard] not recorded: {}", reason.as_log_str());
+            continue;
+        }
 
         if let Err(e) = store.push(db, text) {
             tracing::warn!("Clipboard store error: {e}");
         }
     }
+}
+
+/// Should this copy be kept out of history? Gathers the two live inputs the
+/// pure decider in [`super::sensitive`] needs, and does nothing else — the rule
+/// itself lives there and is tested without a compositor.
+///
+/// Both probes are skipped entirely when the user has turned every exclusion
+/// off, so the default-off case costs nothing per copy.
+fn skip_reason(is_wayland: bool) -> Option<super::sensitive::SkipReason> {
+    use super::sensitive;
+
+    let policy = sensitive::current_policy();
+    if !policy.respect_sensitive_hint && policy.excluded_apps.is_empty() {
+        return None;
+    }
+
+    let offered = if policy.respect_sensitive_hint {
+        sensitive::offered_types(is_wayland)
+    } else {
+        None
+    };
+    // Only ask who is focused if an exclusion list could actually use it.
+    let wm_class = if policy.excluded_apps.is_empty() {
+        String::new()
+    } else {
+        crate::context::snapshot_active_window()
+            .map(|w| w.wm_class)
+            .unwrap_or_default()
+    };
+
+    sensitive::should_skip(&policy, offered.as_deref(), &wm_class)
 }
 
 /// Read plain text from the clipboard. Tries arboard first (works on X11 and
@@ -481,6 +523,34 @@ mod tests {
         let entries = store.get_entries(&db, 3).unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].text, "entry 4"); // Most recent
+    }
+
+    #[test]
+    fn limited_read_returns_the_newest_not_the_oldest() {
+        // The reverse-take rewrite could plausibly return the *first* `limit`
+        // rows in key order — i.e. the oldest — while still passing a length
+        // check. Assert the actual identities.
+        let db = crate::db::open_test_database();
+        let store = ClipboardStore::new();
+        for i in 0..10 {
+            store.push(&db, &format!("entry {i}")).unwrap();
+        }
+
+        let entries = store.get_entries(&db, 3).unwrap();
+        let texts: Vec<&str> = entries.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, vec!["entry 9", "entry 8", "entry 7"]);
+    }
+
+    #[test]
+    fn limit_larger_than_the_table_returns_everything_newest_first() {
+        let db = crate::db::open_test_database();
+        let store = ClipboardStore::new();
+        store.push(&db, "a").unwrap();
+        store.push(&db, "b").unwrap();
+
+        let entries = store.get_entries(&db, 100).unwrap();
+        let texts: Vec<&str> = entries.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, vec!["b", "a"]);
     }
 
     #[test]

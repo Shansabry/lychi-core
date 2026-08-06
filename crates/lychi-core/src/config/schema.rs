@@ -613,6 +613,33 @@ pub struct PrivacyConfig {
     pub allow_ip_geolocation: bool,
     /// Allow public IP lookup (sysinfo net via ifconfig.me)
     pub allow_public_ip: bool,
+    /// What the clipboard monitor refuses to record.
+    pub clipboard: ClipboardPrivacyConfig,
+}
+
+/// Clipboard capture exclusions. Unlike the flags above these default to *on*:
+/// a secret that reaches the history is already leaked, so the safe default is
+/// to skip it and let the user opt out, not opt in.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct ClipboardPrivacyConfig {
+    /// Honour the `x-kde-passwordManagerHint` / `--sensitive` marker that
+    /// password managers put on the selection alongside the text.
+    pub respect_sensitive_hint: bool,
+    /// Normalised `wm_class` values whose copies are never recorded.
+    /// Matched against the window that owned focus when the copy happened.
+    pub excluded_apps: Vec<String>,
+}
+
+impl Default for ClipboardPrivacyConfig {
+    fn default() -> Self {
+        Self {
+            respect_sensitive_hint: true,
+            // Deliberately empty. Password managers are covered by the hint
+            // above, which is what they actually set — guessing at `wm_class`
+            // values would be a name-matching table that silently rots.
+            excluded_apps: Vec::new(),
+        }
+    }
 }
 
 /// Configurable keyboard shortcuts for in-app actions.

@@ -164,6 +164,7 @@ mod tests {
         PrivacyConfig {
             allow_ip_geolocation: true,
             allow_public_ip: true,
+            ..PrivacyConfig::default()
         }
     }
 

@@ -442,6 +442,16 @@ pub fn run() {
                 }
             }
 
+            // Publish clipboard privacy policy before the monitor starts, so the
+            // very first copy after launch is already filtered (C6/H1).
+            lychi_core::clipboard::sensitive::publish_policy(
+                &app.state::<AppState>()
+                    .config
+                    .blocking_read()
+                    .privacy
+                    .clipboard,
+            );
+
             // Background clipboard monitor — owns its OS thread (not the Tokio blocking pool)
             let clip_db = app.state::<AppState>().db.clone();
             let clipboard_running = app.state::<AppState>().clipboard_running.clone();

@@ -8,7 +8,7 @@ import type {
 	KeybindingsConfig,
 	PrivacyConfig,
 } from "$lib/ipc";
-import { KEYBINDINGS_DEFAULTS } from "$lib/ipc";
+import { KEYBINDINGS_DEFAULTS, PRIVACY_DEFAULTS } from "$lib/ipc";
 import { preloadSettings } from "$lib/preloadCache";
 import AboutTab from "./settings/AboutTab.svelte";
 import AiTab from "./settings/ai/AiTab.svelte";
@@ -60,10 +60,9 @@ let commandsConfig: CommandsConfig = $state({
 	terminal_routing: "manual",
 	search_engines: {},
 });
-let privacyConfig: PrivacyConfig = $state({
-	allow_ip_geolocation: false,
-	allow_public_ip: false,
-});
+// Protecting until the real config arrives, so a slow load never renders the
+// clipboard toggle as off.
+let privacyConfig: PrivacyConfig = $state(structuredClone(PRIVACY_DEFAULTS));
 let keybindingsConfig: KeybindingsConfig = $state({ ...KEYBINDINGS_DEFAULTS });
 let projectDirs: string[] = $state([]);
 
