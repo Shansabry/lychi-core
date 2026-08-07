@@ -652,11 +652,21 @@ pub fn reposition_to_monitor(window: &WebviewWindow, monitor: &gdk::Monitor) {
             gtk_win.move_(geom.x(), geom.y());
         } else if wants_fullscreen() {
             // Mutter ignores move_() — retarget via fullscreen-on-output
-            if let Some(display) = gdk::Display::default() {
-                gtk_win.fullscreen_on_monitor(
-                    &gtk::prelude::WidgetExt::screen(&gtk_win)
-                        .unwrap_or_else(|| gdk::Screen::default().expect("no GDK screen")),
-                    monitor_index(&display, monitor),
+            // Every other GDK accessor in this file treats "no display/screen"
+            // as a condition to handle (`?`, `if let`, `ok_or`); this one
+            // panicked. It runs on the GTK main thread during a monitor
+            // change, where a screen can genuinely be absent mid-hotplug — and
+            // a panic there takes the process down rather than skipping one
+            // repositioning. Fall through: the window stays where it is, which
+            // is what happens on every other compositor anyway.
+            if let (Some(display), Some(screen)) = (
+                gdk::Display::default(),
+                gtk::prelude::WidgetExt::screen(&gtk_win).or_else(gdk::Screen::default),
+            ) {
+                gtk_win.fullscreen_on_monitor(&screen, monitor_index(&display, monitor));
+            } else {
+                tracing::warn!(
+                    "[window] no GDK screen while repositioning — leaving the window in place"
                 );
             }
         }

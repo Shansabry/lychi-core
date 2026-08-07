@@ -678,3 +678,126 @@ mod tests {
         assert!(p.is_expired(), "a past-deadline pending must be rejected");
     }
 }
+
+#[cfg(test)]
+mod ai_prompt_coverage {
+    /// E3: `intent::prompt::action_description` is a hand-maintained table
+    /// parallel to `ActionHandler::description()`, and a handler missing from
+    /// it reaches the model as "Unknown command" — i.e. it is invisible to AI
+    /// routing, silently, from the moment it is registered.
+    ///
+    /// The duplication itself is not fixed here (see the note at that
+    /// function: `known_actions: &[&str]` is a trait parameter on every
+    /// provider and part of the cloud request body). This test makes the
+    /// consequence impossible to miss instead: add a handler, forget the
+    /// description, and CI says so.
+    ///
+    /// It lives in this crate because this is where the registry is built —
+    /// `lychi-core` has no list of what gets registered.
+    /// Every `registry.register(...)` line in this file, by handler id.
+    ///
+    /// Read from the SOURCE rather than by constructing handlers: most need a
+    /// database and a live config, so building the real registry in a unit
+    /// test would mean standing up half the app to check a list of strings.
+    /// Scanning the registration block cannot drift from it either — adding a
+    /// handler necessarily adds a line here.
+    fn registered_handler_types() -> Vec<String> {
+        let src = include_str!("state.rs");
+        src.lines()
+            .filter_map(|l| l.trim().strip_prefix("registry.register(Box::new("))
+            .filter_map(|rest| {
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                (!name.is_empty()).then_some(name)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_registration_scan_finds_the_handlers() {
+        // Guard the guard: a scan that silently matches nothing would make the
+        // coverage test below vacuously pass.
+        let found = registered_handler_types();
+        assert!(
+            found.len() > 30,
+            "expected to find the registration block; got {found:?}"
+        );
+        assert!(found.iter().any(|h| h == "WebSearch"));
+    }
+
+    /// Handler ids that carry no AI description today.
+    ///
+    /// This list is the CURRENT state, not the desired one — it exists so the
+    /// number cannot grow silently. Adding a handler without a description
+    /// fails this test; the fix is an arm in `action_description`, not an
+    /// entry here.
+    #[test]
+    fn ai_description_coverage_does_not_regress() {
+        // Ids are the stable contract with the prompt table, and a handler
+        // type name is not its id, so only ids we can name are checked.
+        // Read off `ActionHandler::id()` across handlers/ — the actual ids, not
+        // plausible-looking guesses. (`snip` not "snippet", `sym` not "symbol",
+        // `reminder` not "remind": the first version of this list guessed and
+        // reported three commands missing that do not exist.)
+        const KNOWN_IDS: &[&str] = &[
+            "alias",
+            "appctl",
+            "bm",
+            "browse",
+            "calc",
+            "clear",
+            "clip",
+            "color",
+            "convert",
+            "ctx",
+            "define",
+            "devutil",
+            "emoji",
+            "extract",
+            "file",
+            "generate",
+            "media",
+            "note",
+            "open",
+            "packages",
+            "pin_workspace",
+            "project",
+            "qr",
+            "quicklink",
+            "reminder",
+            "resize",
+            "run",
+            "screenshot",
+            "script",
+            "service",
+            "services",
+            "snip",
+            "ssh",
+            "sym",
+            "sysinfo",
+            "system",
+            "time",
+            "timer",
+            "todo",
+            "unicode",
+            "url",
+            "weather",
+            "web",
+            "win",
+            "yt",
+            "zip",
+        ];
+        let missing: Vec<&&str> = KNOWN_IDS
+            .iter()
+            .filter(|id| !lychi_core::intent::prompt::has_action_description(id))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these commands have no AI description, so the model sees \"Unknown \
+             command\" and cannot route to them: {missing:?}\n\
+             Add an arm to `intent::prompt::action_description`.",
+        );
+    }
+}

@@ -65,6 +65,14 @@ Rules:
     )
 }
 
+/// Does this command have a real description for the AI prompt?
+///
+/// Public so the crate that BUILDS the registry can assert every registered
+/// handler is covered — `lychi-core` cannot see the registration list itself.
+pub fn has_action_description(id: &str) -> bool {
+    action_description(id) != "Unknown command"
+}
+
 fn action_description(id: &str) -> &'static str {
     match id {
         "ask" => {
@@ -136,6 +144,39 @@ fn action_description(id: &str) -> &'static str {
         "packages" => {
             "Search or install SYSTEM packages via the OS package manager (dnf/apt/pacman/flatpak). Args: 'search <query>' or 'install <package>'. Use for 'install neovim', 'search for a markdown editor', 'is ripgrep available to install'. NOT for web searches"
         }
+        // --- Added 2026-08-07: these were registered but undescribed, so the
+        // --- model saw "Unknown command" and could never route to them.
+        // --- Text mirrors each handler's own `description()`.
+        "win" => {
+            "Switch between open windows — focus or close a running application's window (e.g. 'win firefox'). Use when the user wants to switch TO something already open rather than launch it"
+        }
+        "ssh" => "Connect to an SSH host from ~/.ssh/config (e.g. 'ssh myserver')",
+        "define" => "Look up a word's dictionary definition (e.g. 'define ephemeral')",
+        "qr" => "Generate a QR code from text or a URL",
+        "zip" => "Create an archive: zip <path...> [to <out.zip>]",
+        "extract" => "Extract an archive: extract <archive.zip|.tar.gz> [to <dir>]",
+        "convert" => {
+            "Convert an image to another format: convert <path> to <png|jpg|webp|gif|bmp|tiff>"
+        }
+        "resize" => "Resize an image: resize <path> to <800x600|800|x600|50%>",
+        "clear" => {
+            "Clear stored data — history, clipboard, or learned suggestions. Destructive, so it always confirms first"
+        }
+        "quicklink" => "Run a user-defined search shortcut (gh, npm, mdn, …)",
+        "script" => "Run a user Script Command from ~/.config/lychi/scripts/",
+        "pin_workspace" => "Pin a workspace directory so context detection uses it",
+        "ctx" => "Show the current environment context (debugging aid)",
+
+        // A handler with no entry here is INVISIBLE to AI routing: the model
+        // sees "Unknown command" and cannot reasonably pick it.
+        //
+        // The real fix is to read `ActionHandler::description()` (which
+        // `ActionRegistry::list_descriptions` already returns and nothing
+        // calls), but `known_actions: &[&str]` is a trait-level parameter on
+        // every provider AND part of the cloud request body, so threading
+        // descriptions through is a wider change than this is worth before
+        // 1.0. Until then the test below fails when a registered handler is
+        // missing from this table, so it cannot go unnoticed.
         _ => "Unknown command",
     }
 }

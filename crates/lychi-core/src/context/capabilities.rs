@@ -216,3 +216,107 @@ mod tests {
         );
     }
 }
+
+/// Why window enumeration cannot work here, if it cannot.
+///
+/// `active_window::detect()` dispatches on the compositor and falls to
+/// `_ => None` for GNOME Wayland, because Mutter implements neither
+/// wlr-foreign-toplevel nor a scripting interface. The whole `context/` brick
+/// goes with it: no terminal CWD, no git branch, no IDE workspace. Every one of
+/// those degrades quietly, and `win` reported "No open windows" — a sentence
+/// that is indistinguishable from the truthful answer on a working system.
+///
+/// This is the one decider for that question, so a handler never has to infer
+/// "unsupported" from an empty list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowSupport {
+    /// Windows can be listed and focused.
+    Available,
+    /// The compositor exposes no protocol for it. Nothing to fix locally.
+    Unsupported,
+}
+
+impl WindowSupport {
+    /// Decide from the compositor. Pure so every branch is testable.
+    pub fn for_compositor(compositor: crate::context::Compositor) -> Self {
+        use crate::context::Compositor;
+        match compositor {
+            // KWin scripting, wlroots foreign-toplevel, and X11 EWMH all work.
+            Compositor::KdeWayland | Compositor::OtherWayland | Compositor::X11 => Self::Available,
+            // Mutter: no foreign-toplevel protocol, no scripting interface.
+            Compositor::GnomeWayland => Self::Unsupported,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn detect() -> Self {
+        Self::for_compositor(crate::context::compositor())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn detect() -> Self {
+        Self::Available
+    }
+
+    pub fn is_available(self) -> bool {
+        matches!(self, Self::Available)
+    }
+
+    /// What to tell the user instead of "No open windows".
+    ///
+    /// Names the cause and the one thing that actually helps, because a user on
+    /// GNOME Wayland cannot install their way out of this — the protocol is
+    /// simply absent, and saying "no windows" sends them looking for a bug in
+    /// Lychi.
+    pub fn explain(self) -> &'static str {
+        match self {
+            Self::Available => "Window control is available.",
+            Self::Unsupported => {
+                "GNOME on Wayland does not expose a window list to other \
+                 applications, so Lychi cannot see or switch windows here. \
+                 Everything else works. An X11 session (or KDE/wlroots on \
+                 Wayland) restores it."
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod window_support_tests {
+    use super::*;
+    use crate::context::Compositor;
+
+    #[test]
+    fn gnome_wayland_is_the_unsupported_case() {
+        let s = WindowSupport::for_compositor(Compositor::GnomeWayland);
+        assert_eq!(s, WindowSupport::Unsupported);
+        assert!(!s.is_available());
+        // The message must name the cause, not just report emptiness.
+        assert!(s.explain().contains("GNOME"));
+        assert!(s.explain().contains("Wayland"));
+    }
+
+    #[test]
+    fn the_three_working_backends_are_available() {
+        for c in [
+            Compositor::KdeWayland,
+            Compositor::OtherWayland,
+            Compositor::X11,
+        ] {
+            assert!(
+                WindowSupport::for_compositor(c).is_available(),
+                "{c:?} has a working backend and must not be reported unsupported"
+            );
+        }
+    }
+
+    /// The point of the item: "unsupported" and "nothing open" must not read
+    /// the same to a user.
+    #[test]
+    fn the_two_states_say_different_things() {
+        assert_ne!(
+            WindowSupport::Available.explain(),
+            WindowSupport::Unsupported.explain()
+        );
+    }
+}

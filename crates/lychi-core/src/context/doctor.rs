@@ -97,6 +97,13 @@ pub fn report() -> String {
     // the reader knows which of their symptoms it explains.
     out.push_str("\nConsequences\n");
     let mut notes: Vec<String> = Vec::new();
+
+    // The definitive verdict, from the same decider the handlers use, so
+    // `doctor` and `win` can never disagree about whether windows work here.
+    let support = crate::context::capabilities::WindowSupport::detect();
+    if !support.is_available() {
+        notes.push(support.explain().into());
+    }
     if !caps.kwin_scripting && !caps.gnome_shell && s.is_wayland() {
         notes.push(
             "No compositor scripting interface. Window listing and focus rely on \

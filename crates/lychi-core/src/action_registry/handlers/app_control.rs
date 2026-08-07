@@ -136,33 +136,76 @@ fn enumerate_windows() -> Vec<RunningWindow> {
     Vec::new()
 }
 
-/// Fuzzy match a query against a window's title and class.
+/// How well a window answers a query. Higher is better; `None` is no match.
+///
+/// Bare `contains` on `wm_class` was the whole of this before, and it is the
+/// false-positive class `classify_window_class` was rewritten to eliminate:
+/// "code" matches "vscode", "qtcreator" and anything else with those letters
+/// mid-word, and the FIRST such window in enumeration order won. Enumeration
+/// order is arbitrary, so `quit code` could close the wrong application.
+///
+/// Substring is still allowed — this is a user searching, not a classifier —
+/// but it is now the WEAKEST signal rather than the only one, and every
+/// candidate is scored so the best match wins instead of the first seen.
+fn match_score(window: &RunningWindow, query_lower: &str) -> Option<u32> {
+    let class = window.wm_class.to_lowercase();
+    let short = class.rsplit('.').next().unwrap_or(&class);
+    let title = window.title.to_lowercase();
+
+    if class == query_lower || short == query_lower {
+        return Some(100); // exact class ("firefox")
+    }
+    if class.starts_with(query_lower) || short.starts_with(query_lower) {
+        return Some(80); // prefix ("fire" → "firefox")
+    }
+    // Whole-word hit in the title ("slack" in "Slack | general"), which is a
+    // real match rather than an accident of letters.
+    if title
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| w == query_lower)
+    {
+        return Some(60);
+    }
+    if title.starts_with(query_lower) {
+        return Some(50);
+    }
+    // Weakest: letters appearing anywhere. Kept so a partial recall still
+    // finds something, but it can no longer outrank a real match.
+    if class.contains(query_lower) {
+        return Some(30);
+    }
+    if title.contains(query_lower) {
+        return Some(20);
+    }
+    None
+}
+
+/// Does this window answer the query at all?
 fn matches_window(window: &RunningWindow, query: &str) -> bool {
-    let query_lower = query.to_lowercase();
-    window.wm_class.contains(&query_lower) || window.title.to_lowercase().contains(&query_lower)
+    match_score(window, &query.to_lowercase()).is_some()
 }
 
 /// Find the best matching window for a query.
+///
+/// Scores every candidate and takes the highest, rather than returning the
+/// first window that happens to contain the letters. Ties keep enumeration
+/// order (`max_by_key` is last-wins, so the fold below keeps the first).
 pub(crate) fn find_window<'a>(
     windows: &'a [RunningWindow],
     query: &str,
 ) -> Option<&'a RunningWindow> {
     let query_lower = query.to_lowercase();
-
-    // Exact class match first
-    if let Some(w) = windows.iter().find(|w| w.wm_class == query_lower) {
-        return Some(w);
-    }
-
-    // Substring match on class
-    if let Some(w) = windows.iter().find(|w| w.wm_class.contains(&query_lower)) {
-        return Some(w);
-    }
-
-    // Substring match on title
     windows
         .iter()
-        .find(|w| w.title.to_lowercase().contains(&query_lower))
+        .filter_map(|w| match_score(w, &query_lower).map(|s| (s, w)))
+        .fold(
+            None::<(u32, &'a RunningWindow)>,
+            |best, (score, w)| match best {
+                Some((bs, _)) if bs >= score => best,
+                _ => Some((score, w)),
+            },
+        )
+        .map(|(_, w)| w)
 }
 
 /// Parse the verb and target from args.
@@ -600,5 +643,99 @@ impl ActionHandler for AppControlHandler {
         }
 
         items
+    }
+}
+
+#[cfg(test)]
+mod window_matching_tests {
+    use super::*;
+
+    fn win(wm_class: &str, title: &str) -> RunningWindow {
+        RunningWindow {
+            window_id: Some(1),
+            kwin_id: None,
+            wm_class: wm_class.into(),
+            title: title.into(),
+            pid: 1,
+            desktop: None,
+        }
+    }
+
+    /// F4: bare `contains` returned the FIRST window holding those letters, and
+    /// enumeration order is arbitrary — so `quit code` could close QtCreator.
+    /// An exact match must win regardless of where it sits in the list.
+    #[test]
+    fn an_exact_class_beats_an_incidental_substring() {
+        let windows = vec![
+            win("qtcreator", "main.cpp"),
+            win("vscodium", "notes.md"),
+            win("code", "lychi — executor.rs"),
+        ];
+        let found = find_window(&windows, "code").expect("should match");
+        assert_eq!(found.wm_class, "code", "an exact class match must win");
+    }
+
+    /// Order must not decide the answer: same set, exact match placed first.
+    #[test]
+    fn the_winner_does_not_depend_on_enumeration_order() {
+        let a = vec![win("code", "editor"), win("qtcreator", "main.cpp")];
+        let b = vec![win("qtcreator", "main.cpp"), win("code", "editor")];
+        assert_eq!(find_window(&a, "code").unwrap().wm_class, "code");
+        assert_eq!(find_window(&b, "code").unwrap().wm_class, "code");
+    }
+
+    #[test]
+    fn a_prefix_beats_a_mid_string_hit() {
+        let windows = vec![win("vscodium", "x"), win("firefox", "y")];
+        assert_eq!(find_window(&windows, "fire").unwrap().wm_class, "firefox");
+    }
+
+    /// The case only the EXACT tier can answer: a query that is a prefix of
+    /// another window's class, and the exact name of this one. "code" is a
+    /// prefix of "codium", so prefix-matching alone cannot separate them —
+    /// deleting the exact tier makes this fail.
+    #[test]
+    fn an_exact_match_beats_a_prefix_of_a_longer_name() {
+        // "code-insiders" genuinely starts with "code", so both score at the
+        // prefix tier and only the exact tier separates them.
+        let windows = vec![win("code-insiders", "notes.md"), win("code", "editor")];
+        assert_eq!(
+            find_window(&windows, "code").unwrap().wm_class,
+            "code",
+            "the window NAMED code must win over one merely starting with it"
+        );
+    }
+
+    /// Reverse-DNS classes are common on Wayland; the leaf must match too.
+    #[test]
+    fn a_reverse_dns_class_matches_on_its_last_segment() {
+        let windows = vec![win("org.gnome.Nautilus", "Home")];
+        assert_eq!(
+            find_window(&windows, "nautilus").unwrap().wm_class,
+            "org.gnome.Nautilus"
+        );
+    }
+
+    /// A whole word in the title is a real match; letters mid-word are not,
+    /// and must not outrank it.
+    #[test]
+    fn a_title_word_beats_an_incidental_class_substring() {
+        let windows = vec![win("vscodium", "scratch"), win("slack", "Slack | general")];
+        assert_eq!(find_window(&windows, "slack").unwrap().wm_class, "slack");
+    }
+
+    /// Substring is still allowed — a partial recall should find something.
+    #[test]
+    fn a_substring_still_matches_when_nothing_better_exists() {
+        let windows = vec![win("qtcreator", "main.cpp")];
+        assert!(find_window(&windows, "creator").is_some());
+        assert!(matches_window(&windows[0], "creator"));
+    }
+
+    #[test]
+    fn no_match_is_none() {
+        let windows = vec![win("firefox", "Mozilla Firefox")];
+        assert!(find_window(&windows, "inkscape").is_none());
+        assert!(!matches_window(&windows[0], "inkscape"));
     }
 }

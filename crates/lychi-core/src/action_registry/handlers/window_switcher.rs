@@ -98,6 +98,19 @@ fn completion_label(display_name: &str, title: &str, is_multi: bool, is_close: b
     }
 }
 
+/// The honest answer when no windows came back.
+///
+/// `WindowSupport` is the ONE decider (`context::capabilities`); this never
+/// re-derives "unsupported" from an empty list, which is exactly the inference
+/// that made the two cases indistinguishable.
+fn unsupported_or_empty() -> String {
+    use crate::context::capabilities::WindowSupport;
+    match WindowSupport::detect() {
+        WindowSupport::Available => "No open windows".to_string(),
+        s @ WindowSupport::Unsupported => s.explain().to_string(),
+    }
+}
+
 /// Find the exact window that matches a completion label.
 /// When the label contains " — ", match by class + title substring.
 fn find_window_by_label<'a>(
@@ -158,7 +171,10 @@ impl ActionHandler for WindowSwitcherHandler {
         if query.is_empty() {
             let windows = app_control::get_windows();
             if windows.is_empty() {
-                return Ok(ActionResult::ok("No open windows", OutputType::Status));
+                // An empty list means two very different things, and saying
+                // "No open windows" for both sent GNOME Wayland users hunting
+                // a bug in Lychi. Ask the capability layer which one it is.
+                return Ok(ActionResult::ok(unsupported_or_empty(), OutputType::Status));
             }
             let list: Vec<String> = windows
                 .iter()
@@ -183,7 +199,15 @@ impl ActionHandler for WindowSwitcherHandler {
         let window = match window {
             Some(w) => w,
             None => {
-                return Ok(ActionResult::err(format!("No window matching '{query}'")));
+                // Same distinction as the empty-list path above: on a
+                // compositor with no window protocol, "no window matching X"
+                // blames the query for a limitation of the session.
+                use crate::context::capabilities::WindowSupport;
+                let msg = match WindowSupport::detect() {
+                    WindowSupport::Available => format!("No window matching '{query}'"),
+                    s @ WindowSupport::Unsupported => s.explain().to_string(),
+                };
+                return Ok(ActionResult::err(msg));
             }
         };
 

@@ -62,7 +62,45 @@ fn main() {
     // ghosting. Users with genuine NVIDIA blank-window issues can set the
     // env var themselves — we never override an explicit value.
 
+    install_async_runtime();
     lychi_app::run();
+}
+
+/// Hand Tauri a runtime sized for a launcher, before it builds its own.
+///
+/// Tauri's default is `TokioRuntime::new()`, i.e. `worker_threads` = CPU count
+/// — 12 on this machine, more on a workstation. Every worker costs a 2 MB
+/// stack reservation and its own allocator arena, and Lychi's async work is
+/// almost entirely I/O-bound (subprocess waits, D-Bus round trips, HTTP to an
+/// AI provider). Those block, they do not compute, so scaling the pool with
+/// core count buys nothing and charges memory for it.
+///
+/// Four is enough to keep several blocking round trips in flight without
+/// serialising them; `spawn_blocking` has its own separate pool and is
+/// unaffected. Deliberately not 1: the reactors and the IPC server genuinely
+/// run concurrently.
+///
+/// Must run before the first `async_runtime` call — the global is a
+/// `OnceLock`, so a later `set()` is silently ignored.
+fn install_async_runtime() {
+    const WORKERS: usize = 4;
+    match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(WORKERS)
+        .thread_name("lychi-async")
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => {
+            // Tauri takes a Handle and requires the runtime to outlive it;
+            // leaking is the documented way to express "lives for the process".
+            let handle = rt.handle().clone();
+            std::mem::forget(rt);
+            tauri::async_runtime::set(handle);
+        }
+        // A runtime we could not build is not worth aborting over — Tauri will
+        // construct its default one and the app still runs, just wider.
+        Err(e) => tracing::warn!("[startup] custom async runtime failed ({e}); using the default"),
+    }
 }
 
 /// Map argv to the socket line the running instance expects, or `None` when
