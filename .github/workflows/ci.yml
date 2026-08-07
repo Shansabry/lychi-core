@@ -270,7 +270,7 @@ jobs:
           #
           # Verified by mutation: typo'ing the `_NET_WM_PID` atom fails it.
           - backend: x11
-            packages: xvfb openbox xterm x11-utils
+            packages: xvfb openbox xterm x11-utils xdotool
             script: ./scripts/test-x11.sh
     steps:
       - uses: actions/checkout@v4

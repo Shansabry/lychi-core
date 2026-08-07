@@ -13,16 +13,16 @@
 # tests.
 #
 # Usage:  scripts/test-x11.sh
-# Needs:  Xvfb, openbox, xterm, xprop, xdpyinfo
+# Needs:  Xvfb, openbox, xterm, xprop, xdpyinfo, xdotool
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-for tool in Xvfb openbox xterm xprop xdpyinfo; do
+for tool in Xvfb openbox xterm xprop xdpyinfo xdotool; do
   if ! command -v "$tool" >/dev/null; then
     echo "$tool not installed — skipping X11 tests" >&2
-    echo "  Fedora: sudo dnf install xorg-x11-server-Xvfb openbox xterm xorg-x11-utils" >&2
-    echo "  Debian: sudo apt-get install xvfb openbox xterm x11-utils" >&2
+    echo "  Fedora: sudo dnf install xorg-x11-server-Xvfb openbox xterm xorg-x11-utils xdotool" >&2
+    echo "  Debian: sudo apt-get install xvfb openbox xterm x11-utils xdotool" >&2
     exit 127
   fi
 done
@@ -91,6 +91,25 @@ APP_PID=$!
 #
 # `_NET_ACTIVE_WINDOW` present and non-zero means the WM is up AND has focused
 # a window — exactly the precondition, and precisely what the tests read.
+# Openbox publishes `_NET_ACTIVE_WINDOW` only once it has actually FOCUSED a
+# window. Headless, with no pointer and no user input, it may map the window
+# (it appears in `_NET_CLIENT_LIST`) and never focus it — which is exactly what
+# CI showed: the client list had the window while `_NET_ACTIVE_WINDOW` was
+# "not found". That is not a race, so waiting longer cannot fix it; focus has
+# to be requested explicitly.
+#
+# `xdotool windowactivate` sends the EWMH `_NET_ACTIVE_WINDOW` client message,
+# i.e. it asks the WM through the same protocol a taskbar would.
+activate_first_client() {
+  local wid
+  wid=$(DISPLAY="$DISP" xprop -root _NET_CLIENT_LIST 2>/dev/null \
+        | sed -n 's/.*# \(0x[0-9a-fA-F]*\).*/\1/p' | head -1)
+  [ -n "$wid" ] || return 1
+  DISPLAY="$DISP" xdotool windowactivate "$wid" >/dev/null 2>&1 || true
+  DISPLAY="$DISP" xdotool windowfocus "$wid" >/dev/null 2>&1 || true
+  return 0
+}
+
 echo "Waiting for the window manager to focus a window..."
 # `xprop` EXITS 0 even when the atom is absent, printing one of:
 #   "_NET_ACTIVE_WINDOW:  not found."            (WM not up yet)
@@ -106,6 +125,8 @@ for _ in $(seq 1 80); do   # up to 20s
     active="$id"
     break
   fi
+  # The window may be mapped but unfocused — ask for focus, then re-check.
+  activate_first_client || true
   sleep 0.25
 done
 if [ -z "$active" ]; then
