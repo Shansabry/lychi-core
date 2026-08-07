@@ -129,6 +129,24 @@ pub fn providers() -> &'static [Box<dyn SuggestionProvider>] {
     })
 }
 
+/// Is this workspace-memory command just launching an app?
+///
+/// Matched against the app index rather than by parsing the verb: `open` is
+/// also how files and URLs are opened, and only the index can tell
+/// `open Spotify` (an app `recent_apps` will offer properly) from
+/// `open ./notes.md` (a file, which it will not).
+fn is_app_launch(command: &str) -> bool {
+    command
+        .strip_prefix("open ")
+        .map(str::trim)
+        .filter(|rest| !rest.is_empty())
+        .is_some_and(|app| {
+            crate::desktop_apps::app_index()
+                .by_name_exact(&app.to_lowercase())
+                .is_some()
+        })
+}
+
 // ── Clipboard (universal) ───────────────────────────────────────────────
 
 struct ClipboardProvider;
@@ -301,6 +319,18 @@ impl SuggestionProvider for MemoryProvider {
 
         ranked
             .into_iter()
+            // Drop app launches. `recent_apps` already offers these as real app
+            // rows — display name, real icon, one keystroke — and a `Candidate`
+            // cannot carry an icon (`into_completion_item` hardcodes
+            // `__context__`), so anything emitted here is necessarily the raw
+            // command text. Showing "open Xfce Terminal" as a lightning-bolt row
+            // above the Xfce Terminal app row is the duplicate the app zero
+            // state exists to remove.
+            //
+            // Workspace memory keeps everything else — `cargo test`, `npm run
+            // dev` — which is what it is genuinely good at: commands, not
+            // targets.
+            .filter(|(command, _)| !is_app_launch(command))
             .take(5)
             .enumerate()
             .map(|(i, (command, _score))| {

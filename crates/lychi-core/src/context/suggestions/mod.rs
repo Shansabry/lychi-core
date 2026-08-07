@@ -621,7 +621,7 @@ mod tests {
 
     // ── End-to-end engine behavior ──────────────────────────────────────
 
-    fn dev_env() -> EnvironmentContext {
+    pub(super) fn dev_env() -> EnvironmentContext {
         let mut env = empty_env();
         env.active_window = Some(super::super::WindowContext {
             title: "term".into(),
@@ -957,6 +957,50 @@ mod app_zero_state_tests {
             resolved <= MAX_RECENT_APPS,
             "resolved {resolved} icons for at most {MAX_RECENT_APPS} visible rows — \
              the take-before-resolve ordering has been lost"
+        );
+    }
+
+    /// The screenshot bug: workspace memory offered `open Xfce Terminal` as a
+    /// raw command row (lightning bolt, "Recent in <project>") ABOVE the real
+    /// Xfce Terminal app row. Two rows, one target, and the uglier one first.
+    #[test]
+    fn workspace_memory_does_not_duplicate_an_app_row() {
+        let _idx = with_apps(&[("Xfce Terminal", "/usr/bin/xfce4-terminal")]);
+        let db = crate::db::open_test_database();
+        // The app itself, and a workspace memory of having launched it here.
+        frecency::record(&db, "xfce terminal").unwrap();
+        frecency::record_workspace(&db, "/home/u/proj", "open Xfce Terminal").unwrap();
+
+        // `MemoryProvider` keys on the project root or, failing that, the cwd.
+        let mut env = super::tests::dev_env();
+        env.cwd = Some("/home/u/proj".into());
+
+        let items = suggest(&env, Some(&db));
+        let raw = items
+            .iter()
+            .filter(|i| i.label.starts_with("open "))
+            .count();
+        assert_eq!(
+            raw, 0,
+            "an app launch is still shown as raw command text: {items:?}"
+        );
+    }
+
+    /// ...but workspace memory must keep offering real COMMANDS. Dropping app
+    /// launches must not gut the feature.
+    #[test]
+    fn workspace_memory_still_offers_commands() {
+        let _idx = with_apps(&[("Xfce Terminal", "/usr/bin/xfce4-terminal")]);
+        let db = crate::db::open_test_database();
+        frecency::record_workspace(&db, "/home/u/proj", "cargo test").unwrap();
+
+        let mut env = super::tests::dev_env();
+        env.cwd = Some("/home/u/proj".into());
+
+        let items = suggest(&env, Some(&db));
+        assert!(
+            items.iter().any(|i| i.label == "cargo test"),
+            "workspace memory stopped offering commands: {items:?}"
         );
     }
 
