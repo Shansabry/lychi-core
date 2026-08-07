@@ -13,6 +13,7 @@ use crate::error::LychiError;
 use super::kwin_windows;
 #[cfg(target_os = "linux")]
 use super::x11_windows;
+use crate::text::truncate_display;
 
 pub struct AppControlHandler;
 
@@ -496,7 +497,7 @@ impl ActionHandler for AppControlHandler {
                         label: display_name.clone(),
                         icon_path: None,
                         score: (1000 - i as u16).max(1),
-                        description: Some(truncate(&w.title, 50)),
+                        description: Some(truncate_display(&w.title, 50)),
                         reason: None,
                         thumb_b64: None,
                         run: Some(format!("appctl {verb} {display_name}")),
@@ -525,7 +526,7 @@ impl ActionHandler for AppControlHandler {
                     label: display_name.clone(),
                     icon_path: None,
                     score: (1000 - i as u16).max(1),
-                    description: Some(truncate(&w.title, 50)),
+                    description: Some(truncate_display(&w.title, 50)),
                     reason: None,
                     thumb_b64: None,
                     run: Some(format!("appctl {verb} {display_name}")),
@@ -587,7 +588,7 @@ impl ActionHandler for AppControlHandler {
                         description: Some(format!(
                             "{} — {}",
                             proc.comm,
-                            truncate(&proc.cmdline, 60)
+                            truncate_display(&proc.cmdline, 60)
                         )),
                         reason: None,
                         thumb_b64: None,
@@ -599,13 +600,5 @@ impl ActionHandler for AppControlHandler {
         }
 
         items
-    }
-}
-
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len - 3])
     }
 }

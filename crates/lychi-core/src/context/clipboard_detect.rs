@@ -284,13 +284,7 @@ fn extract_error_line(s: &str) -> Option<String> {
 
 /// Cap the extracted line for use as a completion label / search query.
 fn truncate_line(line: &str) -> String {
-    const MAX_CHARS: usize = 80;
-    if line.chars().count() <= MAX_CHARS {
-        line.to_string()
-    } else {
-        let cut: String = line.chars().take(MAX_CHARS).collect();
-        format!("{}…", cut.trim_end())
-    }
+    crate::text::truncate_display(line, 80)
 }
 
 #[cfg(test)]

@@ -14,6 +14,7 @@ use crate::error::LychiError;
 
 use super::app_control::{self, RunningWindow};
 use super::icons;
+use crate::text::truncate_display;
 
 pub struct WindowSwitcherHandler {
     db: Arc<Database>,
@@ -85,7 +86,7 @@ fn class_counts(windows: &[RunningWindow]) -> HashMap<String, usize> {
 /// Build a completion label. If multiple windows share the same app, disambiguate with title.
 fn completion_label(display_name: &str, title: &str, is_multi: bool, is_close: bool) -> String {
     let base = if is_multi {
-        let short_title = truncate(title, 40);
+        let short_title = truncate_display(title, 40);
         format!("{display_name} — {short_title}")
     } else {
         display_name.to_string()
@@ -105,7 +106,11 @@ fn find_window_by_label<'a>(
 ) -> Option<&'a RunningWindow> {
     // Try "DisplayName — Title..." format first
     if let Some(dash_pos) = label.find(" — ") {
-        let title_fragment = label[dash_pos + " — ".len()..].trim_end_matches("...");
+        // The label may carry a truncation ellipsis; strip the one
+        // `truncate_display` actually appends, never a hardcoded literal.
+        let title_fragment = label[dash_pos + " — ".len()..]
+            .trim_end_matches(crate::text::ELLIPSIS)
+            .trim_end();
         return windows.iter().find(|w| {
             let name = display_name_for_class(&w.wm_class);
             label.starts_with(&name) && w.title.starts_with(title_fragment)
@@ -159,7 +164,7 @@ impl ActionHandler for WindowSwitcherHandler {
                 .iter()
                 .map(|w| {
                     let name = display_name_for_class(&w.wm_class);
-                    format!("  {name} — {}", truncate(&w.title, 50))
+                    format!("  {name} — {}", truncate_display(&w.title, 50))
                 })
                 .collect();
             return Ok(ActionResult::ok(
@@ -252,8 +257,8 @@ impl ActionHandler for WindowSwitcherHandler {
 
             let desk = desktop_label(w.desktop, is_kwin);
             let description = match desk {
-                Some(d) => Some(format!("{d} · {}", truncate(&w.title, 40))),
-                None => Some(truncate(&w.title, 50)),
+                Some(d) => Some(format!("{d} · {}", truncate_display(&w.title, 40))),
+                None => Some(truncate_display(&w.title, 50)),
             };
 
             let run = format!("win {label}");
@@ -330,14 +335,6 @@ impl ActionHandler for WindowSwitcherHandler {
 
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.into_iter().map(|(_, item)| item).take(20).collect()
-    }
-}
-
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len - 3])
     }
 }
 
@@ -443,5 +440,71 @@ mod tests {
         let counts = class_counts(&windows);
         assert_eq!(counts["firefox"], 2);
         assert_eq!(counts["konsole"], 1);
+    }
+}
+
+#[cfg(test)]
+mod truncate_regression {
+    /// F1: window titles are arbitrary UTF-8 set by any application. The old
+    /// `&s[..max_len - 3]` panicked mid-character on emoji/CJK titles.
+    #[test]
+    fn emoji_window_title_does_not_panic() {
+        for title in [
+            "🎵🎵🎵🎵🎵🎵🎵🎵🎵🎵 Now Playing",
+            "日本語のウィンドウタイトルです、とても長い",
+            "café ☕ — editor",
+        ] {
+            for cap in [40, 50] {
+                let out = crate::text::truncate_display(title, cap);
+                assert!(out.chars().count() <= cap);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod label_roundtrip {
+    use super::*;
+
+    /// The label a completion shows must resolve back to the window it named.
+    #[test]
+    fn a_truncated_label_still_finds_its_window() {
+        let w = RunningWindow {
+            window_id: Some(1),
+            kwin_id: None,
+            wm_class: "firefox".into(),
+            title: "A very long window title that will certainly be truncated".into(),
+            pid: 1,
+            desktop: None,
+        };
+        let label = completion_label("Firefox", &w.title, true, false);
+        assert!(
+            find_window_by_label(std::slice::from_ref(&w), &label).is_some(),
+            "label {label:?} did not resolve back to its window"
+        );
+    }
+
+    /// The same round-trip for a title that forced a multibyte cut — the exact
+    /// input class that used to panic before it ever got here.
+    #[test]
+    fn a_truncated_multibyte_label_still_finds_its_window() {
+        for title in [
+            "🎵🎵🎵🎵🎵🎵🎵🎵🎵🎵🎵🎵🎵🎵🎵 Now Playing Some Long Track",
+            "日本語のウィンドウタイトルです、とても長いのでこれは必ず切られます",
+        ] {
+            let w = RunningWindow {
+                window_id: Some(1),
+                kwin_id: None,
+                wm_class: "player".into(),
+                title: title.into(),
+                pid: 1,
+                desktop: None,
+            };
+            let label = completion_label("Player", &w.title, true, false);
+            assert!(
+                find_window_by_label(std::slice::from_ref(&w), &label).is_some(),
+                "label {label:?} did not resolve back to its window"
+            );
+        }
     }
 }

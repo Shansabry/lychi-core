@@ -3,22 +3,31 @@ use std::sync::OnceLock;
 /// A parsed and pre-indexed desktop application entry.
 #[derive(Debug)]
 pub struct DesktopEntry {
-    /// Display name (e.g. "Visual Studio Code")
+    /// Display name in the user's locale (e.g. "Rechner" under `LANG=de_DE`)
     pub name: String,
+    /// Other names this app answers to — currently the unlocalized `Name=` when
+    /// a localized one is displayed. A German user must find "Rechner" *and*
+    /// still find "Calculator", so both are searchable while only one is shown.
+    pub aliases: Vec<String>,
     /// Raw Exec= value with %u/%f placeholders stripped
     pub exec: String,
     /// Basename of the executable (e.g. "code" from "/usr/bin/code")
     pub exec_basename: String,
     /// StartupWMClass= (e.g. "Code")
     pub wm_class: Option<String>,
-    /// GenericName= (e.g. "Web Browser", "Text Editor")
+    /// GenericName= in the user's locale (e.g. "Web Browser", "Navigateur Web")
     pub generic_name: Option<String>,
+    /// Every GenericName variant worth searching — localized and unlocalized.
+    pub generic_names: Vec<String>,
     /// Keywords= normalized: lowercase, split on ';'/whitespace, deduped, stopwords removed
     pub keywords: Vec<String>,
     /// Lowercase tokens from Name (len ≥ 3, stopwords removed)
     pub name_tokens: Vec<String>,
-    /// Acronym from Name initials (e.g. "vsc" from "Visual Studio Code")
+    /// Acronym from the display Name's initials (e.g. "vsc" from "Visual Studio Code")
     pub acronym: String,
+    /// Acronyms for every name variant, so an acronym learned in one language
+    /// keeps working after a locale change.
+    pub acronyms: Vec<String>,
     /// Icon name or path
     pub icon: Option<String>,
     /// Categories= lowercased (e.g. ["network", "webbrowser"]). Used as a

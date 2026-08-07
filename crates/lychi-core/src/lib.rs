@@ -31,3 +31,4 @@ pub mod rules;
 pub mod script_commands;
 pub mod snippets;
 pub mod suggestions;
+pub mod text;

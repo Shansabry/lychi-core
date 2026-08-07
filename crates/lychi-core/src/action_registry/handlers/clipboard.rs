@@ -23,12 +23,7 @@ impl ClipboardHandler {
     }
 
     fn truncate_label(text: &str, max_len: usize) -> String {
-        let single_line = text.lines().next().unwrap_or(text);
-        if single_line.len() <= max_len {
-            single_line.to_string()
-        } else {
-            format!("{}...", &single_line[..max_len - 3])
-        }
+        crate::text::truncate_first_line(text, max_len)
     }
 
     fn format_age(created_at: u64) -> String {

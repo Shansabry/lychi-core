@@ -93,6 +93,35 @@ fn restrict(path: &Path, mode: u32) {
 #[cfg(not(unix))]
 fn restrict(_path: &Path, _mode: u32) {}
 
+/// Remove the empty `lychi.db` left beside `lychi.redb` by the pre-redb SQLite
+/// era. Nothing has referenced it since the redb migration, so it is pure
+/// confusion in the data directory — someone debugging reasonably assumes the
+/// `.db` file is the database.
+///
+/// **Only ever deletes a zero-byte regular file.** If it has any content it is
+/// left untouched and reported: a non-empty file is data this function has no
+/// business destroying, whatever its name suggests.
+fn remove_stale_sqlite_artifact(redb_path: &Path) {
+    let stale = redb_path.with_extension("db");
+    if stale == redb_path {
+        return;
+    }
+    let Ok(meta) = std::fs::metadata(&stale) else {
+        return; // Not present — the common case after the first cleanup.
+    };
+    if !meta.is_file() {
+        return;
+    }
+    if meta.len() != 0 {
+        tracing::warn!("[db] {} is not empty; leaving it alone", stale.display());
+        return;
+    }
+    match std::fs::remove_file(&stale) {
+        Ok(()) => tracing::info!("[db] removed empty legacy {}", stale.display()),
+        Err(e) => tracing::warn!("[db] could not remove {}: {e}", stale.display()),
+    }
+}
+
 /// Open (or create) the redb database at the given path.
 /// If the file exists but uses an older format version, back it up and recreate.
 pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
@@ -101,6 +130,8 @@ pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
         #[cfg(unix)]
         restrict(parent, OWNER_ONLY_DIR);
     }
+    remove_stale_sqlite_artifact(path);
+
     let db = match Database::create(path) {
         Ok(db) => db,
         Err(e) if path.exists() => {
@@ -321,5 +352,85 @@ mod permission_tests {
         assert_eq!(mode_of(&path), 0o600, "reopening must repair permissions");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod stale_artifact_tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "lychi-stale-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn empty_legacy_file_is_removed() {
+        let d = tmpdir("empty");
+        let redb = d.join("lychi.redb");
+        let stale = d.join("lychi.db");
+        std::fs::write(&stale, b"").unwrap();
+
+        remove_stale_sqlite_artifact(&redb);
+
+        assert!(!stale.exists(), "empty legacy file should be removed");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The safety property that matters: a file with content is DATA, and this
+    /// cleanup must never destroy it no matter what it is called.
+    #[test]
+    fn non_empty_legacy_file_is_left_alone() {
+        let d = tmpdir("nonempty");
+        let redb = d.join("lychi.redb");
+        let stale = d.join("lychi.db");
+        std::fs::write(&stale, b"SQLite format 3\0real user data").unwrap();
+
+        remove_stale_sqlite_artifact(&redb);
+
+        assert!(stale.exists(), "non-empty file must NOT be deleted");
+        assert_eq!(
+            std::fs::read(&stale).unwrap(),
+            b"SQLite format 3\0real user data"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn missing_legacy_file_is_a_no_op() {
+        let d = tmpdir("missing");
+        remove_stale_sqlite_artifact(&d.join("lychi.redb"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_real_database_is_never_touched() {
+        let d = tmpdir("realdb");
+        let redb = d.join("lychi.redb");
+        std::fs::write(&redb, b"redb contents").unwrap();
+
+        remove_stale_sqlite_artifact(&redb);
+
+        assert!(redb.exists(), "the live database must survive");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_directory_named_lychi_db_is_left_alone() {
+        let d = tmpdir("dir");
+        let stale = d.join("lychi.db");
+        std::fs::create_dir_all(&stale).unwrap();
+
+        remove_stale_sqlite_artifact(&d.join("lychi.redb"));
+
+        assert!(stale.is_dir(), "a directory must not be removed");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

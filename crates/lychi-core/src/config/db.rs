@@ -10,28 +10,22 @@ use crate::db::{
 };
 use crate::error::LychiError;
 
-/// Settings keys that are syncable to cloud. Device-local settings stay in TOML only.
-#[allow(dead_code)]
-const SYNCABLE_KEYS: &[&str] = &[
-    "general.theme",
-    "general.hide_on_blur",
-    "general.show_duration_ms",
-    "commands.default_search_engine",
-    "commands.youtube_url",
-    "commands.terminal",
-    "commands.terminal_routing",
-    "history.max_entries",
-    "history.deduplicate",
-    "ai.mode",
-    "ai.provider",
-    "ai.model",
-    "ai.base_url",
-    "ai.wire_format",
-    "ai.ollama_url",
-    "ai.ollama_model",
-    "weather.unit",
-    "weather.default_location",
-];
+/// The syncable settings keys, **derived** from the one function that actually
+/// writes them (`extract_syncable_from_config`).
+///
+/// This used to be a third hand-maintained list beside `apply_to_config` and
+/// `extract_syncable_from_config`, and the three had already drifted:
+/// `commands.terminal` was declared here but read by neither, so the key was
+/// dead while looking supported. Deriving the list means it cannot disagree
+/// with what is written, and `syncable_directions_agree` below pins the
+/// remaining pair (write vs read) so a new key can't be added in one direction
+/// only.
+pub fn syncable_keys() -> Vec<String> {
+    extract_syncable_from_config(&Config::default())
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect()
+}
 
 /// Load all syncable settings from the DB as a HashMap.
 pub fn load_syncable(db: &Arc<Database>) -> Result<HashMap<String, String>, LychiError> {
@@ -125,6 +119,7 @@ pub fn apply_to_config(settings: &HashMap<String, String>, config: &mut Config) 
                 config.commands.default_search_engine = value.clone();
             }
             "commands.youtube_url" => config.commands.youtube_url = value.clone(),
+            "commands.terminal" => config.commands.terminal = value.clone(),
             "commands.terminal_routing" => {
                 config.commands.terminal_routing = value.clone();
             }
@@ -202,6 +197,7 @@ fn extract_syncable_from_config(config: &Config) -> Vec<(String, String)> {
             "commands.youtube_url".into(),
             config.commands.youtube_url.clone(),
         ),
+        ("commands.terminal".into(), config.commands.terminal.clone()),
         (
             "commands.terminal_routing".into(),
             config.commands.terminal_routing.clone(),
@@ -227,4 +223,87 @@ fn extract_syncable_from_config(config: &Config) -> Vec<(String, String)> {
             config.weather.default_location.clone(),
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F6: `apply_to_config` (DB → Config) and `extract_syncable_from_config`
+    /// (Config → DB) are two hand-maintained lists that must stay in step. A
+    /// key written but never read is a setting that silently fails to sync —
+    /// exactly what happened to `commands.terminal`.
+    ///
+    /// This drives `apply_to_config` with a sentinel value per key and asserts
+    /// the value actually lands, so a key added to one side only fails here
+    /// instead of in a user's config months later.
+    #[test]
+    fn syncable_directions_agree() {
+        let mut missing = Vec::new();
+
+        for key in syncable_keys() {
+            // Probe with values that differ from the default for each field
+            // type we sync. Both booleans are needed: every bool field here
+            // defaults to `true`, so probing only "true" is a silent no-op and
+            // would report a working key as broken.
+            for probe in ["false", "true", "9182", "lychi-probe-value"] {
+                let mut config = Config::default();
+                let before = extract_syncable_from_config(&config);
+
+                let mut settings = HashMap::new();
+                settings.insert(key.clone(), probe.to_string());
+                apply_to_config(&settings, &mut config);
+
+                let after = extract_syncable_from_config(&config);
+                if before != after {
+                    // This probe changed the config through this key — the
+                    // read direction handles it. Done with this key.
+                    break;
+                }
+                if probe == "lychi-probe-value" {
+                    missing.push(key.clone());
+                }
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "these keys are written to the DB but ignored by apply_to_config, \
+             so they never sync back: {missing:?}"
+        );
+    }
+
+    /// The derived key list must cover every key the reader knows about, too —
+    /// a key handled by `apply_to_config` but never written is equally dead.
+    #[test]
+    fn every_syncable_key_round_trips() {
+        let config = Config::default();
+        let written: Vec<String> = extract_syncable_from_config(&config)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            written,
+            syncable_keys(),
+            "syncable_keys() must mirror what is actually written"
+        );
+    }
+
+    #[test]
+    fn terminal_syncs_in_both_directions() {
+        // The specific key F6 found dead.
+        let mut config = Config::default();
+        let mut settings = HashMap::new();
+        settings.insert("commands.terminal".to_string(), "kitty".to_string());
+        apply_to_config(&settings, &mut config);
+        assert_eq!(config.commands.terminal, "kitty");
+
+        let written = extract_syncable_from_config(&config);
+        assert!(
+            written
+                .iter()
+                .any(|(k, v)| k == "commands.terminal" && v == "kitty"),
+            "commands.terminal not written back"
+        );
+    }
 }

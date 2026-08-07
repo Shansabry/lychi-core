@@ -105,6 +105,12 @@ impl AppIndex {
         for (id, entry) in entries.iter().enumerate() {
             by_desktop_path.insert(entry.desktop_path.clone(), id);
             by_name.insert(entry.name.to_lowercase(), id);
+            // Aliases (the unlocalized name when a localized one is displayed)
+            // resolve exactly like the display name. `or_insert` so a real
+            // app's own name always beats another app's alias.
+            for alias in &entry.aliases {
+                by_name.entry(alias.to_lowercase()).or_insert(id);
+            }
 
             for token in &entry.name_tokens {
                 by_token.entry(token.clone()).or_default().push(id);
@@ -112,11 +118,10 @@ impl AppIndex {
             for kw in &entry.keywords {
                 by_keyword.entry(kw.clone()).or_default().push(id);
             }
-            if !entry.acronym.is_empty() {
-                by_acronym
-                    .entry(entry.acronym.clone())
-                    .or_default()
-                    .push(id);
+            for acronym in &entry.acronyms {
+                if !acronym.is_empty() {
+                    by_acronym.entry(acronym.clone()).or_default().push(id);
+                }
             }
             if !entry.exec_basename.is_empty() {
                 by_exec
@@ -127,8 +132,9 @@ impl AppIndex {
             if let Some(ref wmc) = entry.wm_class {
                 by_wmclass.entry(wmc.to_lowercase()).or_default().push(id);
             }
-            // Also index generic_name tokens into by_token
-            if let Some(ref gn) = entry.generic_name {
+            // Also index generic_name tokens into by_token — every locale
+            // variant, so "navigateur" and "browser" both reach the browser.
+            for gn in &entry.generic_names {
                 for token in tokenize(gn) {
                     by_token.entry(token).or_default().push(id);
                 }
@@ -327,15 +333,16 @@ impl AppIndex {
     ) -> f32 {
         let name_lower = entry.name.to_lowercase();
 
-        // Exact name match
-        if norm == name_lower {
+        // Exact name match — on the displayed name or any alias, so typing the
+        // English name still lands the app under a localized display name.
+        if norm == name_lower || entry.aliases.iter().any(|a| a.to_lowercase() == norm) {
             return 1.0;
         }
 
         let mut det_score: f32 = 0.0;
 
-        // Acronym match
-        if norm == entry.acronym {
+        // Acronym match (any name variant's acronym)
+        if entry.acronyms.iter().any(|a| a == norm) {
             det_score = det_score.max(0.85 + 0.08);
         }
 
@@ -397,14 +404,10 @@ impl AppIndex {
         // Keyword-only match (query token in keywords or generic_name tokens)
         if det_score == 0.0 {
             let in_keywords = query_tokens.iter().any(|t| entry.keywords.contains(t));
-            let in_generic = entry
-                .generic_name
-                .as_deref()
-                .map(|gn| {
-                    let gn_tokens = tokenize(gn);
-                    query_tokens.iter().any(|t| gn_tokens.contains(t))
-                })
-                .unwrap_or(false);
+            let in_generic = entry.generic_names.iter().any(|gn| {
+                let gn_tokens = tokenize(gn);
+                query_tokens.iter().any(|t| gn_tokens.contains(t))
+            });
             if in_keywords || in_generic {
                 det_score = 0.75;
             }
@@ -504,13 +507,16 @@ mod tests {
         let exec_base = exec_basename(exec);
         DesktopEntry {
             name: name.to_string(),
+            aliases: Vec::new(),
             exec: exec.to_string(),
             exec_basename: exec_base,
             wm_class: wm_class.map(|s| s.to_string()),
             generic_name: generic_name.map(|s| s.to_string()),
+            generic_names: generic_name.map(|s| s.to_string()).into_iter().collect(),
             keywords: keywords.iter().map(|s| s.to_string()).collect(),
             name_tokens: tokenize(name),
             acronym: make_acronym(name),
+            acronyms: vec![make_acronym(name)],
             icon: None,
             categories: categories.iter().map(|s| s.to_lowercase()).collect(),
             is_terminal_app,

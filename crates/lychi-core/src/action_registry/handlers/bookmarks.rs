@@ -205,11 +205,7 @@ impl BookmarkHandler {
             .or_else(|| url.strip_prefix("http://"))
             .unwrap_or(url);
 
-        if display.len() > max_len {
-            format!("{}…", &display[..max_len - 1])
-        } else {
-            display.to_string()
-        }
+        crate::text::truncate_display(display, max_len)
     }
 }
 
