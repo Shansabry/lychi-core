@@ -202,6 +202,19 @@ impl AppIndex {
         self.by_desktop_path.get(path).map(|&id| &self.entries[id])
     }
 
+    /// Look up an entry by its **lowercased** display name (or alias).
+    ///
+    /// `app_launcher` records frecency under `entry.name.to_lowercase()`, in a
+    /// keyspace it shares with `history:`, `win:`, `ws:` and bare file paths.
+    /// This lookup is what decides whether such a key names an installed app —
+    /// so an app since uninstalled simply misses and is skipped, rather than
+    /// lingering as a dead row.
+    pub fn by_name_exact(&self, lowercased_name: &str) -> Option<&DesktopEntry> {
+        self.by_name
+            .get(lowercased_name)
+            .map(|&id| &self.entries[id])
+    }
+
     /// Whether `args` is a known .desktop path that exists in this index.
     /// Used by the open handler fast-path to distinguish "concrete target" from "human query".
     pub fn is_desktop_path(&self, args: &str) -> bool {

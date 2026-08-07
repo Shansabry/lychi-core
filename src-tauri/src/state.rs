@@ -270,6 +270,14 @@ impl AppState {
             tracing::info!("[backup] pre-upgrade snapshot saved: {}", b.name);
         }
 
+        // The rolling hourly backup. Separate from the pre-upgrade one above
+        // and deliberately after it: on the first run of a new version both
+        // fire, and the upgrade snapshot must be the one taken BEFORE any of
+        // this version's code has written anything.
+        if let Some(b) = lychi_core::backup::hourly_backup(&db, env!("CARGO_PKG_VERSION")) {
+            tracing::info!("[backup] hourly snapshot saved: {}", b.name);
+        }
+
         // Seed settings from TOML on first launch (if settings table is empty)
         if let Err(e) = lychi_core::config::db::seed_from_config(&db, &config) {
             tracing::error!("Failed to seed settings: {e}");

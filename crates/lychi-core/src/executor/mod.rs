@@ -906,6 +906,7 @@ impl Executor {
         };
         let handler_results = self.registry.completions(route_handler, route_args).await;
         let handler_empty = handler_results.is_empty();
+
         all.extend(
             handler_results
                 .into_iter()
@@ -1716,18 +1717,32 @@ mod tests {
         }
 
         async fn completions(&self, partial: &str) -> Vec<crate::action_registry::CompletionItem> {
-            // `partial` is the ARGS after routing, so it is empty for a bare
-            // "open". The label is what the ranker keys defaultability on, so
-            // it must be the full command either way.
-            let label = if partial.trim().is_empty() {
-                "open".to_string()
-            } else {
-                format!("open {}", partial.trim())
+            // Mirrors `AppLauncher::completions`: `partial` is the ARGS after
+            // routing ("spotify" for `open spotify`), the label is the APP
+            // NAME, and `run` is `open <Name>`. Labelling with the full command
+            // instead would be a mock that cannot reproduce the defaultability
+            // bug this exists to test.
+            let arg = partial.trim();
+            if arg.is_empty() {
+                // A bare "open" names no app; the real handler returns nothing
+                // for an empty query.
+                return vec![crate::action_registry::CompletionItem {
+                    label: "open".to_string(),
+                    score: 100,
+                    run: Some("open".to_string()),
+                    ..Default::default()
+                }];
+            }
+            // Title-case the arg the way a display name reads.
+            let mut chars = arg.chars();
+            let name = match chars.next() {
+                Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+                None => arg.to_string(),
             };
             vec![crate::action_registry::CompletionItem {
-                label: label.clone(),
+                label: name.clone(),
                 score: 100,
-                run: Some(label),
+                run: Some(format!("open {name}")),
                 ..Default::default()
             }]
         }
@@ -2462,6 +2477,53 @@ mod tests {
     /// the answer onto the item, every row would arrive with the `false` default
     /// and Enter would stop auto-selecting anything. A test that only checks the
     /// rule in `suggestions` cannot see that.
+    /// `open spotify` must be Enter-launchable.
+    ///
+    /// It was not: `Tier::classify` saw that "open spotify" *contains*
+    /// "Spotify" and returned `Subset`, which refuses to auto-select. That
+    /// rule is right for `dnf search firefox` and wrong here — the user named
+    /// the verb AND the app. Explicit routes now classify against the args.
+    #[tokio::test]
+    async fn an_explicit_open_is_enter_launchable() {
+        // `CompletingHandler` stands in for AppLauncher: it returns a row
+        // whose label is the app name, exactly as the real handler does for
+        // `open spotify` (route args = "spotify").
+        let ex = make_executor(registry_with_completing_open());
+        let completions = ex
+            .completions(
+                "open spotify",
+                &crate::config::schema::SuggestionsConfig::default(),
+            )
+            .await;
+        let row = completions
+            .iter()
+            .find(|c| c.label == "Spotify")
+            .unwrap_or_else(|| panic!("no app row: {completions:?}"));
+        assert!(
+            row.can_be_default,
+            "Enter would not launch the app the user explicitly named: {row:?}"
+        );
+    }
+
+    /// The protection that must survive: a NON-explicit route still classifies
+    /// against the whole input, so a query that merely mentions an app cannot
+    /// auto-launch it. This is the `dnf search firefox` shape.
+    #[tokio::test]
+    async fn a_query_that_merely_mentions_an_app_is_not_defaultable() {
+        let ex = make_executor(registry_with_completing_open());
+        // No registered keyword typed → the route is not explicit.
+        let completions = ex
+            .completions(
+                "how do i install firefox",
+                &crate::config::schema::SuggestionsConfig::default(),
+            )
+            .await;
+        assert!(
+            !completions.iter().any(|c| c.can_be_default),
+            "a query mentioning an app must never auto-launch it: {completions:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_real_match_is_stamped_defaultable() {
         // A MOCK handler that actually returns a row, rather than relying on

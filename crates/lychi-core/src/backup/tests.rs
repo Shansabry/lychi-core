@@ -472,3 +472,101 @@ fn an_upgrade_snapshots_the_old_version_first() {
         Some(&b"data from 0.1.0"[..])
     );
 }
+
+/// One rolling automatic archive, refreshed — not accumulated.
+#[test]
+fn the_hourly_backup_replaces_the_previous_one() {
+    let sb = Sandbox::new("hourly");
+    let db = test_db(&sb);
+    put(&db, crate::db::HISTORY, "k", b"v");
+
+    let first = hourly_backup(&db, "0.1.0").expect("first run must back up");
+    // Force the interval to have elapsed.
+    crate::config::db::save_setting(&db, LAST_AUTO_BACKUP_KEY, "0").unwrap();
+    let second = hourly_backup(&db, "0.1.0").expect("an elapsed interval must back up");
+
+    assert_ne!(first.name, second.name);
+    let rolling: Vec<_> = list()
+        .into_iter()
+        .filter(|b| b.manifest.as_ref().is_some_and(|m| m.reason == "hourly"))
+        .collect();
+    assert_eq!(
+        rolling.len(),
+        1,
+        "expected ONE rolling backup, got {rolling:?}"
+    );
+    assert_eq!(
+        rolling[0].name, second.name,
+        "the newest must be the survivor"
+    );
+}
+
+/// Within the hour it must not fire again — otherwise every summon writes an
+/// archive.
+#[test]
+fn a_second_summon_within_the_hour_does_nothing() {
+    let sb = Sandbox::new("interval");
+    let db = test_db(&sb);
+    put(&db, crate::db::HISTORY, "k", b"v");
+
+    assert!(hourly_backup(&db, "0.1.0").is_some());
+    assert!(
+        hourly_backup(&db, "0.1.0").is_none(),
+        "a summon inside the interval must not take another backup"
+    );
+}
+
+/// The rolling refresh must never evict a pre-upgrade snapshot: that marks the
+/// riskiest moment for data and has to outlive the next hour.
+#[test]
+fn the_rolling_refresh_spares_upgrade_and_manual_backups() {
+    let sb = Sandbox::new("spare");
+    let db = test_db(&sb);
+    put(&db, crate::db::HISTORY, "k", b"v");
+
+    let manual = create(&db, BackupKind::Manual, "keep me", "0.1.0").unwrap();
+    let upgrade = create(
+        &db,
+        BackupKind::Automatic,
+        "before upgrade to 0.2.0",
+        "0.1.0",
+    )
+    .unwrap();
+
+    // Refresh several times. Each pass calls `prune_rolling`, so if that
+    // dropped its `reason == "hourly"` check the upgrade snapshot would be
+    // deleted on the very first refresh — two passes only proves the newest
+    // rolling one survives, which is a different claim.
+    for _ in 0..3 {
+        crate::config::db::save_setting(&db, LAST_AUTO_BACKUP_KEY, "0").unwrap();
+        hourly_backup(&db, "0.1.0").unwrap();
+    }
+
+    let names: Vec<String> = list().into_iter().map(|b| b.name).collect();
+    assert!(
+        names.contains(&manual.name),
+        "a manual backup was evicted: {names:?}"
+    );
+    assert!(
+        names.contains(&upgrade.name),
+        "a pre-upgrade backup was evicted: {names:?}"
+    );
+}
+
+/// A clock that jumps backwards must defer, not fire on every summon.
+#[test]
+fn a_backwards_clock_does_not_cause_a_backup_storm() {
+    let sb = Sandbox::new("clock");
+    let db = test_db(&sb);
+    put(&db, crate::db::HISTORY, "k", b"v");
+
+    hourly_backup(&db, "0.1.0").unwrap();
+    // "Last backup" in the future — what a backwards clock jump looks like.
+    let future = crate::db::now_millis() + 10 * AUTO_BACKUP_INTERVAL_MS;
+    crate::config::db::save_setting(&db, LAST_AUTO_BACKUP_KEY, &future.to_string()).unwrap();
+
+    assert!(
+        hourly_backup(&db, "0.1.0").is_none(),
+        "a backwards clock must defer, not back up repeatedly"
+    );
+}

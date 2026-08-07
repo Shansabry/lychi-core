@@ -171,7 +171,20 @@ pub fn create(
     restrict_dir(&dir);
 
     let created_at = crate::db::now_millis();
-    let name = format!("lychi-{}-{}.tar.gz", stamp(created_at), kind.slug());
+    // Second-resolution stamps collide when two backups land in the same
+    // second (a manual click right after the hourly refresh, or the
+    // pre-upgrade and hourly snapshots on the same startup) — and the second
+    // would silently overwrite the first. Suffix on collision rather than
+    // widening the stamp, which would make filenames harder to read for the
+    // case that never collides.
+    let base = format!("lychi-{}-{}", stamp(created_at), kind.slug());
+    let mut name = format!("{base}.tar.gz");
+    for n in 2..100 {
+        if !dir.join(&name).exists() {
+            break;
+        }
+        name = format!("{base}-{n}.tar.gz");
+    }
     let path = dir.join(&name);
 
     // Build into a temp file, then rename. A crash mid-write must not leave a
@@ -485,6 +498,78 @@ pub fn restore(
 
 /// Settings key holding the version that last ran. Absent on a fresh install.
 const LAST_VERSION_KEY: &str = "app.last_version";
+
+/// Settings key holding when the rolling hourly backup was last taken.
+const LAST_AUTO_BACKUP_KEY: &str = "app.last_auto_backup_ms";
+
+/// How often the rolling automatic backup refreshes.
+const AUTO_BACKUP_INTERVAL_MS: u64 = 60 * 60 * 1000;
+
+/// Take the rolling hourly backup if an hour has passed, replacing the previous
+/// one.
+///
+/// **Exactly one** automatic archive exists at a time by design: the Data tab
+/// stays legible (one "Automatic" row, plus whatever the user took manually),
+/// and the common loss — noticing within the hour that something is gone — is
+/// covered without accumulating a wall of near-identical archives.
+///
+/// Pre-upgrade backups are separate and NOT pruned by this: an upgrade is the
+/// riskiest moment for data, and its snapshot must outlive the next hourly
+/// refresh. Manual backups are never touched.
+///
+/// Never fails startup; a backup that cannot be written is logged, because
+/// refusing to launch over it would be the worse outcome.
+pub fn hourly_backup(db: &Arc<Database>, app_version: &str) -> Option<BackupInfo> {
+    let now = crate::db::now_millis();
+    let last = crate::config::db::load_syncable(db)
+        .ok()
+        .and_then(|s| s.get(LAST_AUTO_BACKUP_KEY).cloned())
+        .and_then(|v| v.parse::<u64>().ok());
+
+    // `saturating_sub` so a clock that moved backwards defers rather than
+    // firing on every summon.
+    if let Some(last) = last
+        && now.saturating_sub(last) < AUTO_BACKUP_INTERVAL_MS
+    {
+        return None;
+    }
+
+    let taken = match create(db, BackupKind::Automatic, "hourly", app_version) {
+        Ok(info) => {
+            // Replace, don't accumulate: drop every OTHER automatic archive
+            // that is not a pre-upgrade one.
+            prune_rolling(&info.name);
+            Some(info)
+        }
+        Err(e) => {
+            tracing::error!("[backup] hourly backup failed: {e}");
+            None
+        }
+    };
+
+    if let Err(e) = crate::config::db::save_setting(db, LAST_AUTO_BACKUP_KEY, &now.to_string()) {
+        tracing::warn!("[backup] could not record backup time: {e}");
+    }
+    taken
+}
+
+/// Keep only `keep` among the rolling automatic backups.
+///
+/// Deliberately narrow: a backup whose reason is not exactly `"hourly"` — a
+/// pre-upgrade or pre-restore snapshot — is left alone, because those mark
+/// moments the user would want to return to and an hourly refresh must not
+/// evict them.
+fn prune_rolling(keep: &str) {
+    for b in list() {
+        let is_rolling = b
+            .manifest
+            .as_ref()
+            .is_some_and(|m| m.kind == BackupKind::Automatic && m.reason == "hourly");
+        if is_rolling && b.name != keep {
+            let _ = delete(&b.name);
+        }
+    }
+}
 
 /// Take an automatic backup if this is the first run of a new version, then
 /// record the current one.

@@ -124,7 +124,7 @@ function isNewer(a: string, b: string): boolean {
 				<h3>Backups</h3>
 				<p class="hint">
 					Your history, clipboard, notes, snippets, settings and scripts. One is taken
-					automatically before every upgrade.
+					automatically every hour.
 				</p>
 			</div>
 			<button class="primary" onclick={backUpNow} disabled={busy}>
