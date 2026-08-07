@@ -289,26 +289,52 @@ fn find_bt_device<'a>(devices: &'a [BtDevice], query: &str) -> Option<&'a BtDevi
     devices.iter().find(|d| d.name.to_lowercase().contains(&q))
 }
 
+/// The two verbs, and the two words that name the radio. Every accepted phrase
+/// is a *product* of these — `<verb> <noun>` or `<noun> <verb>` — rather than a
+/// list of literal strings.
+///
+/// This used to be two hand-written phrase tables (one for parsing, one for
+/// completions) and they had already drifted: parsing accepted `bt connect`
+/// while completions did not, so that phrasing executed but offered no device
+/// rows. One table, both directions.
+const BT_VERBS: [&str; 2] = ["connect", "disconnect"];
+const BT_NOUNS: [&str; 2] = ["bluetooth", "bt"];
+
+/// If `lower` opens with a bluetooth verb phrase, return the canonical verb and
+/// the rest of the input. `require_space` distinguishes "this is the whole
+/// command, args follow" (execute) from "the user is still typing" (completions).
+fn bt_phrase(lower: &str, require_space: bool) -> Option<(&'static str, &str)> {
+    for verb in BT_VERBS {
+        for noun in BT_NOUNS {
+            for phrase in [format!("{verb} {noun}"), format!("{noun} {verb}")] {
+                let rest = if require_space {
+                    lower.strip_prefix(&format!("{phrase} "))
+                } else {
+                    lower.strip_prefix(&phrase)
+                };
+                if let Some(rest) = rest {
+                    return Some((
+                        if verb == "connect" {
+                            "connect"
+                        } else {
+                            "disconnect"
+                        },
+                        rest,
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Handle `connect bluetooth <device>` / `disconnect bluetooth <device>`.
 /// Returns `Some(Ok/Err)` if matched, `None` if not a bluetooth connect/disconnect command.
 fn try_bluetooth_connect(input: &str) -> Option<Result<String, String>> {
     let lower = input.to_lowercase();
 
-    let (action, query) = if let Some(q) = lower
-        .strip_prefix("connect bluetooth ")
-        .or_else(|| lower.strip_prefix("connect bt "))
-        .or_else(|| lower.strip_prefix("bluetooth connect "))
-        .or_else(|| lower.strip_prefix("bt connect "))
-    {
-        ("connect", q.trim())
-    } else {
-        let q = lower
-            .strip_prefix("disconnect bluetooth ")
-            .or_else(|| lower.strip_prefix("disconnect bt "))
-            .or_else(|| lower.strip_prefix("bluetooth disconnect "))
-            .or_else(|| lower.strip_prefix("bt disconnect "))?;
-        ("disconnect", q.trim())
-    };
+    let (action, rest) = bt_phrase(&lower, true)?;
+    let query = rest.trim();
 
     if query.is_empty() {
         return Some(Err(
@@ -789,22 +815,14 @@ impl ActionHandler for SystemCommand {
             })
             .collect();
 
-        // Show paired devices for bluetooth connect/disconnect queries
-        let bt_prefix = if lower.starts_with("connect bluetooth")
-            || lower.starts_with("connect bt")
-            || lower.starts_with("bluetooth connect")
-        {
-            Some("connect bluetooth")
-        } else if lower.starts_with("disconnect bluetooth")
-            || lower.starts_with("disconnect bt")
-            || lower.starts_with("bluetooth disconnect")
-        {
-            Some("disconnect bluetooth")
-        } else {
-            None
-        };
+        // Show paired devices for bluetooth connect/disconnect queries. Same
+        // decider as `try_bluetooth_connect`, so anything that EXECUTES also
+        // completes — no space required here, since the user is mid-phrase.
+        // Emit the canonical `<verb> bluetooth` phrasing whatever the user
+        // typed, so the row's `run` is a string `try_bluetooth_connect` accepts.
+        let bt_prefix = bt_phrase(&lower, false).map(|(verb, _)| format!("{verb} bluetooth"));
 
-        if let Some(action) = bt_prefix {
+        if let Some(action) = bt_prefix.as_deref() {
             let devices = list_bt_devices();
             for dev in &devices {
                 // Read from the bulk query, not a subprocess per device.
@@ -1074,6 +1092,25 @@ mod tests {
     #[test]
     fn test_bluetooth_connect_parsing() {
         // All prefix variants should match
+        // G3: every phrasing is a product of BT_VERBS x BT_NOUNS, so the
+        // parse side and the completion side cannot drift apart. The old code
+        // had two hand-written tables and they HAD drifted: `bt connect`
+        // executed but offered no device rows.
+        for verb in super::BT_VERBS {
+            for noun in super::BT_NOUNS {
+                for phrase in [format!("{verb} {noun}"), format!("{noun} {verb}")] {
+                    assert!(
+                        try_bluetooth_connect(&format!("{phrase} speaker")).is_some(),
+                        "execute rejected {phrase:?}"
+                    );
+                    assert!(
+                        super::bt_phrase(&phrase, false).is_some(),
+                        "completions rejected {phrase:?}"
+                    );
+                }
+            }
+        }
+
         assert!(try_bluetooth_connect("connect bluetooth speaker").is_some());
         assert!(try_bluetooth_connect("connect bt speaker").is_some());
         assert!(try_bluetooth_connect("bluetooth connect speaker").is_some());

@@ -7,8 +7,14 @@
  * snapshot (two enums + a flag), two surfaces can never be visible at once — the
  * overlap bug is structurally impossible (see ui-machine.ts for the invariant).
  *
- * Also owns window/layout/onboarding/flash/action-panel state — small shared UI
- * data with no transitions of its own, kept here rather than in bespoke stores.
+ * Also owns the action-panel flag — the one piece of transient chrome with no
+ * transition of its own, kept here because `summonReset` must clear it.
+ *
+ * It deliberately does NOT mirror window/layout/onboarding/flash state. Those
+ * were declared here once and shadowed by page-local `$state`, so the copies
+ * here had zero readers while looking authoritative — and `summonReset` cleared
+ * an action-panel flag nothing rendered. A field belongs here only if this is
+ * the copy that renders.
  *
  * Svelte 5 note: transitions are arrow-function fields so `this` is bound when they
  * are passed down as component callback props (`onclick={ui.closePanel}`).
@@ -20,13 +26,15 @@ class UiState {
 	// The one snapshot everything derives from.
 	snapshot = $state<m.UiSnapshot>({ ...m.INITIAL });
 
-	// --- Window / layout / onboarding / transient chrome (shared data) ---
-	windowStrategy = $state<"layer-shell" | "x11" | "toplevel">("x11");
-	compactMode = $state(false);
-	launcherReady = $state(false);
-	hotkeyBannerVisible = $state(false);
-	hotkeyBannerCopied = $state(false);
-	flashMessage = $state("");
+	// --- Transient chrome owned here because `summonReset` must clear it ---
+	/**
+	 * Whether the ⌘K per-result action panel is open.
+	 *
+	 * Lives here rather than in the page because summon has to close it, and a
+	 * page-local copy meant `summonReset` cleared a field nobody rendered: the
+	 * panel stayed open across dismiss → re-summon while this said otherwise.
+	 * The page reads and writes THIS field; there is no second copy.
+	 */
 	actionPanelOpen = $state(false);
 	/** Local-AI model warmup ("Loading AI model…" status-bar indicator). */
 	aiLoading = $state(false);
@@ -37,9 +45,6 @@ class UiState {
 	}
 	get aiVisible(): boolean {
 		return m.showAi(this.snapshot);
-	}
-	get planVisible(): boolean {
-		return m.showPlan(this.snapshot);
 	}
 	get resultsVisible(): boolean {
 		return m.showResults(this.snapshot);

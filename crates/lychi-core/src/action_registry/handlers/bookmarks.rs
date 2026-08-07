@@ -313,11 +313,17 @@ impl ActionHandler for BookmarkHandler {
 
         results
             .into_iter()
-            .filter_map(|(i, score)| {
+            .enumerate()
+            .filter_map(|(rank, (i, _))| {
                 bookmarks.get(i).map(|bm| CompletionItem {
                     label: bm.title.clone(),
                     icon_path: None,
-                    score,
+                    // Rank-derived, matching the empty-query branch above.
+                    // This used to emit nucleo's RAW score — a different scale
+                    // from the same handler's other branch, so the two paths
+                    // could not be compared with each other. The rows are
+                    // already sorted; position is the ranking.
+                    score: (20 - rank) as u16,
                     description: Some(Self::truncate_url(&bm.url, 60)),
                     reason: None,
                     thumb_b64: None,
@@ -332,6 +338,22 @@ impl ActionHandler for BookmarkHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G2: this handler has two completion branches (empty query vs fuzzy
+    /// match). The fuzzy one used to emit nucleo's RAW score while the other
+    /// emitted a 1..=20 rank, so scores from the same handler sat on
+    /// incompatible scales and could not be compared. Both are rank-derived now.
+    #[test]
+    fn both_branches_score_on_the_same_scale() {
+        // The empty-query branch caps at 20 items scored 20 down to 1.
+        for rank in 0..20usize {
+            let score = (20 - rank) as u16;
+            assert!(
+                (1..=20).contains(&score),
+                "rank {rank} produced out-of-scale score {score}"
+            );
+        }
+    }
 
     #[test]
     fn test_truncate_url() {

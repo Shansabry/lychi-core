@@ -248,7 +248,13 @@ function loadEmptySuggestions() {
 			// result. Selection happens only on mouse press or arrow key.
 			completions.index = -1;
 		})
-		.catch(() => {});
+		// Discarding this left a permanently empty launcher with nothing to
+		// distinguish "no recents yet" from "the backend call failed". Logged
+		// rather than flashed: this runs on every summon, and a toast on an
+		// empty box would be noise the user cannot act on.
+		.catch((err) => {
+			uiLog.error(`[suggestions] empty-state load failed: ${err}`);
+		});
 }
 
 // Transient confirmation shown in the completions hints bar (e.g. "Path copied").
@@ -539,19 +545,29 @@ onMount(() => {
 	// invisible to the log file, and a frontend crash otherwise leaves a log
 	// that looks perfectly healthy.
 	installUiLogging();
-	getActiveWindowStrategy().then((s) => {
+	// Each of these degrades one feature on failure and none should take down
+	// the launcher, but an unguarded `.then()` also leaves NO trace: the symptom
+	// is a launcher quietly missing a capability with a clean-looking log.
+	// `startup` keeps them independent and makes each failure a logged fact.
+	const startup = <T>(what: string, p: Promise<T>, apply: (v: T) => void) => {
+		p.then(apply).catch((err) => {
+			uiLog.error(`[startup] ${what} failed: ${err}`);
+		});
+	};
+
+	startup("window strategy", getActiveWindowStrategy(), (s) => {
 		windowStrategy = s;
 	});
-	getHideOnBlur().then((v) => {
+	startup("hide-on-blur", getHideOnBlur(), (v) => {
 		hideOnBlur = v;
 	});
-	getAiStatus().then((s) => {
+	startup("AI status", getAiStatus(), (s) => {
 		aiEnabled = s.has_ai_router;
 	});
-	getMountPoints().then((mounts) => {
+	startup("mount points", getMountPoints(), (mounts) => {
 		completions.mountPoints = mounts;
 	});
-	getHistory().then((entries) => {
+	startup("history", getHistory(), (entries) => {
 		historyEntries = entries;
 	});
 	Promise.all([preloadAll(), getCompletions("__warmup__").catch(() => {})])
@@ -576,10 +592,27 @@ onMount(() => {
 					});
 			}
 		})
+		// A throw inside the handler above (not just a rejected preload) would
+		// otherwise be an unhandled rejection with no log line.
+		.catch((err) => {
+			uiLog.error(`[startup] preload failed: ${err}`);
+		})
 		.finally(() => {
 			backendReady = true;
 			if (inputValue.trim()) handleInput(inputValue);
 		});
+
+	// `.finally` above covers rejection but NOT a hang: a preload that never
+	// settles leaves `backendReady` false forever, and submit is gated on it —
+	// so the launcher accepts keystrokes and silently ignores Enter, which is
+	// exactly the "intermittent no-response" symptom. Time it out instead.
+	setTimeout(() => {
+		if (!backendReady) {
+			uiLog.error("[startup] preload did not settle in 10s — unblocking input");
+			backendReady = true;
+			if (inputValue.trim()) handleInput(inputValue);
+		}
+	}, 10_000);
 
 	// Guard: only attach Tauri listeners if running inside Tauri
 	if (!("__TAURI_INTERNALS__" in window)) return;
@@ -733,7 +766,12 @@ function handleBlurDismiss() {
  * user's follow-up drives the next turn.
  */
 async function openConversation(id: string) {
-	const conv = await loadConversation(id).catch(() => null);
+	// A user clicked this row; returning silently looks like a dead click.
+	const conv = await loadConversation(id).catch((err) => {
+		uiLog.error(`[chat] loadConversation(${id}) failed: ${err}`);
+		flashHint("Couldn't open that conversation");
+		return null;
+	});
 	if (!conv) return;
 	// ui.showAi() below closes the chat-history panel as it takes the surface.
 	// Pair the stored messages into user→assistant turns for the transcript.
@@ -785,13 +823,27 @@ async function openConversation(id: string) {
 
 /** Delete one stored conversation from the recall list. */
 async function deleteConversationEntry(id: string) {
-	await deleteConversation(id).catch(() => {});
+	// Only drop the row if the delete actually happened. Filtering regardless
+	// showed the conversation vanishing and then reappearing on next summon.
+	try {
+		await deleteConversation(id);
+	} catch (err) {
+		uiLog.error(`[chat] deleteConversation(${id}) failed: ${err}`);
+		flashHint("Couldn't delete that conversation");
+		return;
+	}
 	conversations = conversations.filter((c) => c.id !== id);
 }
 
 /** Clear all stored conversations. */
 async function clearAllConversations() {
-	await clearConversations().catch(() => {});
+	try {
+		await clearConversations();
+	} catch (err) {
+		uiLog.error(`[chat] clearConversations failed: ${err}`);
+		flashHint("Couldn't clear conversations");
+		return;
+	}
 	conversations = [];
 }
 
@@ -849,14 +901,29 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 	let inputDecision: RouteDecision | undefined;
 	let runDecision: RouteDecision | undefined;
 	if (needsDecision) {
-		// ~2-3ms warm; gated by backendReady above. Errors → undefined (reducer
-		// no-ops rather than misroute).
+		// ~2-3ms warm; gated by backendReady above.
+		//
+		// A classifier failure used to be swallowed to `undefined`, and the
+		// reducer treats "no decision" as a race it expects the caller to retry
+		// — but the caller had already awaited, so Enter silently did NOTHING.
+		// That is invisible to the user and indistinguishable from a hang, in a
+		// bug class ("intermittent no-response") that has cost real time. A
+		// failure now says so and is logged; the input is left intact to retry.
+		let classifyFailed: unknown;
+		const classify = (q: string) =>
+			classifyInput(q).catch((err) => {
+				classifyFailed ??= err;
+				return undefined;
+			});
 		[inputDecision, runDecision] = await Promise.all([
-			trimmed ? classifyInput(trimmed).catch(() => undefined) : Promise.resolve(undefined),
-			selectedRun && selectedRun !== trimmed
-				? classifyInput(selectedRun).catch(() => undefined)
-				: Promise.resolve(undefined),
+			trimmed ? classify(trimmed) : Promise.resolve(undefined),
+			selectedRun && selectedRun !== trimmed ? classify(selectedRun) : Promise.resolve(undefined),
 		]);
+		if (classifyFailed !== undefined) {
+			uiLog.error(`[submit] classifyInput failed: ${classifyFailed}`);
+			flashHint("Couldn't route that — press Enter to retry");
+			return;
+		}
 	}
 
 	// The FE reducer folds the backend decision with keyboard/mode/selection
@@ -1260,7 +1327,6 @@ async function copySelectedPath() {
 // A secondary-actions menu for the selected result. The action IMPLEMENTATIONS
 // already exist above; this just enumerates which apply (frontend-only, keyed off
 // mode flags + icon_path sentinels + run/fill/label conventions) and dispatches.
-let actionPanelOpen = $state(false);
 
 type PanelAction = { id: string; label: string; hint?: string };
 
@@ -1371,16 +1437,16 @@ let panelActions = $derived.by((): PanelAction[] => {
 
 function openActionPanel() {
 	// Toggle: pressing Ctrl+K again (or the affordance) closes an open panel.
-	if (actionPanelOpen) {
+	if (ui.actionPanelOpen) {
 		closeActionPanel();
 		return;
 	}
 	if (!selectedCompletion || panelActions.length === 0) return;
-	actionPanelOpen = true;
+	ui.actionPanelOpen = true;
 }
 
 function closeActionPanel() {
-	actionPanelOpen = false;
+	ui.actionPanelOpen = false;
 	// Restore focus to the input (the panel had grabbed it).
 	requestAnimationFrame(() => {
 		document.querySelector<HTMLInputElement>(".input-container input")?.focus();
@@ -1398,7 +1464,7 @@ async function copyTextFlash(text: string, msg: string) {
 
 function runPanelAction(id: string) {
 	const item = selectedCompletion;
-	actionPanelOpen = false;
+	ui.actionPanelOpen = false;
 	if (!item) {
 		closeActionPanel();
 		return;
@@ -1938,7 +2004,7 @@ async function handleDismiss() {
 			hasAttachments={attachments.any}
 		/>
 		<AttachmentTray />
-		{#if actionPanelOpen}
+		{#if ui.actionPanelOpen}
 			<ActionPanel
 				actions={panelActions}
 				onrun={runPanelAction}
