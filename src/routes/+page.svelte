@@ -56,6 +56,7 @@ import { getComboString, loadKeybindings } from "$lib/keybindings";
 import { type BannerMode, bannerMode } from "$lib/onboarding";
 import { hasVisibleOutput, resolveOutput } from "$lib/output";
 import { preloadAll } from "$lib/preloadCache";
+import { MARKER, PANEL, PREFIX } from "$lib/sentinels";
 import { attachments } from "$lib/stores/attachments.svelte";
 import { type AiTurn, chat, type UserAttachment } from "$lib/stores/chat.svelte";
 import { completions } from "$lib/stores/completions.svelte";
@@ -230,7 +231,7 @@ let launcherReady = $state(false);
  */
 /** Sentinel prefix stashed in a completion's `run` to mark it as an AI-chat
  *  recall row: `__chat__:<conversationId>`. Chosen → opens the conversation. */
-const CHAT_RUN_PREFIX = "__chat__:";
+const CHAT_RUN_PREFIX = PREFIX.chat;
 
 function loadEmptySuggestions() {
 	if (inputValue.trim().length > 0) return;
@@ -570,7 +571,7 @@ onMount(() => {
 	startup("history", getHistory(), (entries) => {
 		historyEntries = entries;
 	});
-	Promise.all([preloadAll(), getCompletions("__warmup__").catch(() => {})])
+	Promise.all([preloadAll(), getCompletions(MARKER.warmup).catch(() => {})])
 		.then(([[settings]]) => {
 			loadKeybindings(settings.keybindingsConfig);
 			loadedGeneralConfig = settings.generalConfig;
@@ -1160,30 +1161,30 @@ async function runCommand(command: string, opts?: { runInline?: boolean }) {
 		if (lastResult.open_url && (lastResult.auto_open || !lastResult.output)) {
 			await hide();
 			await openUri(lastResult.open_url);
-		} else if (lastResult.output === "__media_panel__") {
+		} else if (lastResult.output === PANEL.media) {
 			ui.openPanel("media");
 			lastResult = null;
-		} else if (lastResult.output === "__notes_panel__") {
+		} else if (lastResult.output === PANEL.notes) {
 			ui.openPanel("notes");
 			lastResult = null;
-		} else if (lastResult.output === "__timer_panel__") {
+		} else if (lastResult.output === PANEL.timer) {
 			ui.openPanel("notes");
 			initialNotesTab = "timers";
 			lastResult = null;
-		} else if (lastResult.output === "__reminders_panel__") {
+		} else if (lastResult.output === PANEL.reminders) {
 			ui.openPanel("notes");
 			initialNotesTab = "reminders";
 			lastResult = null;
-		} else if (lastResult.output === "__snippets_panel__") {
+		} else if (lastResult.output === PANEL.snippets) {
 			ui.openPanel("notes");
 			initialNotesTab = "snippets";
 			lastResult = null;
-		} else if (lastResult.output?.startsWith("__notes_limit__:")) {
-			pendingNoteText = lastResult.output.slice("__notes_limit__:".length);
+		} else if (lastResult.output?.startsWith(PREFIX.notesLimit)) {
+			pendingNoteText = lastResult.output.slice(PREFIX.notesLimit.length);
 			ui.openPanel("notes");
 			lastResult = null;
-		} else if (lastResult.output?.startsWith("__browse_panel__:")) {
-			const dir = lastResult.output.slice("__browse_panel__:".length);
+		} else if (lastResult.output?.startsWith(PREFIX.browsePanel)) {
+			const dir = lastResult.output.slice(PREFIX.browsePanel.length);
 			inputValue = `@${dir}`;
 			completions.atMode = true;
 			completions.atStart = 0;

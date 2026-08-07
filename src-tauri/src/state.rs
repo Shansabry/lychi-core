@@ -801,3 +801,68 @@ mod ai_prompt_coverage {
         );
     }
 }
+
+#[cfg(test)]
+mod sentinel_contract {
+    /// D4: the `__sentinel__` strings are the one part of the IPC surface that
+    /// is NOT a generated type — the backend writes bare strings into
+    /// `icon_path`/`output` and the frontend matches them by hand. A rename on
+    /// either side breaks the UI silently: the row just stops rendering as a
+    /// folder, or a panel stops opening, with nothing to fail.
+    ///
+    /// `src/lib/sentinels.ts` collects the frontend's expectations. This
+    /// asserts the Rust side still emits the same strings, so the two ends
+    /// cannot drift apart unnoticed. It reads the TypeScript as text rather
+    /// than generating it, because generating would make this a build-order
+    /// problem for one small table.
+    #[test]
+    fn the_frontend_and_backend_agree_on_sentinels() {
+        let ts = include_str!("../../src/lib/sentinels.ts");
+
+        // Every `"__foo__"` the frontend declares.
+        let declared: Vec<String> = ts
+            .split('"')
+            .filter(|s| s.starts_with("__") && (s.ends_with("__") || s.ends_with("__:")))
+            .map(str::to_string)
+            .collect();
+
+        assert!(
+            declared.len() > 15,
+            "the sentinel scan found almost nothing ({declared:?}) — has sentinels.ts moved?"
+        );
+
+        // The ones this crate and lychi-core actually emit. Kept explicit: a
+        // grep over the Rust sources would also match these very literals.
+        const EMITTED: &[&str] = &[
+            "__folder__",
+            "__none__",
+            "__web__",
+            "__history__",
+            "__separator__",
+            "__warning__",
+            "__context__",
+            "__context_stale__",
+            "__terminal__",
+            "__info__",
+            "__clipboard_image__",
+            "__ai_chat__",
+            "__media_panel__",
+            "__notes_panel__",
+            "__timer_panel__",
+            "__reminders_panel__",
+            "__snippets_panel__",
+            "__browse_panel__:",
+            "__notes_limit__:",
+        ];
+
+        let missing: Vec<&&str> = EMITTED
+            .iter()
+            .filter(|e| !declared.iter().any(|d| d == *e))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the backend emits these but src/lib/sentinels.ts does not declare them, \
+             so the frontend will silently ignore them: {missing:?}"
+        );
+    }
+}

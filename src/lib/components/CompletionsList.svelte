@@ -13,6 +13,7 @@ import {
 } from "lucide-svelte";
 import { onMount } from "svelte";
 import type { CompletionItem, MountPoint } from "$lib/ipc";
+import { ICON, isCustomIcon } from "$lib/sentinels";
 
 let {
 	items,
@@ -189,7 +190,7 @@ function formatSize(bytes: number | null | undefined): string {
 		{@const active = idx < items.length}
 		{@const label = item?.label ?? "\u00A0"}
 		{@const isSeparator = item?.icon_path === "__separator__"}
-		{@const isFolder = item?.icon_path === "__folder__"}
+		{@const isFolder = item?.icon_path === ICON.folder}
 		{@const isHistory = item?.icon_path === "__history__"}
 		{@const isWarning = item?.icon_path === "__warning__"}
 		{@const isContext = item?.icon_path === "__context__"}
@@ -198,8 +199,8 @@ function formatSize(bytes: number | null | undefined): string {
 		{@const isClipImage = item?.icon_path === "__clipboard_image__"}
 		{@const isAiChat = item?.icon_path === "__ai_chat__"}
 		{@const isWeb = item?.label?.startsWith("Search web:")}
-		{@const hideIcon = item?.icon_path === "__none__" || item?.icon_path === "__web__" || isWeb || isSeparator}
-		{@const hasCustomIcon = !!(item?.icon_path && item.icon_path !== "__folder__" && item.icon_path !== "__none__" && item.icon_path !== "__web__" && item.icon_path !== "__history__" && item.icon_path !== "__separator__" && item.icon_path !== "__warning__" && item.icon_path !== "__context__" && item.icon_path !== "__terminal__" && item.icon_path !== "__info__" && item.icon_path !== "__clipboard_image__" && item.icon_path !== "__ai_chat__")}
+		{@const hideIcon = item?.icon_path === ICON.none || item?.icon_path === ICON.web || isWeb || isSeparator}
+		{@const hasCustomIcon = isCustomIcon(item?.icon_path)}
 		{@const noIcon = !item?.icon_path}
 		{@const iconKey = item?.icon_path ?? ""}
 		{@const iconBroken = hasCustomIcon && brokenIcons.has(iconKey)}
