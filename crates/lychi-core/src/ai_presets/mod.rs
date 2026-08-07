@@ -24,6 +24,15 @@ pub struct AiPresetItem {
     pub template: String,
     pub created_at: u64,
     pub updated_at: u64,
+    /// A shipped default (`translate`, `summarize`, `rewrite`).
+    ///
+    /// Derived from the keyword at read time rather than stored, so it cannot
+    /// drift from `BUILTIN_PRESETS` and needs no migration for rows written
+    /// before this field existed. The UI uses it to show a "Default" badge and
+    /// hide the edit/delete actions; the store refuses those operations
+    /// regardless, since presets are reachable over IPC too.
+    #[serde(default)]
+    pub is_builtin: bool,
 }
 
 impl AiPresetItem {

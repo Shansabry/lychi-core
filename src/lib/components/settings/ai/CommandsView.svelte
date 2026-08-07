@@ -115,6 +115,15 @@ export function dismissConfirm(): boolean {
 	}
 	return false;
 }
+
+/// Is the preset currently open in the detail pane a shipped default?
+///
+/// `is_builtin` comes from the backend (derived from the keyword, not stored),
+/// which is also where the refusal is enforced — hiding these controls is the
+/// courtesy, not the guard.
+const editingBuiltin = $derived(
+	!isNew && presets.find((p) => p.id === editingId)?.is_builtin === true,
+);
 </script>
 
 <div class="cmd-layout">
@@ -126,6 +135,7 @@ export function dismissConfirm(): boolean {
 				onclick={() => startEdit(p)}
 			>
 				<span class="cmd-kw">{p.keyword}</span>
+				{#if p.is_builtin}<span class="cmd-default">Default</span>{/if}
 				<span class="cmd-shortcut kbd">{i + 1}</span>
 			</button>
 		{/each}
@@ -146,6 +156,7 @@ export function dismissConfirm(): boolean {
 				type="text"
 				maxlength={24}
 				spellcheck="false"
+				readonly={editingBuiltin}
 			/>
 		</div>
 		<div class="field">
@@ -157,6 +168,7 @@ export function dismissConfirm(): boolean {
 				placeholder="Display name"
 				type="text"
 				maxlength={40}
+				readonly={editingBuiltin}
 			/>
 		</div>
 		<div class="field top">
@@ -167,13 +179,19 @@ export function dismissConfirm(): boolean {
 				bind:value={template}
 				placeholder={"Prompt template… use {input} for the user's text"}
 				maxlength={5000}
+				readonly={editingBuiltin}
 			></textarea>
 		</div>
 		{#if error}
 			<div class="err">{error}</div>
 		{/if}
 		<div class="actions">
-			{#if !isNew}
+			{#if editingBuiltin}
+				<span class="builtin-note">
+					Built-in command — add your own to customise this.
+				</span>
+			{/if}
+			{#if !isNew && !editingBuiltin}
 				<button
 					class="btn del"
 					class:confirming={confirmingDelete}
@@ -184,9 +202,11 @@ export function dismissConfirm(): boolean {
 				</button>
 			{/if}
 			<div class="spacer"></div>
-			<button class="btn ai" onclick={save}>
-				Save <span class="kbd">⌘↵</span>
-			</button>
+			{#if !editingBuiltin}
+				<button class="btn ai" onclick={save}>
+					Save <span class="kbd">⌘↵</span>
+				</button>
+			{/if}
 		</div>
 	</div>
 </div>
@@ -199,6 +219,24 @@ export function dismissConfirm(): boolean {
 		border-radius: 10px;
 		overflow: hidden;
 		min-height: 300px;
+	}
+	.cmd-default {
+		font-size: 9px;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		padding: 1px 4px;
+		border-radius: 2px;
+		background: var(--bg);
+		color: var(--fg-muted);
+		flex-shrink: 0;
+	}
+	.builtin-note {
+		font-size: 11px;
+		color: var(--fg-muted);
+	}
+	.control[readonly] {
+		opacity: 0.65;
+		cursor: default;
 	}
 	.cmd-list {
 		background: var(--bg-secondary);

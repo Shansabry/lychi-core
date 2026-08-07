@@ -58,6 +58,7 @@ impl AiPresetsStore {
             if entry.deleted_at.is_none() {
                 presets.push(AiPresetItem {
                     id: key.value().to_string(),
+                    is_builtin: is_builtin_keyword(&entry.keyword),
                     keyword: entry.keyword,
                     name: entry.name,
                     template: entry.template,
@@ -147,6 +148,7 @@ impl AiPresetsStore {
 
         Ok(AiPresetItem {
             id,
+            is_builtin: is_builtin_keyword(&keyword),
             keyword,
             name,
             template,
@@ -205,6 +207,10 @@ impl AiPresetsStore {
             if entry.deleted_at.is_some() {
                 return Err(LychiError::AiPreset(format!("Preset not found: {id}")));
             }
+            // Checked against the STORED keyword, not the submitted one: the
+            // question is "is the thing being edited a default", and reading
+            // the new keyword would let a rename slip a built-in through.
+            reject_if_builtin(&entry.keyword)?;
             entry.keyword = keyword;
             entry.name = name.to_string();
             entry.template = template.to_string();
@@ -230,6 +236,7 @@ impl AiPresetsStore {
             if entry.deleted_at.is_some() {
                 return Err(LychiError::AiPreset(format!("Preset not found: {id}")));
             }
+            reject_if_builtin(&entry.keyword)?;
             entry.deleted_at = Some(db::now_millis());
             let bytes =
                 postcard::to_allocvec(&entry).map_err(|e| LychiError::Database(e.to_string()))?;
@@ -273,6 +280,32 @@ impl AiPresetsStore {
         }
         Ok(())
     }
+}
+
+/// Is this keyword one of the shipped defaults?
+///
+/// Derived from `BUILTIN_PRESETS` rather than a second list — adding a default
+/// there makes it protected here with no further edit, and the two can never
+/// disagree about which presets are built in.
+pub fn is_builtin_keyword(keyword: &str) -> bool {
+    let k = keyword.trim().to_lowercase();
+    BUILTIN_PRESETS.iter().any(|(kw, _, _)| *kw == k)
+}
+
+/// Refuse an edit or delete aimed at a shipped default.
+///
+/// Enforced HERE, not in the settings UI, because presets are also reachable
+/// over IPC — hiding a button would make the protection cosmetic. The message
+/// says what to do instead, since "you can't" without "here's how" is the
+/// unhelpful half of a refusal.
+fn reject_if_builtin(keyword: &str) -> Result<(), LychiError> {
+    if is_builtin_keyword(keyword) {
+        return Err(LychiError::AiPreset(format!(
+            "\"{keyword}\" is a built-in command and cannot be changed or removed. \
+             Add your own command with a different keyword to customise this."
+        )));
+    }
+    Ok(())
 }
 
 /// Normalize + validate an invocation keyword: trimmed, lowercased, a single
@@ -341,6 +374,7 @@ mod tests {
     fn render_substitutes_placeholder() {
         let item = AiPresetItem {
             id: "1".into(),
+            is_builtin: false,
             keyword: "tr".into(),
             name: "T".into(),
             template: "Translate to French: {input}".into(),
@@ -354,6 +388,7 @@ mod tests {
     fn render_appends_when_no_placeholder() {
         let item = AiPresetItem {
             id: "1".into(),
+            is_builtin: false,
             keyword: "sum".into(),
             name: "S".into(),
             template: "Summarize this:".into(),
@@ -398,5 +433,124 @@ mod tests {
         // Renaming b's keyword to "a" collides.
         let err = store.update_preset(&db, &b.id, "a", "B", "y").unwrap_err();
         assert!(err.to_string().contains("already exists"));
+    }
+}
+
+#[cfg(test)]
+mod builtin_protection {
+    use super::*;
+    use crate::db::open_test_database;
+
+    fn seeded() -> (Arc<Database>, AiPresetsStore) {
+        let db = open_test_database();
+        let store = AiPresetsStore::new();
+        store.seed_builtins(&db).unwrap();
+        (db, store)
+    }
+
+    fn preset(store: &AiPresetsStore, db: &Arc<Database>, keyword: &str) -> AiPresetItem {
+        store
+            .get_preset_by_keyword(db, keyword)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{keyword} should have been seeded"))
+    }
+
+    #[test]
+    fn the_shipped_defaults_are_marked_builtin() {
+        let (db, store) = seeded();
+        for (keyword, _, _) in BUILTIN_PRESETS {
+            assert!(
+                preset(&store, &db, keyword).is_builtin,
+                "{keyword} should be flagged built-in"
+            );
+        }
+    }
+
+    #[test]
+    fn a_user_preset_is_not_marked_builtin() {
+        let (db, store) = seeded();
+        let mine = store
+            .add_preset(&db, "haiku", "Haiku", "Write a haiku about {input}")
+            .unwrap();
+        assert!(!mine.is_builtin);
+    }
+
+    #[test]
+    fn a_builtin_cannot_be_deleted() {
+        let (db, store) = seeded();
+        let p = preset(&store, &db, "translate");
+        let err = store.delete_preset(&db, &p.id).unwrap_err();
+        assert!(
+            format!("{err}").contains("built-in"),
+            "the refusal should say why: {err}"
+        );
+        // And it is still there.
+        assert!(
+            store
+                .get_preset_by_keyword(&db, "translate")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_builtin_cannot_be_edited() {
+        let (db, store) = seeded();
+        let p = preset(&store, &db, "summarize");
+        let err = store
+            .update_preset(&db, &p.id, "summarize", "Summarise", "Changed: {input}")
+            .unwrap_err();
+        assert!(format!("{err}").contains("built-in"), "{err}");
+        assert_eq!(preset(&store, &db, "summarize").template, p.template);
+    }
+
+    /// The bypass worth closing: renaming a built-in to a free keyword would
+    /// let an edit through if the guard read the SUBMITTED keyword instead of
+    /// the stored one.
+    #[test]
+    fn a_builtin_cannot_be_renamed_out_of_protection() {
+        let (db, store) = seeded();
+        let p = preset(&store, &db, "rewrite");
+        let err = store
+            .update_preset(&db, &p.id, "myrewrite", "Mine", "Anything: {input}")
+            .unwrap_err();
+        assert!(format!("{err}").contains("built-in"), "{err}");
+        assert!(
+            store
+                .get_preset_by_keyword(&db, "rewrite")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get_preset_by_keyword(&db, "myrewrite")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Protection must not leak onto the user's own presets.
+    #[test]
+    fn user_presets_stay_editable_and_deletable() {
+        let (db, store) = seeded();
+        let mine = store
+            .add_preset(&db, "haiku", "Haiku", "Write a haiku about {input}")
+            .unwrap();
+        store
+            .update_preset(&db, &mine.id, "haiku", "Haiku v2", "A haiku on {input}")
+            .expect("a user preset must stay editable");
+        store
+            .delete_preset(&db, &mine.id)
+            .expect("a user preset must stay deletable");
+    }
+
+    /// A user may still take a built-in's KEYWORD if they delete nothing —
+    /// guard against the check accidentally blocking creation.
+    #[test]
+    fn the_builtin_check_reads_the_keyword_not_the_name() {
+        assert!(is_builtin_keyword("translate"));
+        assert!(is_builtin_keyword("  TRANSLATE  "), "trim + lowercase");
+        assert!(!is_builtin_keyword("translated"));
+        assert!(!is_builtin_keyword("Translate this"));
     }
 }

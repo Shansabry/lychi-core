@@ -1344,7 +1344,17 @@ name: string;
 /**
  * The prompt template; `{input}` is replaced with the user's text.
  */
-template: string; created_at: number; updated_at: number }
+template: string; created_at: number; updated_at: number; 
+/**
+ * A shipped default (`translate`, `summarize`, `rewrite`).
+ * 
+ * Derived from the keyword at read time rather than stored, so it cannot
+ * drift from `BUILTIN_PRESETS` and needs no migration for rows written
+ * before this field existed. The UI uses it to show a "Default" badge and
+ * hide the edit/delete actions; the store refuses those operations
+ * regardless, since presets are reachable over IPC too.
+ */
+is_builtin?: boolean }
 export type AiStatus = { mode: string; provider: string; model: string; has_ai_router: boolean }
 /**
  * Result of a live connection test — a real round-trip, not just a reachability
