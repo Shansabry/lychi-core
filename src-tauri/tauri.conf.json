@@ -99,7 +99,7 @@
       "  4. add TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD as GitHub secrets",
       "Only the AppImage self-updates; deb/rpm/Flatpak are gated at runtime by lychi_core::install."
     ],
-    "_updater": {
+    "updater": {
       "pubkey": "",
       "endpoints": [
         "https://github.com/Shansabry/lychi-core/releases/latest/download/latest.json"
