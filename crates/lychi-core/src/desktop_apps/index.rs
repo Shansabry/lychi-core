@@ -73,6 +73,28 @@ pub fn rebuild_app_index() {
     global_store().store(new_index);
 }
 
+/// Replace the global index with a fixed set of entries. **Tests only.**
+///
+/// Without this, anything that routes through the app index asserts against
+/// whatever happens to be installed on the machine running the tests — which
+/// passes on a developer desktop with Firefox and fails on a CI runner with no
+/// `.desktop` files at all. Three executor tests failed exactly that way.
+///
+/// The global is process-wide, so callers must serialise on
+/// [`test_index_lock`] and restore what they replaced.
+#[cfg(test)]
+pub fn set_app_index_for_test(entries: Vec<DesktopEntry>) {
+    global_store().store(Arc::new(AppIndex::build(entries)));
+}
+
+/// Serialises tests that swap the global index. Exposed because the tests that
+/// need it live in other modules (`executor`).
+#[cfg(test)]
+pub fn test_index_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
 pub struct AppIndex {
     /// All entries — indexed by usize ID.
     pub entries: Vec<DesktopEntry>,
@@ -479,8 +501,10 @@ impl AppIndex {
     }
 }
 
+//  so other modules' tests can build fixture entries via
+// `make_entry` — see `set_app_index_for_test`.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::desktop_apps::entry::{DesktopEntry, exec_basename, make_acronym};
 

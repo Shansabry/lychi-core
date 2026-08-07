@@ -1687,6 +1687,52 @@ mod tests {
         id: &'static str,
     }
 
+    /// An `open` handler that returns a completion.
+    ///
+    /// The plain `StubHandler` returns none, which makes any assertion about
+    /// completion ROWS silently depend on the app index — i.e. on which
+    /// applications the test machine happens to have installed.
+    struct CompletingHandler;
+
+    #[async_trait]
+    impl ActionHandler for CompletingHandler {
+        fn id(&self) -> &str {
+            "open"
+        }
+
+        fn description(&self) -> &str {
+            "mock open handler that completes"
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &crate::action_registry::ExecContext,
+            _args: &str,
+        ) -> Result<ActionResult, crate::error::LychiError> {
+            Ok(ActionResult::ok(
+                "open stub executed",
+                crate::action_registry::OutputType::Status,
+            ))
+        }
+
+        async fn completions(&self, partial: &str) -> Vec<crate::action_registry::CompletionItem> {
+            // `partial` is the ARGS after routing, so it is empty for a bare
+            // "open". The label is what the ranker keys defaultability on, so
+            // it must be the full command either way.
+            let label = if partial.trim().is_empty() {
+                "open".to_string()
+            } else {
+                format!("open {}", partial.trim())
+            };
+            vec![crate::action_registry::CompletionItem {
+                label: label.clone(),
+                score: 100,
+                run: Some(label),
+                ..Default::default()
+            }]
+        }
+    }
+
     #[async_trait]
     impl ActionHandler for StubHandler {
         fn id(&self) -> &str {
@@ -2220,6 +2266,16 @@ mod tests {
     }
 
     /// Registry where "open" succeeds and "web" is present
+    /// `open` returns one real completion, so `completions()` has a row whose
+    /// `can_be_default` stamp can be asserted without depending on the host's
+    /// installed applications.
+    fn registry_with_completing_open() -> ActionRegistry {
+        let mut r = ActionRegistry::new();
+        r.register(Box::new(CompletingHandler));
+        r.register(Box::new(StubHandler { id: "web" }));
+        r
+    }
+
     fn registry_open_succeeds() -> ActionRegistry {
         let mut r = ActionRegistry::new();
         r.register(Box::new(StubHandler { id: "open" }));
@@ -2254,9 +2310,51 @@ mod tests {
         assert!(r.result.success);
     }
 
+    /// Pin the app index to ONE known app for the duration of a test.
+    ///
+    /// These tests assert *routing*, but routing consults the global app index,
+    /// so without this they assert whatever is installed on the machine: they
+    /// passed on a developer desktop with Firefox and failed on a CI runner
+    /// with no `.desktop` files, where "firefox" fell through to `run` and the
+    /// stub registry answered `UnknownCommand("run")`.
+    ///
+    /// The guard restores the real index on drop, and the lock serialises
+    /// tests that touch the process-wide global.
+    fn with_firefox_indexed() -> impl Drop {
+        with_indexed_app("Firefox", "/usr/bin/firefox")
+    }
+
+    /// As above, for a caller that needs a specific app name.
+    fn with_indexed_app(name: &str, exec: &str) -> impl Drop {
+        use crate::desktop_apps::index;
+        // The guard is never *read* — holding it IS the point, since dropping
+        // it releases the lock that serialises index swaps. Named rather than
+        // positional so `dead_code` can see it is deliberate.
+        struct Restore {
+            _lock: std::sync::MutexGuard<'static, ()>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                index::rebuild_app_index();
+            }
+        }
+        let guard = index::test_index_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        index::set_app_index_for_test(vec![index::tests::make_entry(
+            name,
+            exec,
+            &[],
+            None,
+            Some(&name.to_lowercase()),
+        )]);
+        Restore { _lock: guard }
+    }
+
     /// 2. Short word + "open" handler succeeds → action stays "open"
     #[tokio::test]
     async fn app_present_routes_to_open() {
+        let _idx = with_firefox_indexed();
         let ex = make_executor(registry_open_succeeds());
         let r = ex
             .run(
@@ -2274,6 +2372,7 @@ mod tests {
     /// 3. App missing: "open" returns success:false → executor falls back to "web"
     #[tokio::test]
     async fn app_missing_falls_back_to_web() {
+        let _idx = with_firefox_indexed();
         let ex = make_executor(registry_open_fails());
         let r = ex
             .run(
@@ -2365,7 +2464,14 @@ mod tests {
     /// rule in `suggestions` cannot see that.
     #[tokio::test]
     async fn a_real_match_is_stamped_defaultable() {
-        let ex = make_executor(registry_open_succeeds());
+        // A MOCK handler that actually returns a row, rather than relying on
+        // whatever the host has installed. The stub `open` handler yields no
+        // completions, so on the dev box this test passed only because a real
+        // installed app happened to match "open" through the app index — and
+        // on a CI runner with no .desktop files nothing did. What is being
+        // asserted is that the executor STAMPS the verdict onto the item, so
+        // the row's provenance is irrelevant; it just has to exist.
+        let ex = make_executor(registry_with_completing_open());
         let completions = ex
             .completions("open", &crate::config::schema::SuggestionsConfig::default())
             .await;

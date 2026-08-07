@@ -466,18 +466,33 @@ mod truncate_regression {
 mod label_roundtrip {
     use super::*;
 
-    /// The label a completion shows must resolve back to the window it named.
-    #[test]
-    fn a_truncated_label_still_finds_its_window() {
-        let w = RunningWindow {
+    fn window(wm_class: &str, title: &str) -> RunningWindow {
+        RunningWindow {
             window_id: Some(1),
             kwin_id: None,
-            wm_class: "firefox".into(),
-            title: "A very long window title that will certainly be truncated".into(),
+            wm_class: wm_class.into(),
+            title: title.into(),
             pid: 1,
             desktop: None,
-        };
-        let label = completion_label("Firefox", &w.title, true, false);
+        }
+    }
+
+    /// The label a completion shows must resolve back to the window it named.
+    ///
+    /// The display name comes from `display_name_for_class`, the same resolver
+    /// `find_window_by_label` uses, rather than a hardcoded "Firefox". Naming
+    /// a real app makes the assertion depend on that app being INSTALLED: on a
+    /// CI runner with no .desktop files the index misses, the fallback
+    /// capitalisation applies, and the round-trip fails for reasons that have
+    /// nothing to do with truncation. Build host is not the target.
+    #[test]
+    fn a_truncated_label_still_finds_its_window() {
+        let w = window(
+            "firefox",
+            "A very long window title that will certainly be truncated",
+        );
+        let display = display_name_for_class(&w.wm_class);
+        let label = completion_label(&display, &w.title, true, false);
         assert!(
             find_window_by_label(std::slice::from_ref(&w), &label).is_some(),
             "label {label:?} did not resolve back to its window"
@@ -492,15 +507,9 @@ mod label_roundtrip {
             "🎵🎵🎵🎵🎵🎵🎵🎵🎵🎵🎵🎵🎵🎵🎵 Now Playing Some Long Track",
             "日本語のウィンドウタイトルです、とても長いのでこれは必ず切られます",
         ] {
-            let w = RunningWindow {
-                window_id: Some(1),
-                kwin_id: None,
-                wm_class: "player".into(),
-                title: title.into(),
-                pid: 1,
-                desktop: None,
-            };
-            let label = completion_label("Player", &w.title, true, false);
+            let w = window("player", title);
+            let display = display_name_for_class(&w.wm_class);
+            let label = completion_label(&display, &w.title, true, false);
             assert!(
                 find_window_by_label(std::slice::from_ref(&w), &label).is_some(),
                 "label {label:?} did not resolve back to its window"
