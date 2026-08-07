@@ -299,10 +299,16 @@ jobs:
       # put its socket in, and it must be 0700 or wlroots refuses to start.
       # Harmless for the X11 job.
       - name: Run ${{ matrix.backend }} tests
+        env:
+          SCRIPT: ${{ matrix.script }}
         run: |
-          export XDG_RUNTIME_DIR="$(mktemp -d)"
+          set -euo pipefail
+          # Declared then assigned: `export X="$(cmd)"` returns export's status,
+          # not the command's, so a failing mktemp would sail past `set -e`.
+          XDG_RUNTIME_DIR="$(mktemp -d)"
+          export XDG_RUNTIME_DIR
           chmod 700 "$XDG_RUNTIME_DIR"
-          ${{ matrix.script }}
+          "$SCRIPT"
 
   # ── Stage 3c: frontend ─────────────────────────────────────────────────────
   frontend:

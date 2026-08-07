@@ -152,7 +152,16 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v') && env.TAURI_SIGNING_PRIVATE_KEY != ''
         run: |
           set -euo pipefail
-          APPIMAGE=$(ls target/release/bundle/appimage/*.AppImage | head -1)
+          # A glob, not `ls`: parsing ls output breaks on unusual filenames,
+          # and nullglob makes "no match" an empty array rather than the
+          # literal pattern.
+          shopt -s nullglob
+          appimages=(target/release/bundle/appimage/*.AppImage)
+          if [ ${#appimages[@]} -eq 0 ]; then
+            echo "No AppImage was produced" >&2
+            exit 1
+          fi
+          APPIMAGE="${appimages[0]}"
           SIG_FILE="${APPIMAGE}.sig"
           if [ ! -f "$SIG_FILE" ]; then
             echo "No signature beside $APPIMAGE — is bundle.createUpdaterArtifacts true?" >&2
