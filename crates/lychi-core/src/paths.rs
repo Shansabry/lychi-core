@@ -37,6 +37,13 @@ pub fn clipboard_images_dir() -> PathBuf {
     data_dir().join("clipboard-images")
 }
 
+/// Where backup archives live. Inside the data dir so a user copying that one
+/// directory takes their backups with them, but excluded from the archive
+/// itself so backups never nest.
+pub fn backups_dir() -> PathBuf {
+    data_dir().join("backups")
+}
+
 /// Directory where downloaded local-AI model weights (GGUF) are stored. Weights
 /// are fetched on first use (not bundled), so this lives in the data dir.
 pub fn models_dir() -> PathBuf {

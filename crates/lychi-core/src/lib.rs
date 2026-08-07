@@ -2,6 +2,7 @@ pub mod action_registry;
 pub mod ai_history;
 pub mod ai_presets;
 pub mod aliases;
+pub mod backup;
 pub mod clipboard;
 pub mod config;
 pub mod context;
@@ -17,6 +18,7 @@ pub mod files;
 pub mod fonts;
 pub mod history;
 pub mod hotkey;
+pub mod install;
 pub mod intent;
 #[cfg(feature = "mpris")]
 pub mod mpris;

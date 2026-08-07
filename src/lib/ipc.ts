@@ -16,6 +16,7 @@ import type {
 	AliasItem,
 	AllNotes,
 	AllSettings,
+	BackupInfo,
 	CommandInfo,
 	CommandsConfig,
 	CompletionItem,
@@ -40,12 +41,14 @@ import type {
 	PrivacyConfig,
 	ProjectsConfig,
 	ReminderItem,
+	RestoreReport,
 	RouteDecision,
 	ScratchItem,
 	SnippetItem,
 	TimerStatus,
 	TodoItem,
 	TrackInfo,
+	UpdateStatus,
 } from "./bindings";
 import { commands, type Result } from "./bindings";
 
@@ -61,6 +64,7 @@ export type {
 	AllNotes,
 	AllSettings,
 	AttachmentRoute,
+	BackupInfo,
 	ChatMessage,
 	ClipboardContentType,
 	CommandInfo,
@@ -100,6 +104,7 @@ export type {
 	Quicklink,
 	QuicklinkKind,
 	ReminderItem,
+	RestoreReport,
 	RiskLevel,
 	RouteDecision,
 	ScratchItem,
@@ -107,6 +112,7 @@ export type {
 	TimerStatus,
 	TodoItem,
 	TrackInfo,
+	UpdateStatus,
 	WindowContext,
 } from "./bindings";
 
@@ -560,6 +566,55 @@ export async function getReservedKeywords(): Promise<string[]> {
 export async function getInstalledFonts(): Promise<FontFamily[]> {
 	if (!isTauri()) return [];
 	return unwrap(await commands.getInstalledFonts());
+}
+
+// --- Updates ---
+
+/** Version + how this install is managed. No network call. */
+export async function updateStatus(): Promise<UpdateStatus | null> {
+	if (!isTauri()) return null;
+	return unwrap(await commands.updateStatus());
+}
+
+/** Ask the release endpoint whether something newer exists. */
+export async function checkForUpdate(): Promise<UpdateStatus | null> {
+	if (!isTauri()) return null;
+	return unwrap(await commands.checkForUpdate());
+}
+
+/** Download, install and relaunch. Takes a backup first. */
+export async function installUpdate(): Promise<void> {
+	unwrap(await commands.installUpdate());
+}
+
+// --- Backup & restore ---
+
+export async function listBackups(): Promise<BackupInfo[]> {
+	if (!isTauri()) return [];
+	return unwrap(await commands.listBackups());
+}
+
+export async function createBackup(reason?: string): Promise<BackupInfo> {
+	return unwrap(await commands.createBackup(reason ?? null));
+}
+
+/** Restore by filename (`BackupInfo.name`). Destructive — confirm first. */
+export async function restoreBackup(name: string): Promise<RestoreReport> {
+	return unwrap(await commands.restoreBackup(name));
+}
+
+export async function deleteBackup(name: string): Promise<void> {
+	unwrap(await commands.deleteBackup(name));
+}
+
+export async function backupsDir(): Promise<string> {
+	if (!isTauri()) return "";
+	return unwrap(await commands.backupsDir());
+}
+
+export async function appVersionString(): Promise<string> {
+	if (!isTauri()) return "dev";
+	return unwrap(await commands.appVersionString());
 }
 
 // --- Aliases ---

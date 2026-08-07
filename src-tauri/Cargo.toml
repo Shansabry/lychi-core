@@ -75,3 +75,6 @@ gtk-layer-shell = { version = "0.8.2", features = ["v0_6"] }
 # v2_38 matches the feature wry already enables, so this adds no new API
 # surface beyond what is compiled in regardless. set_enable_webrtc needs it.
 webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
+
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-updater = "2.10.1"

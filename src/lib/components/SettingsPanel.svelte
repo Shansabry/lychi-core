@@ -1,5 +1,13 @@
 <script lang="ts">
-import { BookOpen, FolderOpen, Info, Keyboard, SlidersHorizontal, Sparkles } from "lucide-svelte";
+import {
+	Archive,
+	BookOpen,
+	FolderOpen,
+	Info,
+	Keyboard,
+	SlidersHorizontal,
+	Sparkles,
+} from "lucide-svelte";
 import { onMount } from "svelte";
 import type {
 	AiConfig,
@@ -12,12 +20,13 @@ import { KEYBINDINGS_DEFAULTS, PRIVACY_DEFAULTS } from "$lib/ipc";
 import { preloadSettings } from "$lib/preloadCache";
 import AboutTab from "./settings/AboutTab.svelte";
 import AiTab from "./settings/ai/AiTab.svelte";
+import DataTab from "./settings/DataTab.svelte";
 import GeneralTab from "./settings/GeneralTab.svelte";
 import GuideTab from "./settings/GuideTab.svelte";
 import ProjectsTab from "./settings/ProjectsTab.svelte";
 import ShortcutsTab from "./settings/ShortcutsTab.svelte";
 
-type Tab = "general" | "ai" | "projects" | "shortcuts" | "guide" | "about";
+type Tab = "general" | "ai" | "projects" | "shortcuts" | "data" | "guide" | "about";
 
 let { ondismiss, onpresetchange }: { ondismiss: () => void; onpresetchange?: () => void } =
 	$props();
@@ -160,6 +169,14 @@ function handleKeydown(e: KeyboardEvent) {
 			<span>Guide</span>
 		</button>
 		<button
+			class="tab-btn"
+			class:active={activeTab === "data"}
+			onclick={() => (activeTab = "data")}
+		>
+			<Archive size={14} strokeWidth={1.5} />
+			<span>Data</span>
+		</button>
+		<button
 			class="tab-btn about-tab"
 			class:active={activeTab === "about"}
 			onclick={() => (activeTab = "about")}
@@ -193,6 +210,8 @@ function handleKeydown(e: KeyboardEvent) {
 				bind:projectDirs
 				onsaveerror={(msg) => (saveError = msg)}
 			/>
+		{:else if activeTab === "data"}
+			<DataTab onsaveerror={(msg) => (saveError = msg)} />
 		{:else if activeTab === "shortcuts"}
 			<ShortcutsTab
 				bind:keybindingsConfig

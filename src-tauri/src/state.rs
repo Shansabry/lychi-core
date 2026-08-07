@@ -261,6 +261,15 @@ impl AppState {
         // built, so the factory can wire failure-learning into BYO clients.
         lychi_core::providers::capability::init_store(db.clone());
 
+        // FIRST write-adjacent step at startup: if this is the first run of a
+        // new version, snapshot the old version's data before any seeding,
+        // migration or new-code path has touched it. Ordering is the whole
+        // point — a backup taken after the new code writes is a backup of the
+        // problem. Never fatal; a failure is logged inside.
+        if let Some(b) = lychi_core::backup::backup_if_upgraded(&db, env!("CARGO_PKG_VERSION")) {
+            tracing::info!("[backup] pre-upgrade snapshot saved: {}", b.name);
+        }
+
         // Seed settings from TOML on first launch (if settings table is empty)
         if let Err(e) = lychi_core::config::db::seed_from_config(&db, &config) {
             tracing::error!("Failed to seed settings: {e}");

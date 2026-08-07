@@ -83,6 +83,28 @@
     }
   },
   "plugins": {
+    "_updater_README": [
+      "DECISION 2026-08-07: the updater is wired but deliberately OFF for v0.1.0.",
+      "Enable it at v0.2.0 only if AppImage users turn out to matter — Flatpak,",
+      "AUR, dnf and apt all update themselves, and every key you do not hold is",
+      "a key that cannot leak. Rotation is the reason for the caution: the public",
+      "key is compiled into installed binaries, so replacing it needs a release",
+      "signed with the OLD key that carries the NEW one. Sign with the new key",
+      "first and every existing install is stranded on a manual re-download.",
+      "",
+      "To enable it:",
+      "  1. pnpm tauri signer generate -w ~/.tauri/lychi.key   (keep the private key + password secret)",
+      "  2. rename this key to \"updater\" and paste the PUBLIC key into \"pubkey\" below",
+      "  3. set bundle.createUpdaterArtifacts to true",
+      "  4. add TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD as GitHub secrets",
+      "Only the AppImage self-updates; deb/rpm/Flatpak are gated at runtime by lychi_core::install."
+    ],
+    "_updater": {
+      "pubkey": "",
+      "endpoints": [
+        "https://github.com/Shansabry/lychi-core/releases/latest/download/latest.json"
+      ]
+    },
     "deep-link": {
       "desktop": {
         "schemes": [

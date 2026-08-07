@@ -49,6 +49,7 @@
     "vitest": "^4.1.10"
   },
   "dependencies": {
+    "@tauri-apps/plugin-updater": "^2.10.1",
     "ansi-to-html": "^0.7.2",
     "dompurify": "^3.3.1",
     "highlight.js": "^11.11.1",

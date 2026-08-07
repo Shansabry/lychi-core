@@ -858,6 +858,109 @@ async deleteTodo(id: string) : Promise<Result<null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Current version + how this copy is managed. Never hits the network, so the
+ * tab can render instantly and check for updates only when asked.
+ */
+async updateStatus() : Promise<Result<UpdateStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Ask the update endpoint whether something newer exists.
+ * 
+ * On a distro package this returns the status unchanged rather than checking:
+ * telling a `dnf` user that 0.2.0 exists, with no way to install it from here,
+ * is noise — their package manager will tell them in its own time.
+ */
+async checkForUpdate() : Promise<Result<UpdateStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("check_for_update") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Download and install the available update, then relaunch.
+ * 
+ * **Takes a backup first.** An update is the single most likely moment for a
+ * migration to eat data, and it is precisely when the user is not thinking
+ * about backups. The snapshot is stamped with the CURRENT version, because
+ * that is whose data it holds.
+ */
+async installUpdate() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("install_update") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listBackups() : Promise<Result<BackupInfo[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_backups") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async createBackup(reason: string | null) : Promise<Result<BackupInfo, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("create_backup", { reason }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Restore a backup by its filename (the `name` field from `list_backups`).
+ * 
+ * The path is rebuilt from the backups directory rather than accepted from the
+ * frontend, so a crafted argument cannot make this read an arbitrary file.
+ */
+async restoreBackup(name: string) : Promise<Result<RestoreReport, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("restore_backup", { name }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteBackup(name: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_backup", { name }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Absolute path of the backups directory, so the UI can offer "show in files".
+ */
+async backupsDir() : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("backups_dir") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The running version — the UI needs it to mark which backups are restorable.
+ */
+async appVersionString() : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("app_version_string") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async getAliases() : Promise<Result<AliasItem[], string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_aliases") };
@@ -1279,6 +1382,41 @@ export type AttachmentRoute =
  * We can't feed this to the model — `note` explains why.
  */
 "unsupported"
+/**
+ * A backup on disk, as listed for the UI.
+ */
+export type BackupInfo = { 
+/**
+ * Absolute path to the `.tar.gz`.
+ */
+path: string; 
+/**
+ * Bare filename, the stable id the UI passes back to restore/delete.
+ */
+name: string; 
+/**
+ * Archive size in bytes.
+ */
+size_bytes: number; 
+/**
+ * `None` when the manifest could not be read — such an archive is listed
+ * (so the user can see and delete it) but must never be restored.
+ */
+manifest: Manifest | null }
+/**
+ * What a backup was taken for. Recorded in the manifest and the filename so
+ * the reason survives into the UI.
+ */
+export type BackupKind = 
+/**
+ * The user asked for it.
+ */
+"manual" | 
+/**
+ * Taken automatically before something that could lose data (an upgrade,
+ * a restore, a migration).
+ */
+"automatic"
 /**
  * A short state chip on a row.
  */
@@ -1897,6 +2035,35 @@ export type LocalModelInfo = { id: string; label: string; description: string; s
  */
 downloaded: boolean }
 /**
+ * What is inside an archive, written as `manifest.json` at its root.
+ */
+export type Manifest = { 
+/**
+ * Archive layout version — see [`ARCHIVE_VERSION`].
+ */
+archive_version: number; 
+/**
+ * The Lychi version that produced it.
+ */
+app_version: string; 
+/**
+ * Unix millis when it was taken.
+ */
+created_at: number; kind: BackupKind; 
+/**
+ * Free-text note ("before restore", "before upgrade to 0.2.0").
+ */
+reason?: string; 
+/**
+ * Table name → row count, so the UI can say what is in a backup without
+ * unpacking it, and restore can verify it got everything.
+ */
+tables: ([string, number])[]; 
+/**
+ * Which optional extras are present.
+ */
+has_config?: boolean; has_scripts?: boolean }
+/**
  * The presentational split of a user turn: the instruction line shown in the
  * bubble plus the payload folded into a collapsed chip. Computed ONCE by the
  * sender (the frontend's `presetDisplay`) and persisted with the message.
@@ -2099,6 +2266,14 @@ export type QuicklinkKind =
 "command"
 export type ReminderItem = { id: string; text: string; due_at: number; fired: boolean; created_at: number }
 /**
+ * What a restore did, for reporting back to the user.
+ */
+export type RestoreReport = { tables_restored: number; rows_restored: number; config_restored: boolean; scripts_restored: boolean; 
+/**
+ * The safety backup taken of the pre-restore state.
+ */
+safety_backup: string }
+/**
  * Risk level for any action. Used by the Rules Engine to decide
  * whether to auto-execute, require confirmation, or deny.
  */
@@ -2245,6 +2420,38 @@ bus_name: string;
  * Friendly player name (e.g. "Spotify", "Firefox").
  */
 player_name: string }
+/**
+ * What the Settings tab needs to say about updates, in one round trip.
+ */
+export type UpdateStatus = { 
+/**
+ * Running version.
+ */
+current_version: string; 
+/**
+ * How this copy was installed (`appimage` / `flatpak` / `system`).
+ */
+install_kind: string; 
+/**
+ * Whether Lychi may update itself here. False for distro packages.
+ */
+can_self_update: boolean; 
+/**
+ * What to tell the user when it cannot — the command they'd actually run.
+ */
+hint: string; 
+/**
+ * Newer version available, if a check has found one.
+ */
+available_version: string | null; 
+/**
+ * Release notes for that version.
+ */
+notes: string | null; 
+/**
+ * Set when a check could not complete (offline, no endpoint configured).
+ */
+error: string | null }
 export type WindowContext = { title: string; wm_class: string; pid: number; is_terminal: boolean; is_ide?: boolean; 
 /**
  * Stable per-window identifier. On KWin: UUID string from `w.internalId`.

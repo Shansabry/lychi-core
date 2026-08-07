@@ -28,6 +28,13 @@ jobs:
     env:
       # linuxdeploy's embedded strip breaks on modern toolchains (.relr.dyn)
       NO_STRIP: "1"
+      # Updater signing. Both are empty until the keypair exists, and
+      # `createUpdaterArtifacts` stays false in tauri.conf.json until then, so
+      # the build is unaffected — an unsigned release simply produces no
+      # `.sig`/`latest.json` and installed copies keep reporting "not
+      # configured" rather than failing a signature check.
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       # `cmake clang libclang-dev` are for `local-ai`: llama-cpp-sys-2 compiles
       # llama.cpp with CMake and generates its bindings with bindgen, which
@@ -133,3 +140,49 @@ jobs:
           name: lychi-appimage
           path: target/release/bundle/appimage/*.AppImage
           if-no-files-found: error
+
+      # The updater reads `latest.json` from the release. It is generated from
+      # the signature the build just produced, so it can never claim a version
+      # or hash the artifact does not have.
+      #
+      # Skipped entirely when unsigned: publishing a manifest with no signature
+      # would make every client fail verification, which is worse than having no
+      # manifest at all (clients then simply report "no update found").
+      - name: Generate updater manifest
+        if: startsWith(github.ref, 'refs/tags/v') && env.TAURI_SIGNING_PRIVATE_KEY != ''
+        run: |
+          set -euo pipefail
+          APPIMAGE=$(ls target/release/bundle/appimage/*.AppImage | head -1)
+          SIG_FILE="${APPIMAGE}.sig"
+          if [ ! -f "$SIG_FILE" ]; then
+            echo "No signature beside $APPIMAGE — is bundle.createUpdaterArtifacts true?" >&2
+            exit 1
+          fi
+          VERSION="${GITHUB_REF_NAME#v}"
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          cat > latest.json <<EOF
+          {
+            "version": "${VERSION}",
+            "notes": "See https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "linux-x86_64": {
+                "signature": "$(cat "$SIG_FILE")",
+                "url": "${BASE}/$(basename "$APPIMAGE")"
+              }
+            }
+          }
+          EOF
+          cat latest.json
+
+      # Attaching the AppImage, its signature and the manifest to the tagged
+      # release is what makes the updater endpoint resolve.
+      - name: Publish release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/bundle/appimage/*.AppImage
+            target/release/bundle/appimage/*.AppImage.sig
+            latest.json
+          fail_on_unmatched_files: false

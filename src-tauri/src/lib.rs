@@ -138,6 +138,15 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::notes::add_todo,
         commands::notes::toggle_todo,
         commands::notes::delete_todo,
+        commands::update::update_status,
+        commands::update::check_for_update,
+        commands::update::install_update,
+        commands::backup::list_backups,
+        commands::backup::create_backup,
+        commands::backup::restore_backup,
+        commands::backup::delete_backup,
+        commands::backup::backups_dir,
+        commands::backup::app_version_string,
         commands::aliases::get_aliases,
         commands::aliases::add_alias,
         commands::aliases::update_alias,
@@ -315,6 +324,11 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_deep_link::init())
+        // Updater. Registered unconditionally because the plugin only acts when
+        // asked; whether an update may be INSTALLED is decided per-install by
+        // `lychi_core::install` (only the AppImage self-updates — a .deb, .rpm
+        // or Flatpak is owned by its package manager). See `commands::update`.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // Autostart entry launches with --hidden so login doesn't pop the launcher
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
