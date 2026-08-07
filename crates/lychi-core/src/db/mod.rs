@@ -134,6 +134,20 @@ pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
 
     let db = match Database::create(path) {
         Ok(db) => db,
+        // A lock conflict is NOT corruption — it means another Lychi already
+        // owns this database. Recreating here renames the live file to `.bak`
+        // and hands the second instance an EMPTY database, which reads to the
+        // user as "all my history and clipboard are gone". Measured: launching
+        // a second instance while the first ran did exactly that.
+        //
+        // Refuse instead. The caller decides what to do with a second instance;
+        // destroying the first one's data is never the answer.
+        Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
+            return Err(LychiError::Database(format!(
+                "another Lychi instance already has {} open",
+                path.display()
+            )));
+        }
         Err(e) if path.exists() => {
             tracing::warn!("[db] cannot open database ({e}), backing up and recreating");
             let backup = path.with_extension("redb.bak");
@@ -369,6 +383,47 @@ mod stale_artifact_tests {
         ));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// The data-loss bug this guards: a SECOND instance used to treat the
+    /// first's lock as corruption, rename the live database to `.bak` and hand
+    /// itself an empty one. The user saw every note, clip and history row gone.
+    #[test]
+    fn a_locked_database_is_refused_not_recreated() {
+        let d = tmpdir("locked");
+        let path = d.join("lychi.redb");
+
+        // First instance owns the lock and holds real content.
+        let first = open_database(&path).expect("first open should succeed");
+        {
+            let txn = first.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(HISTORY).unwrap();
+                t.insert("row-1", b"user data".as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        // Second instance must REFUSE, not recreate.
+        let second = open_database(&path);
+        assert!(second.is_err(), "a locked database must not open");
+
+        // The live file is untouched and no backup was minted from it.
+        assert!(path.exists(), "the live database must still be there");
+        assert!(
+            !path.with_extension("redb.bak").exists(),
+            "a lock conflict must NOT produce a .bak — that is the data loss"
+        );
+
+        // And the first instance still sees its row.
+        let txn = first.begin_read().unwrap();
+        let t = txn.open_table(HISTORY).unwrap();
+        assert!(t.get("row-1").unwrap().is_some(), "user data survived");
+
+        drop(t);
+        drop(txn);
+        drop(first);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

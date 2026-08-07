@@ -240,8 +240,15 @@ impl AppState {
 
         // Open redb database (creates file if missing)
         let db_path = paths::db_file();
+        // A second instance now gets a clear refusal rather than an empty
+        // database (see `open_database`). Exiting beats panicking: a stack
+        // trace for "Lychi is already running" is noise, and the running
+        // instance is the one the user wants anyway.
         let db = lychi_core::db::open_database(&db_path).unwrap_or_else(|e| {
-            panic!("Failed to open database: {e}");
+            tracing::error!("Cannot open database: {e}");
+            eprintln!("lychi: cannot open database: {e}");
+            eprintln!("lychi: if Lychi is already running, use the hotkey or `lychi --toggle`.");
+            std::process::exit(1);
         });
         let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
         tracing::info!(
