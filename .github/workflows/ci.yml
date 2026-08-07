@@ -66,6 +66,22 @@ jobs:
       - name: Frontend lint
         run: pnpm lint
 
+      # Workflow files are the one thing CI cannot check by running: a syntax
+      # error means GitHub rejects the file, produces ZERO jobs, and reports a
+      # 0-second failure with no log. That is exactly how a `" "` separator in
+      # a `join()` expression (GitHub expressions take only single quotes) broke
+      # every push to main for three days while every local gate stayed green.
+      #
+      # actionlint is a single static binary — no toolchain, no install step —
+      # and it catches that class before it can merge.
+      - name: Lint workflows
+        run: |
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            | tar xz actionlint
+          ./actionlint -color
+        env:
+          ACTIONLINT_VERSION: 1.7.7
+
   # ── Stage 2: the one expensive Rust compile ────────────────────────────────
   #
   # Everything in `rust-checks` needs the same dependency build. Doing it once
@@ -260,9 +276,14 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install ${{ matrix.backend }} and build deps
+        env:
+          PACKAGES: ${{ matrix.packages }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y ${{ matrix.packages }} \
+          # Unquoted on purpose: PACKAGES is a space-separated list that must
+          # word-split into separate arguments.
+          # shellcheck disable=SC2086
+          sudo apt-get install -y $PACKAGES \
             libdbus-1-dev libssl-dev pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
@@ -346,8 +367,12 @@ jobs:
       # here as an explicit diff.
       - name: Did the dependency graph change?
         id: changed
+        # `github.event.*` is externally influenced, so it arrives as an env
+        # var rather than being spliced into the script text.
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
         run: |
-          base='${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}'
+          base="$BASE_SHA"
           # First push to a branch, or a force-push with no usable base: check.
           if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
@@ -387,11 +412,19 @@ jobs:
     needs: [quick, rust-checks, env-tests, frontend, licenses]
     runs-on: ubuntu-latest
     steps:
+      # The expression goes through `env:`, not straight into the script.
+      # Interpolating `${{ }}` into a shell line splices attacker-influenceable
+      # text into the script itself; an env var is passed as data and cannot be
+      # re-parsed as shell. It also keeps the quoting honest — GitHub
+      # expressions accept ONLY single quotes, and the `" "` separator that
+      # used to be here made the whole workflow unparseable, so every push to
+      # main failed in 0s with no jobs and no log.
       - name: Verify every job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
-          results='${{ join(needs.*.result, " ") }}'
-          echo "job results: $results"
-          for r in $results; do
+          echo "job results: $RESULTS"
+          for r in $RESULTS; do
             # `skipped` is legitimate — the licences job self-gates.
             if [ "$r" != "success" ] && [ "$r" != "skipped" ]; then
               echo "::error::a required job did not pass ($r)"
