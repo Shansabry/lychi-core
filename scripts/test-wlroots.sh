@@ -77,7 +77,21 @@ SWAYSOCK="$(ls -t "$RUNTIME_DIR"/sway-ipc.*."$SWAY_PID".sock 2>/dev/null | head 
 if [ -n "$SWAYSOCK" ] && command -v foot >/dev/null; then
   echo "Opening a toplevel so the child-object path is exercised..."
   SWAYSOCK="$SWAYSOCK" swaymsg exec foot >/dev/null 2>&1 || true
-  sleep 2
+  # Poll sway's own view count rather than sleeping a guessed interval. The
+  # X11 harness failed on CI for exactly this reason: a fixed sleep is a bet on
+  # machine speed, and a loaded runner loses it. Here the compositor can be
+  # asked directly whether a toplevel exists — which is the precondition these
+  # tests need.
+  for _ in $(seq 1 60); do   # up to 15s
+    views=$(SWAYSOCK="$SWAYSOCK" swaymsg -t get_tree 2>/dev/null |
+            grep -c '"type": *"con"' || true)
+    [ "${views:-0}" -gt 0 ] && break
+    sleep 0.25
+  done
+  if [ "${views:-0}" -eq 0 ]; then
+    echo "WARNING: no toplevel appeared within 15s — the child-object path may" >&2
+    echo "         not be exercised by this run." >&2
+  fi
 else
   echo "WARNING: no foot/swaysock — running with zero toplevels, which does" >&2
   echo "         NOT exercise the event_created_child path." >&2
