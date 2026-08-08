@@ -119,6 +119,125 @@ pub(crate) fn cached_shell_env(shell: &str) -> HashMap<String, String> {
     env
 }
 
+/// How long an inline `run` may hold its result panel before it is killed.
+///
+/// Generous on purpose: inline is for commands whose output you want in the
+/// launcher, and some legitimate ones (a build step, a slow curl) take a
+/// minute. What it must never be is *unbounded* — the runtime has four
+/// workers, and an inline `tail -f` used to hold one (plus the executor read
+/// guard) until app restart. Anything longer-running belongs in a terminal,
+/// which is what the timeout message says.
+const INLINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Output cap for inline `run`. The result is one String shipped over IPC into
+/// the WebView; uncapped, a chatty command materialised its entire output in
+/// memory and then asked WebKitGTK to lay it out. 256KB is far more than the
+/// panel can usefully show and far less than what jams the bridge.
+const INLINE_MAX_OUTPUT_BYTES: usize = 256 * 1024;
+
+/// What the one capture core produced: the command's capped output, or the fact
+/// that it was killed at the timeout. Callers shape this into their own
+/// `ActionResult` — presentation differs per surface, safety must not.
+enum Capture {
+    Completed(CapturedOutput),
+    /// The deadline passed. The shell and its whole process group have been
+    /// SIGKILLed by the time this is returned — "reported stopped" and
+    /// "actually stopped" are the same fact.
+    TimedOut,
+}
+
+struct CapturedOutput {
+    /// Capped at `max_bytes`, char-safe.
+    stdout: String,
+    /// Capped at `max_bytes`, char-safe.
+    stderr: String,
+    success: bool,
+    duration_ms: u64,
+}
+
+/// The ONE shell-capture core: run `cmd` through the login shell, race a
+/// timeout, cap output. Every captured execution (`run` inline, Script
+/// Commands) goes through here — there used to be a second, bespoke capture in
+/// `execute_inline` with no timeout and no cap, which is exactly how a `run
+/// tail -f` permanently ate one of the four runtime workers.
+///
+/// On timeout the child is genuinely killed, not abandoned: `kill_on_drop`
+/// takes the shell when the wait future is dropped, and the process group
+/// (`process_group(0)` gives the shell its own) is SIGKILLed so a pipeline's
+/// children die with it. The previous implementation reported "Timed out"
+/// while the child ran on — a user who retried a mutating script then had two
+/// instances running.
+async fn capture_shell_output(
+    shell: &str,
+    cmd: &str,
+    cwd: Option<&str>,
+    env: HashMap<String, String>,
+    timeout: std::time::Duration,
+    max_bytes: usize,
+) -> Result<Capture, LychiError> {
+    let start = Instant::now();
+    let mut command = tokio::process::Command::new(shell);
+    command
+        .args(["-ic", cmd])
+        .env_clear()
+        .envs(&env)
+        .env("TERM", "xterm-256color")
+        .env("COLUMNS", "120")
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        // Its own process group: the timeout must be able to kill the shell
+        // AND everything it spawned, not orphan a pipeline's children.
+        .process_group(0)
+        // If the wait future is dropped (timeout), kill rather than orphan.
+        .kill_on_drop(true);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+
+    let child = command
+        .spawn()
+        .map_err(|e| LychiError::ExecutionFailed(format!("shell spawn: {e}")))?;
+    let pid = child.id();
+
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Err(LychiError::ExecutionFailed(format!("shell wait: {e}"))),
+        Err(_) => {
+            // The dropped wait future has SIGKILLed the shell (kill_on_drop).
+            // Take the rest of its process group too — the group leader's pid
+            // is the child's own, courtesy of process_group(0) above.
+            if let Some(pid) = pid {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(-(pid as i32)),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            return Ok(Capture::TimedOut);
+        }
+    };
+
+    // Cap output at max_bytes (char-safe) to protect against a chatty command.
+    let cap = |bytes: &[u8]| -> String {
+        let s = String::from_utf8_lossy(bytes);
+        if s.len() <= max_bytes {
+            return s.into_owned();
+        }
+        let mut end = max_bytes;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}\n… (output truncated)", &s[..end])
+    };
+
+    Ok(Capture::Completed(CapturedOutput {
+        stdout: cap(&output.stdout),
+        stderr: cap(&output.stderr),
+        success: output.status.success(),
+        duration_ms: start.elapsed().as_millis() as u64,
+    }))
+}
+
 /// Run `cmd` through the login shell and capture its output, with a timeout and
 /// an output-size cap — the safe reusable capture path for handlers other than
 /// `run` (e.g. Script Commands). `sh -ic "<cmd>"` honors shebangs and the login
@@ -135,62 +254,27 @@ pub(crate) async fn run_captured(
 ) -> Result<ActionResult, LychiError> {
     check_shell_authorization(cmd, clearance)?;
     let env = cached_shell_env(shell);
-    let shell = shell.to_string();
-    let cmd = cmd.to_string();
-    let cwd = cwd.map(|s| s.to_string());
-
-    // The blocking child runs on a spawn_blocking thread; the timeout races it.
     let start = Instant::now();
-    let handle = tokio::task::spawn_blocking(move || {
-        let mut command = Command::new(&shell);
-        command
-            .args(["-ic", &cmd])
-            .env_clear()
-            .envs(&env)
-            .env("TERM", "xterm-256color")
-            .env("COLUMNS", "120")
-            .stdin(Stdio::null())
-            .stderr(Stdio::piped())
-            .stdout(Stdio::piped());
-        if let Some(cwd) = cwd {
-            command.current_dir(cwd);
-        }
-        command.output()
-    });
 
-    let output = match tokio::time::timeout(timeout, handle).await {
-        Ok(Ok(Ok(out))) => out,
-        Ok(Ok(Err(e))) => return Err(LychiError::ExecutionFailed(format!("script spawn: {e}"))),
-        Ok(Err(e)) => return Err(LychiError::ExecutionFailed(format!("script task: {e}"))),
-        Err(_) => {
-            // Timed out — the spawn_blocking thread is detached; the child will be
-            // reaped when it eventually exits. Report the timeout to the user.
+    let CapturedOutput {
+        stdout,
+        stderr,
+        success,
+        duration_ms,
+    } = match capture_shell_output(shell, cmd, cwd, env, timeout, max_bytes).await? {
+        Capture::Completed(out) => out,
+        Capture::TimedOut => {
             return Ok(ActionResult {
                 success: false,
-                error: Some(format!("Timed out after {}s", timeout.as_secs())),
+                error: Some(format!(
+                    "Timed out after {}s — command killed",
+                    timeout.as_secs()
+                )),
                 duration_ms: start.elapsed().as_millis() as u64,
                 ..Default::default()
             });
         }
     };
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-    let success = output.status.success();
-
-    // Cap output at max_bytes (char-safe) to protect against a chatty script.
-    let cap = |bytes: &[u8]| -> String {
-        let s = String::from_utf8_lossy(bytes);
-        if s.len() <= max_bytes {
-            return s.into_owned();
-        }
-        let mut end = max_bytes;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}\n… (output truncated)", &s[..end])
-    };
-    let stdout = cap(&output.stdout);
-    let stderr = cap(&output.stderr);
 
     let mut result = if success {
         // Prefer stdout; fall back to stderr (some tools print to stderr).
@@ -625,6 +709,12 @@ impl ShellExec {
     }
 
     /// Run a command inline (captured output, displayed in Lychi's result panel).
+    ///
+    /// Capture goes through the one core (`capture_shell_output`) — this used
+    /// to carry its own synchronous `command.output()` with no timeout and no
+    /// output cap, blocking a runtime worker for as long as the command ran.
+    /// The runtime has four workers; one `run tail -f` ate a quarter of the
+    /// app's async capacity forever, while also holding the executor guard.
     async fn execute_inline(
         &self,
         cmd: &str,
@@ -634,27 +724,36 @@ impl ShellExec {
         check_shell_authorization(cmd, clearance)?;
         let start = Instant::now();
         let env = self.get_env();
-        let mut command = Command::new(&self.shell);
-        command
-            .args(["-ic", cmd])
-            .env_clear()
-            .envs(&env)
-            .env("TERM", "xterm-256color")
-            .env("COLUMNS", "120")
-            .stdin(Stdio::null())
-            .stderr(Stdio::piped())
-            .stdout(Stdio::piped());
 
-        if let Some(cwd) = cwd {
-            command.current_dir(cwd);
-        }
-
-        let output = command.output()?;
-        let duration_ms = start.elapsed().as_millis() as u64;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let success = output.status.success();
+        let CapturedOutput {
+            stdout,
+            stderr,
+            success,
+            duration_ms,
+        } = match capture_shell_output(
+            &self.shell,
+            cmd,
+            cwd,
+            env,
+            INLINE_TIMEOUT,
+            INLINE_MAX_OUTPUT_BYTES,
+        )
+        .await?
+        {
+            Capture::Completed(out) => out,
+            Capture::TimedOut => {
+                return Ok(ActionResult {
+                    success: false,
+                    error: Some(format!(
+                        "Timed out after {}s — command killed. Long-running \
+                         commands belong in a terminal.",
+                        INLINE_TIMEOUT.as_secs()
+                    )),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                });
+            }
+        };
 
         let (out, err) = if success {
             let combined = if stdout.is_empty() && !stderr.is_empty() {
@@ -879,6 +978,107 @@ fn error_result(message: &str) -> ActionResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal env for capture tests: enough PATH to find `sleep`/`head`,
+    /// nothing from the host (the core does `env_clear`).
+    fn test_env() -> HashMap<String, String> {
+        HashMap::from([(
+            "PATH".to_string(),
+            "/usr/bin:/bin:/usr/local/bin".to_string(),
+        )])
+    }
+
+    /// Is any process on the system running with `marker` in its cmdline?
+    fn proc_running_with(marker: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+            {
+                continue;
+            }
+            if let Ok(cmdline) = std::fs::read(entry.path().join("cmdline"))
+                && String::from_utf8_lossy(&cmdline).contains(marker)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// EXEC-1/6: "reported stopped" and "actually stopped" must be the same
+    /// fact. The old timeout arm returned "Timed out" while the detached child
+    /// ran to completion — a user who retried a mutating script then had two
+    /// instances running. The kill must take the process GROUP: killing only
+    /// the shell orphans a pipeline's children.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn capture_timeout_kills_the_whole_process_group() {
+        // The marker rides in the shell's -c string, so both the shell and the
+        // sleep it spawns are findable (group members share the fate).
+        let marker = format!("lychi-exec16-test-{}", std::process::id());
+        let cmd = format!("sleep 300 # {marker}");
+
+        let started = Instant::now();
+        let res = capture_shell_output(
+            "/bin/sh",
+            &cmd,
+            None,
+            test_env(),
+            std::time::Duration::from_millis(200),
+            4096,
+        )
+        .await
+        .expect("capture must not error on timeout");
+
+        assert!(matches!(res, Capture::TimedOut));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "timeout must return promptly, not wait out the child"
+        );
+
+        // SIGKILL delivery is immediate but reaping is async — poll briefly.
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while proc_running_with(&marker) && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !proc_running_with(&marker),
+            "the child survived the timeout — the kill contract is broken \
+             (docstring promises the child dies with the deadline)"
+        );
+    }
+
+    /// The cap must hold for both streams, char-safely, with the truncation
+    /// marker — the inline path used to materialise unbounded output.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn capture_caps_output() {
+        let res = capture_shell_output(
+            "/bin/sh",
+            "head -c 100000 /dev/zero | tr '\\0' 'a'",
+            None,
+            test_env(),
+            std::time::Duration::from_secs(30),
+            1000,
+        )
+        .await
+        .expect("capture failed");
+
+        let Capture::Completed(out) = res else {
+            panic!("command should complete well within the timeout");
+        };
+        assert!(out.success);
+        assert!(
+            out.stdout.len() < 1100,
+            "cap not applied: {}",
+            out.stdout.len()
+        );
+        assert!(out.stdout.ends_with("(output truncated)"));
+    }
 
     #[test]
     fn command_head_skips_env_assignments() {
