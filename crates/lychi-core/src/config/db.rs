@@ -51,7 +51,7 @@ pub fn save_setting(db: &Arc<Database>, key: &str, value: &str) -> Result<(), Ly
         updated_at: db::now_millis(),
         sync_status: SYNC_LOCAL,
     };
-    let bytes = postcard::to_allocvec(&entry).map_err(|e| LychiError::Database(e.to_string()))?;
+    let bytes = crate::db::encode_row(&entry)?;
 
     let txn = db.begin_write()?;
     {
@@ -74,8 +74,7 @@ pub fn save_settings(db: &Arc<Database>, pairs: &[(&str, &str)]) -> Result<(), L
                 updated_at: now,
                 sync_status: SYNC_LOCAL,
             };
-            let bytes =
-                postcard::to_allocvec(&entry).map_err(|e| LychiError::Database(e.to_string()))?;
+            let bytes = crate::db::encode_row(&entry)?;
             table.insert(*key, bytes.as_slice())?;
         }
     }

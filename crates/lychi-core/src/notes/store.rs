@@ -85,8 +85,7 @@ impl NotesStore {
         let txn = db.begin_write()?;
         {
             let mut table = txn.open_table(db::NOTES)?;
-            let bytes =
-                postcard::to_allocvec(&entry).map_err(|e| LychiError::Database(e.to_string()))?;
+            let bytes = crate::db::encode_row(&entry)?;
             table.insert(id.as_str(), bytes.as_slice())?;
         }
         txn.commit()?;
@@ -115,15 +114,13 @@ impl NotesStore {
             let existing_val = table
                 .get(id)?
                 .ok_or_else(|| LychiError::Notes(format!("Note not found: {id}")))?;
-            let mut entry: NoteEntry = postcard::from_bytes(existing_val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            let mut entry: NoteEntry = crate::db::decode_value(existing_val.value())?;
             if entry.deleted_at.is_some() {
                 return Err(LychiError::Notes(format!("Note not found: {id}")));
             }
             entry.text = text.to_string();
             entry.updated_at = db::now_millis();
-            let bytes =
-                postcard::to_allocvec(&entry).map_err(|e| LychiError::Database(e.to_string()))?;
+            let bytes = crate::db::encode_row(&entry)?;
             drop(existing_val);
             table.insert(id, bytes.as_slice())?;
         }
@@ -138,14 +135,12 @@ impl NotesStore {
             let existing_val = table
                 .get(id)?
                 .ok_or_else(|| LychiError::Notes(format!("Note not found: {id}")))?;
-            let mut entry: NoteEntry = postcard::from_bytes(existing_val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            let mut entry: NoteEntry = crate::db::decode_value(existing_val.value())?;
             if entry.deleted_at.is_some() {
                 return Err(LychiError::Notes(format!("Note not found: {id}")));
             }
             entry.deleted_at = Some(db::now_millis());
-            let bytes =
-                postcard::to_allocvec(&entry).map_err(|e| LychiError::Database(e.to_string()))?;
+            let bytes = crate::db::encode_row(&entry)?;
             drop(existing_val);
             table.insert(id, bytes.as_slice())?;
         }
@@ -286,8 +281,7 @@ impl NotesStore {
         let txn = db.begin_write()?;
         {
             let mut table = txn.open_table(db::TODOS)?;
-            let bytes =
-                postcard::to_allocvec(&entry).map_err(|e| LychiError::Database(e.to_string()))?;
+            let bytes = crate::db::encode_row(&entry)?;
             table.insert(id.as_str(), bytes.as_slice())?;
         }
         txn.commit()?;
@@ -306,15 +300,13 @@ impl NotesStore {
             let existing_val = table
                 .get(id)?
                 .ok_or_else(|| LychiError::Notes(format!("Todo not found: {id}")))?;
-            let mut entry: TodoEntry = postcard::from_bytes(existing_val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            let mut entry: TodoEntry = crate::db::decode_value(existing_val.value())?;
             if entry.deleted_at.is_some() {
                 return Err(LychiError::Notes(format!("Todo not found: {id}")));
             }
             entry.done = !entry.done;
             entry.updated_at = db::now_millis();
-            let bytes =
-                postcard::to_allocvec(&entry).map_err(|e| LychiError::Database(e.to_string()))?;
+            let bytes = crate::db::encode_row(&entry)?;
             drop(existing_val);
             table.insert(id, bytes.as_slice())?;
         }
@@ -329,14 +321,12 @@ impl NotesStore {
             let existing_val = table
                 .get(id)?
                 .ok_or_else(|| LychiError::Notes(format!("Todo not found: {id}")))?;
-            let mut entry: TodoEntry = postcard::from_bytes(existing_val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            let mut entry: TodoEntry = crate::db::decode_value(existing_val.value())?;
             if entry.deleted_at.is_some() {
                 return Err(LychiError::Notes(format!("Todo not found: {id}")));
             }
             entry.deleted_at = Some(db::now_millis());
-            let bytes =
-                postcard::to_allocvec(&entry).map_err(|e| LychiError::Database(e.to_string()))?;
+            let bytes = crate::db::encode_row(&entry)?;
             drop(existing_val);
             table.insert(id, bytes.as_slice())?;
         }

@@ -34,7 +34,7 @@ impl AiHistoryStore {
         let mut out = Vec::new();
         for result in table.iter()? {
             let (_, val) = result?;
-            let conv: Conversation = serde_json::from_slice(val.value())
+            let conv: Conversation = serde_json::from_slice(crate::db::body_of(val.value())?)
                 .map_err(|e| LychiError::Database(e.to_string()))?;
             out.push(ConversationSummary {
                 id: conv.id,
@@ -54,7 +54,7 @@ impl AiHistoryStore {
         let table = txn.open_table(db::AI_CONVERSATIONS)?;
         match table.get(id)? {
             Some(val) => {
-                let conv: Conversation = serde_json::from_slice(val.value())
+                let conv: Conversation = serde_json::from_slice(crate::db::body_of(val.value())?)
                     .map_err(|e| LychiError::Database(e.to_string()))?;
                 Ok(Some(conv))
             }
@@ -93,8 +93,9 @@ impl AiHistoryStore {
         let txn = db.begin_write()?;
         {
             let mut table = txn.open_table(db::AI_CONVERSATIONS)?;
-            let bytes =
-                serde_json::to_vec(&conv).map_err(|e| LychiError::Database(e.to_string()))?;
+            let bytes = crate::db::wrap_body(
+                &serde_json::to_vec(&conv).map_err(|e| LychiError::Database(e.to_string()))?,
+            );
             table.insert(id, bytes.as_slice())?;
         }
         txn.commit()?;
@@ -260,7 +261,7 @@ mod tests {
         let txn = db.begin_write().unwrap();
         {
             let mut table = txn.open_table(db::AI_CONVERSATIONS).unwrap();
-            let bytes = serde_json::to_vec(&ancient).unwrap();
+            let bytes = crate::db::wrap_body(&serde_json::to_vec(&ancient).unwrap());
             table.insert("ancient", bytes.as_slice()).unwrap();
         }
         txn.commit().unwrap();

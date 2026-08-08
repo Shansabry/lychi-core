@@ -140,8 +140,7 @@ impl AliasesStore {
         let table = txn.open_table(db::ALIASES)?;
         match table.get(key.as_str())? {
             Some(val) => {
-                let entry: AliasEntry = postcard::from_bytes(val.value())
-                    .map_err(|e| LychiError::Database(e.to_string()))?;
+                let entry: AliasEntry = crate::db::decode_value(val.value())?;
                 if entry.deleted_at.is_some() {
                     return Ok(None);
                 }
@@ -210,8 +209,7 @@ impl AliasesStore {
         let txn = db.begin_write()?;
         {
             let mut table = txn.open_table(db::ALIASES)?;
-            let bytes =
-                postcard::to_allocvec(&entry).map_err(|e| LychiError::Database(e.to_string()))?;
+            let bytes = crate::db::encode_row(&entry)?;
             table.insert(name_lower.as_str(), bytes.as_slice())?;
         }
         txn.commit()?;
@@ -245,15 +243,13 @@ impl AliasesStore {
             let existing_val = table
                 .get(key.as_str())?
                 .ok_or_else(|| LychiError::Alias(format!("Alias not found: {key}")))?;
-            let mut entry: AliasEntry = postcard::from_bytes(existing_val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            let mut entry: AliasEntry = crate::db::decode_value(existing_val.value())?;
             if entry.deleted_at.is_some() {
                 return Err(LychiError::Alias(format!("Alias not found: {key}")));
             }
             entry.command = command;
             entry.updated_at = db::now_millis();
-            let bytes =
-                postcard::to_allocvec(&entry).map_err(|e| LychiError::Database(e.to_string()))?;
+            let bytes = crate::db::encode_row(&entry)?;
             drop(existing_val);
             table.insert(key.as_str(), bytes.as_slice())?;
         }
@@ -272,14 +268,12 @@ impl AliasesStore {
             let existing_val = table
                 .get(key.as_str())?
                 .ok_or_else(|| LychiError::Alias(format!("Alias not found: {key}")))?;
-            let mut entry: AliasEntry = postcard::from_bytes(existing_val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            let mut entry: AliasEntry = crate::db::decode_value(existing_val.value())?;
             if entry.deleted_at.is_some() {
                 return Err(LychiError::Alias(format!("Alias not found: {key}")));
             }
             entry.deleted_at = Some(db::now_millis());
-            let bytes =
-                postcard::to_allocvec(&entry).map_err(|e| LychiError::Database(e.to_string()))?;
+            let bytes = crate::db::encode_row(&entry)?;
             drop(existing_val);
             table.insert(key.as_str(), bytes.as_slice())?;
         }

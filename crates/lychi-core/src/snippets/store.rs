@@ -112,8 +112,7 @@ impl SnippetsStore {
         let txn = db.begin_write()?;
         {
             let mut table = txn.open_table(db::SNIPPETS)?;
-            let bytes =
-                postcard::to_allocvec(&entry).map_err(|e| LychiError::Database(e.to_string()))?;
+            let bytes = crate::db::encode_row(&entry)?;
             table.insert(id.as_str(), bytes.as_slice())?;
         }
         txn.commit()?;
@@ -160,16 +159,14 @@ impl SnippetsStore {
             let existing_val = table
                 .get(id)?
                 .ok_or_else(|| LychiError::Snippet(format!("Snippet not found: {id}")))?;
-            let mut entry: SnippetEntry = postcard::from_bytes(existing_val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            let mut entry: SnippetEntry = crate::db::decode_value(existing_val.value())?;
             if entry.deleted_at.is_some() {
                 return Err(LychiError::Snippet(format!("Snippet not found: {id}")));
             }
             entry.name = name.to_string();
             entry.body = body.to_string();
             entry.updated_at = db::now_millis();
-            let bytes =
-                postcard::to_allocvec(&entry).map_err(|e| LychiError::Database(e.to_string()))?;
+            let bytes = crate::db::encode_row(&entry)?;
             drop(existing_val);
             table.insert(id, bytes.as_slice())?;
         }
@@ -184,14 +181,12 @@ impl SnippetsStore {
             let existing_val = table
                 .get(id)?
                 .ok_or_else(|| LychiError::Snippet(format!("Snippet not found: {id}")))?;
-            let mut entry: SnippetEntry = postcard::from_bytes(existing_val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            let mut entry: SnippetEntry = crate::db::decode_value(existing_val.value())?;
             if entry.deleted_at.is_some() {
                 return Err(LychiError::Snippet(format!("Snippet not found: {id}")));
             }
             entry.deleted_at = Some(db::now_millis());
-            let bytes =
-                postcard::to_allocvec(&entry).map_err(|e| LychiError::Database(e.to_string()))?;
+            let bytes = crate::db::encode_row(&entry)?;
             drop(existing_val);
             table.insert(id, bytes.as_slice())?;
         }

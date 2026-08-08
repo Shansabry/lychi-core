@@ -105,15 +105,14 @@ pub fn record(db: &Arc<Database>, key: &str) -> Result<(), LychiError> {
         let entry = match table.get(key)? {
             Some(existing) => {
                 let mut entry: FrecencyEntry =
-                    postcard::from_bytes(existing.value()).unwrap_or(FrecencyEntry::new(now_ms));
+                    crate::db::decode_value(existing.value()).unwrap_or(FrecencyEntry::new(now_ms));
                 entry.record_access(now_ms);
                 entry
             }
             None => FrecencyEntry::new(now_ms),
         };
 
-        let bytes = postcard::to_allocvec(&entry)
-            .map_err(|e| LychiError::Database(format!("frecency serialize: {e}")))?;
+        let bytes = crate::db::encode_row(&entry)?;
         table.insert(key, bytes.as_slice())?;
     }
     commit_write(txn)
@@ -276,7 +275,7 @@ fn with_entries<R>(db: &Arc<Database>, f: impl FnOnce(&[(String, FrecencyEntry)]
     {
         for item in iter.flatten() {
             let (key, value) = item;
-            if let Ok(entry) = postcard::from_bytes::<FrecencyEntry>(value.value()) {
+            if let Ok(entry) = crate::db::decode_value::<FrecencyEntry>(value.value()) {
                 entries.push((key.value().to_string(), entry));
             }
         }
@@ -335,7 +334,7 @@ fn for_prefix<T: serde::de::DeserializeOwned>(
         let Some(rest) = key.value().strip_prefix(prefix) else {
             break;
         };
-        if let Ok(entry) = postcard::from_bytes::<T>(value.value()) {
+        if let Ok(entry) = crate::db::decode_value::<T>(value.value()) {
             f(rest, entry);
         }
     }
@@ -425,12 +424,11 @@ pub fn record_impressions(
             let key = format!("imp:{context_key}:{command}");
             let mut entry: ImpressionEntry = table
                 .get(key.as_str())?
-                .and_then(|v| postcard::from_bytes(v.value()).ok())
+                .and_then(|v| crate::db::decode_value(v.value()).ok())
                 .unwrap_or_default();
             entry.impressions = entry.impressions.saturating_add(1);
             entry.last_ms = now_ms;
-            let bytes = postcard::to_allocvec(&entry)
-                .map_err(|e| LychiError::Database(format!("impression serialize: {e}")))?;
+            let bytes = crate::db::encode_row(&entry)?;
             table.insert(key.as_str(), bytes.as_slice())?;
         }
     }
@@ -451,12 +449,11 @@ pub fn record_acceptance(
         let mut table = txn.open_table(FRECENCY)?;
         let mut entry: ImpressionEntry = table
             .get(key.as_str())?
-            .and_then(|v| postcard::from_bytes(v.value()).ok())
+            .and_then(|v| crate::db::decode_value(v.value()).ok())
             .unwrap_or_default();
         entry.accepts = entry.accepts.saturating_add(1);
         entry.last_ms = now_ms;
-        let bytes = postcard::to_allocvec(&entry)
-            .map_err(|e| LychiError::Database(format!("acceptance serialize: {e}")))?;
+        let bytes = crate::db::encode_row(&entry)?;
         table.insert(key.as_str(), bytes.as_slice())?;
     }
     commit_write(txn)
@@ -517,7 +514,7 @@ fn prune_expired_impl(db: &Arc<Database>, max_rows: usize) -> Result<usize, Lych
         for (key, value) in table.iter()?.flatten() {
             let key_str = key.value();
             if key_str.starts_with("latch:") {
-                if let Ok(entry) = postcard::from_bytes::<FrecencyEntry>(value.value()) {
+                if let Ok(entry) = crate::db::decode_value::<FrecencyEntry>(value.value()) {
                     if latch_strength(&entry, now_ms) <= 0.0 {
                         dead.push(key_str.to_string());
                     } else {
@@ -527,7 +524,7 @@ fn prune_expired_impl(db: &Arc<Database>, max_rows: usize) -> Result<usize, Lych
                     continue;
                 }
             } else if key_str.starts_with("imp:") {
-                if let Ok(entry) = postcard::from_bytes::<ImpressionEntry>(value.value()) {
+                if let Ok(entry) = crate::db::decode_value::<ImpressionEntry>(value.value()) {
                     if decay_counts(&entry, now_ms) == (0, 0) {
                         dead.push(key_str.to_string());
                     } else {
@@ -535,7 +532,7 @@ fn prune_expired_impl(db: &Arc<Database>, max_rows: usize) -> Result<usize, Lych
                     }
                     continue;
                 }
-            } else if let Ok(entry) = postcard::from_bytes::<FrecencyEntry>(value.value()) {
+            } else if let Ok(entry) = crate::db::decode_value::<FrecencyEntry>(value.value()) {
                 let last = entry.recent_timestamps.last().copied().unwrap_or(0);
                 living.push((last, key_str.to_string()));
                 continue;
@@ -716,7 +713,7 @@ mod prune_tests {
         let txn = db.begin_write().unwrap();
         {
             let mut table = txn.open_table(FRECENCY).unwrap();
-            let bytes = postcard::to_allocvec(entry).unwrap();
+            let bytes = crate::db::encode_row(entry).unwrap();
             table.insert(key, bytes.as_slice()).unwrap();
         }
         commit_write(txn).unwrap();
@@ -1123,7 +1120,7 @@ mod tests {
             {
                 let mut table = txn.open_table(FRECENCY).unwrap();
                 let key = format!("ws:/home/u/proj:{cmd}");
-                let bytes = postcard::to_allocvec(&entry).unwrap();
+                let bytes = crate::db::encode_row(&entry).unwrap();
                 table.insert(key.as_str(), bytes.as_slice()).unwrap();
             }
             txn.commit().unwrap();

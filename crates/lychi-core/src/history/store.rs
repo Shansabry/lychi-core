@@ -67,8 +67,7 @@ impl HistoryStore {
                 deleted_at: None,
                 sync_status: SYNC_LOCAL,
             };
-            let bytes =
-                postcard::to_allocvec(&data).map_err(|e| LychiError::Database(e.to_string()))?;
+            let bytes = crate::db::encode_row(&data)?;
             table.insert(id.as_str(), bytes.as_slice())?;
 
             // Enforce max entries by soft-deleting oldest
@@ -222,7 +221,7 @@ impl HistoryStore {
                 .iter()?
                 .filter_map(|r| {
                     let (key, val) = r.ok()?;
-                    let entry: HistoryEntry = postcard::from_bytes(val.value()).ok()?;
+                    let entry: HistoryEntry = crate::db::decode_value(val.value()).ok()?;
                     entry.deleted_at.map(|_| key.value().to_string())
                 })
                 .collect();
@@ -367,7 +366,7 @@ mod tests {
                     deleted_at: Some(1),
                     sync_status: SYNC_LOCAL,
                 };
-                let bytes = postcard::to_allocvec(&e).unwrap();
+                let bytes = crate::db::encode_row(&e).unwrap();
                 t.insert(db::new_id().as_str(), bytes.as_slice()).unwrap();
             }
             txn.commit().unwrap();

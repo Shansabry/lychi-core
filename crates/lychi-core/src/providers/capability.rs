@@ -93,7 +93,7 @@ pub fn get_vision(db: &Arc<Database>, provider: &str, model: &str) -> Vision {
         return Vision::Unknown;
     };
     match table.get(k.as_str()) {
-        Ok(Some(v)) => postcard::from_bytes::<ModelCapability>(v.value())
+        Ok(Some(v)) => crate::db::decode_value::<ModelCapability>(v.value())
             .map(|c| c.vision)
             .unwrap_or(Vision::Unknown),
         _ => Vision::Unknown,
@@ -125,8 +125,7 @@ pub fn record(
         from_metadata,
         updated_at: crate::db::now_millis(),
     };
-    let bytes = postcard::to_allocvec(&entry)
-        .map_err(|e| LychiError::ExecutionFailed(format!("encode model capability: {e}")))?;
+    let bytes = crate::db::encode_row(&entry)?;
 
     let txn = db.begin_write()?;
     {
@@ -141,7 +140,7 @@ fn existing(db: &Arc<Database>, k: &str) -> Option<ModelCapability> {
     let txn = db.begin_read().ok()?;
     let table = txn.open_table(MODEL_CAPS).ok()?;
     let v = table.get(k).ok()??;
-    postcard::from_bytes::<ModelCapability>(v.value()).ok()
+    crate::db::decode_value::<ModelCapability>(v.value()).ok()
 }
 
 /// Extract vision support from an OpenAI-compatible `/models` entry.

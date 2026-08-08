@@ -374,6 +374,7 @@ fn restorability_is_reported_for_the_ui() {
         kind: BackupKind::Manual,
         reason: String::new(),
         tables: vec![],
+        schema_version: crate::db::SCHEMA_VERSION,
         has_config: false,
         has_scripts: false,
     };

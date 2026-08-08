@@ -155,8 +155,7 @@ pub fn persist_timers(state: &TimerState, db: &Arc<redb::Database>) {
                 table.remove(k.as_str())?;
             }
             for (id, entry) in &snapshot {
-                let bytes = postcard::to_allocvec(entry)
-                    .map_err(|e| LychiError::Database(e.to_string()))?;
+                let bytes = crate::db::encode_row(entry)?;
                 table.insert(id.as_str(), bytes.as_slice())?;
             }
         }

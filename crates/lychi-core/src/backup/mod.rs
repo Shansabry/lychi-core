@@ -84,6 +84,13 @@ pub struct Manifest {
     /// Table name → row count, so the UI can say what is in a backup without
     /// unpacking it, and restore can verify it got everything.
     pub tables: Vec<(String, u64)>,
+    /// Schema generation of the archived row VALUES. `0` (the serde
+    /// default) marks archives from before the row envelope existed — their
+    /// values are raw postcard, and restore must wrap them after applying, or
+    /// every restored row decodes as garbage. Current archives stamp
+    /// [`crate::db::SCHEMA_VERSION`].
+    #[serde(default)]
+    pub schema_version: u8,
     /// Which optional extras are present.
     #[serde(default)]
     pub has_config: bool,
@@ -205,6 +212,7 @@ pub fn create(
         kind,
         reason: reason.to_string(),
         tables,
+        schema_version: crate::db::SCHEMA_VERSION,
         has_config: config_path.is_file(),
         has_scripts: scripts_path.is_dir(),
     };
@@ -452,6 +460,15 @@ pub fn restore(
                 table.insert(k.as_str(), v.as_slice())?;
                 rows_restored += 1;
             }
+        }
+        // A pre-envelope archive holds raw postcard values; the live database
+        // is stamped and its readers strip a version tag. Wrap the restored
+        // rows in the same transaction — either the tagged rows land with the
+        // data, or neither does.
+        if manifest.schema_version < crate::db::SCHEMA_VERSION {
+            let names: Vec<&str> = dumps.iter().map(|d| d.name.as_str()).collect();
+            let wrapped = crate::db::envelope_raw_rows(&txn, &names)?;
+            tracing::info!("[backup] enveloped {wrapped} row(s) from a pre-envelope archive");
         }
         txn.commit()?;
     }

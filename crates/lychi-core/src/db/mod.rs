@@ -4,7 +4,7 @@ pub mod schema;
 use std::path::Path;
 use std::sync::Arc;
 
-use redb::{Database, ReadableDatabase, ReadableTableMetadata, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use crate::error::LychiError;
 
@@ -54,6 +54,51 @@ pub const AI_CONVERSATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new(
 /// the endpoint reports it, and from observed failures otherwise — so Lychi
 /// stops re-sending requests a model has already rejected.
 pub const MODEL_CAPS: TableDefinition<&str, &[u8]> = TableDefinition::new("model_caps");
+
+/// Database metadata: key = a reserved name (only "schema_version" today),
+/// value = raw bytes. NOT enveloped — this table is how the envelope is found.
+pub const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+
+/// The schema generation this binary writes.
+///
+/// Every row value in every table (except `META`) is `[SCHEMA_VERSION][body]`.
+/// Postcard is positional and not self-describing: without a tag, the first
+/// struct-field addition after release makes every pre-existing row of that
+/// table undecodable, and `decode_row`'s skip-and-warn turns that into
+/// silently empty lists — total perceived data loss, produced by the exact
+/// mechanism built to prevent it (verified empirically against pinned
+/// postcard: a trailing `#[serde(default)]` field CANNOT fire on buffer
+/// exhaustion; the attribute is JSON-era comfort, not postcard evolution).
+///
+/// The contract this tag buys, forever:
+/// - **Shape change** ⇒ bump this constant and add a migration arm in
+///   [`body_of`] (decode old shape, convert) or a rewrite step in
+///   [`migrate`]. Old rows keep working.
+/// - **Downgrade** ⇒ an older binary sees a newer tag, skips THAT row, and
+///   keeps every row it does understand — mixed-generation tables degrade
+///   per-row, never wholesale.
+/// - All 60-odd codec sites go through [`encode_row`]/[`decode_row`]/
+///   [`decode_value`] (a source-scan test bans raw `postcard::` row codecs
+///   outside this module), so no writer can produce an untagged row again.
+pub const SCHEMA_VERSION: u8 = 1;
+
+/// Every enveloped table — the migration and any future whole-table rewrite
+/// iterate this list, so a new table added here is versioned from birth.
+pub(crate) const ENVELOPED_TABLES: [&str; 13] = [
+    "history",
+    "notes",
+    "todos",
+    "clipboard",
+    "settings",
+    "frecency",
+    "aliases",
+    "reminders",
+    "snippets",
+    "timers",
+    "ai_presets",
+    "ai_conversations",
+    "model_caps",
+];
 
 /// Owner-only permissions for anything holding user content.
 ///
@@ -176,9 +221,143 @@ pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
     txn.open_table(TIMERS)?;
     txn.open_table(AI_PRESETS)?;
     txn.open_table(AI_CONVERSATIONS)?;
+    txn.open_table(MODEL_CAPS)?;
+    txn.open_table(META)?;
     txn.commit()?;
 
-    Ok(Arc::new(db))
+    let db = Arc::new(db);
+    // BEFORE any store reads: bring the rows to the current schema generation.
+    migrate(&db)?;
+    Ok(db)
+}
+
+/// Bring every row to the current schema generation. Runs at open, before any
+/// store reads, in ONE write transaction — an interrupted migration re-runs
+/// whole next start, never half-applies.
+///
+/// Today there is exactly one step: a database from before the envelope
+/// existed (no `META` version row) has raw postcard values, which become
+/// `[1][raw]`. A future shape change bumps [`SCHEMA_VERSION`] and adds its
+/// step here (or a per-row arm in [`decode_body`], whichever fits the change).
+///
+/// A version NEWER than this binary writes is left alone with a warning: the
+/// user downgraded. Rows this binary understands keep working; rows with a
+/// newer tag are skipped per-row by [`decode_row`] — degradation is per-row,
+/// never wholesale, and nothing is destroyed.
+fn migrate(db: &Arc<Database>) -> Result<(), LychiError> {
+    let stored: Option<u8> = {
+        let txn = db.begin_read()?;
+        let table = txn.open_table(META)?;
+        table
+            .get("schema_version")?
+            .and_then(|v| v.value().first().copied())
+    };
+
+    match stored {
+        Some(v) if v >= SCHEMA_VERSION => {
+            if v > SCHEMA_VERSION {
+                tracing::warn!(
+                    "[db] database schema v{v} is newer than this binary's v{SCHEMA_VERSION} \
+                     (downgrade?) — rows with newer shapes are skipped, not destroyed"
+                );
+            }
+            return Ok(());
+        }
+        Some(_v) => {
+            // Older tagged generation: future migration steps chain here.
+            // Unreachable while SCHEMA_VERSION == 1 (nothing writes tag 0).
+        }
+        None => {
+            // Pre-envelope database (or fresh). Wrap every existing row and
+            // stamp the version, atomically.
+            let txn = db.begin_write()?;
+            let wrapped = envelope_raw_rows(&txn, &ENVELOPED_TABLES)?;
+            {
+                let mut meta = txn.open_table(META)?;
+                meta.insert("schema_version", [SCHEMA_VERSION].as_slice())?;
+            }
+            txn.commit()?;
+            if wrapped > 0 {
+                tracing::info!("[db] enveloped {wrapped} pre-v{SCHEMA_VERSION} row(s)");
+            }
+            return Ok(());
+        }
+    }
+
+    // Stamp the current version after any chained steps ran.
+    let txn = db.begin_write()?;
+    txn.open_table(META)?
+        .insert("schema_version", [SCHEMA_VERSION].as_slice())?;
+    txn.commit()?;
+    Ok(())
+}
+
+/// Prepend the current envelope tag to every row of the named tables, within
+/// the caller's transaction. Used by [`migrate`] for pre-envelope databases,
+/// and by backup restore when the ARCHIVE predates the envelope (its raw rows
+/// were just written into a stamped database — without this they would all
+/// decode as garbage and read as total data loss).
+pub(crate) fn envelope_raw_rows(
+    txn: &redb::WriteTransaction,
+    tables: &[&str],
+) -> Result<u64, LychiError> {
+    let mut wrapped = 0u64;
+    for name in tables {
+        let def: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(name);
+        let mut table = txn.open_table(def)?;
+        let rows: Vec<(String, Vec<u8>)> = table
+            .iter()?
+            .flatten()
+            .map(|(k, v)| (k.value().to_string(), v.value().to_vec()))
+            .collect();
+        for (k, raw) in rows {
+            table.insert(k.as_str(), wrap_body(&raw).as_slice())?;
+            wrapped += 1;
+        }
+    }
+    Ok(wrapped)
+}
+
+/// Wrap already-encoded body bytes in the current envelope. For the one store
+/// whose body is not postcard (ai_history uses JSON); postcard callers use
+/// [`encode_row`].
+pub fn wrap_body(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + 1);
+    out.push(SCHEMA_VERSION);
+    out.extend_from_slice(body);
+    out
+}
+
+/// The body of an enveloped value, if this binary understands its generation.
+///
+/// `Err` for an empty value or an unknown (newer) tag — the caller decides
+/// whether that skips a list row or fails a single-row lookup.
+pub fn body_of(bytes: &[u8]) -> Result<&[u8], LychiError> {
+    match bytes.split_first() {
+        Some((&tag, body)) if tag == SCHEMA_VERSION => Ok(body),
+        Some((&tag, _)) => Err(LychiError::Database(format!(
+            "row written by schema v{tag}; this binary reads v{SCHEMA_VERSION}"
+        ))),
+        None => Err(LychiError::Database("empty row value".into())),
+    }
+}
+
+/// Encode a row value: `[SCHEMA_VERSION][postcard body]`. The ONE writer-side
+/// codec — a source-scan test bans raw `postcard::to_allocvec` against table
+/// values elsewhere, so no code path can produce an untagged row.
+pub fn encode_row<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, LychiError> {
+    let body = postcard::to_allocvec(value)
+        .map_err(|e| LychiError::Database(format!("row serialize: {e}")))?;
+    Ok(wrap_body(&body))
+}
+
+/// Strict single-row decode: envelope + postcard, as a `Result`.
+///
+/// For `update_note(id)`-style lookups where the user named one row and "that
+/// row is corrupt" is the truthful answer. Lists use [`decode_row`].
+pub fn decode_value<'a, T: serde::Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, LychiError> {
+    let body = body_of(bytes)?;
+    postcard::from_bytes(body).map_err(|e| LychiError::Database(format!("row decode: {e}")))
 }
 
 /// Create a throwaway database for testing.
@@ -301,7 +480,19 @@ pub fn decode_row<'a, T: serde::Deserialize<'a>>(
     key: &str,
     bytes: &'a [u8],
 ) -> Option<T> {
-    match postcard::from_bytes(bytes) {
+    // Envelope first: a row tagged by a NEWER schema is not garbage, it is a
+    // downgrade — say so, and skip only that row.
+    let body = match body_of(bytes) {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::warn!(
+                "[db] skipping row in `{table}` (key {key}): {e} — \
+                 the rest of the list is unaffected"
+            );
+            return None;
+        }
+    };
+    match postcard::from_bytes(body) {
         Ok(v) => Some(v),
         Err(e) => {
             // The key, not the value: the value may be user content, and this
@@ -326,6 +517,133 @@ pub fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+
+    fn temp_db_path(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("lychi-envelope-{tag}-{}", new_id()));
+        let path = dir.join("lychi.redb");
+        (dir, path)
+    }
+
+    /// The v0.1.0 upgrade path, end to end: a database whose rows are raw
+    /// postcard (what every pre-envelope install holds) must come out of
+    /// `open_database` fully readable — and stay byte-stable across reopens
+    /// (a re-run migration that re-wrapped would double-tag every row into
+    /// garbage, which is why the version stamp and the wrap share one txn).
+    #[test]
+    fn a_pre_envelope_database_migrates_once_and_reads_back() {
+        let (dir, path) = temp_db_path("migrate");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // What v0.1.0 wrote: raw postcard, no tag, no META table.
+        let raw = postcard::to_allocvec(&frecency::FrecencyEntry {
+            count: 3,
+            recent_timestamps: vec![now_millis()],
+        })
+        .unwrap();
+        {
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(FRECENCY).unwrap();
+                t.insert("firefox", raw.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let db = open_database(&path).unwrap();
+        // One write first: the frecency entry cache is process-global and
+        // generation-keyed, and in a full test run another test's database may
+        // occupy the matching generation. Any write invalidates it for THIS db.
+        frecency::record(&db, "cache-poke").unwrap();
+        assert!(
+            frecency::get_scores(&db).contains_key("firefox"),
+            "a migrated row must decode through the normal read path"
+        );
+        let stored_len = {
+            let txn = db.begin_read().unwrap();
+            let t = txn.open_table(FRECENCY).unwrap();
+            t.get("firefox").unwrap().unwrap().value().len()
+        };
+        assert_eq!(stored_len, raw.len() + 1, "exactly one tag byte prepended");
+        drop(db);
+
+        // Reopen: the stamp must prevent a second wrap.
+        let db = open_database(&path).unwrap();
+        let stored_len2 = {
+            let txn = db.begin_read().unwrap();
+            let t = txn.open_table(FRECENCY).unwrap();
+            t.get("firefox").unwrap().unwrap().value().len()
+        };
+        assert_eq!(stored_len2, stored_len, "migration must be idempotent");
+        assert!(frecency::get_scores(&db).contains_key("firefox"));
+        drop(db);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Downgrade shape: a row tagged by a NEWER schema is skipped per-row —
+    /// the rows this binary understands keep working beside it. This is the
+    /// property the envelope buys over bare postcard, where a foreign-shape
+    /// row is indistinguishable from garbage and, worse, the first shape
+    /// change made 100% of OLD rows unreadable at once.
+    #[test]
+    fn a_newer_generation_row_is_skipped_beside_readable_ones() {
+        let db = open_test_database();
+        frecency::record(&db, "current-row").unwrap();
+        {
+            let txn = db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(FRECENCY).unwrap();
+                t.insert("future-row", [SCHEMA_VERSION + 1, 0xDE, 0xAD].as_slice())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let scores = frecency::get_scores(&db);
+        assert!(
+            scores.contains_key("current-row"),
+            "known rows keep working"
+        );
+        assert!(
+            !scores.contains_key("future-row"),
+            "a newer-tagged row must be skipped, never garbage-decoded"
+        );
+    }
+
+    /// A fresh database is stamped immediately: rows are versioned from the
+    /// first write, so the pre-envelope migration can never run on it again.
+    #[test]
+    fn a_fresh_database_is_stamped_with_the_current_version() {
+        let db = open_test_database();
+        let txn = db.begin_read().unwrap();
+        let meta = txn.open_table(META).unwrap();
+        let v = meta.get("schema_version").unwrap().expect("stamp missing");
+        assert_eq!(v.value(), [SCHEMA_VERSION]);
+    }
+
+    /// The strict/single-row contract: current-tag decodes, wrong-tag and
+    /// empty are errors that SAY what happened.
+    #[test]
+    fn decode_value_reports_generation_mismatches() {
+        let entry = frecency::FrecencyEntry {
+            count: 1,
+            recent_timestamps: vec![1],
+        };
+        let good = encode_row(&entry).unwrap();
+        assert!(decode_value::<frecency::FrecencyEntry>(&good).is_ok());
+
+        let mut future = good.clone();
+        future[0] = SCHEMA_VERSION + 1;
+        let err = decode_value::<frecency::FrecencyEntry>(&future).unwrap_err();
+        assert!(format!("{err:?}").contains("schema v"), "{err:?}");
+
+        assert!(decode_value::<frecency::FrecencyEntry>(&[]).is_err());
+    }
 }
 
 #[cfg(all(test, unix))]

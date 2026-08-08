@@ -91,8 +91,7 @@ impl ClipboardStore {
             created_at: db::now_millis(),
             image: None,
         };
-        let bytes =
-            postcard::to_allocvec(&entry).map_err(|e| LychiError::Database(e.to_string()))?;
+        let bytes = crate::db::encode_row(&entry)?;
 
         let txn = db.begin_write()?;
         {
@@ -141,8 +140,7 @@ impl ClipboardStore {
                 thumb_b64,
             }),
         };
-        let bytes =
-            postcard::to_allocvec(&entry).map_err(|e| LychiError::Database(e.to_string()))?;
+        let bytes = crate::db::encode_row(&entry)?;
 
         let txn = db.begin_write()?;
         {
@@ -166,8 +164,7 @@ impl ClipboardStore {
         let txn = db.begin_read()?;
         let table = txn.open_table(db::CLIPBOARD)?;
         if let Some(val) = table.get(id)? {
-            let entry: ClipboardEntry = postcard::from_bytes(val.value())
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            let entry: ClipboardEntry = crate::db::decode_value(val.value())?;
             Ok(entry.image.map(|m| m.path))
         } else {
             Ok(None)
