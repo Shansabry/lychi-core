@@ -248,6 +248,31 @@ impl AppState {
             tracing::error!("Cannot open database: {e}");
             eprintln!("lychi: cannot open database: {e}");
             eprintln!("lychi: if Lychi is already running, use the hotkey or `lychi --toggle`.");
+
+            // Also say it in a window. Someone who launched from a desktop icon
+            // never sees stderr — for them the app just silently fails to
+            // appear, which is indistinguishable from a crash.
+            //
+            // The already-running case gets its own wording because it is not a
+            // fault: the app the user wants is running, they just cannot see it.
+            let already_running = e.to_string().contains("another Lychi instance");
+            let (title, body) = if already_running {
+                (
+                    "Lychi is already running",
+                    "Use your hotkey to open it, or run `lychi --toggle` from a \
+                     terminal.\n\nThis window appeared because a second copy of \
+                     Lychi was started while the first one is still open."
+                        .to_string(),
+                )
+            } else {
+                // Show the real error: a dialog that hides the cause sends the
+                // user back to the terminal it exists to spare them.
+                (
+                    "Lychi could not start",
+                    format!("{e}\n\nRun `lychi doctor` in a terminal for more detail."),
+                )
+            };
+            crate::platform::show_startup_error(title, &body);
             std::process::exit(1);
         });
         let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);

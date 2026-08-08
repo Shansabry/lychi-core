@@ -11,6 +11,42 @@ pub fn init_app() {
     glib::set_application_name("Lychi");
 }
 
+/// Show a blocking error dialog before the app has a window of its own.
+///
+/// Exists for the startup failures that happen *before* Tauri is running — a
+/// second instance finding the database locked, above all. Those already print a
+/// clear line to stderr, but somebody who launched from a desktop icon never
+/// sees stderr: the window simply fails to appear, with no explanation.
+///
+/// Uses GTK directly rather than the Tauri dialog plugin because at this point
+/// there is no app handle to hang a dialog off. `gtk::init` is idempotent and
+/// safe to call before `tauri::Builder`.
+///
+/// Best-effort by design: if GTK cannot start (no display, a TTY, a headless CI
+/// runner) the caller has already written the same text to stderr, so failing to
+/// draw a dialog costs nothing.
+pub fn show_startup_error(title: &str, body: &str) {
+    if gtk::init().is_err() {
+        return;
+    }
+    use gtk::prelude::{DialogExt, GtkWindowExt, MessageDialogExt, WidgetExtManual};
+    let dialog = gtk::MessageDialog::new(
+        None::<&gtk::Window>,
+        gtk::DialogFlags::MODAL,
+        gtk::MessageType::Warning,
+        gtk::ButtonsType::Ok,
+        title,
+    );
+    dialog.set_secondary_text(Some(body));
+    dialog.set_title("Lychi");
+    dialog.run();
+    // SAFETY: the dialog is owned here and never referenced again; `run` has
+    // already returned, so no GTK callback can still be holding it.
+    unsafe {
+        dialog.destroy();
+    }
+}
+
 /// Detect KDE Plasma on Wayland (where layer-shell focus is unreliable).
 /// Uses `XDG_SESSION_DESKTOP` first (single-valued, more reliable), falls back
 /// to `XDG_CURRENT_DESKTOP`. Only triggers on Wayland sessions.
