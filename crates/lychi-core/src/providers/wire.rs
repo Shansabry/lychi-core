@@ -419,7 +419,8 @@ struct ToolAccum {
 /// Map an Anthropic SSE byte-stream into a stream of normalized `StreamEvent`s.
 /// Emits `TextDelta` live, `ToolCallStart` + `ToolCallArgsDelta` as `tool_use`
 /// blocks stream, `ToolCallComplete` when each block closes, and a terminal
-/// `Done`. Honors `cancel` between reads (HTTP drop-cancel also applies).
+/// `Done`. `cancel` is honored between events AND while parked in a read (the
+/// SSE reader races it), so Esc works even on a connection that went silent.
 pub(crate) fn anthropic_event_stream<S, B>(
     byte_stream: S,
     model: String,
@@ -439,7 +440,7 @@ where
 
         loop {
             if cancel.is_cancelled() { break; }
-            let evt = match sse.next_event().await? { Some(e) => e, None => break };
+            let evt = match sse.next_event(&cancel).await? { Some(e) => e, None => break };
             let data: Value = match serde_json::from_str(&evt) { Ok(v) => v, Err(_) => continue };
             match data["type"].as_str() {
                 Some("message_start") => {
@@ -531,7 +532,7 @@ where
 
         loop {
             if cancel.is_cancelled() { break; }
-            let evt = match sse.next_event().await? { Some(e) => e, None => break };
+            let evt = match sse.next_event(&cancel).await? { Some(e) => e, None => break };
             if evt.trim() == "[DONE]" { break; }
             let data: Value = match serde_json::from_str(&evt) { Ok(v) => v, Err(_) => continue };
             // Usage rides on ONE extra chunk at the end (requested via
@@ -607,6 +608,19 @@ pub(crate) fn unwrap_args(buf: &str) -> String {
 
 // ── SSE reader ───────────────────────────────────────────────────────────────
 
+/// How long a stream may go without delivering a single byte before the
+/// connection is presumed dead.
+///
+/// Generous by design: providers keep long thinking pauses alive with SSE
+/// keepalive comments, and even slow local inference emits chunks far more
+/// often than this. What the deadline exists for is the connection that will
+/// never speak again — NAT expiry, suspend/resume, a wifi switch — which
+/// produces no error, ever: the read just parks. Without a deadline that
+/// parked read WAS the failure mode: the turn never ended, Esc appeared to
+/// work (the UI resets by generation) while the loop task and socket leaked,
+/// and every retry parked another.
+const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// Minimal Server-Sent Events reader over a reqwest byte stream. Buffers across
 /// chunk boundaries (a `data:` line can split mid-token between TCP frames) and
 /// yields the payload after each event. Comment/keepalive lines and the
@@ -628,8 +642,18 @@ where
         }
     }
 
-    /// Return the next SSE `data:` payload, or `None` at end of stream.
-    async fn next_event(&mut self) -> Result<Option<String>, LychiError> {
+    /// Return the next SSE `data:` payload, or `None` at end of stream (or on
+    /// cancellation — the caller's break path is the same either way).
+    ///
+    /// The chunk read is RACED against the token and [`SSE_IDLE_TIMEOUT`], not
+    /// checked before it: a sequential `is_cancelled()` guard can never fire
+    /// while the read is parked on a silent connection, which is exactly where
+    /// a dead peer parks it forever. The event loops' own between-events check
+    /// still exists for the buffered-data case this method returns early from.
+    async fn next_event(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> Result<Option<String>, LychiError> {
         loop {
             if let Some(pos) = find_event_boundary(&self.buf) {
                 let raw = self.buf[..pos].to_string();
@@ -644,7 +668,20 @@ where
                 }
                 continue; // comment/keepalive block — no data line
             }
-            match self.stream.next().await {
+            // Each iteration arms a fresh deadline, so it measures silence
+            // since the last chunk — keepalive comments reset it.
+            let chunk = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Ok(None),
+                _ = tokio::time::sleep(SSE_IDLE_TIMEOUT) => {
+                    return Err(LychiError::Ai(format!(
+                        "stream error: no data for {}s — connection presumed dead",
+                        SSE_IDLE_TIMEOUT.as_secs()
+                    )));
+                }
+                c = self.stream.next() => c,
+            };
+            match chunk {
                 Some(Ok(chunk)) => {
                     self.buf.push_str(&String::from_utf8_lossy(chunk.as_ref()));
                 }
@@ -724,16 +761,56 @@ mod tests {
         ];
         let stream = futures_util::stream::iter(chunks);
         let mut sse = SseReader::new(stream);
+        let cancel = CancellationToken::new();
         assert_eq!(
-            sse.next_event().await.unwrap().as_deref(),
+            sse.next_event(&cancel).await.unwrap().as_deref(),
             Some("{\"a\":1}")
         );
         assert_eq!(
-            sse.next_event().await.unwrap().as_deref(),
+            sse.next_event(&cancel).await.unwrap().as_deref(),
             Some("{\"b\":2}")
         );
-        assert_eq!(sse.next_event().await.unwrap().as_deref(), Some("[DONE]"));
-        assert_eq!(sse.next_event().await.unwrap(), None);
+        assert_eq!(
+            sse.next_event(&cancel).await.unwrap().as_deref(),
+            Some("[DONE]")
+        );
+        assert_eq!(sse.next_event(&cancel).await.unwrap(), None);
+    }
+
+    /// AI-2, half one: a connection that goes silent produces no error, ever —
+    /// the read just parks. It must become a classified stream error at the
+    /// idle deadline instead of a forever-hung turn. (`start_paused` lets the
+    /// 90s deadline elapse instantly once nothing else can make progress.)
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_connection_times_out_instead_of_parking_forever() {
+        let stream = futures_util::stream::pending::<reqwest::Result<Vec<u8>>>();
+        let mut sse = SseReader::new(stream);
+        let cancel = CancellationToken::new();
+        let err = sse.next_event(&cancel).await.unwrap_err();
+        assert!(
+            format!("{err:?}").contains("presumed dead"),
+            "expected the idle-deadline error, got: {err:?}"
+        );
+    }
+
+    /// AI-2, half two: Esc must reach a read parked on a silent connection.
+    /// The old shape checked the token only BETWEEN reads, so cancel_ai_chat
+    /// fired a token nothing would ever poll again.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_unparks_a_read_on_a_silent_connection() {
+        let stream = futures_util::stream::pending::<reqwest::Result<Vec<u8>>>();
+        let mut sse = SseReader::new(stream);
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            c2.cancel();
+        });
+        assert_eq!(
+            sse.next_event(&cancel).await.unwrap(),
+            None,
+            "cancellation must end the stream promptly, not wait out the idle deadline"
+        );
     }
 
     // Collect a driver's events into a Vec for assertions.

@@ -76,7 +76,17 @@ impl BYOClient {
             model,
             api_key,
             max_tokens,
-            http: Client::new(),
+            // connect_timeout only — never a total request timeout, which
+            // would sever legitimate long streams mid-answer. A peer that
+            // connects and then goes silent is the SSE layer's problem
+            // (SSE_IDLE_TIMEOUT in wire.rs); a peer we can't reach at all
+            // must fail in seconds, not whenever the OS gives up. A bare
+            // Client::new() here meant an unroutable endpoint hung the turn
+            // for the kernel's own connect patience.
+            http: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
             caps_db: None,
         }
     }

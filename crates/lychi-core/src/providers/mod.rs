@@ -410,9 +410,12 @@ pub trait AiProvider: Send + Sync {
     ///
     /// The method is SYNC (constructs + returns the stream; all async/IO work
     /// happens when the stream is polled). This keeps the trait object-safe for
-    /// `Box<dyn AiProvider>`. `cancel` is honored by every provider — HTTP ones
-    /// also cancel by drop (dropping the stream closes the connection), but the
-    /// local engine (spawn_blocking, un-abortable) MUST poll the token.
+    /// `Box<dyn AiProvider>`. `cancel` is honored by every provider — the HTTP
+    /// SSE reader RACES each read against the token (a between-reads check can
+    /// never fire while parked on a silent connection; "cancel by drop" never
+    /// applied either, because the owning tasks are parked *in* the read and
+    /// nothing else holds the stream to drop it) — and the local engine
+    /// (spawn_blocking, un-abortable) MUST poll the token.
     ///
     /// Replaces `route_intent` / `route_or_plan` / `answer_question` (kept
     /// temporarily as migration scaffolding, deleted once every caller migrates).
