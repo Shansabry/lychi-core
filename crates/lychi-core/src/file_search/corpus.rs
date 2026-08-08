@@ -578,6 +578,13 @@ impl PathCorpus {
     /// it does — an in-flight search keeps its snapshot until it finishes.
     fn begin_shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
+        // Deterministically break any subscription cycle: a subscriber closure
+        // that (even indirectly) holds an Arc back to this corpus would pin the
+        // arena forever after eviction. Subscribers capture Weak by contract
+        // (live.rs), but this makes the eviction correct even if a future
+        // subscriber forgets — a shut-down corpus never publishes again, so
+        // dropping its subscribers loses nothing.
+        self.on_change.lock().unwrap().clear();
     }
 
     /// The current paths. Cheap: clones an `Arc`, never the path list.

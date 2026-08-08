@@ -200,10 +200,23 @@ impl LiveSearch {
     fn reseed_on_corpus_change(self: &Arc<Self>, corpus: &Arc<PathCorpus>) {
         // Weak, so a subscription never keeps the app's search state alive.
         let weak = Arc::downgrade(self);
-        let corpus_for_cb = corpus.clone();
+        // Weak for the corpus too — and this one is load-bearing in the other
+        // direction: the closure is STORED IN that corpus's own `on_change`
+        // list, so a strong capture here is a self-referential Arc cycle. With
+        // it, an evicted corpus could never deallocate — the reaper released
+        // the watcher thread and inotify watches while the arena (15-39MB per
+        // scope) leaked for the process lifetime, silently defeating the
+        // memory half of the eviction fix this module exists to serve.
+        // (`begin_shutdown` also clears `on_change` at eviction — deliberate
+        // redundancy so a future strongly-capturing subscriber elsewhere
+        // cannot re-create the leak.)
+        let weak_corpus = Arc::downgrade(corpus);
         corpus.subscribe(Arc::new(move || {
             let Some(live) = weak.upgrade() else {
                 return; // app shutting down
+            };
+            let Some(corpus_for_cb) = weak_corpus.upgrade() else {
+                return; // corpus evicted; a fresh scope re-subscribes
             };
             let redraw = {
                 let mut guard = live.matcher.lock().unwrap();
@@ -526,5 +539,44 @@ mod tests {
         live.cancel();
         assert!(live.results(g, 10).is_none(), "results survived a cancel");
         assert!(!live.is_current(g));
+    }
+
+    /// An evicted corpus must actually DEALLOCATE, not merely stop.
+    ///
+    /// The reseed subscription is stored inside the corpus's own `on_change`
+    /// list; when it captured a strong `Arc<PathCorpus>` that was a
+    /// self-referential cycle, and every evicted scope leaked its whole arena
+    /// (15-39MB) for the process lifetime. The eviction test in corpus.rs
+    /// asserts the shutdown flag and map removal — this one asserts the only
+    /// thing that frees memory: the refcount reaching zero.
+    ///
+    /// Two mechanisms both break the cycle (the Weak capture in
+    /// `reseed_on_corpus_change`, and `begin_shutdown` clearing `on_change`);
+    /// they are deliberately redundant, so this test fails only when BOTH are
+    /// lost — that is the invariant, the mechanisms are implementation.
+    #[test]
+    fn evicted_corpus_deallocates_despite_reseed_subscription() {
+        let t = tree(&["a/x.txt"]);
+        let (live, scope) = live(&t);
+
+        // Wires reseed_on_corpus_change — the subscription under test.
+        let corpus = live.corpus(&scope);
+        let weak = Arc::downgrade(&corpus);
+        drop(corpus);
+
+        assert_eq!(live.corpora.evict_idle_for(0), 1);
+        // The watcher thread holds its own Arc until it notices the shutdown
+        // (eviction drops the notify watcher, disconnecting the thread's
+        // channel). That release is prompt but asynchronous — poll for it. A
+        // cycle, by contrast, never releases: this loop times out.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while weak.upgrade().is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "evicted corpus is still strongly referenced — the reseed \
+             subscription (or another cycle) is pinning the arena after evict"
+        );
     }
 }
