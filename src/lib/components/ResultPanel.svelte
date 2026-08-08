@@ -289,8 +289,16 @@ function handleKeydown(e: KeyboardEvent) {
 			<button class="btn btn-cancel" onmousedown={(e) => e.preventDefault()} onclick={ondismiss}>
 				Cancel <span class="kbd">Esc</span>
 			</button>
-			<button class="btn btn-confirm" class:high={isHighRisk} onmousedown={(e) => e.preventDefault()} onclick={onconfirm}>
-				Confirm <span class="kbd">Enter</span> <span class="kbd">{getComboString("approve_action")}</span>
+			<!-- One advertised key, two working ones. Enter is the primary (the
+			     panel autofocuses, and it approves even if approve_action is
+			     rebound). The approve_action combo ALSO approves - it exists for
+			     when focus is back in the command input, where plain Enter would
+			     submit the input instead (I-016) - but stacking both kbds on the
+			     button read as a rendering bug, and the sibling AI-approval
+			     surface shows a single kbd. Keep the keys, advertise the primary. -->
+			<button class="btn btn-confirm" class:high={isHighRisk} onmousedown={(e) => e.preventDefault()} onclick={onconfirm}
+				title={`Confirm (Enter, or ${getComboString("approve_action")} while typing)`}>
+				Confirm <span class="kbd">Enter</span>
 			</button>
 		</div>
 	</div>
