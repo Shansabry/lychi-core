@@ -82,7 +82,20 @@ pub enum Outcome {
     /// The step cap was hit.
     Stopped { reason: String, session: Session },
     /// An infrastructure error (provider down, cancel, etc.).
-    Error(LychiError),
+    ///
+    /// Carries the session whenever the loop still had one: the messages up to
+    /// the failed turn — including partial prose already streamed to the user —
+    /// are valid context, and the caller must be able to persist and re-stash
+    /// them. This variant used to carry only the error, and the caller cleared
+    /// the stashed session while the conversation id lived on; the next
+    /// follow-up then started an EMPTY session under the same id and its
+    /// upsert replaced the stored transcript — one wifi blip mid-answer both
+    /// gave the model amnesia and destroyed the recall copy. `None` only when
+    /// the loop task itself was lost and there is genuinely nothing to save.
+    Error {
+        error: LychiError,
+        session: Option<Session>,
+    },
 }
 
 /// The coordinator's event stream — a boxed, `Send + 'static` stream of
@@ -98,9 +111,10 @@ pub struct OutcomeHandle(oneshot::Receiver<Outcome>);
 impl OutcomeHandle {
     /// Await the outcome. Returns an `Error` outcome if the loop task vanished.
     pub async fn wait(self) -> Outcome {
-        self.0
-            .await
-            .unwrap_or_else(|_| Outcome::Error(LychiError::Ai("agent loop task dropped".into())))
+        self.0.await.unwrap_or_else(|_| Outcome::Error {
+            error: LychiError::Ai("agent loop task dropped".into()),
+            session: None,
+        })
     }
 }
 
@@ -246,7 +260,13 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
         let mut step = 0usize;
         loop {
             if self.cancel.is_cancelled() {
-                return Outcome::Error(LychiError::Ai("cancelled".into()));
+                // Esc ends the TURN, not the conversation — the session (with
+                // whatever partial answer the previous consume_turn kept) goes
+                // back to the caller for persist + re-stash.
+                return Outcome::Error {
+                    error: LychiError::Ai("cancelled".into()),
+                    session: Some(session),
+                };
             }
             if self.stop.should_stop(&session, step) {
                 let reason = format!("reached step limit ({step})");
@@ -260,9 +280,19 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
             // Stream one model turn, forwarding prose + collecting tool calls.
             let turn = match self.consume_turn(&session.messages).await {
                 Ok(t) => t,
-                Err(e) => {
+                Err((e, partial)) => {
+                    // The prose that already streamed is on the user's screen —
+                    // it is context the model must keep. Push it before
+                    // surfacing the error, or the follow-up answers as if the
+                    // interrupted reply never happened.
+                    if !partial.is_empty() {
+                        session.push_assistant(partial, Vec::new());
+                    }
                     self.emit(AgentEvent::Error(e.to_string()));
-                    return Outcome::Error(e);
+                    return Outcome::Error {
+                        error: e,
+                        session: Some(session),
+                    };
                 }
             };
             let (text, calls, truncated) = (turn.text, turn.tool_calls, turn.truncated);
@@ -287,10 +317,14 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
 
     /// Stream one provider turn: forward `TextDelta`/`ReasoningDelta`, accumulate
     /// tool calls, and return them once the stream ends.
+    ///
+    /// On a stream error the text accumulated BEFORE it comes back alongside
+    /// the error — that prose already streamed to the user, and the caller
+    /// preserves it in the session rather than pretending it never happened.
     async fn consume_turn(
         &self,
         messages: &[crate::providers::ChatMessage],
-    ) -> Result<TurnResult, LychiError> {
+    ) -> Result<TurnResult, (LychiError, String)> {
         let mut stream: ProviderStream =
             self.provider
                 .chat(messages, &self.tools, self.cancel.clone());
@@ -302,7 +336,11 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
             if self.cancel.is_cancelled() {
                 break;
             }
-            match item? {
+            let event = match item {
+                Ok(ev) => ev,
+                Err(e) => return Err((e, text)),
+            };
+            match event {
                 StreamEvent::MessageStart { .. } => {}
                 StreamEvent::TextDelta(d) => {
                     text.push_str(&d);
@@ -391,7 +429,10 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
             }
             Err(e) => {
                 self.emit(AgentEvent::Error(e.to_string()));
-                Some(Outcome::Error(e))
+                Some(Outcome::Error {
+                    error: e,
+                    session: Some(session.clone()),
+                })
             }
         }
     }
@@ -908,6 +949,81 @@ mod tests {
         cancel.cancel();
         let (stream, handle) = coordinator(provider, exec).run(Session::new("sys", "go"), cancel);
         drain(stream).await;
-        assert!(matches!(handle.wait().await, Outcome::Error(_)));
+        // Esc ends the turn, not the conversation: the session must come back.
+        match handle.wait().await {
+            Outcome::Error { session, .. } => {
+                assert!(session.is_some(), "cancel must return the session")
+            }
+            _ => panic!("expected Error"),
+        }
+    }
+
+    /// A provider whose stream fails mid-answer, after some prose streamed.
+    struct FailingProvider;
+    #[async_trait]
+    impl AiProvider for FailingProvider {
+        async fn route_intent(&self, _: &str, _: &[&str]) -> Result<AiRoute, LychiError> {
+            unreachable!()
+        }
+        async fn route_or_plan(
+            &self,
+            _: &str,
+            _: &[&str],
+            _: Option<&str>,
+        ) -> Result<AiResponse, LychiError> {
+            unreachable!()
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &str {
+            "failing"
+        }
+        fn chat(
+            &self,
+            _: &[crate::providers::ChatMessage],
+            _: &[ToolDef],
+            _: CancellationToken,
+        ) -> ProviderStream {
+            futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta("partial answer ".into())),
+                Ok(StreamEvent::TextDelta("the user already read".into())),
+                Err(LychiError::Ai("stream error: connection reset".into())),
+            ])
+            .boxed()
+        }
+    }
+
+    /// AI-1: a mid-stream infrastructure error must hand the session back WITH
+    /// the partial prose. The old shape returned only the error; the caller
+    /// cleared its stashed session while the conversation id survived, so the
+    /// next follow-up upserted an empty session over the stored transcript —
+    /// one wifi blip destroyed the conversation twice (context AND recall).
+    #[tokio::test]
+    async fn a_stream_error_preserves_the_session_and_partial_text() {
+        let exec = Arc::new(MockExecutor::new());
+        let coord = Coordinator::new(
+            Arc::new(FailingProvider) as Arc<dyn AiProvider>,
+            exec,
+            Vec::new(),
+        );
+        let (stream, handle) = coord.run(Session::new("sys", "go"), CancellationToken::new());
+        let events = drain(stream).await;
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+            "the error must still surface to the UI"
+        );
+        match handle.wait().await {
+            Outcome::Error { session, .. } => {
+                let session = session.expect("session must survive a stream error");
+                let last = session.messages.last().expect("messages not empty");
+                assert_eq!(
+                    last.content_text(),
+                    "partial answer the user already read",
+                    "the streamed prose must be preserved as an assistant turn"
+                );
+            }
+            _ => panic!("expected Error outcome"),
+        }
     }
 }

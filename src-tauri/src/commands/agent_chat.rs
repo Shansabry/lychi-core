@@ -394,8 +394,21 @@ fn drive(
                     persist_conversation(&db, &conversation_id, &session).await;
                     *pending_session.write().await = Some(session);
                 }
-                Outcome::Error(_) => {
-                    *pending_session.write().await = None;
+                Outcome::Error { session, .. } => {
+                    // An infrastructure error ends the TURN, not the
+                    // conversation: the messages up to the failure (including
+                    // partial prose the user already read) are valid context.
+                    // This arm used to clear the slot without persisting while
+                    // the conversation id survived — the next follow-up then
+                    // upserted an empty session OVER the stored transcript.
+                    match session {
+                        Some(session) => {
+                            persist_conversation(&db, &conversation_id, &session).await;
+                            *pending_session.write().await = Some(session);
+                        }
+                        // The loop task itself was lost — nothing to save.
+                        None => *pending_session.write().await = None,
+                    }
                 }
             }
         }
@@ -565,14 +578,33 @@ pub async fn agent_chat_start(
                 s.push_user_with_images(user, images);
                 s
             }
-            None => Session::new_with_images(system, user, images),
+            None => {
+                // No stashed session to continue (superseded mid-turn, or a
+                // first message sent as a follow-up). Whatever the current id's
+                // history row holds is a transcript this empty session never
+                // saw — reusing the id would make the next upsert REPLACE it.
+                // New session ⇒ new id, unconditionally.
+                *state.agent_conversation_id.write().await = Some(lychi_core::db::new_id());
+                Session::new_with_images(system, user, images)
+            }
         }
     };
 
     let mut session = session;
     session.set_last_user_display(display);
 
-    let (coord, ()) = build_coordinator(&state, with_tools).await?;
+    let (coord, ()) = match build_coordinator(&state, with_tools).await {
+        Ok(c) => c,
+        Err(e) => {
+            // Failed before the loop ever ran (e.g. AI disabled
+            // mid-conversation). Put the taken session back — a build error
+            // must not amputate the conversation it never touched. (The
+            // un-answered user message stays in it; both wire dialects accept
+            // consecutive user turns on retry.)
+            *state.agent_session.write().await = Some(session);
+            return Err(e);
+        }
+    };
     let (stream, handle) = coord.run(session, cancel);
     drive(
         app,
@@ -608,7 +640,15 @@ pub async fn agent_approve(
     *state.ai_cancel.write().await = Some(cancel.clone());
 
     // Approval resumes the full agent (a tool was pending), so tools stay on.
-    let (coord, ()) = build_coordinator(&state, true).await?;
+    let (coord, ()) = match build_coordinator(&state, true).await {
+        Ok(c) => c,
+        Err(e) => {
+            // Restore the taken session: the approval is still pending and the
+            // user can retry once the build error (e.g. AI disabled) is fixed.
+            *state.agent_session.write().await = Some(session);
+            return Err(e);
+        }
+    };
     let decision = if approve {
         ApprovalDecision::Approve
     } else {
