@@ -299,6 +299,48 @@ fn entries_fallback() -> Vec<(String, FrecencyEntry)> {
     Vec::new()
 }
 
+/// Run `f` over every row whose key starts with `prefix`, via a redb range
+/// scan — O(log n + matches), never a full-table walk.
+///
+/// This is the required read shape for the namespaced stores (`latch:`, `imp:`,
+/// `ws:`). Each of them first shipped as `table.iter()` + `strip_prefix` per
+/// row — a full scan and a full decode of EVERY frecency row, on the
+/// per-keystroke path. That is the exact "launcher gets slower the more it is
+/// used" curve measured and banned at the top of this file (0.46ms at 100
+/// rows, 24ms at 5000); the A4 cache fixed `get_scores` and the newer learning
+/// features quietly re-imported the pattern. The keys are prefix-ordered, so
+/// the B-tree can answer a prefix question directly: seek to `prefix`, stop at
+/// the first key past it.
+///
+/// Generic over the row type because the FRECENCY table multiplexes structs by
+/// namespace (`imp:` rows are `ImpressionEntry`, the rest `FrecencyEntry`) —
+/// which is also why these reads cannot ride the typed `ENTRY_CACHE`.
+fn for_prefix<T: serde::de::DeserializeOwned>(
+    db: &Arc<Database>,
+    prefix: &str,
+    mut f: impl FnMut(&str, T),
+) {
+    let Ok(txn) = db.begin_read() else {
+        return;
+    };
+    let Ok(table) = txn.open_table(FRECENCY) else {
+        return;
+    };
+    let Ok(range) = table.range(prefix..) else {
+        return;
+    };
+    for (key, value) in range.flatten() {
+        // Keys are sorted: the first key that no longer carries the prefix
+        // ends the namespace, and everything after it is other data.
+        let Some(rest) = key.value().strip_prefix(prefix) else {
+            break;
+        };
+        if let Ok(entry) = postcard::from_bytes::<T>(value.value()) {
+            f(rest, entry);
+        }
+    }
+}
+
 pub fn get_scores(db: &Arc<Database>) -> HashMap<String, f64> {
     let now_ms = super::now_millis();
     with_entries(db, |entries| {
@@ -313,38 +355,6 @@ pub fn get_scores(db: &Arc<Database>) -> HashMap<String, f64> {
     })
 }
 
-/// Like [`get_scores`] but each score is multiplied by the item's circadian
-/// [`FrecencyEntry::time_affinity`] — so commands used at this hour rank
-/// slightly higher. Used for the zero-state recents (a "knows your routine"
-/// tiebreak, not a driver).
-pub fn get_scores_with_affinity(db: &Arc<Database>) -> HashMap<String, f64> {
-    let now_ms = super::now_millis();
-    let mut scores = HashMap::new();
-
-    let Ok(txn) = db.begin_read() else {
-        return scores;
-    };
-    let Ok(table) = txn.open_table(FRECENCY) else {
-        return scores;
-    };
-    let Ok(iter) = table.iter() else {
-        return scores;
-    };
-
-    for item in iter.flatten() {
-        let (key, value) = item;
-        let Ok(entry) = postcard::from_bytes::<FrecencyEntry>(value.value()) else {
-            continue;
-        };
-        let score = entry.score(now_ms);
-        if score > 0.0 {
-            scores.insert(key.value().to_string(), score * entry.time_affinity(now_ms));
-        }
-    }
-
-    scores
-}
-
 /// Per-command circadian [`FrecencyEntry::time_affinity`] for one workspace's
 /// commands (`ws:<project_root>:<command>` keys). Returns `command → affinity`
 /// (1.0 neutral, up to 1.15) so the cold-path ranker can give workspace-memory
@@ -355,28 +365,9 @@ pub fn get_workspace_affinity(db: &Arc<Database>, project_root: &str) -> HashMap
     let normalized = project_root.trim_end_matches('/');
     let prefix = format!("ws:{normalized}:");
     let mut affinity = HashMap::new();
-
-    let Ok(txn) = db.begin_read() else {
-        return affinity;
-    };
-    let Ok(table) = txn.open_table(FRECENCY) else {
-        return affinity;
-    };
-    let Ok(iter) = table.iter() else {
-        return affinity;
-    };
-
-    for item in iter.flatten() {
-        let (key, value) = item;
-        let Some(cmd) = key.value().strip_prefix(&prefix) else {
-            continue;
-        };
-        let Ok(entry) = postcard::from_bytes::<FrecencyEntry>(value.value()) else {
-            continue;
-        };
+    for_prefix::<FrecencyEntry>(db, &prefix, |cmd, entry| {
         affinity.insert(cmd.to_string(), entry.time_affinity(now_ms));
-    }
-
+    });
     affinity
 }
 
@@ -476,30 +467,104 @@ pub fn get_impression_stats(db: &Arc<Database>, context_key: &str) -> HashMap<St
     let now_ms = super::now_millis();
     let prefix = format!("imp:{context_key}:");
     let mut out = HashMap::new();
-
-    let Ok(txn) = db.begin_read() else {
-        return out;
-    };
-    let Ok(table) = txn.open_table(FRECENCY) else {
-        return out;
-    };
-    let Ok(iter) = table.iter() else {
-        return out;
-    };
-
-    for item in iter.flatten() {
-        let (key, value) = item;
-        let key = key.value();
-        let Some(command) = key.strip_prefix(&prefix) else {
-            continue;
-        };
-        let Ok(entry) = postcard::from_bytes::<ImpressionEntry>(value.value()) else {
-            continue;
-        };
+    for_prefix::<ImpressionEntry>(db, &prefix, |command, entry| {
         let (accepts, impressions) = decay_counts(&entry, now_ms);
         out.insert(command.to_string(), (accepts, impressions));
-    }
+    });
     out
+}
+
+/// Backstop cap on total learning rows. Not a tuning knob: at the measured
+/// decode rates the table stays imperceptible well below this, so the cap
+/// exists only to bound the pathological case (scripted use, years of uptime)
+/// where even dead-row sweeping can't keep growth linear-in-habits rather
+/// than linear-in-lifetime. Eviction is oldest-last-used first.
+const MAX_LEARNING_ROWS: usize = 50_000;
+
+/// Delete learning rows that can no longer influence ranking, then enforce
+/// [`MAX_LEARNING_ROWS`]. Returns how many rows were removed.
+///
+/// Runs at startup (next to history's tombstone purge), never on the hot path.
+/// Without it the table grows monotonically: expiry was read-side only — an
+/// expired latch scored 0.0 forever but its row was scanned and decoded
+/// forever — and every panel-settle mints `imp:` rows, every correction
+/// `latch:` rows. "Habits you drop must stop shaping results" (the latch
+/// doc's own rule) now extends to "and stop costing reads".
+///
+/// Dead means *provably* inert under the read-side rules:
+/// - `latch:` rows past [`LATCH_WINDOW_DAYS`] — the hard horizon after which
+///   `latch_strength` answers 0.0 unconditionally.
+/// - `imp:` rows whose decayed counts round to (0, 0) — invisible to the
+///   CTR demotion that reads them.
+///
+/// Other namespaces decay asymptotically (an ancient row still weighs 0.1 in
+/// `score`), so they are never "dead", only cappable.
+pub fn prune_expired(db: &Arc<Database>) -> Result<usize, LychiError> {
+    prune_expired_impl(db, MAX_LEARNING_ROWS)
+}
+
+fn prune_expired_impl(db: &Arc<Database>, max_rows: usize) -> Result<usize, LychiError> {
+    let now_ms = super::now_millis();
+    let txn = db.begin_write()?;
+    let removed;
+    {
+        let mut table = txn.open_table(FRECENCY)?;
+
+        // One pass: collect the dead, and the last-used stamp of the living
+        // (for the cap). Startup-only, so a full scan is the right tool here.
+        let mut dead: Vec<String> = Vec::new();
+        let mut living: Vec<(u64, String)> = Vec::new();
+        for (key, value) in table.iter()?.flatten() {
+            let key_str = key.value();
+            if key_str.starts_with("latch:") {
+                if let Ok(entry) = postcard::from_bytes::<FrecencyEntry>(value.value()) {
+                    if latch_strength(&entry, now_ms) <= 0.0 {
+                        dead.push(key_str.to_string());
+                    } else {
+                        let last = entry.recent_timestamps.last().copied().unwrap_or(0);
+                        living.push((last, key_str.to_string()));
+                    }
+                    continue;
+                }
+            } else if key_str.starts_with("imp:") {
+                if let Ok(entry) = postcard::from_bytes::<ImpressionEntry>(value.value()) {
+                    if decay_counts(&entry, now_ms) == (0, 0) {
+                        dead.push(key_str.to_string());
+                    } else {
+                        living.push((entry.last_ms, key_str.to_string()));
+                    }
+                    continue;
+                }
+            } else if let Ok(entry) = postcard::from_bytes::<FrecencyEntry>(value.value()) {
+                let last = entry.recent_timestamps.last().copied().unwrap_or(0);
+                living.push((last, key_str.to_string()));
+                continue;
+            }
+            // Undecodable under every known shape: scanned forever, read by
+            // nothing. Dead by definition.
+            dead.push(key_str.to_string());
+        }
+
+        // Backstop: evict oldest-last-used living rows over the cap.
+        if living.len() > max_rows {
+            living.sort_unstable();
+            let excess = living.len() - max_rows;
+            dead.extend(living.drain(..excess).map(|(_, k)| k));
+        }
+
+        removed = dead.len();
+        for key in &dead {
+            table.remove(key.as_str())?;
+        }
+    }
+    if removed > 0 {
+        tracing::info!("[frecency] pruned {removed} inert learning row(s)");
+    }
+    // commit_write even when nothing was removed: the generation bump is
+    // harmless, and an early return would add a second commit path to keep
+    // correct forever.
+    commit_write(txn)?;
+    Ok(removed)
 }
 
 /// Clear all learned ranking data (frecency for history, workspace, and
@@ -606,29 +671,14 @@ pub fn get_latches(db: &Arc<Database>, query: &str) -> HashMap<String, f64> {
     }
     let now_ms = super::now_millis();
     let want = format!("latch:{prefix}\u{1}");
-
-    let Ok(txn) = db.begin_read() else {
-        return out;
-    };
-    let Ok(table) = txn.open_table(FRECENCY) else {
-        return out;
-    };
-    let Ok(iter) = table.iter() else {
-        return out;
-    };
-
-    for (key, value) in iter.flatten() {
-        let Some(command) = key.value().strip_prefix(&want) else {
-            continue;
-        };
-        let Ok(entry) = postcard::from_bytes::<FrecencyEntry>(value.value()) else {
-            continue;
-        };
+    // This runs on EVERY keystroke (Executor::completions) — it must stay a
+    // range scan, never a table walk. See `for_prefix`.
+    for_prefix::<FrecencyEntry>(db, &want, |command, entry| {
         let strength = latch_strength(&entry, now_ms);
         if strength > 0.0 {
             out.insert(command.to_string(), strength);
         }
-    }
+    });
     out
 }
 
@@ -656,9 +706,110 @@ fn latch_strength(entry: &FrecencyEntry, now_ms: u64) -> f64 {
 }
 
 #[cfg(test)]
+mod prune_tests {
+    use super::*;
+    use crate::db::open_test_database;
+
+    /// Write a raw row with a chosen shape and timestamps — the only way to
+    /// produce "old" data, since `record` stamps the wall clock.
+    fn insert_raw<T: Serialize>(db: &Arc<Database>, key: &str, entry: &T) {
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(FRECENCY).unwrap();
+            let bytes = postcard::to_allocvec(entry).unwrap();
+            table.insert(key, bytes.as_slice()).unwrap();
+        }
+        commit_write(txn).unwrap();
+    }
+
+    fn days_ago_ms(days: f64) -> u64 {
+        crate::db::now_millis() - (days * 86_400_000.0) as u64
+    }
+
+    /// The read-side rules say an expired latch and a fully-decayed impression
+    /// are invisible; prune makes the table agree, and leaves the living alone.
+    #[test]
+    fn prune_deletes_exactly_the_rows_reads_ignore() {
+        let db = open_test_database();
+
+        // Dead: latch past the 28-day horizon; imp decayed to (0,0).
+        insert_raw(
+            &db,
+            "latch:old query\u{1}cmd",
+            &FrecencyEntry {
+                count: 3,
+                recent_timestamps: vec![days_ago_ms(LATCH_WINDOW_DAYS + 1.0)],
+            },
+        );
+        insert_raw(
+            &db,
+            "imp:ctx:old-cmd",
+            &ImpressionEntry {
+                impressions: 1,
+                accepts: 0,
+                last_ms: days_ago_ms(120.0),
+            },
+        );
+        // Living: a fresh latch, a fresh impression, an ordinary frecency row.
+        record_latch(&db, "new query", "chosen cmd").unwrap();
+        record_impressions(&db, "ctx", &["fresh-cmd".to_string()]).unwrap();
+        record(&db, "firefox").unwrap();
+
+        let removed = prune_expired(&db).unwrap();
+        assert_eq!(removed, 2, "exactly the two inert rows go");
+
+        assert!(!get_latches(&db, "old query").contains_key("cmd"));
+        assert!(get_latches(&db, "new query").contains_key("chosen cmd"));
+        assert!(get_impression_stats(&db, "ctx").contains_key("fresh-cmd"));
+        assert!(get_scores(&db).contains_key("firefox"));
+
+        // Idempotent: nothing left to prune.
+        assert_eq!(prune_expired(&db).unwrap(), 0);
+    }
+
+    /// The backstop cap evicts oldest-last-used first and only over the limit.
+    #[test]
+    fn cap_evicts_oldest_rows_first() {
+        let db = open_test_database();
+        for i in 0..6 {
+            insert_raw(
+                &db,
+                &format!("cmd-{i}"),
+                &FrecencyEntry {
+                    count: 1,
+                    // cmd-0 is the oldest, cmd-5 the newest.
+                    recent_timestamps: vec![days_ago_ms((60 - i) as f64)],
+                },
+            );
+        }
+        assert_eq!(prune_expired_impl(&db, 4).unwrap(), 2);
+        let scores = get_scores(&db);
+        assert!(!scores.contains_key("cmd-0") && !scores.contains_key("cmd-1"));
+        assert!(scores.contains_key("cmd-2") && scores.contains_key("cmd-5"));
+    }
+}
+
+#[cfg(test)]
 mod latch_tests {
     use super::*;
     use crate::db::open_test_database;
+
+    /// The range scan must stop at the namespace boundary, not just filter —
+    /// and neighbouring keys that share all but the last character must not
+    /// bleed in. Guards the `for_prefix` break condition that replaced the
+    /// full-table walk (A4's curve, re-shipped by the learning features).
+    #[test]
+    fn latches_for_neighbouring_prefixes_stay_separate() {
+        let db = open_test_database();
+        record_latch(&db, "aaa", "for-aaa").unwrap();
+        record_latch(&db, "aab", "for-aab").unwrap();
+        record(&db, "history:aaa something").unwrap(); // other namespace
+        record(&db, "zzz").unwrap(); // sorts after every latch
+
+        let latches = get_latches(&db, "aaa");
+        assert_eq!(latches.len(), 1, "got: {latches:?}");
+        assert!(latches.contains_key("for-aaa"));
+    }
 
     /// The headline case: correcting a query once stops the popular-but-wrong
     /// item being the answer for it. No rule mentions "dnf".

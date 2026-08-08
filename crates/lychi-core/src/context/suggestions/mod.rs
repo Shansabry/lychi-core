@@ -232,8 +232,11 @@ fn recent_apps(db: Option<&Arc<Database>>) -> Vec<CompletionItem> {
     };
     let index = crate::desktop_apps::app_index();
 
-    let mut scored: Vec<(&crate::desktop_apps::DesktopEntry, f64)> =
-        frecency::get_scores_with_affinity(db)
+    // get_scores already applies the circadian affinity multiplier AND rides
+    // the generation-keyed entry cache. (A separate get_scores_with_affinity
+    // existed here; the two had drifted into identical logic, except that the
+    // duplicate re-scanned the whole table per call — on the keystroke path.)
+    let mut scored: Vec<(&crate::desktop_apps::DesktopEntry, f64)> = frecency::get_scores(db)
             .into_iter()
             // Cheap pre-filter: everything namespaced (`history:`, `win:`,
             // `ws:`) or absolute is definitely not an app name. Correctness
