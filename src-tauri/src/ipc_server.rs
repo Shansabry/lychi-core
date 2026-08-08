@@ -87,8 +87,14 @@ async fn handle_ai_on_selection(handle: &tauri::AppHandle, preset_keyword: Strin
 
     // Show the launcher, then hand the turn to the frontend. It owns the AI
     // surface, so the answer streams into the same place every other answer does.
+    //
+    // Hop to a blocking thread: show_window's first act is a
+    // config.blocking_read(), which panics on this tokio task — that panic
+    // killed the whole handler here, silently, before either the window showed
+    // or the event below was emitted. Awaited so the frontend event still
+    // arrives after the show, as the original order intended.
     if let Some(w) = handle.get_webview_window("main") {
-        window::show_window(&w);
+        let _ = tauri::async_runtime::spawn_blocking(move || window::show_window(&w)).await;
     }
     let _ = handle.emit(
         "lychi://ai-on-selection",

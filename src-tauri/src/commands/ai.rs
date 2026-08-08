@@ -46,19 +46,17 @@ pub async fn save_ai_config(
 
     // The AiReactor rebuilds the provider, hot-swaps the router, and
     // re-registers the AI-dependent handlers — no restart needed to switch.
-    //
-    // Emit on a blocking thread: the reactor reads the OS keyring (whose
-    // secret-service backend spins its own runtime) and takes locks with
-    // `blocking_*`. Running it on a tokio async worker would panic ("Cannot
-    // start a runtime from within a runtime"). `EventBus::emit` is synchronous,
-    // so we hop off the worker here.
-    let bus = state.event_bus.clone();
-    let _ = tauri::async_runtime::spawn_blocking(move || {
-        bus.emit(DomainEvent::ConfigChanged {
+    // emit_from_async hops off the tokio worker: the reactor reads the OS
+    // keyring (whose secret-service backend spins its own runtime) and takes
+    // locks with `blocking_*` — both panic in an async execution context.
+    // (This save used to carry that hop by hand; it now lives on the bus so
+    // the other save commands can't forget it, as two of them did.)
+    state
+        .event_bus
+        .emit_from_async(DomainEvent::ConfigChanged {
             section: ConfigSection::Ai,
-        });
-    })
-    .await;
+        })
+        .await;
 
     Ok(())
 }

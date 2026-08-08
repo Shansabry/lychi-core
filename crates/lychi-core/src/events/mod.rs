@@ -104,6 +104,15 @@ impl EventBus {
     /// Contract for callers: emit *after* your own persist+commit and *after*
     /// releasing any DB/state locks (reactors re-acquire them with `blocking_*`).
     pub fn emit(&self, event: DomainEvent) {
+        // Reactors take their locks with `blocking_*`, which tokio panics on
+        // when the calling thread is driving async tasks — and the per-handler
+        // `catch_unwind` below would swallow that panic into one log line, i.e.
+        // the reactor silently never runs. That is not hypothetical: the
+        // Commands/Projects saves shipped in exactly that state (persisted to
+        // disk, never hot-applied) while only the AI save had the hop. Fail
+        // loudly in dev instead; async callers use `emit_from_async`.
+        debug_assert_blocking_legal("EventBus::emit — use emit_from_async");
+
         let depth = EMIT_DEPTH.with(|d| d.get());
         if depth >= MAX_EMIT_DEPTH {
             tracing::warn!(
@@ -143,7 +152,54 @@ impl EventBus {
             }
         }
     }
+
+    /// Emit from an async execution context (a tokio worker task).
+    ///
+    /// [`emit`](Self::emit) runs every reactor synchronously on the calling
+    /// thread, and reactors acquire their locks with `blocking_*` — documented
+    /// by tokio to panic inside an async execution context. This wrapper hops
+    /// to a blocking thread first, so the reactors run on a thread where
+    /// `blocking_*` is legal. Synchronous callers (watcher threads, the main
+    /// thread, code already inside `spawn_blocking`) keep calling `emit`.
+    pub async fn emit_from_async(self: &Arc<Self>, event: DomainEvent) {
+        let bus = Arc::clone(self);
+        // A JoinError here means the blocking task itself panicked. emit
+        // already isolates reactor panics, so this is out-of-memory-grade
+        // unlikely — but an escaped panic must not take the caller down.
+        if tokio::task::spawn_blocking(move || bus.emit(event))
+            .await
+            .is_err()
+        {
+            tracing::error!("[events] emit_from_async: the emitting task panicked");
+        }
+    }
 }
+
+/// Dev-only guard: panic if a `blocking_*` lock acquisition would panic on the
+/// current thread — i.e. this thread is driving async tasks.
+///
+/// The probe IS the operation. `Handle::try_current()` cannot be the predicate:
+/// it reports the runtime context as present both on async workers (blocking
+/// illegal) and inside `spawn_blocking` closures (blocking legal — measured,
+/// not assumed). So ask tokio directly, by performing a trivially uncontended
+/// `blocking_read` and catching the context panic it raises on async workers.
+/// Costs nanoseconds, runs only in debug builds, and cannot drift from tokio's
+/// real rule because it exercises it.
+#[cfg(debug_assertions)]
+pub fn debug_assert_blocking_legal(who: &str) {
+    let legal =
+        std::panic::catch_unwind(|| drop(tokio::sync::RwLock::new(0u8).blocking_read())).is_ok();
+    assert!(
+        legal,
+        "{who}: called from an async execution context. blocking_* locks panic \
+         here, and in release the failure is silent (catch_unwind eats it) — \
+         hop via spawn_blocking or a plain thread first."
+    );
+}
+
+#[cfg(not(debug_assertions))]
+#[inline]
+pub fn debug_assert_blocking_legal(_who: &str) {}
 
 #[cfg(test)]
 mod tests {
@@ -202,6 +258,56 @@ mod tests {
     fn emit_with_no_subscribers_is_a_noop() {
         let bus = EventBus::new();
         // Must not panic.
+        bus.emit(DomainEvent::WorkspaceSwitched { root: None });
+    }
+
+    // --- PLAT-3: blocking reactors vs async emit contexts ---
+
+    /// A reactor shaped like the real ones: takes a tokio lock with
+    /// `blocking_read`, which panics on a thread that is driving async tasks.
+    struct BlockingReactor {
+        lock: Arc<tokio::sync::RwLock<u32>>,
+        ran: Arc<AtomicUsize>,
+    }
+    impl EventHandler for BlockingReactor {
+        fn handle(&self, _event: &DomainEvent) {
+            let _guard = self.lock.blocking_read();
+            self.ran.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The regression that shipped: Commands/Projects saves emitted straight
+    /// from an async command, the reactor's `blocking_read` panicked, and
+    /// `catch_unwind` reduced "settings never hot-apply" to one log line.
+    /// `emit_from_async` must actually reach a blocking-lock reactor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn emit_from_async_reaches_blocking_reactors() {
+        let bus = Arc::new(EventBus::new());
+        let ran = Arc::new(AtomicUsize::new(0));
+        bus.subscribe(Arc::new(BlockingReactor {
+            lock: Arc::new(tokio::sync::RwLock::new(0)),
+            ran: ran.clone(),
+        }));
+
+        bus.emit_from_async(DomainEvent::ConfigChanged {
+            section: ConfigSection::Commands,
+        })
+        .await;
+
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "a blocking_* reactor must run when the emit originates on a tokio worker"
+        );
+    }
+
+    /// The other half of the contract: a direct `emit` from an async context
+    /// is a bug, and must fail loudly in dev builds instead of unwinding into
+    /// catch_unwind where nobody sees it.
+    #[tokio::test]
+    #[should_panic(expected = "emit_from_async")]
+    async fn emitting_directly_from_async_context_fails_loudly() {
+        let bus = EventBus::new();
         bus.emit(DomainEvent::WorkspaceSwitched { root: None });
     }
 

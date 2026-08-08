@@ -162,9 +162,16 @@ pub async fn save_commands_config(
 
     // The CommandsReactor re-derives shell + terminal + bang routing from the live
     // config. The command no longer knows those subsystems exist.
-    state.event_bus.emit(DomainEvent::ConfigChanged {
-        section: ConfigSection::Commands,
-    });
+    //
+    // emit_from_async, not emit: this is a tokio worker, and the reactor's
+    // blocking_* lock acquisition panics here — a panic catch_unwind then eats,
+    // which is how this exact save shipped persisting-but-never-applying.
+    state
+        .event_bus
+        .emit_from_async(DomainEvent::ConfigChanged {
+            section: ConfigSection::Commands,
+        })
+        .await;
 
     Ok(())
 }
@@ -193,9 +200,12 @@ pub async fn save_projects_config(
 
     // The ProjectsReactor updates IDE markers, the pinned workspace, and the
     // project handler's directories from the live config.
-    state.event_bus.emit(DomainEvent::ConfigChanged {
-        section: ConfigSection::Projects,
-    });
+    state
+        .event_bus
+        .emit_from_async(DomainEvent::ConfigChanged {
+            section: ConfigSection::Projects,
+        })
+        .await;
 
     Ok(())
 }

@@ -79,9 +79,16 @@ pub fn toggle_window(window: &WebviewWindow) {
 /// Show the window, reposition to the correct monitor, focus it, and notify
 /// the frontend. Public so lib.rs can call it at startup too.
 pub fn show_window(window: &WebviewWindow) {
-    // Read monitor_mode from config. blocking_read() is safe here because
-    // callers are always on Tokio tasks (shortcut callback, IPC, tray handler),
-    // never inside an async executor that would deadlock.
+    // This function must NEVER run on a tokio async worker: the blocking_read()
+    // below panics in an async execution context. (A comment here used to
+    // claim the exact opposite — "safe because callers are always on Tokio
+    // tasks" — and that inverted rule shipped the `--ai` IPC path calling
+    // this from its async handler, where the panic silently killed the task
+    // and the launcher never appeared.) Async callers hop first, the way
+    // toggle_window and the IPC server do.
+    lychi_core::events::debug_assert_blocking_legal("show_window");
+
+    // Read monitor_mode from config.
     let monitor_mode = {
         let state = window.app_handle().state::<AppState>();
         state.config.blocking_read().general.monitor_mode.clone()
