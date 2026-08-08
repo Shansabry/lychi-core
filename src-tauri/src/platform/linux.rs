@@ -48,10 +48,20 @@ pub fn show_startup_error(title: &str, body: &str) {
 }
 
 /// Detect KDE Plasma on Wayland (where layer-shell focus is unreliable).
-/// Uses `XDG_SESSION_DESKTOP` first (single-valued, more reliable), falls back
-/// to `XDG_CURRENT_DESKTOP`. Only triggers on Wayland sessions.
+///
+/// Delegates to the core compositor decider (`is_kde_wayland_session`: D-Bus
+/// `NameHasOwner("org.kde.KWin")` with a session fallback). This file used to
+/// keep a private env parser that read `XDG_SESSION_DESKTOP` **first** — but
+/// that variable holds a session *file name* (`plasma`), not a desktop name,
+/// which the session decider's own tests document. On any Plasma install whose
+/// display manager exports the file name (GDM, LightDM, greetd), the `kde`
+/// fact came back false and auto strategy resolved to LayerShell on KWin — the
+/// configuration I-008 says cannot receive keyboard focus. The same trap was
+/// already removed from `hotkey_de` and `context::compositor()`; this was the
+/// last surviving copy, invisible locally because the dev box happens to
+/// export `XDG_SESSION_DESKTOP=KDE`.
 pub fn is_kde_wayland() -> bool {
-    is_wayland_session() && desktop_contains("KDE")
+    lychi_core::context::is_kde_wayland_session()
 }
 
 /// Is this a Wayland session?
@@ -72,13 +82,6 @@ pub fn is_kde_wayland() -> bool {
 /// One definition, in the crate that already reasoned about it.
 fn is_wayland_session() -> bool {
     lychi_core::context::is_wayland()
-}
-
-fn desktop_contains(name: &str) -> bool {
-    std::env::var("XDG_SESSION_DESKTOP")
-        .or_else(|_| std::env::var("XDG_CURRENT_DESKTOP"))
-        .map(|v| v.to_uppercase().contains(name))
-        .unwrap_or(false)
 }
 
 /// Switch off WebKit subsystems Lychi does not use.
@@ -324,7 +327,10 @@ impl SessionFacts {
     fn probe() -> Self {
         Self {
             wayland: is_wayland_session(),
-            kde: desktop_contains("KDE"),
+            // KWin-over-Wayland from the core compositor decider — never a
+            // private env parse (see `is_kde_wayland`). False on X11 by
+            // construction; the auto branch's `wayland && kde` tolerates that.
+            kde: is_kde_wayland(),
             layer_shell: gtk_layer_shell::is_supported(),
         }
     }
@@ -1337,6 +1343,34 @@ mod strategy_tests {
             wayland,
             kde,
             layer_shell,
+        }
+    }
+
+    /// The desktop facts must come from the core session/compositor deciders,
+    /// never from a private env parse in this file.
+    ///
+    /// Two copies of that parse have now been buried here. The first read only
+    /// `XDG_SESSION_TYPE` (absent under autostart — the `wayland` fact broke).
+    /// The second, `desktop_contains`, read `XDG_SESSION_DESKTOP` first — a
+    /// session *file name* (`plasma`), not a desktop name — so the `kde` fact
+    /// broke on every display manager that exports the file name, and KDE
+    /// Wayland resolved to LayerShell: unable to type (I-008). Both were
+    /// invisible on a dev box whose environment happens to spell the answer
+    /// correctly, which is exactly why a source scan and not a behaviour test.
+    #[test]
+    fn desktop_env_parsing_stays_in_the_session_decider() {
+        let src = include_str!("linux.rs");
+        for var in [
+            "XDG_SESSION_DESKTOP",
+            "XDG_CURRENT_DESKTOP",
+            "XDG_SESSION_TYPE",
+        ] {
+            assert!(
+                !src.contains(&format!("var(\"{var}\")")),
+                "platform/linux.rs reads {var} directly — derive the fact from \
+                 lychi_core::context::session / compositor() instead (the env \
+                 semantics are subtle and already solved there, once)"
+            );
         }
     }
 
