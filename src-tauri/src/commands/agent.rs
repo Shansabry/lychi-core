@@ -41,7 +41,9 @@ pub async fn execute_agent_plan(
 
     // Config first, released before the executor guard is taken.
     let privacy = state.config_snapshot(|c| c.privacy.clone()).await;
-    let executor = state.executor.read().await;
+    // Snapshot-then-release: a multi-step plan is the LONGEST possible hold —
+    // never keep the guard across it (see `Executor`'s Clone note).
+    let executor = state.executor.read().await.clone();
 
     for (i, step) in plan.steps.iter().enumerate() {
         // Emit running status

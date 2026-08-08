@@ -131,8 +131,16 @@ pub async fn execute_command(
     // guards must never overlap. See `AppState`'s lock-discipline note.
     let privacy = state.config_snapshot(|c| c.privacy.clone()).await;
 
-    // Run through executor pipeline: resolve → validate → execute
-    let executor = state.executor.read().await;
+    // Run through executor pipeline: resolve → validate → execute.
+    //
+    // SNAPSHOT, then release the lock — never hold the guard across the run.
+    // The guard used to live for the whole handler execution, and the reactors
+    // take blocking_write on this fair RwLock: one slow handler plus one
+    // settings save queued EVERY later read (completions per keystroke) behind
+    // the writer — the launcher accepted keystrokes and showed nothing. The
+    // clone is cheap (Arc'd handlers) and shares the gate/tracker/router state,
+    // so semantics are identical; see the note on `Executor`'s Clone impl.
+    let executor = state.executor.read().await.clone();
     let exec = executor
         .run(&input, confirmed.unwrap_or(false), &privacy, &inputs)
         .await?;

@@ -141,6 +141,7 @@ pub fn authorize(cmd: &str) -> ShellDecision {
 }
 
 /// Shell-specific safety rules.
+#[derive(Clone)]
 pub struct ShellRules;
 
 impl ShellRules {

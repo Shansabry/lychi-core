@@ -111,6 +111,22 @@ enum RunRepo {
 /// Executor — the single orchestrator that wires all bricks together.
 ///
 /// Pipeline: input → IntentResolver.resolve() → RulesEngine.validate() → ActionHandler.execute()
+/// `Clone` is deliberate and cheap (Arc'd handlers, small vecs), and it is the
+/// mechanism that keeps the launcher responsive: the app snapshots the executor
+/// under a short read guard and runs the command on the snapshot, so the lock
+/// is NEVER held across handler execution. Before this, the guard lived for
+/// the whole run, and the reactors' queued `blocking_write` on the fair RwLock
+/// stalled every subsequent read — one slow handler plus one settings save
+/// froze completions on every keystroke until the handler finished.
+///
+/// Cross-run state is SHARED across clones, not forked: the concurrency gate,
+/// the suggestion tracker, and the AI router's caches all sit behind `Arc`, so
+/// a snapshot obeys the same exclusivity/learning semantics as the canonical
+/// executor. What a snapshot fixes in place is the point-in-time view —
+/// registry contents, routing side-channels, context — which is exactly what
+/// an in-flight command should see; re-registration lands on the canonical
+/// executor and is picked up by the next snapshot.
+#[derive(Clone)]
 pub struct Executor {
     pub registry: ActionRegistry,
     pub rules: RulesEngine,
@@ -122,7 +138,8 @@ pub struct Executor {
     /// Suggestion-learning state (acceptance latch + impression debounce),
     /// extracted into its own collaborator so the Executor doesn't carry the
     /// ad-hoc mutexes inline. The Executor still owns the policy (what to record).
-    suggestions: SuggestionTracker,
+    /// Arc: learning state is cross-run — snapshots must share it, not fork it.
+    suggestions: Arc<SuggestionTracker>,
     /// The user's quicklinks, so the router can send `gh tokio` to the right
     /// place. Set from config after construction.
     ///
@@ -141,7 +158,9 @@ pub struct Executor {
     /// (immediate / exclusive-fail-fast / replace-previous-with-cancellation).
     /// Extracted into its own collaborator so the Executor stays an orchestrator
     /// rather than accumulating specialized concurrency mechanics.
-    gate: ConcurrencyGate,
+    /// Arc: the gate enforces exclusivity ACROSS runs — every snapshot must go
+    /// through the one gate, or two clones could run an Exclusive handler twice.
+    gate: Arc<ConcurrencyGate>,
 }
 
 impl Executor {
@@ -159,10 +178,10 @@ impl Executor {
             history,
             db,
             context: None,
-            suggestions: SuggestionTracker::new(),
+            suggestions: Arc::new(SuggestionTracker::new()),
             quicklinks: Vec::new(),
             script_keywords: Vec::new(),
-            gate: ConcurrencyGate::new(),
+            gate: Arc::new(ConcurrencyGate::new()),
         }
     }
 
@@ -2196,6 +2215,27 @@ mod tests {
             HistoryStore::new(500, true),
             crate::db::open_test_database(),
         )
+    }
+
+    /// The Clone contract that keeps snapshot-and-release sound: cross-run
+    /// state is SHARED between a snapshot and the canonical executor. A forked
+    /// gate would let an Exclusive handler run twice concurrently (one per
+    /// clone); forked learning state would silently drop acceptance signals
+    /// recorded on a snapshot. `Arc::ptr_eq` is the whole assertion — if either
+    /// field stops being shared, snapshot execution is no longer semantics-
+    /// preserving and the app must go back to holding the lock.
+    #[test]
+    fn snapshots_share_the_gate_and_learning_state() {
+        let ex = make_executor(ActionRegistry::new());
+        let snap = ex.clone();
+        assert!(
+            Arc::ptr_eq(&ex.gate, &snap.gate),
+            "a snapshot must run through the SAME concurrency gate"
+        );
+        assert!(
+            Arc::ptr_eq(&ex.suggestions, &snap.suggestions),
+            "a snapshot must record into the SAME suggestion tracker"
+        );
     }
 
     // --- Quicklink routing ---

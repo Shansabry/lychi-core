@@ -28,13 +28,18 @@ pub struct ResolvedIntent {
 /// Intent Resolver — converts raw user input into structured intents.
 ///
 /// Combines deterministic pattern matching with optional AI routing.
+/// `Clone` shares the router (`Arc`) — its route cache, health gate, and
+/// context hint are cross-clone state and must not fork with a snapshot.
+#[derive(Clone)]
 pub struct IntentResolver {
-    ai_router: Option<AiRouter>,
+    ai_router: Option<std::sync::Arc<AiRouter>>,
 }
 
 impl IntentResolver {
     pub fn new(ai_router: Option<AiRouter>) -> Self {
-        Self { ai_router }
+        Self {
+            ai_router: ai_router.map(std::sync::Arc::new),
+        }
     }
 
     /// Whether AI routing is available.
@@ -44,12 +49,12 @@ impl IntentResolver {
 
     /// Get the AI router reference (for health checks etc).
     pub fn ai_router(&self) -> Option<&AiRouter> {
-        self.ai_router.as_ref()
+        self.ai_router.as_deref()
     }
 
     /// Set or replace the AI router.
     pub fn set_ai_router(&mut self, router: AiRouter) {
-        self.ai_router = Some(router);
+        self.ai_router = Some(std::sync::Arc::new(router));
     }
 
     /// Remove the AI router (switch AI off at runtime).

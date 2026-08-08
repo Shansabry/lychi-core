@@ -33,6 +33,7 @@ pub enum ValidationDecision {
 /// Rules Engine — validates actions before execution.
 ///
 /// Gates every execution path. Deterministic: same input → same decision.
+#[derive(Clone)]
 pub struct RulesEngine {
     shell_rules: ShellRules,
 }

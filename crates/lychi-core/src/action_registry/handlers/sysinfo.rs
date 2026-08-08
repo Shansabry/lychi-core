@@ -137,11 +137,18 @@ impl ActionHandler for SysInfoHandler {
             "temp" => Ok(read_temps()),
             "gpu" => Ok(read_gpu()),
             "battery" | "bat" => Ok(read_battery()),
-            "net" | "network" => Ok(read_network()),
+            // The two network arms shell out to curl (3s and up-to-45s worst
+            // case) — that work goes to the blocking pool. The runtime has four
+            // workers; a speedtest used to occupy one for its whole duration.
+            "net" | "network" => Ok(tokio::task::spawn_blocking(read_network)
+                .await
+                .unwrap_or_else(|e| format!("network probe failed: {e}"))),
             "audio" | "sound" | "volume" => Ok(read_audio()),
             "display" | "monitor" | "screen" => Ok(read_display()),
             "os" | "system" | "uptime" => Ok(read_os()),
-            "speedtest" | "speed" => Ok(read_speedtest()),
+            "speedtest" | "speed" => Ok(tokio::task::spawn_blocking(read_speedtest)
+                .await
+                .unwrap_or_else(|e| format!("speedtest failed: {e}"))),
             _ => Err(format!(
                 "Unknown: '{cmd}'. Try: ip, cpu, mem, disk, temp, gpu, battery, net, audio, display, os, speedtest"
             )),

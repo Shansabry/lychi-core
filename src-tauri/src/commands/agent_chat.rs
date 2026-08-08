@@ -136,7 +136,10 @@ impl ToolExecutor for ExecutorAdapter {
         } else {
             format!("{name} {args}")
         };
-        let exec = self.executor.read().await;
+        // Snapshot-then-release, same as execute_command: an agent tool can be
+        // a slow shell command, and holding the guard across it queued every
+        // launcher keystroke behind the next config save's blocking_write.
+        let exec = self.executor.read().await.clone();
         let res = exec
             .run(&input, false, &self.privacy, &RunInputs::default())
             .await?;
@@ -178,7 +181,9 @@ impl ToolExecutor for ExecutorAdapter {
             args,
             routing: lychi_core::intent::RoutingMethod::Ai,
         };
-        let exec = self.executor.read().await;
+        // Snapshot-then-release (see `execute` above) — approved actions are
+        // the destructive ones, i.e. exactly the slow-shell candidates.
+        let exec = self.executor.read().await.clone();
         let res = exec
             .run_confirmed(intent, &self.privacy, &RunInputs::default())
             .await?;

@@ -32,8 +32,16 @@ struct PrefixRoute {
 /// Pure action registry — stores and looks up handlers. Also owns the keyword→
 /// handler routing index, built from each handler's declared `triggers()` so the
 /// routing table can't drift from the handler set.
+///
+/// `Clone` is part of the contract: handlers are stored as `Arc`, so a clone is
+/// a cheap map-of-refcounts copy sharing the same handler instances. This is
+/// what lets the app snapshot the whole `Executor` and run a command WITHOUT
+/// holding the executor lock across the handler's execution — the freeze class
+/// where one slow handler plus one config save (a queued `blocking_write` on a
+/// fair RwLock) stalled every subsequent keystroke's completions.
+#[derive(Clone)]
 pub struct ActionRegistry {
-    handlers: HashMap<String, Box<dyn ActionHandler>>,
+    handlers: HashMap<String, std::sync::Arc<dyn ActionHandler>>,
     /// keyword (lowercase) → route. Rebuilt whenever a handler is registered.
     prefix_index: HashMap<String, PrefixRoute>,
 }
@@ -47,6 +55,9 @@ impl ActionRegistry {
     }
 
     pub fn register(&mut self, handler: Box<dyn ActionHandler>) {
+        // Stored as Arc (from the Box every call site already passes) so the
+        // registry stays cheaply clonable — see the struct doc.
+        let handler: std::sync::Arc<dyn ActionHandler> = std::sync::Arc::from(handler);
         // Index this handler's keyword triggers. Registering a handler with an
         // id that already exists (hot-reload of shell/quicklink/project handlers)
         // replaces both the handler and its prefix routes.
