@@ -55,6 +55,22 @@ describe("OnboardingBanner", () => {
 		}
 	});
 
+	/// A broken hotkey sends the user to `lychi --toggle`, and that advice is
+	/// only good if the command resolves. Setup is where that is both shown and
+	/// fixable, so the stranded case must be able to reach it.
+	it("offers a route to Setup when the hotkey is broken", () => {
+		const { onopensettings } = mount("broken");
+		screen.getByRole("button", { name: "Check setup" }).click();
+		expect(onopensettings).toHaveBeenCalledWith("setup");
+	});
+
+	/// ...but only there. A working install has nothing to check, and an extra
+	/// button on the welcome banner is noise on the happy path.
+	it("does not offer the Setup route when the hotkey works", () => {
+		mount("welcome");
+		expect(screen.queryByRole("button", { name: "Check setup" })).toBeNull();
+	});
+
 	it("shows the backend's explanation verbatim when broken", () => {
 		// The wording must come from the one decider, not be restated here.
 		mount("broken", { text: "the combination is already bound to something else" });

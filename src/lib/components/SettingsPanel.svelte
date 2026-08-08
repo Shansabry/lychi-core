@@ -2,6 +2,7 @@
 import {
 	Archive,
 	BookOpen,
+	CircleCheck,
 	FolderOpen,
 	Info,
 	Keyboard,
@@ -24,9 +25,10 @@ import DataTab from "./settings/DataTab.svelte";
 import GeneralTab from "./settings/GeneralTab.svelte";
 import GuideTab from "./settings/GuideTab.svelte";
 import ProjectsTab from "./settings/ProjectsTab.svelte";
+import SetupTab from "./settings/SetupTab.svelte";
 import ShortcutsTab from "./settings/ShortcutsTab.svelte";
 
-type Tab = "general" | "ai" | "projects" | "shortcuts" | "data" | "guide" | "about";
+type Tab = "general" | "ai" | "projects" | "shortcuts" | "data" | "guide" | "setup" | "about";
 
 let { ondismiss, onpresetchange }: { ondismiss: () => void; onpresetchange?: () => void } =
 	$props();
@@ -176,8 +178,18 @@ function handleKeydown(e: KeyboardEvent) {
 			<Archive size={14} strokeWidth={1.5} />
 			<span>Data</span>
 		</button>
+		<!-- Last, beside About: a diagnostics surface people visit occasionally,
+		     not the reason they opened Settings. -->
 		<button
-			class="tab-btn about-tab"
+			class="tab-btn setup-tab"
+			class:active={activeTab === "setup"}
+			onclick={() => (activeTab = "setup")}
+		>
+			<CircleCheck size={14} strokeWidth={1.5} />
+			<span>Setup</span>
+		</button>
+		<button
+			class="tab-btn"
 			class:active={activeTab === "about"}
 			onclick={() => (activeTab = "about")}
 		>
@@ -220,6 +232,10 @@ function handleKeydown(e: KeyboardEvent) {
 			/>
 		{:else if activeTab === "guide"}
 			<GuideTab />
+		{:else if activeTab === "setup"}
+			<!-- Mounted only while shown: reading the checklist probes D-Bus and
+			     may run the login shell, which must never happen at startup. -->
+			<SetupTab onopentab={(tab) => showTab(tab as Tab)} />
 		{:else if activeTab === "about"}
 			<AboutTab {appVersion} />
 		{/if}
@@ -288,7 +304,9 @@ function handleKeydown(e: KeyboardEvent) {
 		overflow-y: auto;
 	}
 
-	.about-tab {
+	/* Divides the settings you change from the pages you consult. Sits on
+	   whichever tab starts that trailing group — Setup today, About before it. */
+	.setup-tab {
 		margin-top: 8px;
 		border-top: 1px solid var(--border);
 		padding-top: 8px;

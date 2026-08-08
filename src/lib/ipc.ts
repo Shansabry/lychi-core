@@ -44,6 +44,7 @@ import type {
 	RestoreReport,
 	RouteDecision,
 	ScratchItem,
+	SetupChecklistDto,
 	SnippetItem,
 	TimerStatus,
 	TodoItem,
@@ -108,6 +109,8 @@ export type {
 	RiskLevel,
 	RouteDecision,
 	ScratchItem,
+	SetupChecklistDto,
+	SetupStepDto,
 	SnippetItem,
 	TimerStatus,
 	TodoItem,
@@ -533,6 +536,33 @@ export async function getAutostartEnabled(): Promise<boolean> {
 export async function setAutostartEnabled(enabled: boolean): Promise<void> {
 	if (!isTauri()) return;
 	unwrap(await commands.setAutostartEnabled(enabled));
+}
+
+// --- Setup ---
+
+/// Read every setup row's current state.
+///
+/// Probes D-Bus and may run the user's login shell, so call it when the Setup
+/// tab opens — never on the startup path.
+///
+/// Outside Tauri there is nothing to probe, and an empty list is the honest
+/// answer: inventing rows would make the dev server disagree with the app.
+export async function getSetupChecklist(): Promise<SetupChecklistDto> {
+	if (!isTauri()) return { steps: [], actionable: 0 };
+	return unwrap(await commands.getSetupChecklist());
+}
+
+/// Put `lychi` on the user's PATH. Resolves to a sentence to show as-is;
+/// rejects with one too — including the case where the link was created but the
+/// shell still cannot see it, which is not success.
+export async function installCliLink(): Promise<string> {
+	return unwrap(await commands.installCliLink());
+}
+
+/// The full `lychi doctor` report, for the copy button in About.
+export async function getDiagnostics(): Promise<string> {
+	if (!isTauri()) return "not running under Tauri";
+	return unwrap(await commands.getDiagnostics());
 }
 
 // --- Commands Config ---

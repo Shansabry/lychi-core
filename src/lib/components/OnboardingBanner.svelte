@@ -25,7 +25,7 @@ let {
 	text?: string;
 	copied?: boolean;
 	oncopy: () => void;
-	onopensettings: (tab: "general" | "guide") => void;
+	onopensettings: (tab: "general" | "guide" | "setup") => void;
 	ondismiss: () => void;
 } = $props();
 </script>
@@ -57,6 +57,12 @@ let {
 		</span>
 		<button class="hotkey-banner-btn" onclick={() => onopensettings("general")}>
 			Change hotkey
+		</button>
+		<!-- The advice above only works if `lychi` actually resolves, and Setup is
+		     where that is both shown and fixable. Sending a stranded user to a
+		     command they may not have is how the fallback fails twice. -->
+		<button class="hotkey-banner-btn" onclick={() => onopensettings("setup")}>
+			Check setup
 		</button>
 		<button class="hotkey-banner-btn" onclick={oncopy}>
 			{copied ? "Copied" : "Copy command"}

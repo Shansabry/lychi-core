@@ -31,6 +31,7 @@ pub mod quicklinks;
 pub mod reminders;
 pub mod rules;
 pub mod script_commands;
+pub mod setup;
 pub mod snippets;
 pub mod suggestions;
 pub mod text;

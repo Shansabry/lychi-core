@@ -19,6 +19,7 @@ pub mod open_uri;
 pub mod preview;
 pub mod reminders;
 pub mod reveal_path;
+pub mod setup;
 pub mod snippets;
 pub mod timer;
 pub mod update;

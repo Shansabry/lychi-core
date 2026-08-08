@@ -961,6 +961,51 @@ async appVersionString() : Promise<Result<string, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Read the machine and decide every row.
+ * 
+ * **Never call this from the startup preload path.** It performs a D-Bus
+ * introspect plus two name lookups, and may run the user's login shell. It
+ * belongs behind a tab the user opened on purpose.
+ */
+async getSetupChecklist() : Promise<Result<SetupChecklistDto, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_setup_checklist") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Put `lychi` on the user's `PATH`.
+ * 
+ * Refuses when the command already resolves — including a hand-made
+ * `/usr/local/bin/lychi` — rather than shadowing it. Returns a sentence for the
+ * UI to show as-is.
+ */
+async installCliLink() : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("install_cli_link") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The full `lychi doctor` report, for the copy button in About.
+ * 
+ * Turns "please run `lychi doctor` in a terminal and paste the output" into one
+ * click — which matters because the people who most need to send it are the
+ * ones whose launcher will not open.
+ */
+async getDiagnostics() : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_diagnostics") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async getAliases() : Promise<Result<AliasItem[], string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_aliases") };
@@ -2394,6 +2439,38 @@ export type Section = { title?: string | null; rows: Row[];
  * resolvable without the frontend guessing.
  */
 handler: string }
+export type SetupChecklistDto = { steps: SetupStepDto[]; 
+/**
+ * How many rows want attention. Drives the sidebar badge, which is hidden
+ * entirely at zero — deliberately not an "x of y" progress count.
+ */
+actionable: number }
+/**
+ * A checklist row, flattened for the frontend.
+ * 
+ * `state` is a plain string rather than a tagged union because the UI switches
+ * on it directly; `detail` is whatever the backend decided to say, rendered
+ * verbatim. The frontend owns no copy for these — a second copy table is a
+ * place for the two sides to disagree, and this is exactly the text where
+ * "not applicable" turns into shaming if it drifts.
+ */
+export type SetupStepDto = { id: string; title: string; 
+/**
+ * "done" | "actionable" | "not_applicable"
+ */
+state: string; detail: string; 
+/**
+ * "open_tab" | "install_cli" | "manual", absent when there is nothing to do.
+ */
+action: string | null; 
+/**
+ * Which settings tab `open_tab` should open.
+ */
+tab: string | null; 
+/**
+ * The command `manual` should display.
+ */
+command: string | null }
 export type SnippetItem = { id: string; name: string; body: string; created_at: number; updated_at: number }
 /**
  * Serializable timer status sent to the frontend.

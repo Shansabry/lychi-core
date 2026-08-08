@@ -197,7 +197,7 @@ function dismissHotkeyBanner() {
 ///
 /// Dismisses first so the flag is persisted even if the panel fails to open —
 /// a banner that reappears every launch is worse than one shown once too few.
-function openSettingsFromBanner(tab: "general" | "guide") {
+function openSettingsFromBanner(tab: "general" | "guide" | "setup") {
 	dismissHotkeyBanner();
 	settingsPanel?.showTab(tab);
 	if (!ui.panelVisible("settings")) handleToggleSettings();

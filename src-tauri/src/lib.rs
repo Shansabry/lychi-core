@@ -147,6 +147,9 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::backup::delete_backup,
         commands::backup::backups_dir,
         commands::backup::app_version_string,
+        commands::setup::get_setup_checklist,
+        commands::setup::install_cli_link,
+        commands::setup::get_diagnostics,
         commands::aliases::get_aliases,
         commands::aliases::add_alias,
         commands::aliases::update_alias,
@@ -342,6 +345,25 @@ pub fn run() {
             // Wire specta events into the app (no-op today; ready for typed events).
             specta_builder.mount_events(app);
             let handle = app.handle().clone();
+
+            // Keep the `lychi` command working across updates.
+            //
+            // The symlink we install points at one specific `.AppImage` file, so
+            // renaming it (`Lychi-0.1.0` -> `Lychi-0.2.0`), moving it to
+            // ~/Applications, or replacing it after an update leaves `lychi`
+            // dangling — and the user only finds out when the command they bound
+            // to a key silently stops working. Repointing costs one `readlink`
+            // when nothing is wrong.
+            //
+            // Bounded to links we created: only our own path, only a symlink,
+            // and only when its target is missing or is itself a Lychi AppImage.
+            tauri::async_runtime::spawn_blocking(|| {
+                if let Some(target) =
+                    lychi_core::setup::cli_link::heal_stale_link(std::env::var("APPIMAGE").ok().as_deref())
+                {
+                    tracing::info!("CLI link repointed to {}", target.display());
+                }
+            });
 
             // Deep-link handler for lychi:// callbacks (Firebase auth etc.)
             {
