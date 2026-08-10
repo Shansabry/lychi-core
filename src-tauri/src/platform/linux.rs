@@ -923,8 +923,12 @@ pub fn focus_window(window: &WebviewWindow) {
 ///
 ///   show_window() → dismiss_armed=false
 ///   key-press / button-press inside window → dismiss_armed=true
-///   focus-out (armed) → emit lychi://dismiss
-///   focus-out (not armed) → ignore (compositor churn)
+///   focus-out → reported to the launcher state machine as
+///     `FocusOut { focus_lost, interacted }`; it dismisses only when BOTH hold.
+///     `focus_lost` (the protocol's FOCUSED bit) filters GTK noise; `interacted`
+///     (armed in THIS summon cycle) filters focus theft — on GNOME the
+///     shortcut-approval dialog genuinely takes focus at keys=0, and without
+///     the arming gate every summon flashed and vanished.
 pub fn setup_dismiss_on_blur(
     window: &WebviewWindow,
     dismiss_armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1076,11 +1080,16 @@ pub fn setup_dismiss_on_blur(
             .map(|gw| !gw.state().contains(gdk::WindowState::FOCUSED))
             .unwrap_or(false);
 
+        // Armed AND stamped with THIS summon cycle — interaction from a
+        // previous cycle must not license a dismiss of the fresh window.
+        let interacted =
+            dismiss_armed.load(Ordering::SeqCst) && armed_seq.load(Ordering::SeqCst) == seq;
+
         // `is_active`/`toplevel_focus` stay in the log — not as inputs, but so a
         // future report can be checked against the inversion documented above
         // rather than re-derived from scratch.
         let ctx = format!(
-            "blur#{n} keys={keys} up={up_ms}ms focus_lost={focus_lost} \
+            "blur#{n} keys={keys} up={up_ms}ms focus_lost={focus_lost} interacted={interacted} \
              (is_active={is_active} toplevel_focus={has_focus}) visible={}",
             w.is_visible()
         );
@@ -1090,7 +1099,10 @@ pub fn setup_dismiss_on_blur(
         // three places each decide this independently is what produced the
         // original bug.
         let action = handle.state::<crate::state::AppState>().launcher.apply(
-            crate::launcher_state::Event::FocusOut { focus_lost },
+            crate::launcher_state::Event::FocusOut {
+                focus_lost,
+                interacted,
+            },
             &format!("{ctx} seq={seq}"),
         );
         if matches!(action, crate::launcher_state::Action::EmitDismiss) {

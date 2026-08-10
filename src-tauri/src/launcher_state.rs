@@ -144,7 +144,18 @@ pub enum Event {
     /// focus-out time they still describe the previous state — a predicate on
     /// them reads `true` on every focus-out including a genuine click-away, and
     /// silently disables dismiss-on-blur instead of fixing anything.
-    FocusOut { focus_lost: bool },
+    ///
+    /// `interacted` is whether the user has typed or clicked in the window this
+    /// summon cycle. `focus_lost` alone is not enough: it distinguishes
+    /// protocol-real focus loss from GTK noise, but not the user leaving from
+    /// focus being STOLEN before the user ever touched the window. Measured on
+    /// GNOME/Mutter (tester log, 2026-08-10): show → focus-in at +87ms →
+    /// focus-out with `FOCUSED` genuinely cleared at +560ms, `keys=0` — the
+    /// desktop's own global-shortcut approval dialog took focus, and the
+    /// launcher dismissed itself before it could be used. A focus loss the user
+    /// had no hand in must leave the window up; they can see who won focus and
+    /// click back.
+    FocusOut { focus_lost: bool, interacted: bool },
     /// The hide completed — the window is unmapped.
     HideCompleted,
 }
@@ -186,21 +197,33 @@ pub fn transition(state: LauncherState, event: Event) -> (LauncherState, Action)
         (Showing, FocusOut { .. }) => (Showing, Nothing),
 
         // ---- Visible -------------------------------------------------------
-        // THE FIX, and the only dismissing transition in the machine.
+        // THE FIX, and the only dismissing transition in the machine. Both
+        // flags must hold; each covers the other's blind spot.
         //
-        // A focus-out where GTK still reports the window as focused is the
-        // compositor's noise, not the user leaving. Measured on the real
-        // dismiss that closed the launcher at keys=6:
+        // `focus_lost` filters GTK noise — a focus-out where GTK still reports
+        // the window focused is the compositor's churn, not the user leaving.
+        // Measured on the real dismiss that closed the launcher at keys=6:
         //
         //   focus-out → DISMISS  is_active=true toplevel_focus=true visible=true
         //
-        // Ignoring these is necessary but NOT sufficient on its own: doing it
-        // without owning the state left the window stuck in a "visible" state
-        // that toggle then inverted, so the hotkey hid an already-hidden window
-        // and the launcher stopped summoning. The predicate needs this machine;
-        // this machine needs the predicate.
-        (Visible, FocusOut { focus_lost: true }) => (Hiding, EmitDismiss),
-        (Visible, FocusOut { focus_lost: false }) => (Visible, Nothing),
+        // `interacted` filters focus THEFT — a protocol-real focus loss the
+        // user had no hand in. Measured on GNOME/Mutter: the desktop's
+        // shortcut-approval dialog took focus 560ms after show at keys=0, and
+        // the launcher dismissed itself on arrival. See [`Event::FocusOut`].
+        //
+        // Ignoring events here is necessary but NOT sufficient on its own:
+        // doing it without owning the state left the window stuck in a
+        // "visible" state that toggle then inverted, so the hotkey hid an
+        // already-hidden window and the launcher stopped summoning. The
+        // predicate needs this machine; this machine needs the predicate.
+        (
+            Visible,
+            FocusOut {
+                focus_lost: true,
+                interacted: true,
+            },
+        ) => (Hiding, EmitDismiss),
+        (Visible, FocusOut { .. }) => (Visible, Nothing),
 
         // A second toggle while open means "close it".
         (Visible | Showing, ToggleRequested) => (Hiding, Hide),
@@ -317,7 +340,13 @@ mod tests {
         let (s, _) = transition(s, FocusIn); // ~111ms later — now Visible
         assert_eq!(s, Visible);
         // GTK says focus-out but still reports the window focused.
-        let (s, a) = transition(s, FocusOut { focus_lost: false });
+        let (s, a) = transition(
+            s,
+            FocusOut {
+                focus_lost: false,
+                interacted: true,
+            },
+        );
         assert_eq!(
             (s, a),
             (Visible, Nothing),
@@ -329,8 +358,53 @@ mod tests {
     /// is how the first attempt passed a casual check and still shipped broken.
     #[test]
     fn genuine_focus_loss_while_visible_still_dismisses() {
-        let (s, a) = transition(Visible, FocusOut { focus_lost: true });
+        let (s, a) = transition(
+            Visible,
+            FocusOut {
+                focus_lost: true,
+                interacted: true,
+            },
+        );
         assert_eq!((s, a), (Hiding, EmitDismiss));
+    }
+
+    /// THE GNOME FOCUS-THEFT BUG (tester report, 2026-08-10), in the order the
+    /// log records it: show → focus-in → a protocol-real focus-out at keys=0,
+    /// 560ms in — the desktop's shortcut-approval dialog stole focus before the
+    /// user ever touched the window. The launcher must stay up: dismissing on a
+    /// focus loss the user had no hand in is what made every summon flash and
+    /// vanish.
+    #[test]
+    fn focus_theft_before_any_interaction_does_not_dismiss() {
+        let (s, _) = transition(Hidden, ShowRequested);
+        let (s, _) = transition(s, FocusIn);
+        assert_eq!(s, Visible);
+        let (s, a) = transition(
+            s,
+            FocusOut {
+                focus_lost: true,
+                interacted: false,
+            },
+        );
+        assert_eq!(
+            (s, a),
+            (Visible, Nothing),
+            "unarmed focus theft must not dismiss — this is the GNOME bug"
+        );
+        // The user notices, clicks the launcher back, types, then leaves.
+        let (s, _) = transition(s, FocusIn);
+        let (s, a) = transition(
+            s,
+            FocusOut {
+                focus_lost: true,
+                interacted: true,
+            },
+        );
+        assert_eq!(
+            (s, a),
+            (Hiding, EmitDismiss),
+            "interacted dismiss still works"
+        );
     }
 
     /// Summon → focus settles → the user genuinely leaves.
@@ -340,7 +414,13 @@ mod tests {
         assert_eq!((s, a), (Showing, Show));
         let (s, a) = transition(s, FocusIn);
         assert_eq!((s, a), (Visible, Nothing));
-        let (s, a) = transition(s, FocusOut { focus_lost: true });
+        let (s, a) = transition(
+            s,
+            FocusOut {
+                focus_lost: true,
+                interacted: true,
+            },
+        );
         assert_eq!((s, a), (Hiding, EmitDismiss));
         let (s, a) = transition(s, HideCompleted);
         assert_eq!((s, a), (Hidden, Nothing));
@@ -354,12 +434,24 @@ mod tests {
         let (next, _) = transition(s, FocusIn);
         s = next;
         for _ in 0..6 {
-            let (next, a) = transition(s, FocusOut { focus_lost: false });
+            let (next, a) = transition(
+                s,
+                FocusOut {
+                    focus_lost: false,
+                    interacted: true,
+                },
+            );
             assert_eq!(a, Nothing, "a keystroke-adjacent blur must not dismiss");
             s = next;
         }
         assert_eq!(s, Visible, "still open after six spurious blurs");
-        let (s, a) = transition(s, FocusOut { focus_lost: true });
+        let (s, a) = transition(
+            s,
+            FocusOut {
+                focus_lost: true,
+                interacted: true,
+            },
+        );
         assert_eq!((s, a), (Hiding, EmitDismiss), "real focus loss still works");
     }
 
@@ -388,7 +480,13 @@ mod tests {
     fn many_spurious_focus_outs_never_dismiss() {
         let mut s = Showing;
         for _ in 0..50 {
-            let (next, a) = transition(s, FocusOut { focus_lost: false });
+            let (next, a) = transition(
+                s,
+                FocusOut {
+                    focus_lost: false,
+                    interacted: true,
+                },
+            );
             assert_eq!(a, Nothing);
             s = next;
         }
@@ -399,7 +497,13 @@ mod tests {
     #[test]
     fn focus_events_while_hidden_are_inert() {
         assert_eq!(
-            transition(Hidden, FocusOut { focus_lost: true }),
+            transition(
+                Hidden,
+                FocusOut {
+                    focus_lost: true,
+                    interacted: true,
+                },
+            ),
             (Hidden, Nothing)
         );
         assert_eq!(transition(Hidden, FocusIn), (Hidden, Nothing));
@@ -414,8 +518,22 @@ mod tests {
                 ShowRequested,
                 HideRequested,
                 FocusIn,
-                FocusOut { focus_lost: true },
-                FocusOut { focus_lost: false },
+                FocusOut {
+                    focus_lost: true,
+                    interacted: true,
+                },
+                FocusOut {
+                    focus_lost: true,
+                    interacted: false,
+                },
+                FocusOut {
+                    focus_lost: false,
+                    interacted: true,
+                },
+                FocusOut {
+                    focus_lost: false,
+                    interacted: false,
+                },
                 HideCompleted,
             ] {
                 let _ = transition(s, e);
@@ -431,11 +549,29 @@ mod tests {
         assert_eq!(m.apply(ToggleRequested, "test"), Show);
         assert_eq!(m.get(), Showing);
         // The bug: keystrokes + spurious blur while showing.
-        assert_eq!(m.apply(FocusOut { focus_lost: false }, "test"), Nothing);
+        assert_eq!(
+            m.apply(
+                FocusOut {
+                    focus_lost: false,
+                    interacted: true,
+                },
+                "test"
+            ),
+            Nothing
+        );
         assert_eq!(m.get(), Showing);
         assert_eq!(m.apply(FocusIn, "test"), Nothing);
         assert_eq!(m.get(), Visible);
-        assert_eq!(m.apply(FocusOut { focus_lost: true }, "test"), EmitDismiss);
+        assert_eq!(
+            m.apply(
+                FocusOut {
+                    focus_lost: true,
+                    interacted: true,
+                },
+                "test"
+            ),
+            EmitDismiss
+        );
         assert_eq!(m.get(), Hiding);
     }
 }
