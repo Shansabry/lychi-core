@@ -3,8 +3,10 @@
 //! Wayland forbids client-side key grabs; the sanctioned mechanism is
 //! `org.freedesktop.portal.GlobalShortcuts`: the app asks the compositor to
 //! bind a trigger, the user confirms once in a DE dialog (KDE Plasma ≥5.27,
-//! GNOME ≥48, Hyprland), and the binding persists per app-id across
-//! restarts — later launches find it via ListShortcuts and never re-prompt.
+//! GNOME ≥48, Hyprland), and the approval persists per app-id across
+//! restarts. Every launch still calls BindShortcuts — the binding attaches to
+//! the session, not the app-id (see `run`) — but the stored approval makes
+//! every bind after the first silent.
 //!
 //! Compositors without the portal backend (Sway/wlroots, COSMic, GNOME ≤47)
 //! fail at `GlobalShortcuts::new()` / bind — we log and leave the existing
@@ -234,36 +236,43 @@ async fn run(app: &tauri::AppHandle, configured_hotkey: &str) -> ashpd::Result<(
     let shortcuts = GlobalShortcuts::with_connection(conn).await?;
     let session = shortcuts.create_session(Default::default()).await?;
 
-    // Bindings persist per app-id. Bind only if absent: BindShortcuts may
-    // only be attempted once per session, and skipping it avoids any dialog
-    // on subsequent launches.
+    // BindShortcuts EVERY launch — this is load-bearing, not politeness.
+    // Shortcuts are bound to the SESSION: on Plasma ≥6.7 (kglobalaccel lives
+    // inside KWin) a fresh session is inert until it binds, while
+    // ListShortcuts happily reports the binding stored for our app-id. An
+    // earlier version skipped the bind when ListShortcuts found one, which
+    // left the hotkey dead after every app restart — with this very function
+    // logging "bound and works". The stored user approval makes the re-bind
+    // silent; only the genuinely first bind may show a dialog.
     let existing = shortcuts
         .list_shortcuts(&session, Default::default())
         .await?
         .response()
         .map(|r| r.shortcuts().to_vec())
         .unwrap_or_default();
+    let first_bind = !existing.iter().any(|s| s.id() == SHORTCUT_ID);
 
-    let trigger = if let Some(known) = existing.iter().find(|s| s.id() == SHORTCUT_ID) {
-        known.trigger_description().to_string()
-    } else {
-        let preferred = to_portal_trigger(configured_hotkey);
+    let preferred = to_portal_trigger(configured_hotkey);
+    if first_bind {
         tracing::info!(
             "[portal] binding '{SHORTCUT_ID}' (preferred trigger: {preferred}) — the desktop may show a confirmation dialog"
         );
-        let new_shortcut = NewShortcut::new(SHORTCUT_ID, "Show or hide the Lychi launcher")
-            .preferred_trigger(preferred.as_str());
-        let bound = shortcuts
-            .bind_shortcuts(&session, &[new_shortcut], None, Default::default())
-            .await?
-            .response()?;
-        bound
-            .shortcuts()
-            .iter()
-            .find(|s| s.id() == SHORTCUT_ID)
-            .map(|s| s.trigger_description().to_string())
-            .unwrap_or_default()
-    };
+    } else {
+        tracing::info!(
+            "[portal] re-binding stored '{SHORTCUT_ID}' to activate it for this session"
+        );
+    }
+    let new_shortcut = NewShortcut::new(SHORTCUT_ID, "Show or hide the Lychi launcher")
+        .preferred_trigger(preferred.as_str());
+    let trigger = shortcuts
+        .bind_shortcuts(&session, &[new_shortcut], None, Default::default())
+        .await?
+        .response()?
+        .shortcuts()
+        .iter()
+        .find(|s| s.id() == SHORTCUT_ID)
+        .map(|s| s.trigger_description().to_string())
+        .unwrap_or_default();
 
     if trigger.is_empty() {
         tracing::warn!("[portal] shortcut not bound (user declined or compositor refused)");
