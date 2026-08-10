@@ -2115,6 +2115,14 @@ reason?: string;
  */
 tables: ([string, number])[]; 
 /**
+ * Schema generation of the archived row VALUES. `0` (the serde
+ * default) marks archives from before the row envelope existed — their
+ * values are raw postcard, and restore must wrap them after applying, or
+ * every restored row decodes as garbage. Current archives stamp
+ * [`crate::db::SCHEMA_VERSION`].
+ */
+schema_version?: number; 
+/**
  * Which optional extras are present.
  */
 has_config?: boolean; has_scripts?: boolean }
