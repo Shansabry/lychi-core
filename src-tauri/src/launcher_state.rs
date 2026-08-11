@@ -299,6 +299,24 @@ impl LauncherStateMachine {
         }
     }
 
+    /// What action `event` WOULD produce from the current state, without
+    /// committing the transition.
+    ///
+    /// The one legitimate use is deferral: the Wayland-toplevel dismiss handler
+    /// must not flip `Visible -> Hiding` when it is about to wait out a
+    /// re-focus grace window, because a cancelled dismiss would then strand the
+    /// machine in `Hiding`. It peeks, waits, and only `apply`s once the grace
+    /// window confirms the dismiss. Peeking then applying the SAME event is not
+    /// a re-derived decision — the transition function is still the sole
+    /// decider; this only splits "decide" from "commit" in time.
+    pub fn peek(&self, event: Event) -> Action {
+        let before = match self.state.lock() {
+            Ok(g) => *g,
+            Err(p) => *p.into_inner(),
+        };
+        transition(before, event).1
+    }
+
     /// Apply an event and return the action to take.
     ///
     /// Decide and transition happen under ONE lock. `toggle_window`'s doc
@@ -354,6 +372,34 @@ mod tests {
             (Visible, Nothing),
             "spurious focus-out in Visible must not dismiss — this is the bug"
         );
+    }
+
+    /// `peek` reports the action WITHOUT committing the transition — the
+    /// Wayland-toplevel dismiss deferral depends on this: peek, wait out the
+    /// re-focus grace, then apply. If peek mutated, a cancelled dismiss would
+    /// strand the machine in `Hiding`.
+    #[test]
+    fn peek_does_not_mutate_state() {
+        let m = LauncherStateMachine::new();
+        m.apply(ToggleRequested, "t");
+        m.apply(FocusIn, "t");
+        assert_eq!(m.get(), Visible);
+        let peeked = m.peek(FocusOut {
+            focus_lost: true,
+            interacted: true,
+        });
+        assert_eq!(peeked, EmitDismiss, "peek must report the real action");
+        assert_eq!(m.get(), Visible, "peek must NOT advance the state");
+        // Applying the same event now really does transition.
+        let applied = m.apply(
+            FocusOut {
+                focus_lost: true,
+                interacted: true,
+            },
+            "t",
+        );
+        assert_eq!(applied, EmitDismiss);
+        assert_eq!(m.get(), Hiding);
     }
 
     /// The guard against "fixing" the bug by disabling dismiss entirely, which

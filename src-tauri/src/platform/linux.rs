@@ -952,6 +952,14 @@ pub fn setup_dismiss_on_blur(
     use gtk::prelude::WidgetExt;
     use std::sync::atomic::Ordering;
 
+    // How long a would-be-dismissing focus-out waits for focus to return
+    // before it commits, on Wayland-toplevel. Long enough to absorb Mutter's
+    // spurious focus flicker and a portal/IM dialog handing focus back (both
+    // observed to bounce within a frame or two, well under this); short enough
+    // that a genuine click-away still feels instant. Only pays on GNOME-style
+    // toplevel — layer-shell and X11 dismiss immediately.
+    const GRACE_MS: u64 = 150;
+
     // Session counters, shared by the handlers below purely for diagnostics —
     // nothing branches on them. They exist so the log answers "how many focus
     // events did this window get, and how many keys did the user actually
@@ -960,16 +968,36 @@ pub fn setup_dismiss_on_blur(
     let focusout_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let focusin_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    // focus-IN, logged for one reason: a spurious focus-out on Mutter is
-    // followed by focus coming straight back, whereas a genuine one (the user
-    // switched window) is not. Without this line the two are indistinguishable
-    // in the log, and that distinction is the whole question on GNOME.
+    // The "did focus come BACK?" signal. A spurious Mutter focus-out is
+    // followed within a frame by a focus-in; a genuine switch-away is not.
+    // The dismiss handler snapshots this counter and, after a short grace
+    // window, dismisses only if it has not advanced — so a focus flicker the
+    // compositor invented (or the portal/IM dialog briefly stealing focus, as
+    // in Berin's launch log) can no longer close the launcher. GTK #1395 /
+    // #1871: focus-out on Wayland/Mutter is documented-unreliable, so a single
+    // one can never be trusted as "the user left" without this confirmation.
+    let focusin_generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // Set once the window has actually held focus this cycle. A key-press that
+    // arrives BEFORE focus-in is not the user typing into the launcher — it is
+    // stray input from the compositor/IM layer (Berin's log: `key-press #1`
+    // with no typing, while an input-method context and a portal dialog were
+    // active). Arming on it let the next spurious focus-out dismiss. Arming is
+    // now gated on this, so a pre-focus phantom key cannot arm the gate.
+    let has_focused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // focus-IN: promotes Showing -> Visible, bumps the return-generation, and
+    // records that focus has been held this cycle.
     {
         let ins = focusin_count.clone();
+        let generation = focusin_generation.clone();
+        let focused = has_focused.clone();
         let seq = summon_seq.clone();
         let handle = window.app_handle().clone();
         gtk_win.connect_focus_in_event(move |_, _| {
             let n = ins.fetch_add(1, Ordering::SeqCst) + 1;
+            generation.fetch_add(1, Ordering::SeqCst);
+            focused.store(true, Ordering::SeqCst);
             let s = seq.load(Ordering::SeqCst);
             // Focus-in is what promotes Showing -> Visible. Until it arrives,
             // no focus-out can be a dismiss, because focus was never held.
@@ -988,6 +1016,7 @@ pub fn setup_dismiss_on_blur(
         let seq = summon_seq.clone();
         let stamp = armed_seq.clone();
         let keys = keypress_count.clone();
+        let has_focused_key = has_focused.clone();
         gtk_win.connect_key_press_event(move |_, event| {
             use gdk::keys::constants as key;
             let keyval = event.keyval();
@@ -999,11 +1028,18 @@ pub fn setup_dismiss_on_blur(
             // arrived. The count is the difference between reading a user's
             // recollection and reading what happened.
             let n = keys.fetch_add(1, Ordering::SeqCst) + 1;
-            if keyval != key::Escape && !armed.load(Ordering::SeqCst) {
+            // Only a key that lands AFTER the window has held focus counts as
+            // the user typing into the launcher. A key-press before focus-in
+            // is stray compositor/IM input (see `has_focused`), and arming on
+            // it is what let Berin's launcher self-dismiss.
+            let focused = has_focused_key.load(Ordering::SeqCst);
+            if keyval != key::Escape && focused && !armed.load(Ordering::SeqCst) {
                 let current = seq.load(Ordering::SeqCst);
                 stamp.store(current, Ordering::SeqCst);
                 armed.store(true, Ordering::SeqCst);
                 tracing::info!("[dismiss] seq={current} key-press #{n} → armed=true");
+            } else if !focused {
+                tracing::info!("[dismiss] key-press #{n} IGNORED (before focus-in — stray input)");
             } else {
                 tracing::debug!("[dismiss] key-press #{n} (already armed)");
             }
@@ -1033,6 +1069,9 @@ pub fn setup_dismiss_on_blur(
     let handle = window.app_handle().clone();
     let blurs = focusout_count.clone();
     let keys_seen = keypress_count.clone();
+    let focusin_gen_out = focusin_generation.clone();
+    let summon_seq_out = summon_seq.clone();
+    let has_focused_out = has_focused.clone();
     let started = std::time::Instant::now();
     gtk_win.connect_focus_out_event(move |w, _| {
         let seq = summon_seq.load(Ordering::SeqCst);
@@ -1053,6 +1092,11 @@ pub fn setup_dismiss_on_blur(
         let n = blurs.fetch_add(1, Ordering::SeqCst) + 1;
         let keys = keys_seen.load(Ordering::SeqCst);
         let up_ms = started.elapsed().as_millis();
+        // Focus is no longer held: the next arming key-press must wait for a
+        // fresh focus-in. Cheap and correct across hide→show cycles — arming
+        // is a one-way latch, so this only matters for the not-yet-armed case
+        // that Berin hit (stray key before this cycle's focus-in).
+        has_focused_out.store(false, Ordering::SeqCst);
         use gtk::prelude::{GtkWindowExt, WidgetExt};
         let is_active = w.is_active();
         let has_focus = w.has_toplevel_focus();
@@ -1095,23 +1139,94 @@ pub fn setup_dismiss_on_blur(
             w.is_visible()
         );
 
-        // Report, don't decide. The handler's only job is to say what the
-        // protocol reported; the state machine owns what to do about it. Having
-        // three places each decide this independently is what produced the
-        // original bug.
-        let action = handle.state::<crate::state::AppState>().launcher.apply(
-            crate::launcher_state::Event::FocusOut {
-                focus_lost,
-                interacted,
-            },
-            &format!("{ctx} seq={seq}"),
+        // A focus-out that WOULD dismiss is not acted on immediately on
+        // Wayland-toplevel (GNOME/Mutter): the compositor emits spurious
+        // focus-outs, and a real one caused by the portal/IM dialog is
+        // followed within a frame by focus returning. So the machine is only
+        // told to dismiss once a short grace window confirms focus did NOT
+        // come back. On layer-shell and X11, where focus-out is trustworthy,
+        // the decision is immediate — nothing changes there.
+        //
+        // Crucial ordering: the state machine is NOT stepped here for the
+        // dismissing case, because stepping it flips Visible -> Hiding and a
+        // deferred cancel would strand it. Instead we peek at what it WOULD do
+        // with the current state, and only commit the transition after the
+        // grace window.
+        let would_dismiss = matches!(
+            handle.state::<crate::state::AppState>().launcher.peek(
+                crate::launcher_state::Event::FocusOut {
+                    focus_lost,
+                    interacted,
+                }
+            ),
+            crate::launcher_state::Action::EmitDismiss
         );
-        if matches!(action, crate::launcher_state::Action::EmitDismiss) {
-            tracing::info!("[dismiss] seq={seq} → DISMISS  {ctx}");
-            dismiss_armed.store(false, Ordering::SeqCst);
-            use tauri::Emitter;
-            let _ = handle.emit("lychi://dismiss", ());
+
+        if !would_dismiss {
+            // Non-dismissing focus-out: report to the machine as before so it
+            // keeps its books (Showing/Hiding bookkeeping, logging).
+            handle.state::<crate::state::AppState>().launcher.apply(
+                crate::launcher_state::Event::FocusOut {
+                    focus_lost,
+                    interacted,
+                },
+                &format!("{ctx} seq={seq}"),
+            );
+            return glib::Propagation::Proceed;
         }
+
+        let emit_dismiss = {
+            let handle = handle.clone();
+            let dismiss_armed = dismiss_armed.clone();
+            move |ctx: String, seq: u64| {
+                let action = handle.state::<crate::state::AppState>().launcher.apply(
+                    crate::launcher_state::Event::FocusOut {
+                        focus_lost: true,
+                        interacted: true,
+                    },
+                    &format!("{ctx} seq={seq}"),
+                );
+                if matches!(action, crate::launcher_state::Action::EmitDismiss) {
+                    tracing::info!("[dismiss] seq={seq} → DISMISS  {ctx}");
+                    dismiss_armed.store(false, Ordering::SeqCst);
+                    use tauri::Emitter;
+                    let _ = handle.emit("lychi://dismiss", ());
+                }
+            }
+        };
+
+        if !is_toplevel {
+            // Layer-shell / X11: focus-out is trustworthy, dismiss now.
+            emit_dismiss(ctx, seq);
+            return glib::Propagation::Proceed;
+        }
+
+        // Wayland-toplevel: defer and confirm focus did not return.
+        let gen_at_blur = focusin_gen_out.load(Ordering::SeqCst);
+        let gen_check = focusin_gen_out.clone();
+        let seq_at_blur = seq;
+        let seq_now = summon_seq_out.clone();
+        tracing::info!(
+            "[dismiss] seq={seq} focus-out would dismiss — {GRACE_MS}ms re-focus grace  {ctx}"
+        );
+        glib::timeout_add_local_once(std::time::Duration::from_millis(GRACE_MS), move || {
+            // Focus came back (spurious flicker or reclaimed dialog focus)?
+            // The generation advanced → cancel.
+            if gen_check.load(Ordering::SeqCst) != gen_at_blur {
+                tracing::info!(
+                    "[dismiss] seq={seq_at_blur} focus returned within grace — NOT dismissing"
+                );
+                return;
+            }
+            // A newer summon started meanwhile? This blur is stale.
+            if seq_now.load(Ordering::SeqCst) != seq_at_blur {
+                tracing::info!(
+                    "[dismiss] seq={seq_at_blur} superseded during grace — NOT dismissing"
+                );
+                return;
+            }
+            emit_dismiss(format!("(after {GRACE_MS}ms grace) {ctx}"), seq_at_blur);
+        });
         glib::Propagation::Proceed
     });
     tracing::info!(
