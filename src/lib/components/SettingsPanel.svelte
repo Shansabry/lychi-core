@@ -57,8 +57,14 @@ let aiConfig: AiConfig = $state({
 	ollama_url: "",
 	ollama_model: "",
 	local_model: "",
+	// Placeholder shown only until `preloadSettings()` loads the real config in
+	// onMount; these must MATCH the Rust defaults (config/schema.rs
+	// default_ai_timeout / default_max_tokens) so a fresh user never briefly
+	// sees a wrong value that could be saved. 300 here contradicted the real
+	// 4096 max-token default — the streaming agent needs the headroom or long
+	// answers truncate mid-sentence.
 	timeout_secs: 8,
-	max_tokens: 300,
+	max_tokens: 4096,
 });
 let generalConfig: GeneralConfig = $state({
 	hide_on_blur: true,

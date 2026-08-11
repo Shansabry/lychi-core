@@ -426,7 +426,7 @@ export async function getAllSettings(): Promise<AllSettings> {
 				ollama_model: "",
 				local_model: "",
 				timeout_secs: 8,
-				max_tokens: 300,
+				max_tokens: 4096,
 			},
 			general: {
 				hide_on_blur: true,
@@ -778,7 +778,7 @@ export async function getAiConfig(): Promise<AiConfig> {
 			ollama_model: "",
 			local_model: "",
 			timeout_secs: 8,
-			max_tokens: 300,
+			max_tokens: 4096,
 		};
 	return unwrap(await commands.getAiConfig());
 }
