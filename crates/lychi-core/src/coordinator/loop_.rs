@@ -304,11 +304,68 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                 return Outcome::Done { session };
             }
 
-            // Execute each requested tool; suspend on the first that needs approval.
-            for call in calls {
-                if let Some(outcome) = self.run_one_tool(&mut session, call).await {
-                    return outcome;
+            // Execute the batch IN FULL before suspending. The provider
+            // contract is unforgiving here: every tool_use id in the assistant
+            // turn must have a matching tool_result in the conversation before
+            // the next request, or Anthropic and OpenAI both reject the whole
+            // conversation (400) — permanently, because the broken turn is
+            // baked into the history. An earlier version returned on the FIRST
+            // NeedsApproval, dropping every sibling call after it: never run,
+            // never queued, never answered. One approval in a parallel-tool
+            // turn then wedged the conversation for good.
+            //
+            // So: safe siblings run now; approval-needing ones queue in
+            // session.pending (surfaced to the user one at a time, in order);
+            // and an infra error mid-batch synthesizes error results for
+            // everything not yet answered rather than leaving danglers.
+            let mut first_request: Option<ApprovalRequest> = None;
+            let mut remaining = calls.into_iter();
+            while let Some(call) = remaining.next() {
+                match self.run_one_tool(&mut session, call).await {
+                    Ok(None) => {}
+                    Ok(Some(request)) => {
+                        if first_request.is_none() {
+                            first_request = Some(request);
+                        }
+                    }
+                    Err(error) => {
+                        // The failing call already got its error tool_result in
+                        // run_one_tool. Answer everything else so no tool_use
+                        // dangles: unrun siblings, and any approvals queued
+                        // earlier in this batch (an Error outcome never reaches
+                        // apply_decision, so their pending entries would
+                        // otherwise never produce a result).
+                        for c in remaining {
+                            session.push_tool_result(
+                                &c.id,
+                                "not run: an earlier tool call in this batch failed".into(),
+                                true,
+                            );
+                        }
+                        let queued: Vec<String> =
+                            session.pending.drain(..).map(|p| p.call.id).collect();
+                        for id in queued {
+                            session.push_tool_result(
+                                &id,
+                                "not run: the batch failed before approval could be requested"
+                                    .into(),
+                                true,
+                            );
+                        }
+                        self.emit(AgentEvent::Error(error.to_string()));
+                        return Outcome::Error {
+                            error,
+                            session: Some(session),
+                        };
+                    }
                 }
+            }
+            if let Some(request) = first_request {
+                self.emit(AgentEvent::AwaitingApproval(request.clone()));
+                return Outcome::AwaitingApproval {
+                    request,
+                    session: session.clone(),
+                };
             }
             step += 1;
             // Loop re-enters with the tool results now in session.messages.
@@ -376,9 +433,17 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
         })
     }
 
-    /// Execute one tool call. Appends the result to `session` and returns `None`
-    /// to continue, or `Some(Outcome)` to suspend (approval) / abort (infra err).
-    async fn run_one_tool(&self, session: &mut Session, call: ToolCall) -> Option<Outcome> {
+    /// Execute one tool call. Appends the result to `session` and returns
+    /// `Ok(None)` to continue, `Ok(Some(request))` when the call was QUEUED
+    /// for approval (the caller decides when to surface it — siblings in the
+    /// same batch still run first), or `Err` on an infra failure (this call's
+    /// error tool_result is already appended so it cannot dangle; the caller
+    /// answers the rest of the batch).
+    async fn run_one_tool(
+        &self,
+        session: &mut Session,
+        call: ToolCall,
+    ) -> Result<Option<ApprovalRequest>, LychiError> {
         self.emit(AgentEvent::ToolCallStarted {
             call_id: call.id.clone(),
             name: call.name.clone(),
@@ -406,7 +471,7 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                         artifact,
                     });
                 }
-                None
+                Ok(None)
             }
             Ok(ToolOutcome::NeedsApproval { reason, resume }) => {
                 let request = ApprovalRequest {
@@ -416,38 +481,41 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                     reason: reason.clone(),
                 };
                 // Record the pending call in the session so resume can run it.
+                // No AwaitingApproval event here — the caller emits it for one
+                // request at a time, after the whole batch has been handled.
                 session.pending.push(PendingApproval {
                     call,
                     reason,
                     resume,
                 });
-                self.emit(AgentEvent::AwaitingApproval(request.clone()));
-                Some(Outcome::AwaitingApproval {
-                    request,
-                    session: session.clone(),
-                })
+                Ok(Some(request))
             }
             Err(e) => {
-                self.emit(AgentEvent::Error(e.to_string()));
-                Some(Outcome::Error {
-                    error: e,
-                    session: Some(session.clone()),
-                })
+                // Answer THIS call before surfacing the failure — a tool_use
+                // without a tool_result poisons every later provider request.
+                session.push_tool_result(&call.id, e.to_string(), true);
+                self.emit(AgentEvent::ToolCallFailed {
+                    call_id: call.id,
+                    error: e.to_string(),
+                });
+                Err(e)
             }
         }
     }
 
-    /// Apply the user's decision to the (single) pending approval. Returns
-    /// `Some(Outcome)` if it surfaced another approval or an error; `None` if the
-    /// result was appended and the loop should continue.
+    /// Apply the user's decision to the OLDEST pending approval (FIFO — the
+    /// order the model asked in). Returns `Some(Outcome)` if another queued
+    /// approval must be surfaced next or an error occurred; `None` if every
+    /// pending call is answered and the loop should continue to the model.
     async fn apply_decision(
         &self,
         session: &mut Session,
         decision: ApprovalDecision,
     ) -> Option<Outcome> {
-        let Some(pending) = session.pending.pop() else {
+        if session.pending.is_empty() {
             return None; // nothing pending — nothing to do
-        };
+        }
+        let pending = session.pending.remove(0);
         let call_id = pending.call.id.clone();
         match decision {
             ApprovalDecision::Approve | ApprovalDecision::ApproveWithEdit { .. } => {
@@ -465,7 +533,6 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                             output,
                             artifact: None,
                         });
-                        None
                     }
                     Err(e) => {
                         // A tool-logic failure feeds back; an infra failure aborts.
@@ -474,7 +541,6 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                             call_id,
                             error: e.to_string(),
                         });
-                        None
                     }
                 }
             }
@@ -485,9 +551,27 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                     call_id,
                     error: msg,
                 });
-                None
             }
         }
+
+        // More approvals queued from the same batch: surface the next one
+        // instead of re-entering the model — the transcript is incomplete
+        // until every pending call has a result, and the model must not be
+        // called with tool_use ids that have none.
+        if let Some(next) = session.pending.first() {
+            let request = ApprovalRequest {
+                call_id: next.call.id.clone(),
+                tool_name: next.call.name.clone(),
+                args: next.call.args.clone(),
+                reason: next.reason.clone(),
+            };
+            self.emit(AgentEvent::AwaitingApproval(request.clone()));
+            return Some(Outcome::AwaitingApproval {
+                request,
+                session: session.clone(),
+            });
+        }
+        None
     }
 }
 
@@ -585,6 +669,31 @@ mod tests {
                 usage: None,
             },
         ]
+    }
+    /// One turn requesting SEVERAL tools — the parallel-call shape Claude
+    /// routinely emits, and the one every approval test missed.
+    fn call_tools(calls: &[(&str, &str, &str)]) -> Vec<StreamEvent> {
+        let mut events: Vec<StreamEvent> = calls
+            .iter()
+            .map(|(id, name, args)| StreamEvent::ToolCallComplete {
+                id: (*id).into(),
+                name: (*name).into(),
+                args: (*args).into(),
+            })
+            .collect();
+        events.push(StreamEvent::Done {
+            stop_reason: crate::providers::StopReason::ToolUse,
+            usage: None,
+        });
+        events
+    }
+    /// The call ids that have a tool_result in the session, in message order.
+    fn result_ids(session: &Session) -> Vec<String> {
+        session
+            .messages
+            .iter()
+            .filter_map(|m| m.tool_call_id.clone())
+            .collect()
     }
 
     // ── Mock executor ────────────────────────────────────────────────────────
@@ -920,6 +1029,194 @@ mod tests {
                 );
             }
             _ => panic!("expected Done"),
+        }
+    }
+
+    /// THE WEDGE (ROUTE-3): a parallel-tool turn where one call needs approval
+    /// must not drop its siblings. The old loop returned on the first
+    /// NeedsApproval; the sibling was never run and never answered, and the
+    /// next provider request carried a tool_use id with no tool_result — a
+    /// permanent 400 on both Anthropic and OpenAI. Every prior approval test
+    /// used single-call turns, the one shape that can't show this.
+    #[tokio::test]
+    async fn an_approval_does_not_drop_its_sibling_calls() {
+        let provider = MockProvider::new(vec![call_tools(&[
+            ("t1", "delete", "all"),
+            ("t2", "weather", "London"),
+        ])]);
+        let exec = Arc::new(
+            MockExecutor::new()
+                .needs_approval("delete", "confirm?")
+                .ran("weather", "18C sunny", false),
+        );
+        let coord = Coordinator::new(
+            provider,
+            exec.clone(),
+            vec![
+                ToolDef {
+                    name: "delete".into(),
+                    description: "delete".into(),
+                },
+                ToolDef {
+                    name: "weather".into(),
+                    description: "get weather".into(),
+                },
+            ],
+        );
+        let (s1, h1) = coord.run(Session::new("sys", "go"), CancellationToken::new());
+        drain(s1).await;
+        let session = match h1.wait().await {
+            Outcome::AwaitingApproval { request, session } => {
+                assert_eq!(request.call_id, "t1", "the approval surfaces first");
+                assert_eq!(
+                    result_ids(&session),
+                    vec!["t2"],
+                    "the safe sibling ran BEFORE suspension"
+                );
+                assert_eq!(session.pending.len(), 1);
+                session
+            }
+            _ => panic!("expected AwaitingApproval"),
+        };
+
+        // Approve → the queued call runs, and the model gets a COMPLETE
+        // transcript: a result for every tool_use id of the turn.
+        let provider2 = MockProvider::new(vec![answer("done")]);
+        let coord2 = Coordinator::new(
+            provider2,
+            exec.clone(),
+            vec![ToolDef {
+                name: "delete".into(),
+                description: "delete".into(),
+            }],
+        );
+        let (s2, h2) = coord2.resume(session, ApprovalDecision::Approve, CancellationToken::new());
+        drain(s2).await;
+        match h2.wait().await {
+            Outcome::Done { session } => {
+                let mut ids = result_ids(&session);
+                ids.sort();
+                assert_eq!(ids, vec!["t1", "t2"], "no tool_use id left dangling");
+                assert!(session.pending.is_empty());
+            }
+            _ => panic!("expected Done"),
+        }
+    }
+
+    /// Two approval-needing calls in one turn surface SEQUENTIALLY — deciding
+    /// the first re-suspends on the second instead of calling the model with
+    /// an unanswered tool_use.
+    #[tokio::test]
+    async fn queued_approvals_surface_one_at_a_time_in_order() {
+        let provider = MockProvider::new(vec![call_tools(&[
+            ("t1", "delete", "all"),
+            ("t2", "format", "disk"),
+        ])]);
+        let exec = Arc::new(
+            MockExecutor::new()
+                .needs_approval("delete", "delete?")
+                .needs_approval("format", "format?"),
+        );
+        let tools = vec![
+            ToolDef {
+                name: "delete".into(),
+                description: "delete".into(),
+            },
+            ToolDef {
+                name: "format".into(),
+                description: "format".into(),
+            },
+        ];
+        let coord = Coordinator::new(provider, exec.clone(), tools.clone());
+        let (s1, h1) = coord.run(Session::new("sys", "go"), CancellationToken::new());
+        drain(s1).await;
+        let session = match h1.wait().await {
+            Outcome::AwaitingApproval { request, session } => {
+                assert_eq!(request.call_id, "t1");
+                assert_eq!(session.pending.len(), 2, "both calls queued");
+                session
+            }
+            _ => panic!("expected AwaitingApproval"),
+        };
+
+        // Deciding the first surfaces the SECOND — not a model turn.
+        let coord2 = Coordinator::new(MockProvider::new(vec![]), exec.clone(), tools.clone());
+        let (s2, h2) = coord2.resume(session, ApprovalDecision::Approve, CancellationToken::new());
+        drain(s2).await;
+        let session = match h2.wait().await {
+            Outcome::AwaitingApproval { request, session } => {
+                assert_eq!(request.call_id, "t2", "FIFO: the model's order");
+                assert_eq!(session.pending.len(), 1);
+                assert_eq!(result_ids(&session), vec!["t1"]);
+                session
+            }
+            _ => panic!("expected the second approval"),
+        };
+
+        // Rejecting the second completes the transcript and reaches the model.
+        let coord3 = Coordinator::new(
+            MockProvider::new(vec![answer("understood")]),
+            exec.clone(),
+            tools,
+        );
+        let (s3, h3) = coord3.resume(
+            session,
+            ApprovalDecision::Reject { message: None },
+            CancellationToken::new(),
+        );
+        drain(s3).await;
+        match h3.wait().await {
+            Outcome::Done { session } => {
+                let mut ids = result_ids(&session);
+                ids.sort();
+                assert_eq!(ids, vec!["t1", "t2"]);
+                assert_eq!(*exec.approved_calls.lock().unwrap(), 1, "only t1 ran");
+            }
+            _ => panic!("expected Done"),
+        }
+    }
+
+    /// An infra error mid-batch answers EVERY call of the turn — the failing
+    /// one, unrun siblings, and any approval already queued — so the persisted
+    /// session stays continuable instead of poisoning every later request.
+    #[tokio::test]
+    async fn a_mid_batch_error_leaves_no_dangling_tool_calls() {
+        let provider = MockProvider::new(vec![call_tools(&[
+            ("t1", "delete", "all"),     // queues for approval
+            ("t2", "unknown_tool", "x"), // infra error (not in the mock's map)
+            ("t3", "weather", "London"), // never reached
+        ])]);
+        let exec = Arc::new(
+            MockExecutor::new()
+                .needs_approval("delete", "confirm?")
+                .ran("weather", "18C", false),
+        );
+        let coord = Coordinator::new(
+            provider,
+            exec,
+            vec![ToolDef {
+                name: "delete".into(),
+                description: "delete".into(),
+            }],
+        );
+        let (stream, handle) = coord.run(Session::new("sys", "go"), CancellationToken::new());
+        drain(stream).await;
+        match handle.wait().await {
+            Outcome::Error { session, .. } => {
+                let session = session.expect("error keeps the session");
+                let mut ids = result_ids(&session);
+                ids.sort();
+                assert_eq!(
+                    ids,
+                    vec!["t1", "t2", "t3"],
+                    "every tool_use id answered despite the failure"
+                );
+                assert!(
+                    session.pending.is_empty(),
+                    "queued approvals resolved — nothing left to wedge a resume"
+                );
+            }
+            _ => panic!("expected Error"),
         }
     }
 
