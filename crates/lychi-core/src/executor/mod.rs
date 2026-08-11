@@ -939,8 +939,27 @@ impl Executor {
             PatternResult::Match(r) => (r.handler.as_str(), r.args.as_str()),
             PatternResult::NoMatch { input } => ("open", input.as_str()),
         };
-        let handler_results = self.registry.completions(route_handler, route_args).await;
-        let handler_empty = handler_results.is_empty();
+
+        // An unrouted query is IMPLICITLY sent to `open` (the app launcher). That
+        // is right for "spotify" but wrong for a natural-language sentence: the
+        // app launcher fuzzy-matches every app whose name-tokens appear anywhere
+        // in the text, so "play the music and tell me my disk status" floods the
+        // list with Spotify/Rhythmbox (music) and Disks/Filelight (disk) — the
+        // "mentioned ≠ asked for" failure. Every mainstream launcher (Raycast,
+        // Spotlight, Alfred) matches app NAMES tightly and routes prose to
+        // AI/web instead. So the IMPLICIT open only runs when the query still
+        // looks like an app-launch attempt; an explicit `open …` route is
+        // untouched, and prose falls through to the Ask AI / web escape hatches.
+        let suppress_implicit_open =
+            matches!(&route, PatternResult::NoMatch { .. }) && !looks_like_app_query(trimmed);
+
+        let (handler_results, handler_empty) = if suppress_implicit_open {
+            (Vec::new(), true)
+        } else {
+            let r = self.registry.completions(route_handler, route_args).await;
+            let empty = r.is_empty();
+            (r, empty)
+        };
 
         all.extend(
             handler_results
@@ -1322,6 +1341,66 @@ fn fallback_rows(raw: &str, has_ai: bool) -> Vec<CompletionItem> {
 /// Whether the input's first word is an executable on PATH — a name-agnostic
 /// "is this a shell command?" check. Used to gate multi-repo rows so arbitrary
 /// typed text doesn't get run-target rows.
+/// Whether an unrouted query still looks like an attempt to LAUNCH AN APP,
+/// versus a natural-language sentence that should go to AI/web.
+///
+/// App names are short — one to a few words ("spotify", "vs code", "sublime
+/// text"). A launcher summon to open something is not a sentence. Two cheap,
+/// language-agnostic signals gate the implicit `open` fuzzy match so a phrase
+/// like "play the music and tell me my disk status" stops matching every
+/// music/disk app (the Raycast/Spotlight behaviour: match app NAMES tightly,
+/// route prose elsewhere):
+///
+/// - **word count**: at most `MAX_APP_WORDS` — longer is prose, not a name;
+/// - **not a question / request phrasing**: a leading interrogative or an
+///   embedded "tell me / show me / what's" reads as an ask, never an app name.
+///
+/// Deliberately permissive on the short side: a 1-3 word query still hits the
+/// app index (so "disk usage" can still surface Filelight if the user meant
+/// that), because the cost of a stray app row on a short query is low, while
+/// suppressing a real app launch would be the worse failure.
+fn looks_like_app_query(query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    let words: Vec<&str> = q.split_whitespace().collect();
+
+    // Zero-length can't reach here (zero-state handles empty); guard anyway.
+    if words.is_empty() {
+        return false;
+    }
+    // App names top out at a few words; beyond that it's a phrase.
+    const MAX_APP_WORDS: usize = 4;
+    if words.len() > MAX_APP_WORDS {
+        return false;
+    }
+    // Question / request phrasing → an ask, not a name. Checked as whole words
+    // so "whatsapp" (contains "what") isn't caught, and multi-word cues match.
+    const REQUEST_CUES: &[&str] = &[
+        "what",
+        "whats",
+        "what's",
+        "how",
+        "why",
+        "who",
+        "when",
+        "where",
+        "which",
+        "can",
+        "should",
+        "tell",
+        "show",
+        "explain",
+        "summarize",
+        "translate",
+        "write",
+        "give",
+    ];
+    let has_request_cue = words.iter().any(|w| {
+        let w = w.trim_matches(|c: char| !c.is_alphanumeric());
+        REQUEST_CUES.contains(&w)
+    });
+    !has_request_cue
+}
+
 fn looks_like_shell_command(input: &str) -> bool {
     // The head word is the first non-`FOO=bar` token (leading env assignments
     // are skipped, matching shell semantics).
@@ -3577,6 +3656,41 @@ mod tests {
         assert_eq!(super::shell_single_quote("plain"), "'plain'");
         // A single quote must be rendered as the POSIX '\'' sequence.
         assert_eq!(super::shell_single_quote("sab's"), "'sab'\\''s'");
+    }
+
+    #[test]
+    fn app_queries_pass_the_launch_gate() {
+        // Short, name-shaped → still hit the app index.
+        for q in ["spotify", "vs code", "sublime text", "disk usage"] {
+            assert!(
+                super::looks_like_app_query(q),
+                "{q:?} should read as an app-launch attempt"
+            );
+        }
+    }
+
+    #[test]
+    fn sentences_and_questions_do_not() {
+        // The reported bug + its family: prose must NOT reach the app fuzzy match.
+        for q in [
+            "play the music and tell me whats my disk status",
+            "what's using my disk",
+            "how do I resize an image",
+            "summarize this document for me",
+            "translate hello to french",
+        ] {
+            assert!(
+                !super::looks_like_app_query(q),
+                "{q:?} is prose, must route to AI/web not app launch"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_cue_is_matched_as_a_whole_word() {
+        // "whatsapp" contains "what" but is one word and a real app name — the
+        // cue check is whole-word, so it is NOT mistaken for a question.
+        assert!(super::looks_like_app_query("whatsapp"));
     }
 
     #[test]
