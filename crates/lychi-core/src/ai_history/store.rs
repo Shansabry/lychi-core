@@ -26,22 +26,38 @@ impl AiHistoryStore {
         Self
     }
 
-    /// List conversation summaries, newest first (by `updated_at`). Cheap — reads
-    /// each entry but returns only metadata + a turn count, not message bodies.
+    /// List conversation summaries, newest first (by `updated_at`). Genuinely
+    /// cheap now: deserializes a `ConversationMeta` that SKIPS the `messages`
+    /// array, so listing after every agent turn never parses message bodies or
+    /// inline base64 images. An undecodable row is skipped-and-warned (key only,
+    /// never the value) rather than failing the whole list — the same
+    /// resilience `decode_row` gives the postcard stores, which this serde_json
+    /// store had missed.
     pub fn list(&self, db: &Arc<Database>) -> Result<Vec<ConversationSummary>, LychiError> {
         let txn = db.begin_read()?;
         let table = txn.open_table(db::AI_CONVERSATIONS)?;
         let mut out = Vec::new();
         for result in table.iter()? {
-            let (_, val) = result?;
-            let conv: Conversation = serde_json::from_slice(crate::db::json_body_of(val.value())?)
-                .map_err(|e| LychiError::Database(e.to_string()))?;
+            let (key, val) = result?;
+            let meta: crate::ai_history::ConversationMeta =
+                match crate::db::json_body_of(val.value()).and_then(|b| {
+                    serde_json::from_slice(b).map_err(|e| LychiError::Database(e.to_string()))
+                }) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(
+                            "[history] skipping row `{}`: {e} — the rest of the list is unaffected",
+                            key.value()
+                        );
+                        continue;
+                    }
+                };
             out.push(ConversationSummary {
-                id: conv.id,
-                title: conv.title,
-                turn_count: count_turns(&conv.messages),
-                created_at: conv.created_at,
-                updated_at: conv.updated_at,
+                id: meta.id,
+                title: meta.title,
+                turn_count: meta.turn_count,
+                created_at: meta.created_at,
+                updated_at: meta.updated_at,
             });
         }
         out.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
@@ -97,6 +113,7 @@ impl AiHistoryStore {
         let conv = Conversation {
             id: id.to_string(),
             title: derive_title(messages),
+            turn_count: count_turns(messages),
             messages: messages.to_vec(),
             created_at,
             updated_at: now,
@@ -266,6 +283,7 @@ mod tests {
         let ancient = Conversation {
             id: "ancient".into(),
             title: "old".into(),
+            turn_count: 2,
             messages: conv_messages("old q", "old a"),
             created_at: 0,
             updated_at: 0, // epoch — far older than 30 days ago
@@ -319,6 +337,71 @@ mod tests {
         // And it's now readable.
         let got = store.get(&db, "c1").unwrap().unwrap();
         assert_eq!(got.messages.len(), 3);
+    }
+
+    /// `list()` must skip an undecodable row, not fail the whole list — the C4
+    /// resilience the postcard stores got but this serde_json store had missed.
+    /// This also unblocks `upsert` (which calls `prune → list`).
+    #[test]
+    fn list_skips_a_corrupt_row_and_keeps_the_good_ones() {
+        let db = open_test_database();
+        let store = AiHistoryStore::new();
+        store.upsert(&db, "good", &conv_messages("q", "a")).unwrap();
+
+        // Plant garbage under a second id.
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(db::AI_CONVERSATIONS).unwrap();
+            table.insert("bad", [1u8, 2, 3].as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let list = store.list(&db).unwrap();
+        let ids: Vec<&str> = list.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["good"], "corrupt row skipped, good row kept");
+
+        // And a subsequent upsert (which prunes via list) still succeeds.
+        store
+            .upsert(&db, "good2", &conv_messages("q2", "a2"))
+            .unwrap();
+        assert_eq!(store.list(&db).unwrap().len(), 2);
+    }
+
+    /// The listing summary reads `turn_count` from the stored field WITHOUT
+    /// deserializing message bodies — a row written before the field existed
+    /// (no `turn_count` key) decodes to 0, then self-corrects on next upsert.
+    #[test]
+    fn turn_count_survives_a_pre_field_row() {
+        let db = open_test_database();
+        let store = AiHistoryStore::new();
+
+        // A legacy JSON body with NO turn_count key.
+        let legacy = serde_json::json!({
+            "id": "c1", "title": "legacy",
+            "messages": [
+                {"role":"user","content":[{"type":"text","text":"hi"}]},
+                {"role":"assistant","content":[{"type":"text","text":"hello"}]}
+            ],
+            "created_at": 100, "updated_at": 100
+        });
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(db::AI_CONVERSATIONS).unwrap();
+            let bytes = crate::db::wrap_body(&serde_json::to_vec(&legacy).unwrap());
+            table.insert("c1", bytes.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        // Pre-field row lists with turn_count 0 (no bodies parsed), but is still
+        // fully readable via get().
+        assert_eq!(store.list(&db).unwrap()[0].turn_count, 0);
+        assert_eq!(store.get(&db, "c1").unwrap().unwrap().messages.len(), 2);
+
+        // Re-upserting recomputes and stores the count.
+        store
+            .upsert(&db, "c1", &store.get(&db, "c1").unwrap().unwrap().messages)
+            .unwrap();
+        assert_eq!(store.list(&db).unwrap()[0].turn_count, 2);
     }
 
     #[test]

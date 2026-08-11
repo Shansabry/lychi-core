@@ -1363,7 +1363,9 @@ local_model: string;
  */
 timeout_secs: number; 
 /**
- * Max tokens for routing/intent calls (default 300).
+ * Max tokens the model may generate per turn (default 4096). Enforced on
+ * every path: the HTTP request body (`max_tokens`, both dialects) and the
+ * local engine's decode-loop bound.
  */
 max_tokens: number }
 export type AiPresetItem = { id: string; 
@@ -1817,12 +1819,24 @@ export type ContentPart = { type: "text"; text: string } | { type: "image"; sour
 /**
  * A persisted conversation. `messages` is the full `Session` history (system +
  * user/assistant/tool turns), so recall can continue it exactly.
+ * 
+ * `turn_count` is stored (not derived on read) so the recall LIST can be built
+ * from a summary-shaped deserialize that skips `messages` entirely — listing
+ * after every agent turn used to fully parse every conversation's bodies and
+ * inline base64 images. Field order matters: `messages` sits AFTER the summary
+ * fields so a partial serde struct that omits it still maps the rest by name.
  */
 export type Conversation = { id: string; 
 /**
  * A short title for the recall list — the first user line, truncated.
  */
-title: string; messages: ChatMessage[]; created_at: number; updated_at: number }
+title: string; 
+/**
+ * Number of user+assistant turns. Persisted so `list`/`prune` never touch
+ * `messages`. `#[serde(default)]`: rows written before this field existed
+ * decode to 0, and are corrected on their next upsert.
+ */
+turn_count?: number; created_at: number; updated_at: number; messages: ChatMessage[] }
 /**
  * A lightweight row for the recall list — no message bodies, so listing is cheap.
  */
