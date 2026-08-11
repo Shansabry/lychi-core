@@ -404,7 +404,9 @@ pub struct AiConfig {
     pub local_model: String,
     /// AI request timeout in seconds (default 8).
     pub timeout_secs: u64,
-    /// Max tokens for routing/intent calls (default 300).
+    /// Max tokens the model may generate per turn (default 4096). Enforced on
+    /// every path: the HTTP request body (`max_tokens`, both dialects) and the
+    /// local engine's decode-loop bound.
     pub max_tokens: u32,
 }
 

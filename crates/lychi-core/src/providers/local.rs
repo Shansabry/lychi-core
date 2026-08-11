@@ -178,12 +178,20 @@ fn n_threads() -> i32 {
 }
 
 /// The generation core, returning `(text, decoded_token_count)` so the benchmark
-/// can compute an exact tokens/sec. `run_generation` is the thin public wrapper.
+/// can compute an exact tokens/sec.
 ///
 /// `on_delta`, when `Some`, is called with each newly-decoded text fragment as it
 /// generates (streaming). Returning `false` from it requests cancellation — the
-/// loop stops and returns what it has. Grammar-constrained calls (routing / tool
-/// calls) pass `None` (the JSON isn't meaningful to stream token-by-token).
+/// loop stops and returns what it has. Grammar-constrained calls (tool calls)
+/// pass `None` (the JSON isn't meaningful to stream token-by-token).
+///
+/// `cancel`, when `Some`, is polled once per generated token — INDEPENDENTLY of
+/// `on_delta`. This is what makes tool mode (which streams nothing, so has no
+/// `on_delta` to carry a cancel signal) actually stop: without it, an abandoned
+/// generation ran to `max_tokens` holding `INFER_LOCK`, so the user's retry
+/// queued behind a zombie for minutes of full-core burn (AI-5). The forward pass
+/// is un-abortable from outside, so cooperative per-token polling is the only way
+/// to break a `spawn_blocking` generation early.
 fn generate_inner(
     model: &LoadedModel,
     system: &str,
@@ -191,6 +199,7 @@ fn generate_inner(
     max_tokens: u32,
     grammar: Option<&str>,
     mut on_delta: Option<&mut dyn FnMut(&str) -> bool>,
+    cancel: Option<&CancellationToken>,
 ) -> Result<(String, usize), LychiError> {
     let _guard = INFER_LOCK
         .lock()
@@ -277,6 +286,15 @@ fn generate_inner(
     let mut emitted_chars = 0usize;
 
     for _ in 0..max_tokens {
+        // Cancellation, checked BEFORE each token regardless of streaming. This is
+        // the AI-5 fix: tool mode passes no `on_delta`, so without this the cancel
+        // token was never consulted and an abandoned generation ran to the token
+        // cap holding INFER_LOCK. Return what we have so the lock releases at once.
+        if cancel.is_some_and(|c| c.is_cancelled()) {
+            let text = String::from_utf8_lossy(&bytes);
+            return Ok((text.trim().to_string(), decoded));
+        }
+
         // Sample from the logits of the last decoded position. `sample()` already
         // calls the sampler's `accept` internally (it wraps llama_sampler_sample),
         // so we must NOT accept again — a double-accept advances the grammar
@@ -477,14 +495,29 @@ impl AiProvider for LocalClient {
                         return;
                     }
                 };
-                let raw =
-                    match generate_inner(&model, &system, &user, max, grammar.as_deref(), None) {
-                        Ok((out, _)) => out,
-                        Err(e) => {
-                            let _ = tx.blocking_send(Err(e));
-                            return;
-                        }
-                    };
+                // No on_delta (nothing to stream), but the cancel token is passed
+                // so an abandoned tool generation stops instead of running to the
+                // cap under INFER_LOCK (AI-5).
+                let raw = match generate_inner(
+                    &model,
+                    &system,
+                    &user,
+                    max,
+                    grammar.as_deref(),
+                    None,
+                    Some(&cancel),
+                ) {
+                    Ok((out, _)) => out,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(e));
+                        return;
+                    }
+                };
+                // A cancel during a one-shot tool generation yields a partial /
+                // empty JSON blob — don't surface a parse error for it, just stop.
+                if cancel.is_cancelled() {
+                    return;
+                }
                 tracing::debug!(provider = "local", model = %model_id, "[ai] tool response: {raw}");
                 match serde_json::from_str::<serde_json::Value>(&raw) {
                     Ok(v) if v["tool"].is_string() => {
@@ -519,17 +552,24 @@ impl AiProvider for LocalClient {
                 return;
             }
 
-            // Pure chat: stream free text. `on_delta` pushes each fragment; it
-            // returns false to stop when the consumer is gone OR cancel fired.
+            // Pure chat: stream free text. `on_delta` pushes each fragment and
+            // returns false when the CONSUMER is gone (dropped ReceiverStream);
+            // the cancel token is passed separately so cancellation fires between
+            // tokens even when no delta is produced.
             let mut cb = |delta: &str| {
-                if cancel.is_cancelled() {
-                    return false;
-                }
                 // blocking_send Err ⇒ ReceiverStream dropped ⇒ stop generating.
                 tx.blocking_send(Ok(StreamEvent::TextDelta(delta.to_string())))
                     .is_ok()
             };
-            match generate_inner(&model, &system, &user, max, None, Some(&mut cb)) {
+            match generate_inner(
+                &model,
+                &system,
+                &user,
+                max,
+                None,
+                Some(&mut cb),
+                Some(&cancel),
+            ) {
                 Ok(_) => {
                     let _ = tx.blocking_send(Ok(StreamEvent::Done {
                         stop_reason: StopReason::EndTurn,
@@ -635,6 +675,7 @@ mod bench {
                 128,
                 None,
                 None,
+                None,
             )
             .unwrap_or_else(|e| (format!("<gen failed: {e}>"), 0));
             let gen_s = t1.elapsed().as_secs_f64();
@@ -675,13 +716,55 @@ mod bench {
             .map(|s| s.to_string())
             .collect();
         let grammar = tool_grammar(&tools).expect("grammar builds");
-        let (out, _) = generate_inner(&model, &big, "open firefox", 48, Some(&grammar), None)
+        let (out, _) = generate_inner(&model, &big, "open firefox", 48, Some(&grammar), None, None)
             .expect("large prompt must not abort");
         println!("tool-grammar output: {out:?}");
         // The grammar guarantees a parseable object (tool call or answer).
         let v: serde_json::Value =
             serde_json::from_str(out.trim()).expect("grammar output must be valid JSON");
         assert!(v.is_object(), "output must be a JSON object");
+    }
+
+    /// AI-5: an already-cancelled token must stop generation before the cap, so
+    /// a zombie generation can't hold INFER_LOCK. A pre-cancelled token means the
+    /// per-token check fires on the first iteration — the call returns near-empty
+    /// and fast, having produced far fewer than `max_tokens`.
+    #[test]
+    #[ignore]
+    fn a_cancelled_token_stops_generation_early() {
+        let dir = crate::paths::models_dir();
+        let Some(spec) = MODELS.iter().find(|s| dir.join(s.gguf_filename()).exists()) else {
+            eprintln!("no model downloaded — skipping");
+            return;
+        };
+        let model = load_resident(spec, &dir.join(spec.gguf_filename())).unwrap();
+
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // cancelled up front — the loop must break immediately
+
+        let t = Instant::now();
+        // A high token cap so an UNCANCELLED run would take real time; the cancel
+        // must short-circuit it. No grammar → the free-text loop.
+        let (_out, decoded) = generate_inner(
+            &model,
+            "You are a helpful assistant.",
+            "Write a very long essay about the history of computing.",
+            256,
+            None,
+            None,
+            Some(&cancel),
+        )
+        .expect("a cancelled generation returns Ok with what it had");
+        let elapsed = t.elapsed();
+
+        assert!(
+            decoded == 0,
+            "cancel must fire before the first token, got {decoded} decoded"
+        );
+        assert!(
+            elapsed.as_secs() < 5,
+            "a pre-cancelled generation must return fast, took {elapsed:?}"
+        );
     }
 
     #[test]
