@@ -383,65 +383,13 @@ impl AppState {
         let mpris: Arc<RwLock<Option<lychi_core::mpris::MprisManager>>> =
             Arc::new(RwLock::new(None));
 
-        let mut registry = ActionRegistry::new();
-        registry.register(Box::new(AppControlHandler::new()));
-        registry.register(Box::new(AppLauncher::new(db.clone())));
-        registry.register(Box::new(BookmarkHandler::new()));
-        registry.register(Box::new(EmojiHandler::new()));
-        registry.register(Box::new(WebSearch::with_search_url(
-            config.commands.default_search_engine.clone(),
-        )));
-        registry.register(Box::new(YouTube::new()));
-        registry.register(Box::new(ShellExec::with_shell(
-            config.commands.shell.clone(),
-        )));
-        // The terminal emulator for `run` commands now flows per-run via
-        // `RunInputs` (built in execute.rs from config), not a global setter.
-        registry.register(Box::new(CalcHandler::new()));
-        registry.register(Box::new(DefineHandler::new()));
-        registry.register(Box::new(DevUtilsHandler::new()));
-        registry.register(Box::new(QrHandler::new()));
-        registry.register(Box::new(ResizeImageHandler::new()));
-        registry.register(Box::new(ConvertImageHandler::new()));
-        registry.register(Box::new(ZipHandler::new()));
-        registry.register(Box::new(ExtractHandler::new()));
-        registry.register(Box::new(ScreenshotHandler::new()));
-        registry.register(Box::new(ServicesHandler::new()));
-        registry.register(Box::new(ServicesListHandler::new()));
-        registry.register(Box::new(PackagesHandler::new()));
-        registry.register(Box::new(ClipboardHandler::new(db.clone())));
-        registry.register(Box::new(ClearHandler::new(db.clone())));
-        registry.register(Box::new(FileOpen::new(db.clone())));
-        registry.register(Box::new(UrlOpen::new()));
-        #[cfg(feature = "mpris")]
-        {
-            registry.register(Box::new(MediaHandler::new(Arc::clone(&mpris))));
-        }
-        registry.register(Box::new(ProjectOpen::with_directories(
-            config.projects.directories.clone(),
-        )));
-        registry.register(Box::new(SystemCommand::new()));
-        registry.register(Box::new(TimeHandler::new()));
-        registry.register(Box::new(TimerHandler::new(timer_state.clone(), db.clone())));
-        registry.register(Box::new(SymbolHandler::new()));
-        registry.register(Box::new(SysInfoHandler::new()));
-        registry.register(Box::new(UnicodeHandler::new()));
-        registry.register(Box::new(NotesHandler::new(db.clone())));
-        registry.register(Box::new(TodoHandler::new(db.clone())));
-        registry.register(Box::new(AliasHandler::new(db.clone())));
-        registry.register(Box::new(RemindersHandler::new(db.clone())));
-        registry.register(Box::new(SnippetsHandler::new(db.clone())));
-        registry.register(Box::new(BrowseHandler::new()));
-        registry.register(Box::new(ContextDebugHandler::new()));
-        registry.register(Box::new(PinWorkspaceHandler));
-        registry.register(Box::new(GenerateHandler::new()));
-        registry.register(Box::new(SshHandler::new()));
-        registry.register(Box::new(ColorHandler::new()));
-        registry.register(Box::new(WindowSwitcherHandler::new(db.clone())));
-        registry.register(Box::new(WeatherHandler::new(
-            config.weather.unit.clone(),
-            config.weather.default_location.clone(),
-        )));
+        let mut registry = Self::build_builtin_registry(
+            &db,
+            &config,
+            &timer_state,
+            #[cfg(feature = "mpris")]
+            &mpris,
+        );
 
         // Initialize AI provider if configured (shared between router and ask
         // handler). Single source of truth for mode dispatch is the core factory.
@@ -552,6 +500,82 @@ impl AppState {
     /// Only call this from a synchronous/blocking context — app startup, a
     /// `spawn_blocking` closure, or an event reactor running on its own thread.
     /// Async command handlers must go through [`build_ai_provider_async`].
+    /// Register every BUILT-IN handler. Extracted from `new()` so a test can
+    /// build the real production set (this exact function, not a hand-copied
+    /// list that would drift) and assert its trigger prefixes are
+    /// collision-free — `register()` is last-write-wins, so a collision here
+    /// silently makes this function's ordering load-bearing. User-keyed
+    /// handlers (quicklinks, script commands) stay in `new()`: their keywords
+    /// come from user config, where a collision is diagnosed by the registry's
+    /// warn log and the Settings UI, not treated as a bug in this list.
+    fn build_builtin_registry(
+        db: &Arc<Database>,
+        config: &Config,
+        timer_state: &lychi_core::action_registry::handlers::timer::TimerState,
+        #[cfg(feature = "mpris")] mpris: &Arc<RwLock<Option<lychi_core::mpris::MprisManager>>>,
+    ) -> ActionRegistry {
+        let mut registry = ActionRegistry::new();
+        registry.register(Box::new(AppControlHandler::new()));
+        registry.register(Box::new(AppLauncher::new(db.clone())));
+        registry.register(Box::new(BookmarkHandler::new()));
+        registry.register(Box::new(EmojiHandler::new()));
+        registry.register(Box::new(WebSearch::with_search_url(
+            config.commands.default_search_engine.clone(),
+        )));
+        registry.register(Box::new(YouTube::new()));
+        registry.register(Box::new(ShellExec::with_shell(
+            config.commands.shell.clone(),
+        )));
+        // The terminal emulator for `run` commands now flows per-run via
+        // `RunInputs` (built in execute.rs from config), not a global setter.
+        registry.register(Box::new(CalcHandler::new()));
+        registry.register(Box::new(DefineHandler::new()));
+        registry.register(Box::new(DevUtilsHandler::new()));
+        registry.register(Box::new(QrHandler::new()));
+        registry.register(Box::new(ResizeImageHandler::new()));
+        registry.register(Box::new(ConvertImageHandler::new()));
+        registry.register(Box::new(ZipHandler::new()));
+        registry.register(Box::new(ExtractHandler::new()));
+        registry.register(Box::new(ScreenshotHandler::new()));
+        registry.register(Box::new(ServicesHandler::new()));
+        registry.register(Box::new(ServicesListHandler::new()));
+        registry.register(Box::new(PackagesHandler::new()));
+        registry.register(Box::new(ClipboardHandler::new(db.clone())));
+        registry.register(Box::new(ClearHandler::new(db.clone())));
+        registry.register(Box::new(FileOpen::new(db.clone())));
+        registry.register(Box::new(UrlOpen::new()));
+        #[cfg(feature = "mpris")]
+        {
+            registry.register(Box::new(MediaHandler::new(Arc::clone(mpris))));
+        }
+        registry.register(Box::new(ProjectOpen::with_directories(
+            config.projects.directories.clone(),
+        )));
+        registry.register(Box::new(SystemCommand::new()));
+        registry.register(Box::new(TimeHandler::new()));
+        registry.register(Box::new(TimerHandler::new(timer_state.clone(), db.clone())));
+        registry.register(Box::new(SymbolHandler::new()));
+        registry.register(Box::new(SysInfoHandler::new()));
+        registry.register(Box::new(UnicodeHandler::new()));
+        registry.register(Box::new(NotesHandler::new(db.clone())));
+        registry.register(Box::new(TodoHandler::new(db.clone())));
+        registry.register(Box::new(AliasHandler::new(db.clone())));
+        registry.register(Box::new(RemindersHandler::new(db.clone())));
+        registry.register(Box::new(SnippetsHandler::new(db.clone())));
+        registry.register(Box::new(BrowseHandler::new()));
+        registry.register(Box::new(ContextDebugHandler::new()));
+        registry.register(Box::new(PinWorkspaceHandler));
+        registry.register(Box::new(GenerateHandler::new()));
+        registry.register(Box::new(SshHandler::new()));
+        registry.register(Box::new(ColorHandler::new()));
+        registry.register(Box::new(WindowSwitcherHandler::new(db.clone())));
+        registry.register(Box::new(WeatherHandler::new(
+            config.weather.unit.clone(),
+            config.weather.default_location.clone(),
+        )));
+        registry
+    }
+
     pub fn build_ai_provider(ai: &lychi_core::config::AiConfig) -> Option<Arc<dyn AiProvider>> {
         use lychi_core::providers::factory::{ProviderError, build_provider_with_cloud};
         // Pre-fetch the BYO key once (blocking keyring read) so the factory
@@ -709,6 +733,65 @@ mod tests {
         // Force the deadline into the past.
         p.expires_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
         assert!(p.is_expired(), "a past-deadline pending must be rejected");
+    }
+
+    /// No two BUILT-IN handlers may declare the same trigger prefix — built
+    /// against the real production set (the same `build_builtin_registry` that
+    /// `new()` calls, not a hand-copied list that would drift). `register()`
+    /// is last-write-wins, so a collision silently makes the registration
+    /// order load-bearing: the losing handler's keyword stops routing to it,
+    /// diagnosed by nothing but a warn log nobody watches in production.
+    /// ~45 handlers declare generic words (`net`, `time`, `count`, …)
+    /// decentrally; this is the fence that keeps a new handler from silently
+    /// stealing one.
+    #[test]
+    fn builtin_trigger_prefixes_are_collision_free() {
+        // Unique temp path per run: `open_test_database` is #[cfg(test)] of
+        // lychi-core and invisible across crates.
+        let path = std::env::temp_dir().join(format!(
+            "lychi-registry-test-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = lychi_core::db::open_database(&path).expect("temp db");
+        let config = Config::default();
+        let timer_state = lychi_core::action_registry::handlers::timer::new_timer_state();
+        #[cfg(feature = "mpris")]
+        let mpris = Arc::new(RwLock::new(None));
+
+        let registry = AppState::build_builtin_registry(
+            &db,
+            &config,
+            &timer_state,
+            #[cfg(feature = "mpris")]
+            &mpris,
+        );
+
+        let mut owners: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for id in registry.list_ids() {
+            let handler = registry.get(id).expect("listed id resolves");
+            for trigger in handler.triggers() {
+                for prefix in trigger.prefixes {
+                    owners
+                        .entry(prefix.to_lowercase())
+                        .or_default()
+                        .push(id.to_string());
+                }
+            }
+        }
+        let collisions: Vec<(&String, &Vec<String>)> =
+            owners.iter().filter(|(_, ids)| ids.len() > 1).collect();
+        assert!(
+            collisions.is_empty(),
+            "trigger prefixes declared more than once (prefix → declaring handlers): \
+             {collisions:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }
 

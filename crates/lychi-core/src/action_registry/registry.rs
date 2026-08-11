@@ -66,13 +66,30 @@ impl ActionRegistry {
         self.prefix_index.retain(|_, r| r.handler_id != id);
         for trigger in handler.triggers() {
             for prefix in trigger.prefixes {
-                self.prefix_index.insert(
+                let previous = self.prefix_index.insert(
                     prefix.to_lowercase(),
                     PrefixRoute {
                         handler_id: id.clone(),
                         transform: trigger.transform.clone(),
                     },
                 );
+                // The retain() above already dropped this id's own stale
+                // routes, so a surviving previous owner is a DIFFERENT handler
+                // losing its keyword to registration order. Warn rather than
+                // assert: quicklinks and script commands register user-chosen
+                // keywords through this same path, and a user naming a
+                // quicklink "net" must get a diagnosable log line, not a
+                // panic. The built-in set is held collision-free by the
+                // registry test in state.rs building the real production set.
+                if let Some(prev) = previous
+                    && prev.handler_id != id
+                {
+                    tracing::warn!(
+                        "[registry] prefix '{prefix}': '{id}' steals the route from '{}' \
+                         (registration order decides — rename one of them)",
+                        prev.handler_id
+                    );
+                }
             }
         }
         self.handlers.insert(id, handler);
