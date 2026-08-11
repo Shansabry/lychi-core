@@ -209,12 +209,26 @@ pub fn classify_string(
             // Not a structural command. A confident app-index match is still a
             // command ("spotify" → open) — let the executor resolve it; classify
             // it as Command so Enter runs it rather than asking AI.
-            if let Some((_, score)) = crate::desktop_apps::app_index().best_match(&input)
-                && score >= crate::desktop_apps::AUTO_LAUNCH_THRESHOLD
+            //
+            // The identity gate is NOT optional: it is the same guard
+            // `resolve()` applies at this exact threshold. A token-subset
+            // match scores 0.90, so without it "why is firefox slow"
+            // classified as Command here while the executor's own guard
+            // rejected it — the question then fell to a web search of the
+            // literal text, with AI configured and willing. Two deciders
+            // answering the same question differently is this codebase's
+            // most-documented failure mode; the app row is still OFFERED in
+            // the completions list either way.
             {
-                return RouteDecision::Command {
-                    command: trimmed.to_string(),
-                };
+                let index = crate::desktop_apps::app_index();
+                if let Some((id, score)) = index.best_match(&input)
+                    && score >= crate::desktop_apps::AUTO_LAUNCH_THRESHOLD
+                    && crate::intent::query_is_app_identity(&input, &index.entry(id).name_tokens)
+                {
+                    return RouteDecision::Command {
+                        command: trimmed.to_string(),
+                    };
+                }
             }
 
             // A near-miss TYPO → offer the correction (uniformly, multi-word too).
@@ -467,5 +481,47 @@ mod tests {
                 input: "hola".into()
             }
         );
+    }
+
+    /// THE SUBSET SHAPE (ROUTE-2): a question that merely CONTAINS an app name
+    /// scores 0.90 as a token-subset match — without the identity gate,
+    /// classify_string called it a Command while resolve()'s own guard
+    /// rejected it, and the question fell to a web search of the literal text
+    /// with AI configured. The gate here must be the SAME one resolve()
+    /// applies: identity launches, mentions reach AI.
+    #[test]
+    fn a_question_naming_an_app_reaches_ai_not_launch() {
+        use crate::desktop_apps::index;
+        // Serialise on the global-index lock and restore on drop, mirroring
+        // the executor tests that swap the same process-wide index.
+        let _guard = index::test_index_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        index::set_app_index_for_test(vec![index::tests::make_entry(
+            "Firefox",
+            "firefox",
+            &[],
+            None,
+            Some("firefox"),
+        )]);
+
+        let r = test_registry();
+
+        // Identity → Command (the "spotify" fast path stays).
+        assert_eq!(
+            classify_string("firefox", &r, no_presets, true),
+            RouteDecision::Command {
+                command: "firefox".into()
+            }
+        );
+
+        // Subset — the question mentions the app but is not the app.
+        let decision = classify_string("why is firefox slow", &r, no_presets, true);
+        assert!(
+            matches!(decision, RouteDecision::Nl { .. }),
+            "a question naming an app must reach AI, not launch it"
+        );
+
+        index::rebuild_app_index();
     }
 }

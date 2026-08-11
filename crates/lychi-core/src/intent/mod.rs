@@ -334,7 +334,7 @@ fn command_head(input: &str) -> Option<&str> {
 /// `open firefox` deliberately falls through: `open` is a registered trigger,
 /// so it is handled by the pattern phase above as an explicit command rather
 /// than by guessing here.
-fn query_is_app_identity(query: &str, name_tokens: &[String]) -> bool {
+pub(crate) fn query_is_app_identity(query: &str, name_tokens: &[String]) -> bool {
     let query_tokens: Vec<String> = query
         .to_lowercase()
         .split_whitespace()
