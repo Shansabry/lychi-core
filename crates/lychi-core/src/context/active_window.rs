@@ -274,30 +274,78 @@ pub fn detect() -> Option<WindowContext> {
     result
 }
 
-/// Detect the currently focused window, **bypassing cache**.
+/// Cache age within which the watcher-warmed entry IS the pre-summon truth:
+/// the watcher polls faster than a human can switch windows and re-summon.
+const SUMMON_CACHE_FRESH_SECS: f32 = 1.5;
+/// Hard budget for a live probe on the summon path. The window map must never
+/// wait on D-Bus: past this, the probe keeps running on its thread (and still
+/// refreshes the cache for `gather()`), but summon proceeds with what it has.
+const SUMMON_PROBE_BUDGET_MS: u64 = 150;
+
+/// Detect the focused window for the PRE-SUMMON snapshot — bounded latency.
 ///
-/// Use this for pre-summon snapshots where ground truth matters — the cache
-/// may be stale if the watcher hasn't polled since the user switched windows.
-/// Updates the cache as a side effect so subsequent `detect()` calls are fast.
-pub(crate) fn detect_live() -> Option<WindowContext> {
-    let result = match super::compositor() {
-        super::Compositor::KdeWayland => {
-            let w = detect_kwin_live()?;
-            set_kwin_cache(w.clone());
-            Some(w)
-        }
+/// The snapshot used to run `detect_live()` synchronously before the window
+/// mapped, "because ground truth matters". On KDE Wayland that is a file
+/// write + five D-Bus calls + a receive loop — multiple seconds of dead pause
+/// after the hotkey under any KWin contention, on the metric where 50ms is
+/// treated as material. Ground truth still matters; blocking the map on it
+/// does not:
+/// - cache ≤1.5s old → use it (the watcher keeps it warm for exactly this);
+/// - else probe on a side thread with a 150ms budget;
+/// - over budget → fall back to the stale cache (a slightly-old window beats
+///   a frozen summon), while the probe finishes in background and refreshes
+///   the cache for the `gather()` that follows.
+///
+/// X11 and wlroots probes are a few milliseconds of socket round-trip — live
+/// truth is affordable there and stays synchronous.
+pub(crate) fn detect_for_summon() -> Option<WindowContext> {
+    match super::compositor() {
+        super::Compositor::KdeWayland => detect_kwin_for_summon(),
         super::Compositor::X11 => detect_x11(),
         super::Compositor::OtherWayland => detect_wlr(),
         _ => None,
-    };
-    tracing::debug!(
-        "active_window::detect_live: {:?}",
-        result.as_ref().map(|w| format!(
-            "{}(pid={},term={},ide={},title={})",
-            w.wm_class, w.pid, w.is_terminal, w.is_ide, w.title
-        ))
-    );
-    result
+    }
+}
+
+fn detect_kwin_for_summon() -> Option<WindowContext> {
+    if let Ok(guard) = KWIN_CACHE.lock()
+        && let Some(ref c) = *guard
+    {
+        let age = c.cached_at.elapsed().as_secs_f32();
+        if age < SUMMON_CACHE_FRESH_SECS {
+            tracing::debug!("active_window: summon snapshot from cache (age={age:.2}s)");
+            return Some(c.window.clone());
+        }
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let w = detect_kwin_live();
+        if let Some(ref win) = w {
+            set_kwin_cache(win.clone());
+        }
+        // Receiver may have given up (over budget) — send is best-effort.
+        let _ = tx.send(w);
+    });
+    match rx.recv_timeout(std::time::Duration::from_millis(SUMMON_PROBE_BUDGET_MS)) {
+        Ok(w) => w,
+        Err(_) => {
+            let cached = KWIN_CACHE
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|c| c.window.clone()));
+            tracing::debug!(
+                "active_window: summon probe over {}ms budget — {}",
+                SUMMON_PROBE_BUDGET_MS,
+                if cached.is_some() {
+                    "falling back to stale cache"
+                } else {
+                    "no cache to fall back to"
+                }
+            );
+            cached
+        }
+    }
 }
 
 // ── wlroots (Sway / Hyprland / niri / wlroots family) ────────────────────
@@ -427,7 +475,12 @@ if (w && w.caption && w.pid > 0) {{
             .as_millis()
     );
 
-    let scripting = conn.with_proxy("org.kde.KWin", "/Scripting", Duration::from_secs(2));
+    // 500ms per D-Bus call: these calls answer in single-digit ms on a healthy
+    // KWin; 2s was hang detection masquerading as a latency budget, and five of
+    // them serialised into the worst case. The summon path no longer waits on
+    // this probe at all (detect_kwin_for_summon), so this only bounds how long
+    // the background thread can linger.
+    let scripting = conn.with_proxy("org.kde.KWin", "/Scripting", Duration::from_millis(500));
 
     let (script_id,): (i32,) = scripting
         .method_call(
@@ -457,12 +510,16 @@ if (w && w.caption && w.pid > 0) {{
     );
 
     let script_path_dbus = format!("/Scripting/Script{script_id}");
-    let script_proxy = conn.with_proxy("org.kde.KWin", &script_path_dbus, Duration::from_secs(2));
+    let script_proxy = conn.with_proxy(
+        "org.kde.KWin",
+        &script_path_dbus,
+        Duration::from_millis(500),
+    );
 
     let _ = script_proxy.method_call::<(), _, _, _>("org.kde.kwin.Script", "run", ());
 
-    // Wait for callback (2s timeout)
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Wait for callback (1s — the callback normally arrives within ~10ms).
+    let deadline = Instant::now() + Duration::from_secs(1);
     let mut payload = None;
     while Instant::now() < deadline {
         let remaining = deadline - Instant::now();

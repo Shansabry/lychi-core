@@ -459,10 +459,11 @@ pub fn is_kde_wayland_session() -> bool {
 /// Call this **before** `show_window()`, then pass the result to
 /// `gather()` inside `spawn_blocking`.
 pub fn snapshot_active_window() -> Option<WindowContext> {
-    // Bypass cache — the watcher may not have polled since the user switched
-    // windows, so the cache could still show the previous window. Ground truth
-    // matters here; we also update the cache as a side effect.
-    active_window::detect_live()
+    // Budgeted: fresh cache (the watcher keeps it warm) or a live probe capped
+    // at ~150ms with stale-cache fallback. This runs synchronously before the
+    // window maps, so it must never wait on KWin's D-Bus worst case — see
+    // `detect_for_summon` for the policy and the latency incident behind it.
+    active_window::detect_for_summon()
 }
 
 /// Gather all context. Called on summon via `spawn_blocking`.
