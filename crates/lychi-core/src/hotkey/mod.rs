@@ -46,6 +46,12 @@ pub enum Binding {
     DesktopSettings,
     /// An X11 key-grab returned Ok. Proves the call succeeded, nothing more.
     X11Grab,
+    /// A portal binding existed and its session died (portal crash/restart —
+    /// routine over a long session: package upgrades, OOM, `systemctl --user
+    /// restart`). The key is dead RIGHT NOW while re-registration retries in
+    /// the background. Distinct from [`Binding::None`] because the diagnosis
+    /// and the user story differ: the portal works here, it just went away.
+    PortalLost,
     /// The combination belongs to something else and we declined to steal it.
     Conflict,
     /// Nothing bound the key.
@@ -85,6 +91,10 @@ impl HotkeyVerdict {
             // there is not merely unproven — it is known not to work globally.
             Binding::X11Grab if wayland => Confidence::Broken,
             Binding::X11Grab => Confidence::Unverified,
+            // Not Unverified: no keypress can arrive on a dead session, so
+            // there is no question to ask the user — the key is broken until
+            // re-registration succeeds and records a fresh Portal verdict.
+            Binding::PortalLost => Confidence::Broken,
             Binding::Conflict => Confidence::Broken,
             Binding::None => Confidence::Broken,
         };
@@ -119,6 +129,11 @@ impl HotkeyVerdict {
             }
             (Binding::X11Grab, Confidence::Broken) => {
                 "the X11 grab only covers XWayland windows on this Wayland session"
+            }
+            (Binding::PortalLost, _) => {
+                "the desktop portal closed our shortcut session (it likely \
+                 restarted) — rebinding in the background; restart Lychi if \
+                 the hotkey stays dead"
             }
             (Binding::Conflict, _) => {
                 "the combination is already bound to something else — pick another"
@@ -175,6 +190,19 @@ mod tests {
     }
 
     #[test]
+    fn a_lost_portal_session_is_broken_not_a_question() {
+        // The B6 lesson, applied to the portal path: a verdict must describe
+        // the key's state NOW, not the registration's past success. A dead
+        // session cannot deliver the confirming keypress, so asking the user
+        // to press it would be the old lie in a new place.
+        for wayland in [true, false] {
+            let v = HotkeyVerdict::assess(Binding::PortalLost, wayland);
+            assert_eq!(v.confidence, Confidence::Broken);
+            assert!(!v.needs_confirmation());
+        }
+    }
+
+    #[test]
     fn nothing_bound_is_broken() {
         assert_eq!(
             HotkeyVerdict::assess(Binding::None, false).confidence,
@@ -203,6 +231,7 @@ mod tests {
         let cases = [
             HotkeyVerdict::assess(Binding::X11Grab, false),
             HotkeyVerdict::assess(Binding::X11Grab, true),
+            HotkeyVerdict::assess(Binding::PortalLost, false),
             HotkeyVerdict::assess(Binding::Conflict, false),
             HotkeyVerdict::assess(Binding::None, false),
         ];

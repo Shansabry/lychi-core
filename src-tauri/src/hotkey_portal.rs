@@ -86,25 +86,69 @@ pub fn ensure_app_desktop_file() {
 /// GNOME ≤47) eventually gives up and leaves the fallback UX in place.
 const RETRY_SCHEDULE_SECS: &[u64] = &[0, 1, 2, 4, 8, 15, 30, 30, 30];
 
+/// How a servicing `run` came to an end. `run` blocks for the app's lifetime
+/// while healthy, so every variant is a reason it stopped — a typed outcome
+/// rather than a bare `Ok(())`, because a bare Ok is exactly what the old
+/// `setup` misread as "session closed cleanly — done": a portal crash/restart
+/// (routine over a long session — package upgrades, OOM, `systemctl --user
+/// restart`) ended the stream, `setup` returned, and the hotkey stayed dead
+/// until app restart while the stored verdict kept saying Reliable.
+enum RunOutcome {
+    /// The user (or compositor) declined the bind. Retrying would re-prompt —
+    /// respect the answer and leave the fallback UX in place.
+    Declined,
+    /// The activation stream ended after a successful bind: the portal side
+    /// went away. Re-registration is warranted (and prompt-free — the stored
+    /// approval carries).
+    StreamEnded,
+}
+
+/// Delay before re-registering after a stream death, so we bind to the portal
+/// that replaces the dying one rather than racing its shutdown.
+const REREGISTER_DELAY_SECS: u64 = 2;
+
 /// Bind the toggle hotkey through the portal and service its activations.
 /// Runs for the app's lifetime; all failures are non-fatal (fallback UX).
 ///
-/// Retries with backoff so an autostart race against `xdg-desktop-portal` (the
-/// backend not yet ready when we boot) self-heals: we keep trying until the
-/// portal is available, then bind + service activations for the process lifetime.
+/// Two nested loops, two different failure shapes:
+/// - the INNER schedule retries a registration that has not succeeded yet (an
+///   autostart race against `xdg-desktop-portal` coming up self-heals; a
+///   compositor with no backend at all exhausts the schedule and gives up);
+/// - the OUTER loop re-enters registration when a previously WORKING session
+///   dies (portal crash/restart). Each re-entry gets a fresh schedule: a
+///   session that bound once proves the backend exists, so the give-up
+///   reasoning of the inner loop does not transfer. `run` records the
+///   downgraded verdict before returning, so diagnostics tell the truth
+///   during the gap.
 pub async fn setup(app: tauri::AppHandle, configured_hotkey: String) {
+    loop {
+        match register_cycle(&app, &configured_hotkey).await {
+            CycleOutcome::Done => return,
+            CycleOutcome::StreamEnded => {
+                tokio::time::sleep(std::time::Duration::from_secs(REREGISTER_DELAY_SECS)).await;
+            }
+        }
+    }
+}
+
+enum CycleOutcome {
+    /// Nothing left to do: declined, or the schedule exhausted with no bind.
+    Done,
+    /// A working session died — re-register from scratch.
+    StreamEnded,
+}
+
+/// One pass through the retry schedule. Extracted from `setup` so the loop
+/// there states the actual lifecycle (register → serve → maybe re-register)
+/// instead of interleaving it with backoff bookkeeping.
+async fn register_cycle(app: &tauri::AppHandle, configured_hotkey: &str) -> CycleOutcome {
     for (attempt, &delay) in RETRY_SCHEDULE_SECS.iter().enumerate() {
         if delay > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
         }
-        // If a prior attempt already bound + is servicing (its `run` returned Ok
-        // only when the session ends), we won't re-enter. `run` blocks for the
-        // app lifetime on success, so reaching here again means it failed.
-        match run(&app, &configured_hotkey).await {
-            Ok(()) => {
-                // The activation stream ended cleanly (session closed) — done.
-                return;
-            }
+        match run(app, configured_hotkey).await {
+            Ok(RunOutcome::Declined) => return CycleOutcome::Done,
+            Ok(RunOutcome::StreamEnded) => return CycleOutcome::StreamEnded,
             Err(e) => {
                 let last = attempt + 1 == RETRY_SCHEDULE_SECS.len();
                 if last {
@@ -133,6 +177,7 @@ pub async fn setup(app: tauri::AppHandle, configured_hotkey: String) {
             }
         }
     }
+    CycleOutcome::Done
 }
 
 /// The reverse-DNS app-id, matching the bundle identifier + the installed
@@ -211,7 +256,7 @@ async fn register_host_app_id(conn: &ashpd::zbus::Connection) -> Result<(), Stri
     }
 }
 
-async fn run(app: &tauri::AppHandle, configured_hotkey: &str) -> ashpd::Result<()> {
+async fn run(app: &tauri::AppHandle, configured_hotkey: &str) -> ashpd::Result<RunOutcome> {
     // ONE connection, used for both the handshake and the session — the portal
     // binds the app-id to the calling peer, so these cannot be separate
     // connections. See `register_host_app_id` for what happens when they are.
@@ -276,7 +321,7 @@ async fn run(app: &tauri::AppHandle, configured_hotkey: &str) -> ashpd::Result<(
 
     if trigger.is_empty() {
         tracing::warn!("[portal] shortcut not bound (user declined or compositor refused)");
-        return Ok(());
+        return Ok(RunOutcome::Declined);
     }
 
     {
@@ -306,8 +351,22 @@ async fn run(app: &tauri::AppHandle, configured_hotkey: &str) -> ashpd::Result<(
             crate::window::toggle_window(&win);
         }
     }
-    tracing::warn!("[portal] activation stream ended");
-    Ok(())
+
+    // The stream only ends because the portal side went away. The hotkey is
+    // dead from this instant until re-registration succeeds, and everything
+    // that answers "does the hotkey work?" must say so NOW — the caller will
+    // retry, but a Setup tab read during the gap (or after a failed retry
+    // cycle) must not repeat the stored "Reliable" from a session that no
+    // longer exists.
+    {
+        use std::sync::atomic::Ordering;
+        let state = app.state::<AppState>();
+        state.portal_bound.store(false, Ordering::SeqCst);
+        state.hotkey_registered.store(false, Ordering::SeqCst);
+    }
+    crate::record_hotkey_binding(app, lychi_core::hotkey::Binding::PortalLost);
+    tracing::warn!("[portal] activation stream ended — the portal side went away; re-registering");
+    Ok(RunOutcome::StreamEnded)
 }
 
 /// Map Lychi's hotkey config format ("Super+Space", "Ctrl+Alt+K") to the
