@@ -893,10 +893,19 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 	// (so a replayed history/context command routes exactly as if typed fresh).
 	// KEYBOARD/MODE outcomes (Ctrl/Shift, /-search, @-browse) need no decision, so
 	// skip the round-trip when a modifier or search/@ mode already determines it.
+	// SNAPSHOT everything this Enter acts on BEFORE any await. The classify
+	// round-trip is ~2-3ms, and a completions batch landing in that window used
+	// to swap the array under decideSubmit — which re-derives the selected row
+	// from items[index], so the stale runDecision applied to whatever row now
+	// sat at that position: the "ran the wrong thing" class, unreproducible by
+	// design. This Enter belongs to what was on screen when it was pressed.
 	const trimmed = inputValue.trim();
-	const needsDecision =
-		!opts?.ctrlKey && !opts?.runInline && !completions.searchMode && !completions.atMode;
-	const selected = completions.index >= 0 ? completions.items[completions.index] : undefined;
+	const searchMode = completions.searchMode;
+	const atMode = completions.atMode;
+	const items = completions.items;
+	const index = completions.index;
+	const needsDecision = !opts?.ctrlKey && !opts?.runInline && !searchMode && !atMode;
+	const selected = index >= 0 ? items[index] : undefined;
 	const selectedRun = selected?.run ?? undefined;
 
 	let inputDecision: RouteDecision | undefined;
@@ -927,17 +936,25 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 		}
 	}
 
+	// The user kept typing during the await: the decision belongs to text that
+	// is no longer in the box. Executing it would run something the user can't
+	// see anymore — drop this Enter; the next one classifies the current text.
+	if (inputValue.trim() !== trimmed) {
+		return;
+	}
+
 	// The FE reducer folds the backend decision with keyboard/mode/selection
-	// state (src/lib/submit-router.ts) into exactly one SubmitAction.
+	// state (src/lib/submit-router.ts) into exactly one SubmitAction — fed the
+	// SNAPSHOTS from above, never the live completions state.
 	const action = decideSubmit({
 		trimmed,
 		ctrlKey: opts?.ctrlKey ?? false,
 		runInline: opts?.runInline ?? false,
-		searchMode: completions.searchMode,
-		atMode: completions.atMode,
+		searchMode,
+		atMode,
 		pendingPlan: !!pendingPlan,
-		completions: completions.items,
-		completionIndex: completions.index,
+		completions: items,
+		completionIndex: index,
 		inputDecision,
 		runDecision,
 		hasAttachments: attachments.any,
