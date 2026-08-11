@@ -80,8 +80,19 @@ impl AiHistoryStore {
         }
 
         let now = db::now_millis();
-        // Preserve the original created_at if this id already exists.
-        let created_at = self.get(db, id)?.map(|c| c.created_at).unwrap_or(now);
+        // Preserve the original created_at if this id already exists — but a
+        // corrupt/unreadable existing row must NOT block writing the new turn.
+        // Read-then-write here used `?`, so a single stranded row (a bogus
+        // pre-envelope tag, seen in the field) failed the whole persist and the
+        // conversation was silently lost ("[history] failed to persist"). The
+        // created_at is a nicety, not a reason to drop the transcript: on an
+        // unreadable prior row, fall back to `now` and overwrite it clean.
+        let created_at = self
+            .get(db, id)
+            .ok()
+            .flatten()
+            .map(|c| c.created_at)
+            .unwrap_or(now);
 
         let conv = Conversation {
             id: id.to_string(),
@@ -275,6 +286,39 @@ mod tests {
         let ids: Vec<String> = store.list(&db).unwrap().into_iter().map(|s| s.id).collect();
         assert!(!ids.contains(&"ancient".to_string()));
         assert!(ids.contains(&"recent".to_string()));
+    }
+
+    /// The field bug ("[history] failed to persist conversation: schema v123"):
+    /// a corrupt/undecodable existing row for a conversation id must NOT block
+    /// writing the new turn. Before the fix, `upsert` read the old row with `?`
+    /// to preserve created_at, so one stranded row silently dropped the whole
+    /// conversation. Now the read failure falls back to a fresh created_at.
+    #[test]
+    fn a_corrupt_existing_row_does_not_block_the_upsert() {
+        let db = open_test_database();
+        let store = AiHistoryStore::new();
+
+        // Plant a garbage row under "c1" — a bogus leading tag that neither the
+        // envelope nor the JSON-shape fallback can decode.
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(db::AI_CONVERSATIONS).unwrap();
+            table
+                .insert("c1", [0xDE, 0xAD, 0xBE, 0xEF].as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        assert!(store.get(&db, "c1").is_err(), "the planted row is corrupt");
+
+        // The upsert must still succeed, overwriting the corrupt row.
+        let saved = store
+            .upsert(&db, "c1", &conv_messages("recover me", "done"))
+            .unwrap()
+            .expect("a real conversation is saved");
+        assert_eq!(saved.title, "recover me");
+        // And it's now readable.
+        let got = store.get(&db, "c1").unwrap().unwrap();
+        assert_eq!(got.messages.len(), 3);
     }
 
     #[test]
