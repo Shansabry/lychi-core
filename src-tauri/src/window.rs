@@ -265,13 +265,34 @@ pub fn show_window(window: &WebviewWindow) {
                 .unwrap_or_else(|| "none".into()),
         );
 
-        // Store in executor
+        // Store in executor. A blocking acquire, not `try_write`: the summon
+        // that triggered this gather also fires an immediate `get_completions`,
+        // whose read lock is usually still held when the gather lands — with
+        // `try_write` the fresh context was silently dropped exactly when it
+        // mattered, and the launcher kept suggesting from the PREVIOUS
+        // summon's world. We are on a blocking thread; waiting is what it's
+        // for, and tokio's write-preferring lock bounds the wait to the
+        // in-flight readers.
         let state = ctx_handle.state::<AppState>();
-        if let Ok(mut executor) = state.executor.try_write() {
-            executor.context = Some(ctx.clone());
-        }
+        let stored = {
+            let mut executor = tauri::async_runtime::block_on(state.executor.write());
+            // Re-check AFTER acquiring: a newer summon may have started while
+            // we waited, and its gather must win (latest-wins).
+            if state.summon_seq.load(Ordering::SeqCst) == gather_seq {
+                executor.context = Some(ctx.clone());
+                true
+            } else {
+                false
+            }
+        };
 
-        // Notify frontend that context is ready
-        let _ = ctx_handle.emit("lychi://context-ready", &ctx);
+        // Notify frontend that context is ready — only when the executor
+        // actually holds it. Emitting on a discarded store made the frontend
+        // re-render "fresh" suggestions from context the backend didn't have.
+        if stored {
+            let _ = ctx_handle.emit("lychi://context-ready", &ctx);
+        } else {
+            tracing::debug!("context store skipped (seq={gather_seq}, newer summon in flight)");
+        }
     });
 }
