@@ -3,7 +3,6 @@ import { LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { onMount } from "svelte";
 import ActionPanel from "$lib/components/ActionPanel.svelte";
-import AgentPlanPanel from "$lib/components/AgentPlanPanel.svelte";
 import AiAnswer from "$lib/components/AiAnswer.svelte";
 import AttachmentTray from "$lib/components/AttachmentTray.svelte";
 import ChatHistoryPanel from "$lib/components/ChatHistoryPanel.svelte";
@@ -18,7 +17,7 @@ import ResultPanel from "$lib/components/ResultPanel.svelte";
 import SettingsPanel from "$lib/components/SettingsPanel.svelte";
 import StatusBar from "$lib/components/StatusBar.svelte";
 import { attachTauriEvents } from "$lib/events/bridge.svelte";
-import type { AgentPlan, CommandResult, CompletionItem } from "$lib/ipc";
+import type { CommandResult, CompletionItem } from "$lib/ipc";
 import {
 	addPin,
 	cancelFileSearch,
@@ -30,7 +29,6 @@ import {
 	executeCommand,
 	fuzzyPathCompletions,
 	getActiveWindowStrategy,
-	getAgentPlan,
 	getAiStatus,
 	getCompletions,
 	getContext,
@@ -288,8 +286,6 @@ function flashHint(msg: string) {
 	}, 1400);
 }
 
-let pendingPlan: AgentPlan | null = $state(null);
-let planPanelRef: AgentPlanPanel | undefined = $state(undefined);
 let resultPanelRef: ResultPanel | undefined = $state(undefined);
 // C1/C15: generation counter for AI routing — ESC increments to cancel stale responses
 let routingGeneration = 0;
@@ -648,15 +644,6 @@ onMount(() => {
 		ready: () => {
 			launcherReady = true;
 		},
-		agentStep: (payload) => {
-			planPanelRef?.handleStepEvent(payload);
-			// When the final step completes, expose its result to the StatusBar so
-			// the AI sparkle indicator shows for AI-routed plans.
-			const { result, status } = payload;
-			if (result && (status === "done" || status === "failed")) {
-				lastResult = { ...result, routed_by: "ai" };
-			}
-		},
 		summon: handleSummon,
 		afterContextReady: () => {
 			// Fresh context arrived — re-fetch suggestions to enrich them in place
@@ -707,7 +694,6 @@ function handleSummon() {
 	launcherReady = true;
 	inputValue = "";
 	lastResult = null;
-	pendingPlan = null;
 	// Pristine launcher surface: no panel, nothing parked.
 	ui.summonReset();
 	// Fresh AI conversation each summon (decision: reset-every-summon).
@@ -971,7 +957,7 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 		runInline: opts?.runInline ?? false,
 		searchMode,
 		atMode,
-		pendingPlan: !!pendingPlan,
+		pendingPlan: false,
 		completions: items,
 		completionIndex: index,
 		inputDecision,
@@ -1405,7 +1391,7 @@ let decisionPending: boolean = $derived.by(() => {
  * repopulating the list beneath the result) showed both surfaces stacked.
  */
 $effect(() => {
-	completions.outputShown = ui.aiVisible || !!pendingPlan || !!lastResult;
+	completions.outputShown = ui.aiVisible || !!lastResult;
 });
 
 /** Build the applicable actions for the currently-selected result. */
@@ -2129,16 +2115,6 @@ async function handleDismiss() {
 				onwebsearch={quickWebSearch}
 				onfullchat={escalateToChat}
 			/>
-		{:else if pendingPlan}
-			<AgentPlanPanel
-				bind:this={planPanelRef}
-				plan={pendingPlan}
-				onexecuted={() => {
-					historyEntries = [...historyEntries, pendingPlan!.input];
-					inputValue = "";
-				}}
-				ondismiss={() => { pendingPlan = null; }}
-			/>
 		{:else if !ui.anyPanelOpen}
 			<CompletionsList
 				items={completions.visible ? completions.items : []}
@@ -2204,7 +2180,7 @@ async function handleDismiss() {
 		onshowresult={handleShowResult}
 		onshowplan={handleShowPlan}
 		onshowai={ui.restoreAi}
-		hasPlan={!!pendingPlan}
+		hasPlan={false}
 		contextStale={context.stale}
 		contextStaleHint={context.staleHint}
 		contextRefreshing={context.refreshing}

@@ -1,14 +1,9 @@
 use async_trait::async_trait;
 use reqwest::Client;
-use serde_json::{Value, json};
-
-use crate::error::LychiError;
+use serde_json::json;
 
 use super::wire::{AuthStyle, Dialect, WireClient};
-use super::{
-    AiProvider, AiResponse, AiRoute, CancellationToken, ChatMessage, EventStream, ToolDef,
-};
-use crate::intent::prompt;
+use super::{AiProvider, CancellationToken, ChatMessage, EventStream, ToolDef};
 
 /// Request/response wire format spoken to the endpoint.
 ///
@@ -97,104 +92,6 @@ impl BYOClient {
         self
     }
 
-    async fn call_openai_compatible(
-        &self,
-        system_prompt: &str,
-        user_input: &str,
-    ) -> Result<String, LychiError> {
-        let body = json!({
-            "model": self.model,
-            "messages": [
-                { "role": "system", "content": system_prompt },
-                { "role": "user", "content": user_input }
-            ],
-            "max_tokens": self.max_tokens,
-            "temperature": 0.0
-        });
-
-        let resp = self
-            .http
-            .post(&self.base_url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LychiError::Ai(format!("HTTP request failed: {e}")))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            // Same classifier as the streaming path — one place turns provider
-            // errors into user-facing text. These calls never carry images.
-            let err = super::errors::classify(Some(status.as_u16()), &body, false);
-            return Err(LychiError::Ai(err.message));
-        }
-
-        let json: Value = resp
-            .json()
-            .await
-            .map_err(|e| LychiError::Ai(format!("Failed to parse API response: {e}")))?;
-
-        json["choices"][0]["message"]["content"]
-            .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| LychiError::Ai("No content in API response".to_string()))
-    }
-
-    async fn call_anthropic(
-        &self,
-        system_prompt: &str,
-        user_input: &str,
-    ) -> Result<String, LychiError> {
-        let body = json!({
-            "model": self.model,
-            "system": system_prompt,
-            "messages": [
-                { "role": "user", "content": user_input }
-            ],
-            "max_tokens": self.max_tokens,
-            "temperature": 0.0
-        });
-
-        let resp = self
-            .http
-            .post(&self.base_url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LychiError::Ai(format!("HTTP request failed: {e}")))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            // Same classifier as the streaming path — one place turns provider
-            // errors into user-facing text. These calls never carry images.
-            let err = super::errors::classify(Some(status.as_u16()), &body, false);
-            return Err(LychiError::Ai(err.message));
-        }
-
-        let json: Value = resp
-            .json()
-            .await
-            .map_err(|e| LychiError::Ai(format!("Failed to parse API response: {e}")))?;
-
-        json["content"][0]["text"]
-            .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| LychiError::Ai("No content in API response".to_string()))
-    }
-
-    async fn call(&self, system_prompt: &str, user_input: &str) -> Result<String, LychiError> {
-        match self.wire {
-            WireFormat::OpenAi => self.call_openai_compatible(system_prompt, user_input).await,
-            WireFormat::Anthropic => self.call_anthropic(system_prompt, user_input).await,
-        }
-    }
-
     /// Build the shared streaming client for this provider's dialect + auth. The
     /// whole HTTP→SSE→event mechanism lives in `WireClient`; this just maps the
     /// BYO config (wire format + key) onto it.
@@ -239,36 +136,6 @@ impl BYOClient {
 
 #[async_trait]
 impl AiProvider for BYOClient {
-    async fn route_intent(
-        &self,
-        input: &str,
-        known_actions: &[&str],
-    ) -> Result<AiRoute, LychiError> {
-        match self.route_or_plan(input, known_actions, None).await? {
-            AiResponse::SingleRoute(route) => Ok(route),
-            AiResponse::Plan(_) => Err(LychiError::Ai(
-                "AI returned a plan but single route was expected".to_string(),
-            )),
-        }
-    }
-
-    async fn route_or_plan(
-        &self,
-        input: &str,
-        known_actions: &[&str],
-        context_hint: Option<&str>,
-    ) -> Result<AiResponse, LychiError> {
-        let sys_prompt = prompt::system_prompt(known_actions, context_hint);
-        let response = self.call(&sys_prompt, input).await?;
-        tracing::debug!(
-            prompt_version = prompt::PROMPT_VERSION,
-            provider = %self.provider_id,
-            model = %self.model,
-            "[ai] raw response: {response}"
-        );
-        prompt::parse_ai_response(&response, known_actions, input)
-    }
-
     async fn health_check(&self) -> bool {
         let result = match self.wire {
             WireFormat::Anthropic => {
@@ -330,14 +197,6 @@ impl AiProvider for BYOClient {
 
     fn name(&self) -> &str {
         &self.provider_id
-    }
-
-    async fn answer_question(
-        &self,
-        system_prompt: &str,
-        question: &str,
-    ) -> Result<String, LychiError> {
-        self.call(system_prompt, question).await
     }
 
     fn chat(

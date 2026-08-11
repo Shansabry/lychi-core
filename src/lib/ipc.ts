@@ -8,7 +8,6 @@
 // Local imports for the generated types used in this file's function signatures.
 // (A bare `export type { … } from` re-exports but does not bind the names locally.)
 import type {
-	AgentPlan,
 	AiConfig,
 	AiPresetItem,
 	AiStatus,
@@ -56,8 +55,6 @@ import { commands, type Result } from "./bindings";
 
 // --- Re-exported generated types (single source of truth = Rust) ---
 export type {
-	AgentPlan,
-	AgentStep,
 	AiConfig,
 	AiPresetItem,
 	AiStatus,
@@ -144,13 +141,6 @@ export interface FileSearchBatch {
 	results: FileSearchResult[];
 	done: boolean;
 	has_ignore_rules?: boolean;
-}
-
-export interface StepEvent {
-	plan_id: string;
-	step_index: number;
-	status: "running" | "done" | "failed";
-	result?: CommandResult | null;
 }
 
 /**
@@ -918,23 +908,6 @@ export async function cloudGetCredits(): Promise<CreditBalance> {
 			resets_at: "",
 		};
 	return unwrap(await commands.cloudGetCredits());
-}
-
-// --- Agent Plans ---
-
-export async function getAgentPlan(input: string): Promise<AgentPlan | null> {
-	if (!isTauri()) return null;
-	return unwrap(await commands.getAgentPlan(input));
-}
-
-export async function storeAgentPlan(plan: AgentPlan): Promise<void> {
-	if (!isTauri()) return;
-	unwrap(await commands.storeAgentPlan(plan));
-}
-
-export async function executeAgentPlan(planId: string): Promise<void> {
-	if (!isTauri()) return;
-	unwrap(await commands.executeAgentPlan(planId));
 }
 
 // --- Media (MPRIS) ---

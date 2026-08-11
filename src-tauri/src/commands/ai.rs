@@ -185,15 +185,34 @@ pub async fn test_ai_connection(state: State<'_, AppState>) -> Result<AiTestResu
         });
     };
 
-    // A trivial prompt that forces a real inference call with the chosen model.
-    let fut = provider.answer_question(
-        "You are a connection test. Reply with the single word: ok.",
-        "ping",
-    );
+    // A trivial one-turn chat (no tools) that forces a real inference call with
+    // the chosen model. Routing through `chat()` means the connection test uses
+    // the SAME wire path as real requests — so it inherits `errors::classify`
+    // and capability learning, instead of the separate legacy encoder it used
+    // to call.
+    use futures_util::StreamExt as _;
+    use lychi_core::providers::{CancellationToken, ChatMessage, StreamEvent};
+
+    let messages = [ChatMessage::user("ping")];
+    let mut stream = provider.chat(&messages, &[], CancellationToken::new());
+
+    // We only need to reach the first terminal signal: any successful event
+    // proves endpoint+auth+model; a stream error is the real failure to report.
+    let drain = async {
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(StreamEvent::Done { .. }) => return Ok(()),
+                Ok(_) => continue, // prose/tool deltas — keep reading to Done
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(()) // stream ended without an explicit Done — still a clean run
+    };
+
     // Bound the test so a hung endpoint doesn't wedge the settings UI.
     let timeout = std::time::Duration::from_secs(ai.timeout_secs.clamp(2, 30));
-    match tokio::time::timeout(timeout, fut).await {
-        Ok(Ok(_reply)) => Ok(AiTestResult {
+    match tokio::time::timeout(timeout, drain).await {
+        Ok(Ok(())) => Ok(AiTestResult {
             ok: true,
             error: None,
         }),

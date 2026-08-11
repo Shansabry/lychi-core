@@ -29,12 +29,10 @@ use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 
 use crate::error::LychiError;
-use crate::intent::prompt;
 use crate::providers::local_models::{self, ChatFormat, ModelSpec};
 
 use super::{
-    AiProvider, AiResponse, AiRoute, CancellationToken, ChatMessage, EventStream, Role, StopReason,
-    StreamEvent, ToolDef,
+    AiProvider, CancellationToken, ChatMessage, EventStream, Role, StopReason, StreamEvent, ToolDef,
 };
 
 /// The one-time, process-global llama.cpp backend. `LlamaBackend::init()` sets up
@@ -177,20 +175,6 @@ fn n_threads() -> i32 {
         .map(|n| n.get())
         .unwrap_or(4);
     ((cores / 2).clamp(1, 8)) as i32
-}
-
-/// Run one blocking generation against a loaded model. Pure CPU work — MUST be
-/// called inside `spawn_blocking`. `grammar` (GBNF) constrains the output when
-/// `Some` — used by the routing path to force a valid JSON object so a small
-/// model can't emit trailing prose or malformed JSON.
-fn run_generation(
-    model: &LoadedModel,
-    system: &str,
-    user: &str,
-    max_tokens: u32,
-    grammar: Option<&str>,
-) -> Result<String, LychiError> {
-    generate_inner(model, system, user, max_tokens, grammar, None).map(|(out, _)| out)
 }
 
 /// The generation core, returning `(text, decoded_token_count)` so the benchmark
@@ -395,63 +379,6 @@ impl LocalClient {
             max_tokens,
         })
     }
-
-    /// Generate text under an optional output grammar.
-    async fn generate(
-        &self,
-        system_prompt: &str,
-        user_input: &str,
-        grammar_mode: GrammarMode,
-    ) -> Result<String, LychiError> {
-        let spec = self.spec;
-        let path = self.gguf_path.clone();
-        let (system, user) = (system_prompt.to_string(), user_input.to_string());
-        let max = self.max_tokens;
-
-        // Load (or reuse resident) + run the forward pass off the async runtime.
-        tokio::task::spawn_blocking(move || {
-            let model = load_resident(spec, &path)?;
-            let grammar = grammar_mode.grammar()?;
-            run_generation(&model, &system, &user, max, grammar.as_deref())
-        })
-        .await
-        .map_err(|e| LychiError::Ai(format!("inference task panicked: {e}")))?
-    }
-}
-
-/// How to constrain the model's output for a given call.
-enum GrammarMode {
-    /// Free text — no grammar (ask/answer path).
-    Free,
-    /// Routing: the output must be `{"action_id": <one of these>, "args": "..."}`.
-    /// Constraining `action_id` to the actual known actions structurally prevents
-    /// the model from inventing a nonexistent action — the biggest quality win for
-    /// small models, and correct for any model.
-    Route(Vec<String>),
-    /// Tool-calling (the `chat` primitive): the output is EITHER a tool call
-    /// `{"tool": <one of these>, "args": "..."}` OR a final answer
-    /// `{"answer": "..."}`. The enum-constrained `tool` name means the small
-    /// local model can only pick a real tool; the two-way union lets it also just
-    /// answer. One tool call per turn — the coordinator loops.
-    ///
-    /// TODO(local-tools): the local `chat` impl doesn't yet drive this grammar —
-    /// local AI currently answers (tools=[]) but can't call tools. Wiring this is
-    /// the remaining piece of local-model agent support; `tool_grammar` + this
-    /// variant are the scaffolding, kept intentionally.
-    #[allow(dead_code)]
-    Tool(Vec<String>),
-}
-
-impl GrammarMode {
-    /// Build the GBNF grammar string for this mode (None = free text). The
-    /// route/tool grammars are cached per name-set so we don't rebuild each call.
-    fn grammar(&self) -> Result<Option<String>, LychiError> {
-        match self {
-            GrammarMode::Free => Ok(None),
-            GrammarMode::Route(actions) => Ok(Some(route_grammar(actions)?)),
-            GrammarMode::Tool(tools) => Ok(Some(tool_grammar(tools)?)),
-        }
-    }
 }
 
 /// Build a GBNF grammar for a tool-calling response: EITHER
@@ -485,87 +412,14 @@ fn tool_grammar(tools: &[String]) -> Result<String, LychiError> {
     Ok(grammar)
 }
 
-/// Build a GBNF grammar for a routing response constrained to the given action
-/// IDs: `{"action_id": ("a"|"b"|...), "args": <string>}`. We build the JSON
-/// schema (an object with an `enum`-constrained `action_id`) and hand it to
-/// llama.cpp's official `json_schema_to_grammar`, so the grammar is always valid.
-fn route_grammar(actions: &[String]) -> Result<String, LychiError> {
-    // Cache by the action-set (it's stable across a session but can change if the
-    // registry changes). Keyed by a join of the ids.
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, String>>> = OnceLock::new();
-    let key = actions.join("\u{1}");
-    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    if let Some(g) = cache.lock().ok().and_then(|c| c.get(&key).cloned()) {
-        return Ok(g);
-    }
-
-    // action_id is an enum of the known IDs; args is any string. additional
-    // properties disallowed so no stray fields.
-    let enum_json = serde_json::to_string(actions)
-        .map_err(|e| LychiError::Ai(format!("build route schema: {e}")))?;
-    let schema = format!(
-        r#"{{"type":"object","properties":{{"action_id":{{"type":"string","enum":{enum_json}}},"args":{{"type":"string"}}}},"required":["action_id","args"],"additionalProperties":false}}"#
-    );
-    let grammar = llama_cpp_2::json_schema_to_grammar(&schema)
-        .map_err(|e| LychiError::Ai(format!("build route grammar: {e}")))?;
-    if let Ok(mut c) = cache.lock() {
-        c.insert(key, grammar.clone());
-    }
-    Ok(grammar)
-}
-
 #[async_trait]
 impl AiProvider for LocalClient {
-    async fn route_intent(
-        &self,
-        input: &str,
-        known_actions: &[&str],
-    ) -> Result<AiRoute, LychiError> {
-        match self.route_or_plan(input, known_actions, None).await? {
-            AiResponse::SingleRoute(route) => Ok(route),
-            AiResponse::Plan(_) => Err(LychiError::Ai(
-                "AI returned a plan but single route was expected".to_string(),
-            )),
-        }
-    }
-
-    async fn route_or_plan(
-        &self,
-        input: &str,
-        known_actions: &[&str],
-        context_hint: Option<&str>,
-    ) -> Result<AiResponse, LychiError> {
-        let sys_prompt = prompt::system_prompt(known_actions, context_hint);
-        // Routing → constrain the output to `{"action_id": <known>, "args": ...}`
-        // so the model can only pick a real action (and always emits valid JSON).
-        let actions = known_actions.iter().map(|s| s.to_string()).collect();
-        let response = self
-            .generate(&sys_prompt, input, GrammarMode::Route(actions))
-            .await?;
-        tracing::debug!(
-            provider = "local",
-            model = %self.spec.id,
-            "[ai] raw response: {response}"
-        );
-        prompt::parse_ai_response(&response, known_actions, input)
-    }
-
     async fn health_check(&self) -> bool {
         self.gguf_path.exists()
     }
 
     fn name(&self) -> &str {
         "local"
-    }
-
-    async fn answer_question(
-        &self,
-        system_prompt: &str,
-        question: &str,
-    ) -> Result<String, LychiError> {
-        // Free-form answer → no grammar constraint.
-        self.generate(system_prompt, question, GrammarMode::Free)
-            .await
     }
 
     /// Streaming, grammar-constrained tool-calling chat as a normalized event
@@ -809,42 +663,25 @@ mod bench {
             return;
         };
         let model = load_resident(spec, &dir.join(spec.gguf_filename())).unwrap();
-        // ~1200-token system prompt (well past 512), like the real router prompt,
-        // WITH the action-constrained route grammar — exactly the path that
-        // failed live (grammar assert + oversized-prompt abort).
+        // ~1200-token system prompt (well past 512), like the real agent prompt,
+        // WITH a tool-constrained grammar — exactly the path that failed live
+        // (grammar assert + oversized-prompt abort).
         let big = format!(
-            "You are an intent router. Respond with a JSON object. {}",
-            "Consider the available actions carefully. ".repeat(180)
+            "You are a tool-calling agent. Respond with a JSON object. {}",
+            "Consider the available tools carefully. ".repeat(180)
         );
-        let actions: Vec<String> = ["open", "web", "ask", "run", "calc"]
+        let tools: Vec<String> = ["open", "web", "calc"]
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let grammar = route_grammar(&actions).expect("grammar builds");
+        let grammar = tool_grammar(&tools).expect("grammar builds");
         let (out, _) = generate_inner(&model, &big, "open firefox", 48, Some(&grammar), None)
             .expect("large prompt must not abort");
-        println!("route-grammar output: {out:?}");
-        // The grammar guarantees a parseable object with a KNOWN action_id.
+        println!("tool-grammar output: {out:?}");
+        // The grammar guarantees a parseable object (tool call or answer).
         let v: serde_json::Value =
             serde_json::from_str(out.trim()).expect("grammar output must be valid JSON");
         assert!(v.is_object(), "output must be a JSON object");
-        let action = v["action_id"].as_str().unwrap_or("");
-        assert!(
-            actions.iter().any(|a| a == action),
-            "action_id {action:?} must be one of the constrained actions"
-        );
-    }
-
-    #[test]
-    fn route_grammar_builds_and_constrains() {
-        // Pure (no model needed): the schema→grammar conversion must succeed and
-        // the grammar must mention the action literals.
-        let actions: Vec<String> = ["open", "ask", "web"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let g = route_grammar(&actions).expect("route grammar builds");
-        assert!(g.contains("open") && g.contains("ask") && g.contains("web"));
     }
 
     #[test]

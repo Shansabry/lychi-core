@@ -1,16 +1,12 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::LychiError;
-use crate::intent::prompt;
 
-use super::{
-    AiProvider, AiResponse, AiRoute, CancellationToken, ChatMessage, EventStream, ToolDef,
-};
+use super::{AiProvider, CancellationToken, ChatMessage, EventStream, ToolDef};
 
 /// A source of Firebase ID tokens — implemented by the src-tauri layer
 /// using the OS keyring. This trait lives in core so CloudClient can be
@@ -54,42 +50,6 @@ impl CloudClient {
         }
     }
 
-    /// POST to a cloud endpoint with Bearer auth. Returns parsed JSON.
-    async fn authed_post(&self, path: &str, body: Value) -> Result<Value, LychiError> {
-        let token = self.token_provider.get_token().await?;
-        let url = format!("{}{}", self.base_url, path);
-
-        let resp = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {token}"))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LychiError::Ai(format!("Cloud request failed: {e}")))?;
-
-        let status = resp.status();
-        let body_text = resp.text().await.unwrap_or_default();
-
-        if status.as_u16() == 402 {
-            return Err(LychiError::Ai(
-                "No cloud credits remaining — upgrade your plan at lychi.app".to_string(),
-            ));
-        }
-        if status.as_u16() == 401 {
-            return Err(LychiError::Ai(
-                "Cloud auth expired — please sign in again".to_string(),
-            ));
-        }
-        if !status.is_success() {
-            return Err(LychiError::Ai(format!("Cloud error {status}: {body_text}")));
-        }
-
-        serde_json::from_str::<Value>(&body_text)
-            .map_err(|e| LychiError::Ai(format!("Failed to parse cloud response: {e}")))
-    }
-
     /// Fetch the user's credit balance from the cloud.
     pub async fn get_credits(&self) -> Result<CreditBalance, LychiError> {
         let token = self.token_provider.get_token().await?;
@@ -118,45 +78,6 @@ impl CloudClient {
 
 #[async_trait]
 impl AiProvider for CloudClient {
-    async fn route_intent(
-        &self,
-        input: &str,
-        known_actions: &[&str],
-    ) -> Result<AiRoute, LychiError> {
-        match self.route_or_plan(input, known_actions, None).await? {
-            AiResponse::SingleRoute(route) => Ok(route),
-            AiResponse::Plan(_) => Err(LychiError::Ai(
-                "AI returned a plan but single route was expected".to_string(),
-            )),
-        }
-    }
-
-    async fn route_or_plan(
-        &self,
-        input: &str,
-        known_actions: &[&str],
-        context_hint: Option<&str>,
-    ) -> Result<AiResponse, LychiError> {
-        let body = json!({
-            "input": input,
-            "known_actions": known_actions,
-            "context_hint": context_hint.unwrap_or(""),
-        });
-
-        let json = self.authed_post("/v1/route", body).await?;
-
-        let content = json["content"]
-            .as_str()
-            .ok_or_else(|| LychiError::Ai("No content in cloud response".to_string()))?;
-
-        tracing::debug!(
-            prompt_version = prompt::PROMPT_VERSION,
-            provider = "cloud",
-            "[ai] raw response: {content}"
-        );
-        prompt::parse_ai_response(content, known_actions, input)
-    }
-
     async fn health_check(&self) -> bool {
         let url = format!("{}/health", self.base_url);
         let result = self
@@ -172,24 +93,6 @@ impl AiProvider for CloudClient {
 
     fn name(&self) -> &str {
         "cloud"
-    }
-
-    async fn answer_question(
-        &self,
-        system_prompt: &str,
-        question: &str,
-    ) -> Result<String, LychiError> {
-        let body = json!({
-            "system_prompt": system_prompt,
-            "question": question,
-        });
-
-        let json = self.authed_post("/v1/ask", body).await?;
-
-        json["answer"]
-            .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| LychiError::Ai("No answer in cloud response".to_string()))
     }
 
     /// Cloud streaming chat is not available until the lychi-cloud proxy exposes

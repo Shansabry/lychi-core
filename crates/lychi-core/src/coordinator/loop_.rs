@@ -585,7 +585,6 @@ struct TurnResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{AiResponse, AiRoute};
     use async_trait::async_trait;
     use futures_util::stream;
     use std::sync::Mutex;
@@ -610,17 +609,6 @@ mod tests {
     }
     #[async_trait]
     impl AiProvider for MockProvider {
-        async fn route_intent(&self, _: &str, _: &[&str]) -> Result<AiRoute, LychiError> {
-            unreachable!()
-        }
-        async fn route_or_plan(
-            &self,
-            _: &str,
-            _: &[&str],
-            _: Option<&str>,
-        ) -> Result<AiResponse, LychiError> {
-            unreachable!()
-        }
         async fn health_check(&self) -> bool {
             true
         }
@@ -1259,17 +1247,6 @@ mod tests {
     struct FailingProvider;
     #[async_trait]
     impl AiProvider for FailingProvider {
-        async fn route_intent(&self, _: &str, _: &[&str]) -> Result<AiRoute, LychiError> {
-            unreachable!()
-        }
-        async fn route_or_plan(
-            &self,
-            _: &str,
-            _: &[&str],
-            _: Option<&str>,
-        ) -> Result<AiResponse, LychiError> {
-            unreachable!()
-        }
         async fn health_check(&self) -> bool {
             true
         }

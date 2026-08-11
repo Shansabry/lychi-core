@@ -16,7 +16,6 @@ use crate::context::EnvironmentContext;
 use crate::error::LychiError;
 use crate::history::HistoryStore;
 use crate::intent::{IntentResolver, RoutingMethod};
-use crate::providers::AgentPlan;
 use crate::rules::{RulesEngine, ValidationDecision, ValidationRequest};
 
 /// Expand `@<path>` file references into real filesystem paths before routing.
@@ -650,14 +649,6 @@ impl Executor {
         privacy: &PrivacyConfig,
         inputs: &RunInputs,
     ) -> Result<ExecuteResult, LychiError> {
-        // Set context hint on AI router so it's included in the prompt
-        if preresolved.is_none()
-            && let Some(ai) = self.resolver.ai_router()
-        {
-            let hint = self.context.as_ref().and_then(|ctx| ctx.ai_hint());
-            ai.set_context_hint(hint);
-        }
-
         // Expand `@<path>` file references into real paths FIRST, so every
         // downstream step (routing, clipboard expansion, handler execution) sees
         // a normal path instead of a literal `@…` token.
@@ -1225,11 +1216,6 @@ impl Executor {
     /// input isn't a question yet — offering to search the web for "d" is noise.
     fn wants_fallbacks(raw: &str) -> bool {
         raw.trim().chars().count() >= 2
-    }
-
-    /// Ask AI for a plan.
-    pub async fn try_plan(&self, raw: &str) -> Option<AgentPlan> {
-        self.resolver.try_plan(raw, &self.registry).await
     }
 
     /// Whether AI is available.

@@ -1,4 +1,3 @@
-pub mod agent;
 pub mod agent_chat;
 pub mod ai;
 pub mod ai_chat;

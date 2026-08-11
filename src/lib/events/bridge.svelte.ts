@@ -19,7 +19,6 @@ import type {
 	AiOnSelectionPayload,
 	EnvironmentContext,
 	FileSearchBatch,
-	StepEvent,
 	TrackInfo,
 } from "$lib/ipc";
 import { route } from "./router";
@@ -28,8 +27,6 @@ import { route } from "./router";
 export interface BridgeHandlers {
 	/** Mark the launcher visible/ready (shown / summon / self-heal). */
 	ready: () => void;
-	/** A finished agent-plan step (drives the plan panel + last result). */
-	agentStep: (payload: StepEvent) => void;
 	/** Full summon reset (input/plan/routing clear, focus, load suggestions…). */
 	summon: () => void;
 	/** After fresh context arrives, re-enrich empty-input suggestions. */
@@ -92,7 +89,6 @@ export async function attachTauriEvents(h: BridgeHandlers): Promise<() => void> 
 	);
 
 	// --- Page-coupled events → delegated handlers ---
-	offs.push(await win.listen<StepEvent>("lychi://agent-step", (e) => h.agentStep(e.payload)));
 	offs.push(await win.listen("lychi://shown", () => h.ready()));
 	offs.push(await win.listen("lychi://summon", () => h.summon()));
 	offs.push(await win.listen("lychi://dismiss", () => h.dismiss()));

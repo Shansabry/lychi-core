@@ -1,16 +1,13 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::time::Duration;
 
 use crate::error::LychiError;
-use crate::intent::prompt;
 
 use super::wire::{AuthStyle, Dialect, WireClient};
-use super::{
-    AiProvider, AiResponse, AiRoute, CancellationToken, ChatMessage, EventStream, ToolDef,
-};
+use super::{AiProvider, CancellationToken, ChatMessage, EventStream, ToolDef};
 
 /// Model info returned by Ollama's `/api/tags` endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
@@ -43,46 +40,6 @@ impl OllamaClient {
             max_tokens,
             http,
         }
-    }
-
-    /// Send a chat completion request to Ollama's OpenAI-compatible endpoint.
-    async fn call_chat(&self, system_prompt: &str, user_input: &str) -> Result<String, LychiError> {
-        let url = format!("{}/v1/chat/completions", self.base_url);
-        let body = json!({
-            "model": self.model,
-            "messages": [
-                { "role": "system", "content": system_prompt },
-                { "role": "user", "content": user_input }
-            ],
-            "max_tokens": self.max_tokens,
-            "temperature": 0.0,
-            "stream": false
-        });
-
-        let resp = self
-            .http
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LychiError::Ai(format!("Ollama request failed: {e}")))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(LychiError::Ai(format!("Ollama returned {status}: {body}")));
-        }
-
-        let json: Value = resp
-            .json()
-            .await
-            .map_err(|e| LychiError::Ai(format!("Failed to parse Ollama response: {e}")))?;
-
-        json["choices"][0]["message"]["content"]
-            .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| LychiError::Ai("No content in Ollama response".to_string()))
     }
 
     /// List available models from a running Ollama instance.
@@ -130,37 +87,6 @@ impl OllamaClient {
 
 #[async_trait]
 impl AiProvider for OllamaClient {
-    async fn route_intent(
-        &self,
-        input: &str,
-        known_actions: &[&str],
-    ) -> Result<AiRoute, LychiError> {
-        match self.route_or_plan(input, known_actions, None).await? {
-            AiResponse::SingleRoute(route) => Ok(route),
-            AiResponse::Plan(_) => Err(LychiError::Ai(
-                "AI returned a plan but single route was expected".to_string(),
-            )),
-        }
-    }
-
-    async fn route_or_plan(
-        &self,
-        input: &str,
-        known_actions: &[&str],
-        context_hint: Option<&str>,
-    ) -> Result<AiResponse, LychiError> {
-        let sys_prompt = prompt::system_prompt(known_actions, context_hint);
-        let response = self.call_chat(&sys_prompt, input).await?;
-
-        tracing::debug!(
-            prompt_version = prompt::PROMPT_VERSION,
-            provider = "ollama",
-            model = %self.model,
-            "[ai] raw response: {response}"
-        );
-        prompt::parse_ai_response(&response, known_actions, input)
-    }
-
     async fn health_check(&self) -> bool {
         let url = format!("{}/api/tags", self.base_url);
         let result = self
@@ -176,14 +102,6 @@ impl AiProvider for OllamaClient {
 
     fn name(&self) -> &str {
         "ollama"
-    }
-
-    async fn answer_question(
-        &self,
-        system_prompt: &str,
-        question: &str,
-    ) -> Result<String, LychiError> {
-        self.call_chat(system_prompt, question).await
     }
 
     /// Streaming chat: Ollama is just the OpenAI dialect against its local

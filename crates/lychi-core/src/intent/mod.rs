@@ -5,7 +5,6 @@ pub mod prompt;
 pub mod typo_suggest;
 
 use crate::action_registry::registry::ActionRegistry;
-use crate::providers::{AgentPlan, AiResponse};
 use ai_router::AiRouter;
 use patterns::{Confidence, PatternResult};
 
@@ -42,17 +41,12 @@ impl IntentResolver {
         }
     }
 
-    /// Whether AI routing is available.
+    /// Whether AI is available — its presence gates natural-language routing.
     pub fn has_ai(&self) -> bool {
         self.ai_router.is_some()
     }
 
-    /// Get the AI router reference (for health checks etc).
-    pub fn ai_router(&self) -> Option<&AiRouter> {
-        self.ai_router.as_deref()
-    }
-
-    /// Set or replace the AI router.
+    /// Set or replace the AI holder.
     pub fn set_ai_router(&mut self, router: AiRouter) {
         self.ai_router = Some(std::sync::Arc::new(router));
     }
@@ -260,23 +254,6 @@ impl IntentResolver {
                     routing: RoutingMethod::Pattern,
                 }
             }
-        }
-    }
-
-    /// Ask AI for a multi-step plan. Returns `None` if AI is unavailable
-    /// or the input resolves to a single-shot route.
-    pub async fn try_plan(&self, raw: &str, registry: &ActionRegistry) -> Option<AgentPlan> {
-        // Only unmatched inputs can produce plans — deterministic matches are final
-        if let PatternResult::Match(_) = patterns::route(raw, registry) {
-            return None;
-        }
-
-        let ai = self.ai_router.as_ref()?;
-        let known: Vec<&str> = registry.list_ids();
-
-        match ai.try_route_or_plan(raw, &known).await {
-            Ok(Some(AiResponse::Plan(plan))) => Some(plan),
-            _ => None,
         }
     }
 }

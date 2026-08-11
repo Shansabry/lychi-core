@@ -57,7 +57,7 @@ use lychi_core::intent::ai_router::AiRouter;
 #[cfg(feature = "mpris")]
 use lychi_core::mpris::MprisManager;
 use lychi_core::paths;
-use lychi_core::providers::{AgentPlan, AiProvider};
+use lychi_core::providers::AiProvider;
 use lychi_core::rules::RulesEngine;
 
 /// An action assessed and awaiting user confirmation (G1). Stores the exact
@@ -146,7 +146,6 @@ pub struct AppState {
     /// Stable id for the current conversation, so follow-ups upsert the SAME
     /// history row (Phase 4). Set on a fresh start, reused on continue/approve.
     pub agent_conversation_id: Arc<RwLock<Option<String>>>,
-    pub pending_plan: Arc<RwLock<Option<AgentPlan>>>,
     /// The action awaiting user confirmation (G1). Captured when the pipeline
     /// returns `needs_confirmation`; the `confirm_execution` command executes
     /// THIS exact resolved intent rather than re-resolving raw input, closing the
@@ -445,7 +444,6 @@ impl AppState {
             ai_cancel: Arc::new(RwLock::new(None)),
             agent_session: Arc::new(RwLock::new(None)),
             agent_conversation_id: Arc::new(RwLock::new(None)),
-            pending_plan: Arc::new(RwLock::new(None)),
             pending_execution: Arc::new(RwLock::new(None)),
             active_file_search: Arc::new(AtomicU64::new(0)),
             live_search: Arc::new(lychi_core::file_search::live::LiveSearch::new(Arc::new(
