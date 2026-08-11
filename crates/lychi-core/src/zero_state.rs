@@ -3,51 +3,45 @@
 //! An explicit sectioned composer, not a ranked pool. With nothing typed there
 //! is no query to rank against; these rows are browsable offers, and what the
 //! user needs from them is STABILITY — the same muscle-memory list on every
-//! summon. Section order:
+//! summon. Exactly two sections:
 //!
 //! 1. **Pins** — commands the user chose (⌘K → "Pin to top"). Always first,
 //!    always all of them, in pin order. The ownership backbone: pins never
 //!    decay, never reshuffle, never enter the CTR/suppression loops.
-//! 2. **Fresh clipboard action** — only while the copy is recent; a URL copied
-//!    hours ago is not "an explicit recent action" any more.
-//! 3. **Recent apps** — frecency-ranked launches. Works without context, so
-//!    the very first summon after boot is never blank.
-//! 4. **Workspace commands** — commands actually run ≥2 times in the current
-//!    workspace, ranked by the one blend in `context::suggestions`.
+//! 2. **Recent apps** — frecency-ranked launches, filling the rest.
+//!
+//! Nothing else. Context-derived command rows (workspace memory, clipboard
+//! actions) were tried here and removed by decision 2026-08-11: they vary
+//! with cwd/clipboard, which reads as inconsistency, and the commands a user
+//! actually wants at the top are exactly what pins express better. Context
+//! actions still surface once the user TYPES a matching keyword
+//! (`context::suggestions::typed_matches`), and the usage data keeps being
+//! recorded — re-offering them here is a config flag away if ever wanted.
 //!
 //! This mirrors the empty states users already trust: Raycast (Favorites
-//! first, then suggestions/recents) and PowerToys Command Palette (pinned,
-//! then recents). Nobody shows speculative rows there, and neither does this.
+//! first, then recents) and PowerToys Command Palette (pinned, then recents).
 
 use std::sync::Arc;
 
 use redb::Database;
 
 use crate::action_registry::CompletionItem;
-use crate::context::EnvironmentContext;
 use crate::db::frecency;
 use crate::pins::store::PinsStore;
 
-/// Target row budget. Pins are never trimmed (the user chose them); the
-/// remaining sections fill whatever room is left.
+/// Target row budget. Pins are never trimmed (the user chose them); recent
+/// apps fill whatever room is left.
 const TARGET_ROWS: usize = 8;
 
-/// How many recently-used app rows may show.
-const MAX_RECENT_APPS: usize = 4;
+/// Recent apps may fill the whole budget — with pins the only other section,
+/// there is nothing to reserve slots for.
+const MAX_RECENT_APPS: usize = TARGET_ROWS;
 
-/// Workspace commands are an accent, not the list.
-const MAX_WORKSPACE_ROWS: usize = 2;
-
-/// How recent a copy must be for the clipboard row to appear. Beyond this the
-/// clipboard is ambient state, not an action the user just took.
-const CLIPBOARD_FRESH_MS: u64 = 15 * 60 * 1000;
-
-/// Compose the empty-prompt list. `env` is optional by design: the first
-/// summon after launch runs before any context gather has landed, and pins +
-/// recent apps must show regardless — a blank launcher on the first open was
-/// one of the reported inconsistencies.
+/// Compose the empty-prompt list. Needs no environment context at all — the
+/// first summon after launch runs before any context gather has landed, and
+/// pins + recent apps must show regardless (a blank launcher on the first
+/// open was one of the reported inconsistencies).
 pub fn compose(
-    env: Option<&EnvironmentContext>,
     db: &Arc<Database>,
     cfg: &crate::config::schema::SuggestionsConfig,
 ) -> Vec<CompletionItem> {
@@ -68,37 +62,18 @@ pub fn compose(
         push(&mut items, &mut seen, pin);
     }
 
-    // Pins are never trimmed — the user chose exactly these. Everything after
-    // them fills the remaining room up to the target.
+    // Pins are never trimmed — the user chose exactly these. Apps fill the
+    // remaining room up to the target.
     let budget = TARGET_ROWS.max(items.len());
 
-    // Recents and context sections honour the config flag; pins do not — they
-    // are explicit user configuration (like quicklinks), not inferred history.
+    // Recents honour the config flag; pins do not — they are explicit user
+    // configuration (like quicklinks), not inferred history.
     if cfg.zero_state_recents {
-        if let Some(env) = env
-            && items.len() < budget
-            && clipboard_is_fresh(db)
-            && let Some(row) = crate::context::suggestions::clipboard_action(env)
-        {
-            push(&mut items, &mut seen, row);
-        }
-
         for app in recent_apps(db) {
             if items.len() >= budget {
                 break;
             }
             push(&mut items, &mut seen, app);
-        }
-
-        if let Some(env) = env {
-            for row in
-                crate::context::suggestions::workspace_commands(env, Some(db), MAX_WORKSPACE_ROWS)
-            {
-                if items.len() >= budget {
-                    break;
-                }
-                push(&mut items, &mut seen, row);
-            }
         }
     }
 
@@ -147,19 +122,6 @@ fn pin_rows(db: &Arc<Database>) -> Vec<CompletionItem> {
             }
         })
         .collect()
-}
-
-/// Was the newest clipboard capture recent enough to still be "something the
-/// user just did"? No stored entries (clipboard monitoring off, or nothing
-/// copied yet) means no evidence — the gate stays closed.
-fn clipboard_is_fresh(db: &Arc<Database>) -> bool {
-    crate::clipboard::store::ClipboardStore::new()
-        .get_entries(db, 1)
-        .ok()
-        .and_then(|entries| entries.into_iter().next())
-        .is_some_and(|newest| {
-            crate::db::now_millis().saturating_sub(newest.created_at) <= CLIPBOARD_FRESH_MS
-        })
 }
 
 /// Recently-used APPS, most-used first — the stable backbone of the list.
@@ -239,35 +201,11 @@ fn hint_item() -> CompletionItem {
 mod tests {
     use super::*;
     use crate::config::schema::SuggestionsConfig;
-    use crate::context::{GitContext, WindowContext};
     use crate::desktop_apps::index;
     use crate::pins::store::PinsStore;
 
     fn cfg() -> SuggestionsConfig {
         SuggestionsConfig::default()
-    }
-
-    fn empty_env() -> EnvironmentContext {
-        EnvironmentContext::default()
-    }
-
-    fn dev_env() -> EnvironmentContext {
-        let mut env = empty_env();
-        env.active_window = Some(WindowContext {
-            title: "term".into(),
-            wm_class: "org.gnome.terminal".into(),
-            pid: 1,
-            is_terminal: true,
-            is_ide: false,
-            window_id: None,
-        });
-        env.git = Some(GitContext {
-            repo_root: "/home/u/proj".into(),
-            branch: "main".into(),
-            dirty: true,
-            remote: None,
-        });
-        env
     }
 
     /// Pin the global app index for the duration of a test.
@@ -311,7 +249,7 @@ mod tests {
         store.add(&db, "cargo test", "cargo test").unwrap();
         store.add(&db, "open Notes", "Notes").unwrap();
 
-        let items = compose(None, &db, &cfg());
+        let items = compose(&db, &cfg());
         assert_eq!(items[0].label, "cargo test");
         assert_eq!(items[1].label, "Notes");
         assert!(items[0].pinned && items[1].pinned);
@@ -328,7 +266,7 @@ mod tests {
             .add(&db, "open Spotify", "Spotify")
             .unwrap();
 
-        let items = compose(Some(&empty_env()), &db, &cfg());
+        let items = compose(&db, &cfg());
         let spotify_rows = items
             .iter()
             .filter(|i| {
@@ -349,7 +287,7 @@ mod tests {
             .add(&db, "cargo test", "cargo test")
             .unwrap();
 
-        let items = compose(Some(&empty_env()), &db, &cfg());
+        let items = compose(&db, &cfg());
         for item in &items {
             assert_eq!(
                 item.pinned,
@@ -374,7 +312,7 @@ mod tests {
             zero_state_recents: false,
             ..SuggestionsConfig::default()
         };
-        let items = compose(Some(&empty_env()), &db, &off);
+        let items = compose(&db, &off);
         assert_eq!(items.len(), 1, "only the pin: {items:?}");
         assert_eq!(items[0].label, "cargo test");
     }
@@ -394,67 +332,42 @@ mod tests {
                 .unwrap();
         }
 
-        let items = compose(Some(&empty_env()), &db, &cfg());
+        let items = compose(&db, &cfg());
         assert_eq!(items.len(), TARGET_ROWS);
         assert!(items.iter().all(|i| i.pinned), "{items:?}");
     }
 
-    /// Workspace commands appear only from the second use — a one-off command
-    /// is an event, not a habit, and must not haunt the empty prompt.
+    /// Decision 2026-08-11: the empty prompt shows pins and apps, NOTHING
+    /// else. Workspace commands and clipboard actions — even well-used or
+    /// freshly-copied ones — never appear; they vary with cwd/clipboard,
+    /// which is exactly the inconsistency the zero state exists to avoid.
     #[test]
-    fn a_one_off_workspace_command_stays_hidden_until_the_second_use() {
+    fn command_rows_never_reach_the_empty_prompt() {
         let _idx = with_apps(&[]);
         let db = crate::db::open_test_database();
-        let mut env = dev_env();
-        env.cwd = Some("/home/u/proj".into());
-
-        frecency::record_workspace(&db, "/home/u/proj", "kill 1234").unwrap();
-        let items = compose(Some(&env), &db, &cfg());
-        assert!(
-            !items.iter().any(|i| i.label == "kill 1234"),
-            "a single-use command surfaced: {items:?}"
-        );
-
-        frecency::record_workspace(&db, "/home/u/proj", "kill 1234").unwrap();
-        let items = compose(Some(&env), &db, &cfg());
-        assert!(
-            items.iter().any(|i| i.label == "kill 1234"),
-            "a twice-used command must surface: {items:?}"
-        );
-    }
-
-    /// The clipboard row needs evidence the copy is FRESH. No stored capture
-    /// (or an old one) means the row stays hidden even with clipboard content
-    /// in the environment snapshot.
-    #[test]
-    fn the_clipboard_row_requires_a_fresh_capture() {
-        let _idx = with_apps(&[]);
-        let db = crate::db::open_test_database();
-        let mut env = empty_env();
-        env.clipboard = Some(crate::context::clipboard_detect::ClipboardContentType::Url(
-            "https://example.com/x".into(),
-        ));
-
-        let is_clip_row =
-            |i: &&CompletionItem| i.run.as_deref() == Some("open https://example.com/x");
-        let items = compose(Some(&env), &db, &cfg());
-        assert!(
-            !items.iter().any(|i| is_clip_row(&i)),
-            "no stored capture, yet the clipboard row showed: {items:?}"
-        );
-
+        // A well-established workspace habit (passes any use-count gate)...
+        frecency::record_workspace(&db, "/home/u/proj", "cargo test").unwrap();
+        frecency::record_workspace(&db, "/home/u/proj", "cargo test").unwrap();
+        frecency::record_workspace(&db, "/home/u/proj", "cargo test").unwrap();
+        // ...and a fresh clipboard capture.
         crate::clipboard::store::ClipboardStore::new()
             .push(&db, "https://example.com/x")
             .unwrap();
-        let items = compose(Some(&env), &db, &cfg());
+
+        let items = compose(&db, &cfg());
         assert!(
-            items.iter().any(|i| is_clip_row(&i)),
-            "fresh capture must surface the clipboard action: {items:?}"
+            !items.iter().any(|i| i.label == "cargo test"),
+            "a workspace command reached the empty prompt: {items:?}"
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|i| i.run.as_deref() == Some("open https://example.com/x")),
+            "a clipboard action reached the empty prompt: {items:?}"
         );
     }
 
-    /// A brand-new user sees the honest hint, not an empty list — with or
-    /// without context.
+    /// A brand-new user sees the honest hint, not an empty list.
     #[test]
     fn no_data_yields_the_hint() {
         let _idx = with_apps(&[("Spotify", "/usr/bin/spotify")]);
@@ -463,11 +376,9 @@ mod tests {
         // test that never writes would read the PREVIOUS test's entries. One
         // namespaced write (never a row) points the cache at this db.
         frecency::record(&db, "history:cache-warm").unwrap();
-        for env in [None, Some(&empty_env())] {
-            let items = compose(env, &db, &cfg());
-            assert_eq!(items.len(), 1);
-            assert_eq!(items[0].icon_path.as_deref(), Some("__info__"));
-        }
+        let items = compose(&db, &cfg());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].icon_path.as_deref(), Some("__info__"));
     }
 
     /// Dirty git repo, terminal focused, but nothing used: the zero state
@@ -479,7 +390,7 @@ mod tests {
         frecency::record(&db, "history:open firefox").unwrap();
         frecency::record(&db, "history:web rust docs").unwrap();
 
-        let items = compose(Some(&dev_env()), &db, &cfg());
+        let items = compose(&db, &cfg());
         assert!(
             !items.iter().any(|i| i.label.starts_with("git ")),
             "speculative git commands must never appear: {items:?}"
@@ -501,7 +412,7 @@ mod tests {
         // Exactly what `app_launcher` records on launch.
         frecency::record(&db, "spotify").unwrap();
 
-        let items = compose(Some(&empty_env()), &db, &cfg());
+        let items = compose(&db, &cfg());
 
         let row = items
             .iter()
@@ -524,7 +435,7 @@ mod tests {
         frecency::record(&db, "spotify").unwrap();
         frecency::record(&db, "history:open spotify").unwrap();
 
-        let items = compose(Some(&empty_env()), &db, &cfg());
+        let items = compose(&db, &cfg());
         let opens: Vec<&CompletionItem> = items
             .iter()
             .filter(|i| {
@@ -559,7 +470,7 @@ mod tests {
             frecency::record(&db, key).unwrap();
         }
 
-        let items = compose(Some(&empty_env()), &db, &cfg());
+        let items = compose(&db, &cfg());
 
         // Assert on the COUNT, not on the labels. Five non-app keys were
         // recorded and no app key was, so the only correct answer is zero
@@ -582,7 +493,7 @@ mod tests {
         frecency::record(&db, "spotify").unwrap();
         frecency::record(&db, "an-app-that-was-removed").unwrap();
 
-        let items = compose(Some(&empty_env()), &db, &cfg());
+        let items = compose(&db, &cfg());
         assert!(
             !items
                 .iter()
@@ -604,7 +515,7 @@ mod tests {
             frecency::record(&db, &name.to_lowercase()).unwrap();
         }
 
-        let items = compose(Some(&empty_env()), &db, &cfg());
+        let items = compose(&db, &cfg());
         assert!(items.len() <= TARGET_ROWS, "over the total cap: {items:?}");
         let app_rows = items.iter().filter(|i| i.label.starts_with("App")).count();
         assert!(
@@ -630,7 +541,7 @@ mod tests {
         }
         PinsStore::new().add(&db, "open App9", "App9").unwrap();
 
-        let _ = compose(Some(&empty_env()), &db, &cfg());
+        let _ = compose(&db, &cfg());
 
         let resolved = index::app_index()
             .entries
@@ -645,53 +556,6 @@ mod tests {
         );
     }
 
-    /// The screenshot bug: workspace memory offered `open Xfce Terminal` as a
-    /// raw command row ABOVE the real Xfce Terminal app row. Two rows, one
-    /// target, and the uglier one first.
-    #[test]
-    fn workspace_memory_does_not_duplicate_an_app_row() {
-        let _idx = with_apps(&[("Xfce Terminal", "/usr/bin/xfce4-terminal")]);
-        let db = crate::db::open_test_database();
-        // The app itself, and a workspace memory of having launched it here —
-        // twice, so the ≥2-uses gate is not what hides it.
-        frecency::record(&db, "xfce terminal").unwrap();
-        frecency::record_workspace(&db, "/home/u/proj", "open Xfce Terminal").unwrap();
-        frecency::record_workspace(&db, "/home/u/proj", "open Xfce Terminal").unwrap();
-
-        // `MemoryProvider` keys on the project root or, failing that, the cwd.
-        let mut env = dev_env();
-        env.cwd = Some("/home/u/proj".into());
-
-        let items = compose(Some(&env), &db, &cfg());
-        let raw = items
-            .iter()
-            .filter(|i| i.label.starts_with("open "))
-            .count();
-        assert_eq!(
-            raw, 0,
-            "an app launch is still shown as raw command text: {items:?}"
-        );
-    }
-
-    /// ...but workspace memory must keep offering real COMMANDS. Dropping app
-    /// launches must not gut the feature.
-    #[test]
-    fn workspace_memory_still_offers_commands() {
-        let _idx = with_apps(&[("Xfce Terminal", "/usr/bin/xfce4-terminal")]);
-        let db = crate::db::open_test_database();
-        frecency::record_workspace(&db, "/home/u/proj", "cargo test").unwrap();
-        frecency::record_workspace(&db, "/home/u/proj", "cargo test").unwrap();
-
-        let mut env = dev_env();
-        env.cwd = Some("/home/u/proj".into());
-
-        let items = compose(Some(&env), &db, &cfg());
-        assert!(
-            items.iter().any(|i| i.label == "cargo test"),
-            "workspace memory stopped offering commands: {items:?}"
-        );
-    }
-
     /// The index lookup — not the `:`/`/` pre-filter — is what decides whether
     /// a frecency key names an app. A key that is NOT an app name must produce
     /// no row even though it passes the pre-filter.
@@ -703,7 +567,7 @@ mod tests {
         // not an installed app.
         frecency::record(&db, "definitely-not-an-app").unwrap();
 
-        let items = compose(Some(&empty_env()), &db, &cfg());
+        let items = compose(&db, &cfg());
         assert!(
             !items.iter().any(|i| i.run.is_some()),
             "a key that is not an app produced a launchable row: {items:?}"

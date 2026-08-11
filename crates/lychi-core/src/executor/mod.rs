@@ -1101,17 +1101,17 @@ impl Executor {
             return None;
         }
 
-        // NO context gate, deliberately: the first summon after launch runs
-        // before any context gather has landed, and it must still show pins
-        // and recent apps instead of a blank panel. Context only ENRICHES
-        // (clipboard action, workspace commands) — the composer handles both
-        // shapes. `zero_state_recents` is honoured inside the composer too,
+        // The composer needs no context at all (pins + recent apps only), so
+        // the first summon after launch shows the real list instead of a
+        // blank panel. `zero_state_recents` is honoured inside the composer,
         // because pins survive the flag (explicit config, not history).
-        let items = crate::zero_state::compose(self.context.as_ref(), &self.db, cfg);
+        let items = crate::zero_state::compose(&self.db, cfg);
 
         let Some(ctx) = self.context.as_ref() else {
             return Some(items);
         };
+        // No `__context__` rows exist here any more, so this clears the shown
+        // latch (stale acceptance credit) and records nothing.
         self.note_suggestions(&items);
         self.record_impressions_debounced(ctx, &items);
         let mut items = items;
