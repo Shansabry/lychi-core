@@ -55,7 +55,7 @@ fn check_shell_authorization(cmd: &str, clearance: Clearance) -> Result<(), Lych
             // Command text in a warn line ships in the default-level log file —
             // scrub token shapes (the reason only names the matched pattern).
             tracing::warn!(
-                cmd = %crate::text::scrub_secrets(&cmd),
+                cmd = %crate::text::scrub_secrets(cmd),
                 %reason,
                 "[shell_exec] refused: needs confirmation, none granted"
             );
@@ -65,7 +65,7 @@ fn check_shell_authorization(cmd: &str, clearance: Clearance) -> Result<(), Lych
         }
         ShellDecision::Deny { reason } => {
             tracing::warn!(
-                cmd = %crate::text::scrub_secrets(&cmd),
+                cmd = %crate::text::scrub_secrets(cmd),
                 %reason,
                 "[shell_exec] hard-deny blocked shell execution"
             );

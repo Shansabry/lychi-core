@@ -419,7 +419,7 @@ mod tests {
         }
     }
 
-    fn step<'a>(list: &'a SetupChecklist, id: StepId) -> &'a SetupStep {
+    fn step(list: &SetupChecklist, id: StepId) -> &SetupStep {
         list.steps
             .iter()
             .find(|s| s.id == id)

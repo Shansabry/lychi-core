@@ -55,6 +55,11 @@ pub const AI_CONVERSATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new(
 /// stops re-sending requests a model has already rejected.
 pub const MODEL_CAPS: TableDefinition<&str, &[u8]> = TableDefinition::new("model_caps");
 
+/// User-pinned zero-state rows: key = normalized run string (lowercased,
+/// whitespace-collapsed), value = postcard-serialized PinEntry. The user's
+/// hand-chosen commands, always shown first on the empty prompt.
+pub const PINS: TableDefinition<&str, &[u8]> = TableDefinition::new("pins");
+
 /// Database metadata: key = a reserved name (only "schema_version" today),
 /// value = raw bytes. NOT enveloped — this table is how the envelope is found.
 pub const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -84,7 +89,7 @@ pub const SCHEMA_VERSION: u8 = 1;
 
 /// Every enveloped table — the migration and any future whole-table rewrite
 /// iterate this list, so a new table added here is versioned from birth.
-pub(crate) const ENVELOPED_TABLES: [&str; 13] = [
+pub(crate) const ENVELOPED_TABLES: [&str; 14] = [
     "history",
     "notes",
     "todos",
@@ -98,6 +103,7 @@ pub(crate) const ENVELOPED_TABLES: [&str; 13] = [
     "ai_presets",
     "ai_conversations",
     "model_caps",
+    "pins",
 ];
 
 /// Owner-only permissions for anything holding user content.
@@ -222,6 +228,7 @@ pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
     txn.open_table(AI_PRESETS)?;
     txn.open_table(AI_CONVERSATIONS)?;
     txn.open_table(MODEL_CAPS)?;
+    txn.open_table(PINS)?;
     txn.open_table(META)?;
     txn.commit()?;
 
@@ -381,16 +388,17 @@ pub fn encode_row<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, LychiError>
 /// decodes as `T` from byte zero AND consumes every byte; a newer row's
 /// tagged bytes will not. Exact consumption is load-bearing, not pedantry:
 /// `postcard::from_bytes` tolerates trailing bytes, and a small all-integer
-/// struct really did parse out of a tagged row in testing — `take_from_bytes`
-/// + empty-remainder closes that. On fallback failure the ORIGINAL tag error
-/// is returned, so a real downgrade still says "written by schema vN".
+/// struct really did parse out of a tagged row in testing — the
+/// `take_from_bytes` empty-remainder check closes that. On fallback failure
+/// the ORIGINAL tag error is returned, so a real downgrade still says
+/// "written by schema vN".
 pub fn decode_value<'a, T: serde::Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, LychiError> {
     match body_of(bytes) {
         Ok(body) => {
             postcard::from_bytes(body).map_err(|e| LychiError::Database(format!("row decode: {e}")))
         }
         Err(tag_err) if !bytes.is_empty() => match postcard::take_from_bytes::<T>(bytes) {
-            Ok((v, rest)) if rest.is_empty() => Ok(v),
+            Ok((v, [])) => Ok(v),
             _ => Err(tag_err),
         },
         Err(e) => Err(e),
