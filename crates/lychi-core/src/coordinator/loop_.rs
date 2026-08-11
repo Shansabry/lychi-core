@@ -304,6 +304,18 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                 return Outcome::Done { session };
             }
 
+            // Collapse duplicate calls the model emitted in ONE turn — same tool
+            // name + same args. Small/fast models (seen with groq llama-3.3)
+            // sometimes request an identical tool twice in a single turn;
+            // running a side-effecting tool (a screenshot, a shell command)
+            // twice is never what the user wanted, and it doubles the round-trip
+            // token cost that then trips rate limits. We keep the FIRST call to
+            // actually execute, and answer each later identical call with the
+            // first's result — the API contract still holds (every tool_use id
+            // gets a tool_result) without acting twice. Dedup is per-turn only:
+            // a later turn legitimately re-calling the same tool is untouched.
+            let calls = self.dedup_calls(&mut session, calls);
+
             // Execute the batch IN FULL before suspending. The provider
             // contract is unforgiving here: every tool_use id in the assistant
             // turn must have a matching tool_result in the conversation before
@@ -573,6 +585,42 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
         }
         None
     }
+
+    /// Collapse identical tool calls within a single turn (same name + args).
+    ///
+    /// Returns the calls to actually execute (first occurrence of each unique
+    /// name+args), having already answered every DUPLICATE with a tool_result
+    /// so the provider contract holds. The duplicate's UI events are emitted
+    /// too, so the panel shows it resolved rather than pending. A tool the
+    /// model calls again in a LATER turn is unaffected — this is per-batch only.
+    fn dedup_calls(&self, session: &mut Session, calls: Vec<ToolCall>) -> Vec<ToolCall> {
+        let mut seen: Vec<(String, String)> = Vec::new();
+        let mut unique = Vec::with_capacity(calls.len());
+        for call in calls {
+            let key = (call.name.clone(), call.args.clone());
+            if seen.contains(&key) {
+                // A repeat of a call already accepted this turn. Don't run the
+                // side effect again — answer its id and show it resolved.
+                self.emit(AgentEvent::ToolCallStarted {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    args: call.args.clone(),
+                });
+                let note =
+                    "Skipped: an identical tool call was already made in this turn.".to_string();
+                session.push_tool_result(&call.id, note.clone(), false);
+                self.emit(AgentEvent::ToolCallCompleted {
+                    call_id: call.id,
+                    output: note,
+                    artifact: None,
+                });
+            } else {
+                seen.push(key);
+                unique.push(call);
+            }
+        }
+        unique
+    }
 }
 
 struct TurnResult {
@@ -691,6 +739,7 @@ mod tests {
         outcomes: std::collections::HashMap<String, ToolOutcome>,
         approved_output: String,
         approved_calls: Mutex<usize>,
+        execute_calls: Mutex<usize>,
     }
     impl MockExecutor {
         fn new() -> Self {
@@ -698,6 +747,7 @@ mod tests {
                 outcomes: Default::default(),
                 approved_output: "APPROVED-RAN".into(),
                 approved_calls: Mutex::new(0),
+                execute_calls: Mutex::new(0),
             }
         }
         fn ran(mut self, name: &str, output: &str, is_error: bool) -> Self {
@@ -725,6 +775,7 @@ mod tests {
     #[async_trait]
     impl ToolExecutor for MockExecutor {
         async fn execute(&self, name: &str, _args: &str) -> Result<ToolOutcome, LychiError> {
+            *self.execute_calls.lock().unwrap() += 1;
             match self.outcomes.get(name) {
                 Some(ToolOutcome::Ran {
                     output, is_error, ..
@@ -877,6 +928,45 @@ mod tests {
             Outcome::Done { session } => {
                 // sys, user, assistant(tool_call), tool_result, assistant(final)
                 assert_eq!(session.messages.len(), 5);
+            }
+            _ => panic!("expected Done"),
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_tool_calls_in_one_turn_run_once() {
+        // The model emits the SAME call (name+args) twice in one turn — the
+        // groq-llama double-screenshot case. The side effect must run once; both
+        // ids must still get a tool_result (contract), and the model's next turn
+        // must see two results (one real, one "skipped") so no tool_use dangles.
+        let provider = MockProvider::new(vec![
+            call_tools(&[("t1", "weather", "London"), ("t2", "weather", "London")]),
+            answer("Done."),
+        ]);
+        let exec = Arc::new(MockExecutor::new().ran("weather", "18C sunny", false));
+        let e = exec.clone();
+        let (stream, handle) = coordinator(provider, exec)
+            .run(Session::new("sys", "weather?"), CancellationToken::new());
+        let events = drain(stream).await;
+
+        // The executor ran EXACTLY once despite two identical calls.
+        assert_eq!(
+            *e.execute_calls.lock().unwrap(),
+            1,
+            "an identical duplicate call must not re-execute the tool"
+        );
+        // Both ids answered → no dangling tool_use.
+        assert!(has_text(&events, "Done."));
+        match handle.wait().await {
+            Outcome::Done { session } => {
+                let ids = result_ids(&session);
+                assert!(ids.contains(&"t1".to_string()) && ids.contains(&"t2".to_string()));
+                // One real result, one "skipped" — but both present.
+                let skipped = session
+                    .messages
+                    .iter()
+                    .any(|m| m.content_text().contains("Skipped"));
+                assert!(skipped, "the duplicate got a skipped tool_result");
             }
             _ => panic!("expected Done"),
         }
