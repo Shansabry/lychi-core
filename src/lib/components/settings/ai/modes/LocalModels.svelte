@@ -198,23 +198,7 @@ onMount(() => {
 	</div>
 {/if}
 
-<AdvancedFields bind:open={advancedOpen}>
-	<div class="field">
-		<label for="local-timeout">Timeout</label>
-		<div class="number-row">
-			<input
-				id="local-timeout"
-				class="control num"
-				type="number"
-				min="5"
-				max="120"
-				bind:value={aiConfig.timeout_secs}
-				onchange={onsave}
-			/>
-			<span class="unit">s</span>
-		</div>
-	</div>
-</AdvancedFields>
+<AdvancedFields bind:open={advancedOpen} bind:aiConfig {onsave} />
 
 <style>
 	.section-label {
@@ -352,42 +336,5 @@ onMount(() => {
 	.warn-actions {
 		display: flex;
 		gap: 8px;
-	}
-	.field {
-		display: grid;
-		grid-template-columns: 120px 1fr;
-		align-items: center;
-		gap: 14px;
-		padding: 9px 0;
-	}
-	label {
-		font-size: 12.5px;
-		color: var(--fg-muted);
-	}
-	.number-row {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-	}
-	.control {
-		font-family: var(--font-mono);
-		font-size: 12.5px;
-		color: var(--fg);
-		background: var(--bg-secondary);
-		border: 1px solid var(--border);
-		border-radius: 7px;
-		padding: 8px 11px;
-		outline: none;
-	}
-	.control:focus {
-		border-color: var(--fg-muted);
-	}
-	.control.num {
-		width: 90px;
-		text-align: right;
-	}
-	.unit {
-		font-size: 12px;
-		color: var(--fg-muted);
 	}
 </style>

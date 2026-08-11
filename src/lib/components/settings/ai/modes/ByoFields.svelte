@@ -145,35 +145,7 @@ function handleProviderChange(val: string) {
 
 <ApiKeyField bind:this={apiKeyRef} provider={aiConfig.provider} {onhealthchange} />
 
-<AdvancedFields bind:open={advancedOpen}>
-	<div class="field">
-		<label for="ai-timeout">Timeout</label>
-		<div class="number-row">
-			<input
-				id="ai-timeout"
-				class="control num"
-				type="number"
-				min="2"
-				max="60"
-				bind:value={aiConfig.timeout_secs}
-				onchange={onsave}
-			/>
-			<span class="unit">s</span>
-		</div>
-	</div>
-	<div class="field">
-		<label for="ai-max-tokens">Max Tokens</label>
-		<input
-			id="ai-max-tokens"
-			class="control num"
-			type="number"
-			min="256"
-			max="16000"
-			bind:value={aiConfig.max_tokens}
-			onchange={onsave}
-		/>
-	</div>
-</AdvancedFields>
+<AdvancedFields bind:open={advancedOpen} bind:aiConfig {onsave} />
 
 <style>
 	.field {
@@ -204,19 +176,6 @@ function handleProviderChange(val: string) {
 	}
 	.control:focus {
 		border-color: var(--fg-muted);
-	}
-	.number-row {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-	}
-	.control.num {
-		width: 90px;
-		text-align: right;
-	}
-	.unit {
-		font-size: 12px;
-		color: var(--fg-muted);
 	}
 	.hint {
 		font-size: 11px;
