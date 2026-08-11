@@ -302,7 +302,7 @@ fn clipboard_monitor_loop(db: &Arc<Database>, running: &Arc<std::sync::atomic::A
     let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
 
     // Seed hashes with current clipboard content (don't store what's already
-    // there). Use the same readers as the poll loop so the seed matches what
+    // there). Use the same readers as the capture pass so the seed matches what
     // we'd capture — otherwise the first Wayland text copy could be missed.
     if let Some((rgba, w, h)) = try_get_image(is_wayland) {
         last_image_hash = super::image_utils::hash_image(&rgba, w, h);
@@ -311,62 +311,185 @@ fn clipboard_monitor_loop(db: &Arc<Database>, running: &Arc<std::sync::atomic::A
         last_text_hash = hash_text(text.trim());
     }
 
+    // Event-driven on Wayland: one persistent `wl-paste --watch` child wakes
+    // us per clipboard CHANGE. The 500ms poll fetched and hashed the full
+    // clipboard content every tick — with a 4K screenshot sitting there for
+    // hours (the normal case), that was a continuous full-RGBA alloc+copy+hash
+    // (~66MB/s of churn) plus up to four wl-paste forks per second while
+    // fully idle. Event mode does zero work between copies.
+    if is_wayland
+        && watch_clipboard_events(
+            &store,
+            db,
+            running,
+            &mut last_text_hash,
+            &mut last_image_hash,
+        )
+    {
+        return; // ran until shutdown in event mode
+    }
+
+    // Poll fallback: X11 (no wl-paste), or wl-paste missing/died on Wayland.
+    // Text stays at 500ms (cheap fetch); the IMAGE check runs every 4th tick —
+    // the full-content fetch is the expensive part and a 2s worst-case capture
+    // delay for images is the price of not burning it continuously.
+    let mut tick: u32 = 0;
     while running.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(500));
+        tick = tick.wrapping_add(1);
+        capture_once(
+            &store,
+            db,
+            is_wayland,
+            /* check_image */ tick.is_multiple_of(4),
+            &mut last_text_hash,
+            &mut last_image_hash,
+        );
+    }
+}
 
-        // Try image first — when clipboard has both, image wins
-        if let Some((rgba, width, height)) = try_get_image(is_wayland) {
-            let current_hash = super::image_utils::hash_image(&rgba, width, height);
-            if current_hash != last_image_hash {
-                last_image_hash = current_hash;
+/// Run one clipboard capture pass: image first (when checked), then text.
+/// Shared by the event-driven and polling modes so they cannot drift.
+fn capture_once(
+    store: &ClipboardStore,
+    db: &Arc<Database>,
+    is_wayland: bool,
+    check_image: bool,
+    last_text_hash: &mut u64,
+    last_image_hash: &mut u64,
+) {
+    // Try image first — when clipboard has both, image wins
+    if check_image && let Some((rgba, width, height)) = try_get_image(is_wayland) {
+        let current_hash = super::image_utils::hash_image(&rgba, width, height);
+        if current_hash != *last_image_hash {
+            *last_image_hash = current_hash;
 
-                // Encode and store
-                match process_image_capture(&store, db, &rgba, width, height) {
-                    Ok(true) => {
-                        tracing::debug!("[clipboard] stored image {width}x{height}",);
-                    }
-                    Ok(false) => {} // duplicate or error, skip
-                    Err(e) => {
-                        tracing::warn!("[clipboard] image store error: {e}");
-                    }
+            // Encode and store
+            match process_image_capture(store, db, &rgba, width, height) {
+                Ok(true) => {
+                    tracing::debug!("[clipboard] stored image {width}x{height}",);
                 }
-                continue; // Skip text check — image was the clipboard event
+                Ok(false) => {} // duplicate or error, skip
+                Err(e) => {
+                    tracing::warn!("[clipboard] image store error: {e}");
+                }
             }
-        }
-
-        // Fall through to text. arboard is unreliable for text on Wayland/KDE
-        // (returns errors even when text is present), so fall back to `wl-paste`
-        // — the same strategy the image path and context detection already use.
-        let text = match read_clipboard_text(is_wayland) {
-            Some(t) => t,
-            None => continue,
-        };
-
-        let text = text.trim();
-        if text.is_empty() {
-            continue;
-        }
-
-        let current_hash = hash_text(text);
-        if current_hash == last_text_hash {
-            continue;
-        }
-        // Advance the hash before the privacy check, not after: a skipped
-        // secret must not be re-examined every 500ms for as long as it sits on
-        // the clipboard. We decline to *record* it, we don't keep inspecting it.
-        last_text_hash = current_hash;
-
-        if let Some(reason) = skip_reason(is_wayland) {
-            // Log the reason but never the text — a privacy skip that leaks the
-            // secret into the log has achieved nothing.
-            tracing::debug!("[clipboard] not recorded: {}", reason.as_log_str());
-            continue;
-        }
-
-        if let Err(e) = store.push(db, text) {
-            tracing::warn!("Clipboard store error: {e}");
+            return; // Skip text check — image was the clipboard event
         }
     }
+
+    // Fall through to text. arboard is unreliable for text on Wayland/KDE
+    // (returns errors even when text is present), so fall back to `wl-paste`
+    // — the same strategy the image path and context detection already use.
+    let text = match read_clipboard_text(is_wayland) {
+        Some(t) => t,
+        None => return,
+    };
+
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+
+    let current_hash = hash_text(text);
+    if current_hash == *last_text_hash {
+        return;
+    }
+    // Advance the hash before the privacy check, not after: a skipped
+    // secret must not be re-examined on every wake for as long as it sits on
+    // the clipboard. We decline to *record* it, we don't keep inspecting it.
+    *last_text_hash = current_hash;
+
+    if let Some(reason) = skip_reason(is_wayland) {
+        // Log the reason but never the text — a privacy skip that leaks the
+        // secret into the log has achieved nothing.
+        tracing::debug!("[clipboard] not recorded: {}", reason.as_log_str());
+        return;
+    }
+
+    if let Err(e) = store.push(db, text) {
+        tracing::warn!("Clipboard store error: {e}");
+    }
+}
+
+/// Event-driven monitor: block on change notifications from a single
+/// persistent `wl-paste --watch` child instead of polling.
+///
+/// Returns `true` if it ran until shutdown (the caller is done), `false` if
+/// event mode is unavailable (spawn failed) or broke mid-run (child died —
+/// e.g. compositor restart) and the caller should fall back to polling.
+fn watch_clipboard_events(
+    store: &ClipboardStore,
+    db: &Arc<Database>,
+    running: &Arc<std::sync::atomic::AtomicBool>,
+    last_text_hash: &mut u64,
+    last_image_hash: &mut u64,
+) -> bool {
+    use std::io::BufRead;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+
+    // `--watch echo` runs `echo` (one output line) per clipboard change.
+    let mut child = match std::process::Command::new("wl-paste")
+        .args(["--watch", "echo"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::info!("[clipboard] wl-paste --watch unavailable ({e}) — polling instead");
+            return false;
+        }
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    };
+
+    // Reader thread: one message per change line; drops the sender on EOF
+    // (child died), which surfaces as Disconnected in the recv loop.
+    let (tx, rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines() {
+            if line.is_err() || tx.send(()).is_err() {
+                break;
+            }
+        }
+    });
+    tracing::info!("[clipboard] event-driven (wl-paste --watch)");
+
+    let clean_shutdown = loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(()) => {
+                // Coalesce a burst (some apps set the selection several times
+                // per copy) into one capture pass.
+                while rx.try_recv().is_ok() {}
+                capture_once(
+                    store,
+                    db,
+                    /* is_wayland */ true,
+                    /* check_image */ true,
+                    last_text_hash,
+                    last_image_hash,
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if !running.load(Ordering::Relaxed) {
+                    break true;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::warn!("[clipboard] wl-paste --watch exited — falling back to polling");
+                break false;
+            }
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    clean_shutdown
 }
 
 /// Should this copy be kept out of history? Gathers the two live inputs the
