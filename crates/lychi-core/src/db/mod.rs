@@ -342,6 +342,20 @@ pub fn body_of(bytes: &[u8]) -> Result<&[u8], LychiError> {
     }
 }
 
+/// [`body_of`] for JSON-bodied tables (ai_history): same envelope, plus the
+/// stranded-legacy fallback — a pre-envelope row IS the JSON document, whose
+/// first byte (`{`/`[`) reads as a bogus tag. Unlike postcard, JSON shape is
+/// checkable without knowing the value's type, so the fallback lives here.
+pub fn json_body_of(bytes: &[u8]) -> Result<&[u8], LychiError> {
+    match body_of(bytes) {
+        Ok(b) => Ok(b),
+        Err(e) => match bytes.first() {
+            Some(b'{') | Some(b'[') => Ok(bytes),
+            _ => Err(e),
+        },
+    }
+}
+
 /// Encode a row value: `[SCHEMA_VERSION][postcard body]`. The ONE writer-side
 /// codec — a source-scan test bans raw `postcard::to_allocvec` against table
 /// values elsewhere, so no code path can produce an untagged row.
@@ -355,9 +369,32 @@ pub fn encode_row<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, LychiError>
 ///
 /// For `update_note(id)`-style lookups where the user named one row and "that
 /// row is corrupt" is the truthful answer. Lists use [`decode_row`].
+///
+/// An unknown envelope tag gets ONE fallback: try the whole value as a
+/// legacy (pre-envelope) raw row. The one-shot migration wraps raw rows only
+/// when the META stamp is absent — so a pre-envelope binary running against
+/// an already-migrated DB (a downgrade, or the exact mixed-install incident
+/// of 2026-08-11: dev build migrated, old AppImage kept writing) strands raw
+/// rows the migration never revisits. Their first byte is arbitrary and reads
+/// as a bogus "schema v9"-style tag. Only THIS typed layer can tell a
+/// stranded legacy row from a genuinely newer generation: a legacy row
+/// decodes as `T` from byte zero AND consumes every byte; a newer row's
+/// tagged bytes will not. Exact consumption is load-bearing, not pedantry:
+/// `postcard::from_bytes` tolerates trailing bytes, and a small all-integer
+/// struct really did parse out of a tagged row in testing — `take_from_bytes`
+/// + empty-remainder closes that. On fallback failure the ORIGINAL tag error
+/// is returned, so a real downgrade still says "written by schema vN".
 pub fn decode_value<'a, T: serde::Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, LychiError> {
-    let body = body_of(bytes)?;
-    postcard::from_bytes(body).map_err(|e| LychiError::Database(format!("row decode: {e}")))
+    match body_of(bytes) {
+        Ok(body) => {
+            postcard::from_bytes(body).map_err(|e| LychiError::Database(format!("row decode: {e}")))
+        }
+        Err(tag_err) if !bytes.is_empty() => match postcard::take_from_bytes::<T>(bytes) {
+            Ok((v, rest)) if rest.is_empty() => Ok(v),
+            _ => Err(tag_err),
+        },
+        Err(e) => Err(e),
+    }
 }
 
 /// Create a throwaway database for testing.
@@ -480,25 +517,16 @@ pub fn decode_row<'a, T: serde::Deserialize<'a>>(
     key: &str,
     bytes: &'a [u8],
 ) -> Option<T> {
-    // Envelope first: a row tagged by a NEWER schema is not garbage, it is a
-    // downgrade — say so, and skip only that row.
-    let body = match body_of(bytes) {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::warn!(
-                "[db] skipping row in `{table}` (key {key}): {e} — \
-                 the rest of the list is unaffected"
-            );
-            return None;
-        }
-    };
-    match postcard::from_bytes(body) {
+    // One decode path with decode_value: envelope, then the stranded-legacy-
+    // row fallback (see its doc). The error text preserves the distinction —
+    // a real downgrade says "written by schema vN", corruption says "decode".
+    match decode_value(bytes) {
         Ok(v) => Some(v),
         Err(e) => {
             // The key, not the value: the value may be user content, and this
             // goes to a log file. The key is enough to find or delete the row.
             tracing::warn!(
-                "[db] skipping undecodable row in `{table}` (key {key}): {e} — \
+                "[db] skipping row in `{table}` (key {key}): {e} — \
                  the rest of the list is unaffected"
             );
             None
@@ -624,6 +652,46 @@ mod envelope_tests {
         let meta = txn.open_table(META).unwrap();
         let v = meta.get("schema_version").unwrap().expect("stamp missing");
         assert_eq!(v.value(), [SCHEMA_VERSION]);
+    }
+
+    /// THE STRANDED-ROW INCIDENT (2026-08-11): the dev build migrated the DB
+    /// (META stamped v1), then the old pre-envelope AppImage kept running and
+    /// wrote RAW rows the one-shot migration never revisits — 3 AI presets,
+    /// ~50 clipboard entries and 2 history rows invisible, their first bytes
+    /// read as bogus "schema v9"-style tags. The typed fallback recovers any
+    /// value that parses as `T` from byte zero and consumes every byte.
+    #[test]
+    fn a_stranded_pre_envelope_row_is_recovered_not_skipped() {
+        let entry = schema::TimerEntry {
+            name: "tea".into(),
+            duration_secs: 300,
+            elapsed_before_secs: 0.0,
+            running_since_epoch_ms: Some(123),
+        };
+        // Raw postcard, no envelope — what a pre-envelope binary wrote.
+        // (postcard:: is legal here: db/mod.rs is the codec's whitelisted home.)
+        let raw = postcard::to_allocvec(&entry).unwrap();
+
+        let via_value: schema::TimerEntry = decode_value(&raw).expect("legacy row recovers");
+        assert_eq!(via_value.name, "tea");
+        let via_row: Option<schema::TimerEntry> = decode_row("timers", "k", &raw);
+        assert_eq!(via_row.unwrap().duration_secs, 300);
+
+        // Garbage that decodes as nothing still errors/skips.
+        assert!(decode_value::<schema::TimerEntry>(&[9, 200, 200, 200]).is_err());
+    }
+
+    /// JSON tables get the same recovery via shape: a legacy raw JSON document
+    /// starts with `{`/`[`, which reads as a bogus tag.
+    #[test]
+    fn a_stranded_legacy_json_row_is_recovered() {
+        let legacy = br#"{"id":"c1"}"#;
+        assert_eq!(json_body_of(legacy).unwrap(), legacy.as_slice());
+        // Properly enveloped JSON still unwraps to its body.
+        let wrapped = wrap_body(legacy);
+        assert_eq!(json_body_of(&wrapped).unwrap(), legacy.as_slice());
+        // Non-JSON unknown tags still error.
+        assert!(json_body_of(&[9, 1, 2, 3]).is_err());
     }
 
     /// The strict/single-row contract: current-tag decodes, wrong-tag and

@@ -34,7 +34,7 @@ impl AiHistoryStore {
         let mut out = Vec::new();
         for result in table.iter()? {
             let (_, val) = result?;
-            let conv: Conversation = serde_json::from_slice(crate::db::body_of(val.value())?)
+            let conv: Conversation = serde_json::from_slice(crate::db::json_body_of(val.value())?)
                 .map_err(|e| LychiError::Database(e.to_string()))?;
             out.push(ConversationSummary {
                 id: conv.id,
@@ -54,8 +54,9 @@ impl AiHistoryStore {
         let table = txn.open_table(db::AI_CONVERSATIONS)?;
         match table.get(id)? {
             Some(val) => {
-                let conv: Conversation = serde_json::from_slice(crate::db::body_of(val.value())?)
-                    .map_err(|e| LychiError::Database(e.to_string()))?;
+                let conv: Conversation =
+                    serde_json::from_slice(crate::db::json_body_of(val.value())?)
+                        .map_err(|e| LychiError::Database(e.to_string()))?;
                 Ok(Some(conv))
             }
             None => Ok(None),
