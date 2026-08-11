@@ -434,6 +434,29 @@ impl ActionHandler for WeatherHandler {
         RiskLevel::Low
     }
 
+    fn assess_risk(
+        &self,
+        args: &str,
+        _ctx: &crate::action_registry::RiskContext<'_>,
+    ) -> crate::action_registry::RiskAssessment {
+        use crate::action_registry::{ConsentKind, RiskAssessment};
+        // Consent is decided by the SAME normalizer `execute` uses, so every
+        // spelling of "locate me" is gated. The old Rules Engine check knew
+        // only ""/"here" while execute normalized the full LOCAL_QUALIFIERS
+        // list — `weather now` geolocated without consent.
+        if normalize_weather_location(args).is_empty() {
+            // The frontend matches "freeipapi.com" in this prompt to persist
+            // the grant — keep the domain in the text (FE-4 tracks typing it).
+            RiskAssessment::level(self.default_risk()).with_consent(
+                ConsentKind::IpGeolocation,
+                "Weather will detect your location by sending your IP to freeipapi.com. \
+                 Allow and remember?",
+            )
+        } else {
+            RiskAssessment::level(self.default_risk())
+        }
+    }
+
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         // Normalize the location argument. Words that mean "here / right now" —
         // not a place — resolve to auto-detect (IP geolocation), so "weather now"
@@ -508,6 +531,16 @@ impl ActionHandler for Arc<WeatherHandler> {
     }
     fn default_risk(&self) -> RiskLevel {
         self.as_ref().default_risk()
+    }
+    // Without this forward, the Arc registration would silently fall back to
+    // the trait's default assess_risk and drop the geolocation consent — the
+    // manual-forwarding trap this wrapper is prone to.
+    fn assess_risk(
+        &self,
+        args: &str,
+        ctx: &crate::action_registry::RiskContext<'_>,
+    ) -> crate::action_registry::RiskAssessment {
+        self.as_ref().assess_risk(args, ctx)
     }
     async fn execute(&self, ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         self.as_ref().execute(ctx, args).await

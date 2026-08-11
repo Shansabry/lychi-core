@@ -39,6 +39,37 @@ pub enum ExecutionMode {
     Exclusive,
 }
 
+/// A privacy-relevant network disclosure an invocation performs (C6), declared
+/// by the handler on its [`RiskAssessment`] and enforced by the Rules Engine
+/// against what the user has already granted in `PrivacyConfig`.
+///
+/// Declared HERE — by the handler, next to the dispatch that decides what the
+/// invocation actually does — because the Rules Engine keeping its own list of
+/// which args are sensitive is a second parser of the same question, and the
+/// two drifted three separate ways: `sysinfo speed` ran the speedtest
+/// unconsented (gate knew only "speedtest"), `sysinfo network` fetched the
+/// public IP unconsented (gate knew only "net"), and `sysinfo ip` prompted
+/// about a public-IP lookup it never performs (it prints local addresses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsentKind {
+    /// Sends the user's IP to a geolocation service to locate them.
+    IpGeolocation,
+    /// Looks up the user's public IP via an external service.
+    PublicIp,
+    /// Bulk data transfer to a third party (e.g. speedtest). Has no
+    /// remember-me flag: consented per run, every run.
+    LargeTransfer,
+}
+
+/// A consent requirement: what kind, and the exact prompt to show. The prompt
+/// lives with the declaration for the same reason `reason` lives on
+/// [`RiskAssessment`] — the handler owns its user-facing wording.
+#[derive(Debug, Clone)]
+pub struct ConsentNeed {
+    pub kind: ConsentKind,
+    pub prompt: String,
+}
+
 /// A handler's risk verdict for a specific invocation: the level, plus an
 /// optional custom confirmation message. Returned by `ActionHandler::assess_risk`
 /// so risk logic (and its user-facing wording) lives in the handler, not the
@@ -49,6 +80,10 @@ pub struct RiskAssessment {
     /// Custom confirmation message shown when this action needs confirming. When
     /// `None`, the Rules Engine uses a generic message for the level.
     pub reason: Option<String>,
+    /// A privacy consent this invocation needs before it may run. Independent
+    /// of `level`: an action can be operationally Low risk and still disclose
+    /// data (sysinfo net is harmless to the machine, not to privacy).
+    pub consent: Option<ConsentNeed>,
 }
 
 /// Cheap, borrowed context passed to `assess_risk_ctx` (G2) so a handler can make
@@ -69,6 +104,7 @@ impl RiskAssessment {
         Self {
             level,
             reason: None,
+            consent: None,
         }
     }
 
@@ -77,7 +113,17 @@ impl RiskAssessment {
         Self {
             level: RiskLevel::Medium,
             reason: Some(reason.into()),
+            consent: None,
         }
+    }
+
+    /// Attach a privacy-consent requirement (C6) to this verdict.
+    pub fn with_consent(mut self, kind: ConsentKind, prompt: impl Into<String>) -> Self {
+        self.consent = Some(ConsentNeed {
+            kind,
+            prompt: prompt.into(),
+        });
+        self
     }
 }
 

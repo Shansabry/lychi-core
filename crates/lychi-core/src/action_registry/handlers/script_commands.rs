@@ -98,6 +98,7 @@ impl ActionHandler for ScriptCommandsHandler {
             Some((cmd, _)) if cmd.confirm => RiskAssessment {
                 level: RiskLevel::Medium,
                 reason: Some(format!("Run script “{}”?", cmd.title)),
+                consent: None,
             },
             _ => RiskAssessment::level(RiskLevel::Low),
         }

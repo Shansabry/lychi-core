@@ -77,6 +77,36 @@ impl ActionHandler for SysInfoHandler {
         CommandCategory::System
     }
 
+    fn assess_risk(
+        &self,
+        args: &str,
+        _ctx: &crate::action_registry::RiskContext<'_>,
+    ) -> crate::action_registry::RiskAssessment {
+        use crate::action_registry::{ConsentKind, RiskAssessment, RiskLevel};
+        // The consent declaration parses args EXACTLY as `execute` does (trim +
+        // lowercase, same alias arms). This match and the dispatch match must
+        // agree — the Rules Engine keeping its own alias list is how `sysinfo
+        // speed` ran the speedtest unconsented while `sysinfo ip` prompted
+        // about a public-IP lookup it never performs. `alias_consent_matches_
+        // dispatch` pins the pairing.
+        match args.trim().to_lowercase().as_str() {
+            // read_network fetches the public IP via ifconfig.me. The frontend
+            // matches "ifconfig.me" in this prompt to persist the grant —
+            // keep the domain in the text (FE-4 tracks typing that properly).
+            "net" | "network" => RiskAssessment::level(RiskLevel::Low).with_consent(
+                ConsentKind::PublicIp,
+                "This will look up your public IP via ifconfig.me. Allow and remember?",
+            ),
+            "speedtest" | "speed" => RiskAssessment::level(RiskLevel::Low).with_consent(
+                ConsentKind::LargeTransfer,
+                "Speed test will download 10 MB and upload 1 MB to Cloudflare",
+            ),
+            // "ip" prints LOCAL addresses only — no consent. The old gate
+            // prompted for it anyway, a false prompt that trains click-through.
+            _ => RiskAssessment::level(self.default_risk()),
+        }
+    }
+
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let start = Instant::now();
         let cmd = args.trim().to_lowercase();
@@ -1067,6 +1097,33 @@ fn read_disk_info() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// EVERY alias the dispatch match accepts must carry the same consent as
+    /// its canonical spelling, and consent-free subcommands must stay free.
+    /// This is the drift that shipped: the Rules Engine knew "speedtest" but
+    /// not "speed", "net" but not "network", and prompted for "ip" which
+    /// never leaves the machine.
+    #[test]
+    fn alias_consent_matches_dispatch() {
+        use crate::action_registry::{ConsentKind, RiskContext};
+        let h = SysInfoHandler;
+        let ctx = RiskContext::default();
+        let kind = |args: &str| h.assess_risk(args, &ctx).consent.map(|c| c.kind);
+
+        // Public-IP arms: both spellings, case/whitespace-insensitively.
+        for args in ["net", "network", "NET", " network "] {
+            assert_eq!(kind(args), Some(ConsentKind::PublicIp), "{args:?}");
+        }
+        // Speedtest arms.
+        for args in ["speedtest", "speed", "Speed"] {
+            assert_eq!(kind(args), Some(ConsentKind::LargeTransfer), "{args:?}");
+        }
+        // "ip" prints local addresses only — prompting for it was a false
+        // prompt that trained click-through.
+        for args in ["ip", "cpu", "mem", "disk", "", "os"] {
+            assert_eq!(kind(args), None, "{args:?}");
+        }
+    }
 
     #[test]
     fn format_uptime_pluralizes_and_never_blank() {

@@ -3,7 +3,7 @@ pub mod shell;
 pub mod uri;
 pub mod verbs;
 
-use crate::action_registry::{RiskAssessment, RiskLevel};
+use crate::action_registry::{ConsentKind, RiskAssessment, RiskLevel};
 use crate::config::schema::PrivacyConfig;
 use shell::ShellRules;
 
@@ -68,14 +68,30 @@ impl RulesEngine {
 
     /// The pure decision logic (logged by `validate`).
     fn decide(&self, req: &ValidationRequest, privacy: &PrivacyConfig) -> ValidationDecision {
-        // C6: Check privacy consent for network-sensitive commands first
-        if let Some(decision) = self.check_privacy(req, privacy) {
-            return decision;
+        // C6: privacy consent, checked first. The HANDLER declares what an
+        // invocation discloses (it is the one parser of its own args — see
+        // `ConsentKind`); this engine only holds it against what the user has
+        // already granted. The engine used to keep its own list of sensitive
+        // args, and the two parsers drifted three ways: `sysinfo speed` and
+        // `sysinfo network` bypassed consent, `sysinfo ip` prompted falsely.
+        if let Some(consent) = &req.risk.consent {
+            let granted = match consent.kind {
+                ConsentKind::IpGeolocation => privacy.allow_ip_geolocation,
+                ConsentKind::PublicIp => privacy.allow_public_ip,
+                // Deliberately no remember-flag: a bulk transfer is consented
+                // per run, every run.
+                ConsentKind::LargeTransfer => false,
+            };
+            if !granted {
+                return ValidationDecision::Confirm {
+                    reason: consent.prompt.clone(),
+                };
+            }
         }
 
         // Cross-cutting policy the Rules Engine genuinely owns (not handler-local):
-        // the shell denylist, force-kill safety, and C6 network-consent for
-        // speedtest. Everything else defers to the handler's own risk assessment.
+        // the shell denylist and force-kill safety. Everything else defers to the
+        // handler's own risk assessment.
         match req.action_id {
             "run" => return self.shell_rules.validate(req.args),
             "appctl" if req.args.trim_start().starts_with("kill ") => {
@@ -87,13 +103,6 @@ impl RulesEngine {
                     .trim();
                 return ValidationDecision::Confirm {
                     reason: format!("Force-kill '{target}'? This may cause data loss."),
-                };
-            }
-            // C6: speedtest uploads data to Cloudflare — require consent.
-            "sysinfo" if req.args.trim().eq_ignore_ascii_case("speedtest") => {
-                return ValidationDecision::Confirm {
-                    reason: "Speed test will download 10 MB and upload 1 MB to Cloudflare"
-                        .to_string(),
                 };
             }
             _ => {}
@@ -111,38 +120,6 @@ impl RulesEngine {
                     }),
                 }
             }
-        }
-    }
-
-    /// C6: Check if a command requires privacy consent before executing.
-    /// Returns Some(Confirm) if consent is needed, None if privacy is not relevant.
-    fn check_privacy(
-        &self,
-        req: &ValidationRequest,
-        privacy: &PrivacyConfig,
-    ) -> Option<ValidationDecision> {
-        match req.action_id {
-            // weather with no args or "here" → needs IP geolocation
-            "weather"
-                if (req.args.trim().is_empty()
-                    || req.args.trim().eq_ignore_ascii_case("here"))
-                    && !privacy.allow_ip_geolocation =>
-            {
-                Some(ValidationDecision::Confirm {
-                    reason: "Weather will detect your location by sending your IP to freeipapi.com. Allow and remember?".to_string(),
-                })
-            }
-            // sysinfo net → public IP lookup via ifconfig.me
-            "sysinfo"
-                if matches!(req.args.trim().to_lowercase().as_str(), "net" | "ip")
-                    && !privacy.allow_public_ip =>
-            {
-                Some(ValidationDecision::Confirm {
-                    reason: "This will look up your public IP via ifconfig.me. Allow and remember?"
-                        .to_string(),
-                })
-            }
-            _ => None,
         }
     }
 }
@@ -174,6 +151,7 @@ mod tests {
     const LOW: RiskAssessment = RiskAssessment {
         level: RiskLevel::Low,
         reason: None,
+        consent: None,
     };
 
     fn req<'a>(action_id: &'a str, args: &'a str) -> ValidationRequest<'a> {
@@ -302,53 +280,92 @@ mod tests {
         assert!(matches!(result, ValidationDecision::Confirm { .. }));
     }
 
+    /// Build a request the way the executor does: through the REAL handler's
+    /// `assess_risk`. This is the drift test — the gate is exercised against
+    /// whatever the handler actually declares, so an alias added to dispatch
+    /// without a consent declaration fails here, not in the field.
+    fn validate_real(action_id: &str, args: &str, p: &PrivacyConfig) -> ValidationDecision {
+        use crate::action_registry::{ActionHandler, RiskContext};
+        let risk = match action_id {
+            "sysinfo" => crate::action_registry::handlers::sysinfo::SysInfoHandler
+                .assess_risk(args, &RiskContext::default()),
+            "weather" => crate::action_registry::handlers::weather::WeatherHandler::new(
+                "celsius".into(),
+                String::new(),
+            )
+            .assess_risk(args, &RiskContext::default()),
+            _ => panic!("unknown handler {action_id}"),
+        };
+        RulesEngine::new().validate(
+            &ValidationRequest {
+                action_id,
+                args,
+                routed_by: "explicit",
+                risk: &risk,
+            },
+            p,
+        )
+    }
+
     #[test]
     fn privacy_weather_requires_consent() {
-        let engine = RulesEngine::new();
-        // Without consent, weather with no args should require confirmation
-        let result = engine.validate(&req("weather", ""), &privacy());
-        assert!(matches!(result, ValidationDecision::Confirm { .. }));
+        // Every spelling execute treats as "locate me" needs consent — the old
+        // engine-side list knew ""/"here" while execute normalized more
+        // qualifiers, so `weather now` geolocated without asking.
+        for args in ["", "here", "Here", "now"] {
+            let result = validate_real("weather", args, &privacy());
+            assert!(
+                matches!(result, ValidationDecision::Confirm { .. }),
+                "weather {args:?} must ask before geolocating"
+            );
+        }
 
-        // "here" is an alias for auto-detect — also requires consent
-        let result = engine.validate(&req("weather", "here"), &privacy());
-        assert!(matches!(result, ValidationDecision::Confirm { .. }));
-        let result = engine.validate(&req("weather", "Here"), &privacy());
-        assert!(matches!(result, ValidationDecision::Confirm { .. }));
-
-        // With consent, it should pass through to default risk (Low → Execute)
-        let result = engine.validate(&req("weather", ""), &privacy_all_allowed());
-        assert_eq!(result, ValidationDecision::Execute);
-        let result = engine.validate(&req("weather", "here"), &privacy_all_allowed());
-        assert_eq!(result, ValidationDecision::Execute);
+        // With consent granted, it passes through to default risk (Low → Execute)
+        for args in ["", "here"] {
+            let result = validate_real("weather", args, &privacy_all_allowed());
+            assert_eq!(result, ValidationDecision::Execute);
+        }
 
         // Weather with explicit location is always fine
-        let result = engine.validate(&req("weather", "London"), &privacy());
+        let result = validate_real("weather", "London", &privacy());
         assert_eq!(result, ValidationDecision::Execute);
     }
 
     #[test]
     fn privacy_sysinfo_net_requires_consent() {
-        let engine = RulesEngine::new();
-        // Without consent, sysinfo net should require confirmation
-        let result = engine.validate(&req("sysinfo", "net"), &privacy());
-        assert!(matches!(result, ValidationDecision::Confirm { .. }));
+        // BOTH dispatch aliases of the public-IP arm — "network" ran
+        // unconsented when the engine kept its own list.
+        for args in ["net", "network"] {
+            let result = validate_real("sysinfo", args, &privacy());
+            assert!(
+                matches!(result, ValidationDecision::Confirm { .. }),
+                "sysinfo {args:?} must ask before fetching the public IP"
+            );
+        }
 
-        let result = engine.validate(&req("sysinfo", "ip"), &privacy());
-        assert!(matches!(result, ValidationDecision::Confirm { .. }));
+        // With consent, it passes through
+        let result = validate_real("sysinfo", "net", &privacy_all_allowed());
+        assert_eq!(result, ValidationDecision::Execute);
 
-        // With consent, it should pass through
-        let result = engine.validate(&req("sysinfo", "net"), &privacy_all_allowed());
+        // "ip" prints LOCAL addresses only. The old gate prompted for it — a
+        // false prompt that trained click-through.
+        let result = validate_real("sysinfo", "ip", &privacy());
         assert_eq!(result, ValidationDecision::Execute);
 
         // Other sysinfo subcommands are fine regardless
-        let result = engine.validate(&req("sysinfo", "cpu"), &privacy());
+        let result = validate_real("sysinfo", "cpu", &privacy());
         assert_eq!(result, ValidationDecision::Execute);
     }
 
     #[test]
     fn speedtest_always_confirms() {
-        let engine = RulesEngine::new();
-        let result = engine.validate(&req("sysinfo", "speedtest"), &privacy_all_allowed());
-        assert!(matches!(result, ValidationDecision::Confirm { .. }));
+        // Both aliases, and no privacy flag exempts a bulk transfer.
+        for args in ["speedtest", "speed"] {
+            let result = validate_real("sysinfo", args, &privacy_all_allowed());
+            assert!(
+                matches!(result, ValidationDecision::Confirm { .. }),
+                "sysinfo {args:?} must confirm every run"
+            );
+        }
     }
 }
