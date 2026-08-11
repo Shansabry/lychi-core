@@ -10,6 +10,19 @@
 //! Both honour `RUST_LOG` (default `info`). Plus a panic hook that writes a crash
 //! file before the process dies — otherwise a panic in an AppImage vanishes with
 //! stderr and leaves nothing to debug.
+//!
+//! # Content policy — the file log is a SHAREABLE artifact
+//!
+//! Because this file is exactly what a beta user sends with a bug report, the
+//! default (`info`) level must never contain what the user typed: no command
+//! text, no `ask …` questions, no shell lines (which carry pasted secrets and
+//! clipboard-expanded content), no reminder/note text. At `info`, execution
+//! logs carry METADATA ONLY — action id, routing, input length + short hash
+//! (correlatable without content). Full text lives at `debug` for local
+//! diagnosis, and the handful of security-decision lines that must quote a
+//! shell command pass it through `lychi_core::text::scrub_secrets` first.
+//! A new log line that interpolates user-typed text at `info`/`warn` is a
+//! privacy regression, not a style choice.
 
 use std::io::Write;
 

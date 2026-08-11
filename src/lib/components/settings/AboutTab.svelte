@@ -25,6 +25,12 @@ let { appVersion }: { appVersion: string } = $props();
 			<span class="about-link-value">support@lychi.app</span>
 		</div>
 		<div class="about-link-row">
+			<span class="about-link-label">Logs</span>
+			<span class="about-link-value"
+				>~/.local/share/lychi/logs — kept 7 days; commands you type are not recorded</span
+			>
+		</div>
+		<div class="about-link-row">
 			<span class="about-link-label">Features</span>
 			<span class="about-link-value">feat@lychi.app</span>
 		</div>

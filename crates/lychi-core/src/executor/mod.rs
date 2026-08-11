@@ -733,14 +733,26 @@ impl Executor {
             RunRepo::Resolved(dir) => Some(dir),
             _ => None,
         };
+        // Metadata only at info: the JSON file log is the artifact beta users
+        // send with bug reports, and at default level it must not contain what
+        // the user typed (`ask <personal question>`, shell lines with pasted
+        // secrets, clipboard-expanded text). The length + a short hash keep
+        // repeat-failure reports correlatable without the content; the full
+        // input is available at debug for local diagnosis.
+        let input_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            input.hash(&mut h);
+            h.finish() & 0xffff_ffff
+        };
         tracing::info!(
             action = %intent.action_id,
             routing = ?intent.routing,
-            "[execute] resolved action={} routing={:?} input={:?}",
-            intent.action_id,
-            intent.routing,
-            input
+            input_chars = input.chars().count(),
+            input_hash = format!("{input_hash:08x}"),
+            "[execute] resolved"
         );
+        tracing::debug!("[execute] input={input:?}");
 
         let action_id = intent.action_id.clone();
 

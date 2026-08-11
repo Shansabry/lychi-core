@@ -487,6 +487,9 @@ pub async fn run_row_action(
     }
     .map_err(LychiError::ExecutionFailed)?;
 
-    tracing::info!("[row-action] {handler}/{id} target={target} → {command}");
+    // `target`/`command` can carry row content (note text, snippet bodies) —
+    // metadata at info, content at debug (the file log ships with bug reports).
+    tracing::info!("[row-action] {handler}/{id}");
+    tracing::debug!("[row-action] target={target} → {command}");
     execute_command(command, None, None, None, app, state).await
 }

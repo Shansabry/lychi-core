@@ -21,7 +21,10 @@ pub fn check_and_fire(store: &RemindersStore, db: &Arc<Database>) {
                 {
                     tracing::warn!("[reminder] notification error: {e}");
                 }
-                tracing::info!("[reminder] fired: {}", entry.text);
+                // The reminder TEXT is user content — keep it out of the
+                // default-level (shareable) log file.
+                tracing::info!("[reminder] fired: {id}");
+                tracing::debug!("[reminder] text: {}", entry.text);
 
                 if let Err(e) = store.mark_fired(db, &id) {
                     tracing::error!("[reminder] failed to mark fired {id}: {e}");

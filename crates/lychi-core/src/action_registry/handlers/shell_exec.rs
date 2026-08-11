@@ -52,13 +52,23 @@ fn check_shell_authorization(cmd: &str, clearance: Clearance) -> Result<(), Lych
             Ok(())
         }
         ShellDecision::Confirm { reason } => {
-            tracing::warn!(%cmd, %reason, "[shell_exec] refused: needs confirmation, none granted");
+            // Command text in a warn line ships in the default-level log file —
+            // scrub token shapes (the reason only names the matched pattern).
+            tracing::warn!(
+                cmd = %crate::text::scrub_secrets(&cmd),
+                %reason,
+                "[shell_exec] refused: needs confirmation, none granted"
+            );
             Err(LychiError::ExecutionFailed(format!(
                 "Command needs confirmation and was not approved: {reason}"
             )))
         }
         ShellDecision::Deny { reason } => {
-            tracing::warn!(%cmd, %reason, "[shell_exec] hard-deny blocked shell execution");
+            tracing::warn!(
+                cmd = %crate::text::scrub_secrets(&cmd),
+                %reason,
+                "[shell_exec] hard-deny blocked shell execution"
+            );
             Err(LychiError::ExecutionFailed(reason))
         }
     }
@@ -514,7 +524,13 @@ fn launch_in_terminal(
         }
     });
 
-    tracing::info!("[shell_exec] launched in terminal: {terminal} (pid={pid}, cmd={cmd})");
+    // The command text stays out of the default-level (shareable) log; the
+    // scrubbed form is available at debug for local diagnosis.
+    tracing::info!("[shell_exec] launched in terminal: {terminal} (pid={pid})");
+    tracing::debug!(
+        "[shell_exec] terminal cmd: {}",
+        crate::text::scrub_secrets(cmd)
+    );
 
     Ok(pid)
 }
@@ -836,10 +852,9 @@ impl ShellExec {
 
                 crate::context::metrics::inc_terminal_route_hit();
                 tracing::info!(
-                    "terminal_route: sent wm_class={} pid={} cmd={}",
+                    "terminal_route: sent wm_class={} pid={}",
                     target.wm_class,
-                    target.pid,
-                    cmd
+                    target.pid
                 );
 
                 Some(ActionResult::ok(

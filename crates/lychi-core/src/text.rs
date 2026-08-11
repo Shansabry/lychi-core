@@ -58,9 +58,121 @@ pub fn truncate_first_line(text: &str, max_chars: usize) -> String {
     truncate_display(text.lines().next().unwrap_or(text), max_chars)
 }
 
+/// Replace obvious secret shapes in a command line with `[redacted]`, for the
+/// few log lines that must carry command text (shell security decisions at
+/// debug/warn). The log file is the artifact beta users send in with bug
+/// reports, so a `run curl -H 'Authorization: Bearer sk-…'` must not land in
+/// it verbatim even at levels above the default.
+///
+/// Deliberately a conservative token scanner, not a regex engine: it redacts
+/// whitespace-delimited tokens that carry a known secret PREFIX (API keys,
+/// PATs, JWTs), the value of `key=value` pairs whose key names a credential,
+/// and the token following a `Bearer` marker. It will miss exotic shapes —
+/// that is acceptable for a defense-in-depth layer whose primary protection is
+/// that full command text only appears below the default log level at all.
+///
+/// Rejoins tokens with single spaces: the output is for log lines, where exact
+/// whitespace carries no meaning.
+pub fn scrub_secrets(cmd: &str) -> String {
+    const SECRET_PREFIXES: [&str; 10] = [
+        "sk-",         // OpenAI/Anthropic-style API keys
+        "sk_live_",    // Stripe live
+        "sk_test_",    // Stripe test
+        "ghp_",        // GitHub PAT (classic)
+        "gho_",        // GitHub OAuth
+        "github_pat_", // GitHub PAT (fine-grained)
+        "xoxb-",       // Slack bot token
+        "xoxp-",       // Slack user token
+        "AKIA",        // AWS access key id
+        "AIza",        // Google API key
+    ];
+    const SECRET_KEYS: [&str; 9] = [
+        "token",
+        "access_token",
+        "api_key",
+        "apikey",
+        "secret",
+        "password",
+        "passwd",
+        "auth",
+        "authorization",
+    ];
+
+    let mut out: Vec<String> = Vec::new();
+    let mut redact_next = false;
+    for word in cmd.split_whitespace() {
+        // Strip surrounding quotes for classification, keep them in output.
+        let bare = word.trim_matches(|c| c == '\'' || c == '"');
+
+        if redact_next {
+            redact_next = false;
+            out.push("[redacted]".into());
+            continue;
+        }
+        if bare.eq_ignore_ascii_case("bearer") {
+            redact_next = true;
+            out.push(word.to_string());
+            continue;
+        }
+        if SECRET_PREFIXES
+            .iter()
+            .any(|p| bare.starts_with(p) && bare.len() >= p.len() + 8)
+        {
+            out.push("[redacted]".into());
+            continue;
+        }
+        if let Some((key, value)) = bare.split_once('=')
+            && !value.is_empty()
+            && SECRET_KEYS
+                .iter()
+                .any(|k| key.to_ascii_lowercase().trim_start_matches("--") == *k)
+        {
+            out.push(format!("{key}=[redacted]"));
+            continue;
+        }
+        out.push(word.to_string());
+    }
+    out.join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrub_redacts_bearer_tokens_and_key_prefixes() {
+        assert_eq!(
+            scrub_secrets(
+                "curl -H 'Authorization: Bearer sk-abc123def456' https://api.example.com"
+            ),
+            "curl -H 'Authorization: Bearer [redacted] https://api.example.com"
+        );
+        assert_eq!(
+            scrub_secrets("deploy --key ghp_0123456789abcdef"),
+            "deploy --key [redacted]"
+        );
+    }
+
+    #[test]
+    fn scrub_redacts_credential_key_value_pairs() {
+        assert_eq!(
+            scrub_secrets("run TOKEN=supersecret ./deploy.sh"),
+            "run TOKEN=[redacted] ./deploy.sh"
+        );
+        assert_eq!(
+            scrub_secrets("mysql --password=hunter2 -u root"),
+            "mysql --password=[redacted] -u root"
+        );
+    }
+
+    #[test]
+    fn scrub_leaves_ordinary_commands_alone() {
+        assert_eq!(scrub_secrets("ls -la /tmp"), "ls -la /tmp");
+        // A short sk- token is more likely a flag than a key.
+        assert_eq!(scrub_secrets("git log --sk-ip"), "git log --sk-ip");
+        // key=value with a non-credential key survives.
+        assert_eq!(scrub_secrets("make MODE=release"), "make MODE=release");
+    }
 
     #[test]
     fn short_text_is_returned_unchanged() {
