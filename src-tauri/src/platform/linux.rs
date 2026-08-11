@@ -926,9 +926,10 @@ pub fn focus_window(window: &WebviewWindow) {
 ///   focus-out → reported to the launcher state machine as
 ///     `FocusOut { focus_lost, interacted }`; it dismisses only when BOTH hold.
 ///     `focus_lost` (the protocol's FOCUSED bit) filters GTK noise; `interacted`
-///     (armed in THIS summon cycle) filters focus theft — on GNOME the
-///     shortcut-approval dialog genuinely takes focus at keys=0, and without
-///     the arming gate every summon flashed and vanished.
+///     (armed in THIS summon cycle) filters focus theft — on GNOME something
+///     genuinely takes focus at keys=0 shortly after show (unidentified; see
+///     `launcher_state::Event::FocusOut`), and without the arming gate every
+///     summon flashed and vanished.
 pub fn setup_dismiss_on_blur(
     window: &WebviewWindow,
     dismiss_armed: std::sync::Arc<std::sync::atomic::AtomicBool>,

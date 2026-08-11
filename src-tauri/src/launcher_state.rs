@@ -148,13 +148,15 @@ pub enum Event {
     /// `interacted` is whether the user has typed or clicked in the window this
     /// summon cycle. `focus_lost` alone is not enough: it distinguishes
     /// protocol-real focus loss from GTK noise, but not the user leaving from
-    /// focus being STOLEN before the user ever touched the window. Measured on
+    /// focus being TAKEN before the user ever touched the window. Measured on
     /// GNOME/Mutter (tester log, 2026-08-10): show → focus-in at +87ms →
-    /// focus-out with `FOCUSED` genuinely cleared at +560ms, `keys=0` — the
-    /// desktop's own global-shortcut approval dialog took focus, and the
-    /// launcher dismissed itself before it could be used. A focus loss the user
-    /// had no hand in must leave the window up; they can see who won focus and
-    /// click back.
+    /// focus-out with `FOCUSED` genuinely cleared at +560ms, `keys=0` — and the
+    /// launcher dismissed itself before it could be used. What took focus is
+    /// unidentified (NOT the shortcut-approval dialog: the bind response had
+    /// already returned ~340ms earlier, far too fast for a human to have had a
+    /// dialog open). The gate deliberately does not depend on knowing the
+    /// thief: a focus loss the user had no hand in must leave the window up,
+    /// whoever won it — the user can see who did and click back.
     FocusOut { focus_lost: bool, interacted: bool },
     /// The hide completed — the window is unmapped.
     HideCompleted,
@@ -207,9 +209,9 @@ pub fn transition(state: LauncherState, event: Event) -> (LauncherState, Action)
         //   focus-out → DISMISS  is_active=true toplevel_focus=true visible=true
         //
         // `interacted` filters focus THEFT — a protocol-real focus loss the
-        // user had no hand in. Measured on GNOME/Mutter: the desktop's
-        // shortcut-approval dialog took focus 560ms after show at keys=0, and
-        // the launcher dismissed itself on arrival. See [`Event::FocusOut`].
+        // user had no hand in. Measured on GNOME/Mutter: something (still
+        // unidentified) took focus 560ms after show at keys=0, and the
+        // launcher dismissed itself on arrival. See [`Event::FocusOut`].
         //
         // Ignoring events here is necessary but NOT sufficient on its own:
         // doing it without owning the state left the window stuck in a
@@ -370,10 +372,10 @@ mod tests {
 
     /// THE GNOME FOCUS-THEFT BUG (tester report, 2026-08-10), in the order the
     /// log records it: show → focus-in → a protocol-real focus-out at keys=0,
-    /// 560ms in — the desktop's shortcut-approval dialog stole focus before the
-    /// user ever touched the window. The launcher must stay up: dismissing on a
-    /// focus loss the user had no hand in is what made every summon flash and
-    /// vanish.
+    /// 560ms in — something stole focus before the user ever touched the
+    /// window (what, exactly, is unidentified — see [`Event::FocusOut`]). The
+    /// launcher must stay up: dismissing on a focus loss the user had no hand
+    /// in is what made every summon flash and vanish.
     #[test]
     fn focus_theft_before_any_interaction_does_not_dismiss() {
         let (s, _) = transition(Hidden, ShowRequested);
