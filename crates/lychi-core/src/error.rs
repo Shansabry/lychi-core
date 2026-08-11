@@ -41,6 +41,9 @@ pub enum LychiError {
     #[error("AI preset error: {0}")]
     AiPreset(String),
 
+    #[error("Pin error: {0}")]
+    Pin(String),
+
     #[error("Database error: {0}")]
     Database(String),
 }

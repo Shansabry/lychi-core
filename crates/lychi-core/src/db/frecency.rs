@@ -354,6 +354,32 @@ pub fn get_scores(db: &Arc<Database>) -> HashMap<String, f64> {
     })
 }
 
+/// Workspace commands with score AND raw use count — `command → (score, count)`.
+///
+/// The zero-state quality gate needs "how many times", which the score alone
+/// cannot answer (a single use minutes ago outscores five uses last week).
+/// Rides the same [`with_entries`] cache as [`get_scores`]; no extra scan.
+pub fn get_workspace_stats(db: &Arc<Database>, project_root: &str) -> HashMap<String, (f64, u32)> {
+    let now_ms = super::now_millis();
+    let normalized = project_root.trim_end_matches('/');
+    let prefix = format!("ws:{normalized}:");
+    with_entries(db, |entries| {
+        let mut stats = HashMap::new();
+        for (key, entry) in entries {
+            if let Some(cmd) = key.strip_prefix(&prefix) {
+                let score = entry.score(now_ms);
+                if score > 0.0 {
+                    stats.insert(
+                        cmd.to_string(),
+                        (score * entry.time_affinity(now_ms), entry.count),
+                    );
+                }
+            }
+        }
+        stats
+    })
+}
+
 /// Per-command circadian [`FrecencyEntry::time_affinity`] for one workspace's
 /// commands (`ws:<project_root>:<command>` keys). Returns `command → affinity`
 /// (1.0 neutral, up to 1.15) so the cold-path ranker can give workspace-memory
@@ -984,6 +1010,23 @@ mod tests {
             "a write did not invalidate the cache: {after:?}"
         );
         assert!(after.contains_key("alpha"), "existing entries must survive");
+    }
+
+    /// The stats accessor must expose true use counts per workspace command —
+    /// the zero-state ≥2-uses gate keys on the count, not the score.
+    #[test]
+    fn workspace_stats_carry_counts() {
+        let db = open_test_database();
+        record_workspace(&db, "/proj", "cargo test").unwrap();
+        record_workspace(&db, "/proj", "cargo test").unwrap();
+        record_workspace(&db, "/proj", "kill 1234").unwrap();
+        record_workspace(&db, "/other", "make").unwrap();
+
+        let stats = get_workspace_stats(&db, "/proj/");
+        assert_eq!(stats["cargo test"].1, 2);
+        assert_eq!(stats["kill 1234"].1, 1);
+        assert!(!stats.contains_key("make"), "other workspaces stay out");
+        assert!(stats["cargo test"].0 > 0.0);
     }
 
     /// Repeated access must still raise a score — the cache returns entries,

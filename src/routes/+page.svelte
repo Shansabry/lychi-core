@@ -20,6 +20,7 @@ import StatusBar from "$lib/components/StatusBar.svelte";
 import { attachTauriEvents } from "$lib/events/bridge.svelte";
 import type { AgentPlan, CommandResult, CompletionItem } from "$lib/ipc";
 import {
+	addPin,
 	cancelFileSearch,
 	classifyInput,
 	clearConversations,
@@ -46,6 +47,7 @@ import {
 	openPath,
 	openUri,
 	readSelection,
+	removePin,
 	revealPath,
 	runRowAction,
 	saveGeneralConfig,
@@ -244,10 +246,27 @@ function loadEmptySuggestions() {
 	getCompletions("")
 		.then((rawResults) => {
 			if (gen !== completions.completionGen || inputValue.trim().length > 0) return;
-			completions.items = context.extractStale(rawResults);
+			const next = context.extractStale(rawResults);
+			// This runs twice per summon (immediately, then on context-ready).
+			// When the second fetch matches what's showing, don't reassign:
+			// a wholesale replace resets selection and visibly reshuffles a
+			// list the user may already be arrowing through.
+			const rowKey = (i: CompletionItem) =>
+				`${i.label} ${i.run ?? ""} ${i.icon_path ?? ""} ${i.description ?? ""} ${i.pinned ?? false} ${i.reason ?? ""}`;
+			if (
+				next.length === completions.items.length &&
+				next.every((item, i) => rowKey(item) === rowKey(completions.items[i]))
+			) {
+				return;
+			}
+			// Re-locate a row the user had selected; fall back to no selection.
+			const selected = completions.index >= 0 ? completions.items[completions.index] : undefined;
+			completions.items = next;
 			// Do NOT preselect: on an empty box these are recents, not a query
 			// result. Selection happens only on mouse press or arrow key.
-			completions.index = -1;
+			completions.index = selected
+				? next.findIndex((item) => rowKey(item) === rowKey(selected))
+				: -1;
 		})
 		// Discarding this left a permanently empty launcher with nothing to
 		// distinguish "no recents yet" from "the backend call failed". Logged
@@ -1445,6 +1464,13 @@ let panelActions = $derived.by((): PanelAction[] => {
 		}
 	}
 
+	// Pin to the zero state — for any runnable row (same condition as "Run":
+	// a fill-only hint has no command worth pinning). The verb switches on the
+	// backend-stamped `pinned` flag (never re-derived from display text).
+	if (!hasPath && !isCalc && (item.run || !item.fill)) {
+		acts.push(item.pinned ? { id: "unpin", label: "Unpin" } : { id: "pin", label: "Pin to top" });
+	}
+
 	// AI actions available for any non-path row (ask the agent about it / open a
 	// fresh chat seeded with the label). Only when AI is configured.
 	if (aiEnabled && !hasPath && !isCalc) {
@@ -1452,6 +1478,12 @@ let panelActions = $derived.by((): PanelAction[] => {
 	}
 	return acts;
 });
+
+/** The command a row actually executes — what a pin must store. `run` when the
+ *  backend set one, else the label (the same fallback selection uses). */
+function effectiveRun(item: CompletionItem): string {
+	return item.run ?? item.label;
+}
 
 function openActionPanel() {
 	// Toggle: pressing Ctrl+K again (or the affordance) closes an open panel.
@@ -1511,6 +1543,24 @@ function runPanelAction(id: string) {
 			break;
 		case "copy_command":
 			copyTextFlash(item.run ?? item.label, "Command copied");
+			closeActionPanel();
+			break;
+		case "pin":
+			addPin(effectiveRun(item), item.label)
+				.then(() => {
+					flashHint("Pinned");
+					loadEmptySuggestions();
+				})
+				.catch((err) => flashHint(String(err?.message ?? err)));
+			closeActionPanel();
+			break;
+		case "unpin":
+			removePin(effectiveRun(item))
+				.then(() => {
+					flashHint("Unpinned");
+					loadEmptySuggestions();
+				})
+				.catch((err) => flashHint(String(err?.message ?? err)));
 			closeActionPanel();
 			break;
 		case "insert":

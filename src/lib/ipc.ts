@@ -38,6 +38,7 @@ import type {
 	MountPoint,
 	NoteItem,
 	OllamaModelInfo,
+	PinItem,
 	PrivacyConfig,
 	ProjectsConfig,
 	ReminderItem,
@@ -96,6 +97,7 @@ export type {
 	NoteItem,
 	OllamaModelInfo,
 	OutputType,
+	PinItem,
 	PlaybackStatus,
 	PrivacyConfig,
 	ProjectContext,
@@ -1100,6 +1102,23 @@ export async function updateAiPreset(
 export async function deleteAiPreset(id: string): Promise<void> {
 	if (!isTauri()) return;
 	unwrap(await commands.deleteAiPreset(id));
+}
+
+// --- Pins (zero-state Favorites) ---
+
+export async function getPins(): Promise<PinItem[]> {
+	if (!isTauri()) return [];
+	return unwrap(await commands.getPins());
+}
+
+export async function addPin(run: string, label: string): Promise<PinItem> {
+	if (!isTauri()) return { run, label, position: 0, created_at: 0 };
+	return unwrap(await commands.addPin(run, label));
+}
+
+export async function removePin(run: string): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.removePin(run));
 }
 
 // --- AI Conversation History (recall) ---

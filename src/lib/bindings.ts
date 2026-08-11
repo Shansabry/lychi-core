@@ -1142,6 +1142,30 @@ async deleteAiPreset(id: string) : Promise<Result<null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async getPins() : Promise<Result<PinItem[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_pins") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async addPin(run: string, label: string) : Promise<Result<PinItem, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_pin", { run, label }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async removePin(run: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_pin", { run }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async getConversations() : Promise<Result<ConversationSummary[], string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_conversations") };
@@ -1774,7 +1798,13 @@ fill?: string | null;
  * routing that depends on them breaks silently when they do. A row that
  * needs special handling declares it here.
  */
-kind?: CompletionKind | null }
+kind?: CompletionKind | null; 
+/**
+ * This row is user-pinned to the zero state. The ⌘K panel switches its
+ * action label on this (Pin ↔ Unpin); like `can_be_default` it is a
+ * backend verdict carried across IPC, never re-derived from display text.
+ */
+pinned?: boolean }
 /**
  * Rows whose selection behaviour differs from "run the command".
  * 
@@ -2213,6 +2243,22 @@ export type OutputType =
  * Which panel a bare keyword opens. Actuated by the frontend `ui` store.
  */
 export type PanelKind = "settings" | "history" | "media" | "notes" | "chat-history"
+/**
+ * A pin as the UI sees it, in display order.
+ */
+export type PinItem = { 
+/**
+ * The exact command Enter runs (original casing).
+ */
+run: string; 
+/**
+ * Display text.
+ */
+label: string; 
+/**
+ * Explicit order — lower shows first.
+ */
+position: number; created_at: number }
 export type PlaybackStatus = "playing" | "paused" | "stopped"
 /**
  * Privacy consent flags — all default to false (C6: Privacy First).

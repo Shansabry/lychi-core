@@ -31,22 +31,6 @@ use crate::db::frecency;
 use super::EnvironmentContext;
 use providers::{Candidate, ProviderTier, SuggestCtx, providers};
 
-/// Cap on rows shown on the empty prompt.
-///
-/// Every comparable launcher sits well below what a "show everything" zero
-/// state produces: PowerToys Run 4, Superhuman and Flow Launcher 5, Chrome's
-/// omnibox 8, Alfred and Ulauncher 9 (hard ceilings). Six keeps the whole list
-/// scannable in one glance, which is the entire point of the zero state.
-const MAX_COLD_RECENTS: usize = 6;
-
-/// How many recently-used app rows the zero state may show.
-///
-/// Below the 6-row total so clipboard actions and workspace memory keep a
-/// slot — apps must not starve the other two sources. Every launcher surveyed
-/// (Raycast, Alfred, Spotlight, PowerToys Run, Ulauncher) sits at or under 9,
-/// most under 6.
-const MAX_RECENT_APPS: usize = 4;
-
 // ── Tuning ──────────────────────────────────────────────────────────────
 
 /// Suggestions scoring below this after the learned boost are dropped —
@@ -164,120 +148,38 @@ fn workspace_root(env: &EnvironmentContext) -> Option<String> {
 }
 
 // ── Public API ──────────────────────────────────────────────────────────
+//
+// The zero-state (empty prompt) list itself lives in `crate::zero_state` — an
+// explicit sectioned composer (pins → clipboard → recent apps → workspace
+// commands). This module keeps the typed-input machinery (providers, ranking,
+// learning) and exposes two narrow helpers so the composer reuses the same
+// deciders instead of growing its own.
 
-/// The zero-state (empty prompt) shortlist. Shows ONLY what the user has
-/// actually used or explicitly did — frecency recents, workspace memory, and
-/// clipboard actions — never speculative context-derived commands. This is the
-/// industry-standard empty-state (Raycast/Alfred/Chrome ZPS): recents cold,
-/// context after intent. If nothing qualifies, returns a single hint row.
-///
-/// Pass `db` to enable recents/learned ranking and workspace memory (None in
-/// tests → cold-eligible providers with no db yield nothing).
-pub fn suggest(env: &EnvironmentContext, db: Option<&Arc<Database>>) -> Vec<CompletionItem> {
-    // Cold-eligible providers: workspace memory (usage-driven) + clipboard
-    // (explicit recent action). Ranked with the learned blend.
-    let mut items: Vec<CompletionItem> =
-        rank(collect(env, db, ProviderTier::ColdEligible), env, db)
-            .into_iter()
-            .map(|c| c.into_completion_item())
-            .collect();
-
-    // Recently-used APPS carry the zero-state. Lychi is a launcher first, and
-    // the empty prompt used to show recent COMMAND STRINGS as text — a past
-    // `open spotify` rendered as those literal characters with a clock glyph,
-    // never as Spotify with the Spotify icon. The app the user wants was one
-    // resolution away and nothing performed it.
-    //
-    // Deduped on `run`, not `label`: launching Spotify writes BOTH the app key
-    // (`spotify`, from `app_launcher`) and `history:open spotify` (from the
-    // execute command), so a label-keyed set would let "Spotify" and the
-    // literal "open spotify" both through — which is the bug, not the fix.
-    let mut seen: std::collections::HashSet<String> = items
-        .iter()
-        .map(|i| i.run.as_deref().unwrap_or(&i.label).to_lowercase())
-        .collect();
-    for item in recent_apps(db) {
-        if items.len() >= MAX_COLD_RECENTS {
-            break;
-        }
-        if seen.insert(item.run.as_deref().unwrap_or(&item.label).to_lowercase()) {
-            items.push(item);
-        }
-    }
-    items.truncate(MAX_COLD_RECENTS);
-
-    // Nothing to show (brand-new user / empty context) → one honest hint,
-    // never a wall of speculative priors.
-    if items.is_empty() {
-        return vec![hint_item()];
-    }
-    items
+/// The clipboard row, if the clipboard currently holds actionable content —
+/// [`providers::clipboard_candidate`] mapped to a completion row. The
+/// freshness gate (is the copy recent enough to still be "an explicit recent
+/// action"?) belongs to the caller, which owns the clock.
+pub fn clipboard_action(env: &EnvironmentContext) -> Option<CompletionItem> {
+    providers::clipboard_candidate(env, None).map(Candidate::into_completion_item)
 }
 
-/// Recently-used APPS, most-used first — the zero-state list.
-///
-/// `app_launcher` already records every launch under the app's lowercased
-/// display name (`handlers/app_launcher.rs`), in a flat keyspace it shares with
-/// `history:`, `win:`, `ws:`, `sug:` and bare file paths. There is no "this is
-/// an app" marker, so the `AppIndex` lookup IS the test: a key that resolves to
-/// an installed app is one, and a key that does not is skipped. An app since
-/// uninstalled therefore disappears on its own.
-///
-/// The `run` is `open <Name>`, so Enter launches it — the same string
-/// `AppLauncher::completions` emits, so selection behaves identically whether
-/// the row came from here or from typing.
-fn recent_apps(db: Option<&Arc<Database>>) -> Vec<CompletionItem> {
-    let Some(db) = db else {
-        return Vec::new();
-    };
-    let index = crate::desktop_apps::app_index();
-
-    // get_scores already applies the circadian affinity multiplier AND rides
-    // the generation-keyed entry cache. (A separate get_scores_with_affinity
-    // existed here; the two had drifted into identical logic, except that the
-    // duplicate re-scanned the whole table per call — on the keystroke path.)
-    let mut scored: Vec<(&crate::desktop_apps::DesktopEntry, f64)> = frecency::get_scores(db)
-            .into_iter()
-            // Cheap pre-filter: everything namespaced (`history:`, `win:`,
-            // `ws:`) or absolute is definitely not an app name. Correctness
-            // still rests on the index lookup below; this only avoids probes.
-            .filter(|(key, _)| !key.contains(':') && !key.starts_with('/'))
-            .filter_map(|(key, score)| index.by_name_exact(&key).map(|e| (e, score)))
-            .collect();
-
-    // Score desc, then name for a deterministic order when scores tie.
-    scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.name.cmp(&b.0.name))
-    });
-
-    scored
+/// Workspace-memory commands for the current workspace, ranked by the ONE
+/// blend (learned boost, CTR demotion, circadian affinity) and capped. The
+/// composer places this section; it never re-orders it.
+pub fn workspace_commands(
+    env: &EnvironmentContext,
+    db: Option<&Arc<Database>>,
+    cap: usize,
+) -> Vec<CompletionItem> {
+    let memory: Vec<(&'static str, Candidate)> = collect(env, db, ProviderTier::ColdEligible)
         .into_iter()
-        // TAKE BEFORE RESOLVING ICONS. This ordering is the startup guard, not
-        // a style choice: resolving every app's icon eagerly cost 6.5s of
-        // warmup (see `handlers/app_launcher.rs` and the icon-warmup work), so
-        // only the handful actually shown may pay it. Each `OnceLock` then
-        // caches for the process lifetime.
-        .take(MAX_RECENT_APPS)
-        .map(|(entry, _)| {
-            let icon_path = entry
-                .icon_path
-                .get_or_init(|| {
-                    entry
-                        .icon
-                        .as_deref()
-                        .and_then(crate::action_registry::handlers::icons::resolve_icon)
-                })
-                .clone();
-            CompletionItem {
-                label: entry.name.clone(),
-                icon_path,
-                score: 0,
-                run: Some(format!("open {}", entry.name)),
-                ..Default::default()
-            }
-        })
+        .filter(|(provider, _)| *provider == "memory")
+        .collect();
+    let mut ranked = rank(memory, env, db);
+    ranked.truncate(cap);
+    ranked
+        .into_iter()
+        .map(Candidate::into_completion_item)
         .collect()
 }
 
@@ -317,17 +219,6 @@ fn intent_key(cmd: &str) -> String {
     words.sort();
     words.dedup();
     words.join(" ")
-}
-
-/// The empty-state hint shown to a brand-new user with no recents.
-fn hint_item() -> CompletionItem {
-    CompletionItem {
-        label: "Type a command, or search the web".to_string(),
-        icon_path: Some("__info__".to_string()),
-        score: 0,
-        description: Some("Your recent commands will appear here".to_string()),
-        ..Default::default()
-    }
 }
 
 /// Context actions matching the typed input — the home for context-derived
@@ -669,74 +560,44 @@ mod tests {
         }
     }
 
-    #[test]
-    fn zero_state_never_shows_speculative_context() {
-        // Dirty git repo, terminal focused, but NO history/recents. The
-        // zero-state must NOT surface git commit/diff/etc. — context actions
-        // are typed-gated now. Only the hint should show.
-        let items = suggest(&dev_env(), None);
-        assert!(
-            !items.iter().any(|i| i.label.starts_with("git ")),
-            "zero-state must not show speculative git commands"
-        );
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].icon_path.as_deref(), Some("__info__"));
-    }
+    // The zero-state composition tests live in `crate::zero_state` — this
+    // module keeps the typed-input machinery and its two narrow helpers.
 
     #[test]
-    fn zero_state_never_shows_speculative_commands() {
-        // Rewritten 2026-08-07: the zero state is APPS now, so the original
-        // assertions (history rows labelled "open firefox" with a
-        // `__history__` clock) describe behaviour that was deliberately
-        // removed — see `recent_apps`. What this test still owns, and what it
-        // was really guarding, is that a dirty repo does NOT conjure `git`
-        // commands nobody ran.
+    fn workspace_commands_are_dev_window_only() {
+        // MemoryProvider is not universal: outside a terminal/IDE the empty
+        // prompt must not surface workspace commands.
         let db = crate::db::open_test_database();
-        frecency::record(&db, "history:open firefox").unwrap();
-        frecency::record(&db, "history:web rust docs").unwrap();
-        let items = suggest(&dev_env(), Some(&db));
-        assert!(
-            !items.iter().any(|i| i.label.starts_with("git ")),
-            "speculative git commands must never appear: {items:?}"
-        );
-        // And history keys must not come back as raw command text.
-        assert!(
-            !items.iter().any(|i| i.label == "web rust docs"),
-            "a raw command string leaked into the app zero state: {items:?}"
-        );
-    }
+        frecency::record_workspace(&db, "/home/u/proj", "cargo test").unwrap();
+        frecency::record_workspace(&db, "/home/u/proj", "cargo test").unwrap();
 
-    #[test]
-    fn zero_state_hint_for_new_user() {
-        // Empty store, empty context → a single honest hint, never junk.
-        let items = suggest(&empty_env(), None);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].icon_path.as_deref(), Some("__info__"));
-    }
-
-    #[test]
-    fn suggest_non_dev_window_skips_dev_providers() {
         let mut env = dev_env();
-        // Browser focused: git context exists but window isn't a dev window.
-        env.active_window.as_mut().unwrap().is_terminal = false;
-        let items = suggest(&env, None);
+        env.cwd = Some("/home/u/proj".into());
         assert!(
-            !items.iter().any(|i| i.label.starts_with("git ")),
-            "git suggestions must not appear outside dev windows"
+            workspace_commands(&env, Some(&db), 5)
+                .iter()
+                .any(|i| i.label == "cargo test"),
+            "dev window must offer the workspace command"
+        );
+
+        env.active_window.as_mut().unwrap().is_terminal = false;
+        assert!(
+            workspace_commands(&env, Some(&db), 5).is_empty(),
+            "a browser window must not surface workspace commands"
         );
     }
 
     #[test]
-    fn suggest_clipboard_error_carries_real_query() {
+    fn clipboard_action_carries_real_query() {
         let mut env = empty_env();
         env.clipboard = Some(
             super::super::clipboard_detect::ClipboardContentType::ErrorTrace(
                 "TypeError: x is undefined".into(),
             ),
         );
-        let items = suggest(&env, None);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "web TypeError: x is undefined");
+        let item = clipboard_action(&env).expect("an error trace is actionable");
+        assert_eq!(item.label, "web TypeError: x is undefined");
+        assert!(clipboard_action(&empty_env()).is_none());
     }
 
     #[test]
@@ -765,292 +626,5 @@ mod tests {
             workspace_scripts: vec![],
         });
         assert_eq!(workspace_root(&env).as_deref(), Some("/home/u/proj"));
-    }
-}
-
-#[cfg(test)]
-mod app_zero_state_tests {
-    use super::*;
-    use crate::db::frecency;
-    use crate::desktop_apps::index;
-
-    /// Pin the global app index for the duration of a test.
-    ///
-    /// The index is process-wide, so these tests must serialise on its lock
-    /// and restore the real index afterwards — otherwise they assert whatever
-    /// the machine happens to have installed, which passes on a developer
-    /// desktop and fails on a bare CI runner.
-    fn with_apps(names: &[(&str, &str)]) -> impl Drop {
-        struct Restore {
-            _lock: std::sync::MutexGuard<'static, ()>,
-        }
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                index::rebuild_app_index();
-            }
-        }
-        let guard = index::test_index_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        index::set_app_index_for_test(
-            names
-                .iter()
-                .map(|(name, exec)| {
-                    index::tests::make_entry(name, exec, &[], None, Some(&name.to_lowercase()))
-                })
-                .collect(),
-        );
-        Restore { _lock: guard }
-    }
-
-    fn env() -> EnvironmentContext {
-        super::tests::empty_env()
-    }
-
-    /// The headline: a launched app comes back as an APP ROW, not the literal
-    /// text of the command that launched it.
-    #[test]
-    fn a_launched_app_returns_as_an_app_row() {
-        let _idx = with_apps(&[("Spotify", "/usr/bin/spotify")]);
-        let db = crate::db::open_test_database();
-        // Exactly what `app_launcher` records on launch.
-        frecency::record(&db, "spotify").unwrap();
-
-        let items = suggest(&env(), Some(&db));
-
-        let row = items
-            .iter()
-            .find(|i| i.label == "Spotify")
-            .unwrap_or_else(|| panic!("no Spotify app row: {items:?}"));
-        assert_eq!(row.run.as_deref(), Some("open Spotify"));
-        assert!(
-            !items.iter().any(|i| i.label == "open spotify"),
-            "the raw command string is still being shown: {items:?}"
-        );
-    }
-
-    /// Launching an app writes BOTH `spotify` and `history:open spotify`, so
-    /// without run-keyed dedupe the user would see the app row AND the literal
-    /// text — the exact bug this change exists to remove.
-    #[test]
-    fn the_history_twin_of_an_app_never_appears() {
-        let _idx = with_apps(&[("Spotify", "/usr/bin/spotify")]);
-        let db = crate::db::open_test_database();
-        frecency::record(&db, "spotify").unwrap();
-        frecency::record(&db, "history:open spotify").unwrap();
-
-        let items = suggest(&env(), Some(&db));
-        let opens: Vec<&CompletionItem> = items
-            .iter()
-            .filter(|i| {
-                i.run
-                    .as_deref()
-                    .unwrap_or(&i.label)
-                    .to_lowercase()
-                    .starts_with("open spotify")
-            })
-            .collect();
-        assert_eq!(
-            opens.len(),
-            1,
-            "expected exactly one Spotify row: {items:?}"
-        );
-        assert_eq!(opens[0].label, "Spotify");
-    }
-
-    /// The keyspace is flat and shared. Only keys that resolve to an installed
-    /// app may become rows.
-    #[test]
-    fn non_app_frecency_keys_never_become_rows() {
-        let _idx = with_apps(&[("Spotify", "/usr/bin/spotify")]);
-        let db = crate::db::open_test_database();
-        for key in [
-            "history:web rust docs",
-            "win:firefox",
-            "ws:/home/u/p:cargo test",
-            "/home/u/notes.md",
-            "sug:something",
-        ] {
-            frecency::record(&db, key).unwrap();
-        }
-
-        let items = suggest(&env(), Some(&db));
-
-        // Assert on the COUNT, not on the labels. Checking labels only proves
-        // the key text did not leak verbatim — a bug that resolved every key
-        // to some arbitrary app would produce perfectly clean-looking labels
-        // and still be wrong. Five non-app keys were recorded and no app key
-        // was, so the only correct answer is zero app rows.
-        assert!(
-            items
-                .iter()
-                .all(|i| i.run.is_none()
-                    || !i.run.as_deref().unwrap_or_default().starts_with("open ")),
-            "a non-app frecency key produced an app row: {items:?}"
-        );
-    }
-
-    /// An app recorded once and since uninstalled must not linger as a dead
-    /// row that launches nothing.
-    #[test]
-    fn an_uninstalled_app_is_dropped() {
-        let _idx = with_apps(&[("Spotify", "/usr/bin/spotify")]);
-        let db = crate::db::open_test_database();
-        frecency::record(&db, "spotify").unwrap();
-        frecency::record(&db, "an-app-that-was-removed").unwrap();
-
-        let items = suggest(&env(), Some(&db));
-        assert!(
-            !items
-                .iter()
-                .any(|i| i.label.eq_ignore_ascii_case("an-app-that-was-removed")),
-            "an uninstalled app is still listed: {items:?}"
-        );
-    }
-
-    #[test]
-    fn app_rows_respect_the_cap() {
-        let apps: Vec<(String, String)> = (0..10)
-            .map(|i| (format!("App{i}"), format!("/usr/bin/app{i}")))
-            .collect();
-        let refs: Vec<(&str, &str)> = apps.iter().map(|(n, e)| (n.as_str(), e.as_str())).collect();
-        let _idx = with_apps(&refs);
-
-        let db = crate::db::open_test_database();
-        for (name, _) in &apps {
-            frecency::record(&db, &name.to_lowercase()).unwrap();
-        }
-
-        let items = suggest(&env(), Some(&db));
-        assert!(
-            items.len() <= MAX_COLD_RECENTS,
-            "over the total cap: {items:?}"
-        );
-        let app_rows = items.iter().filter(|i| i.label.starts_with("App")).count();
-        assert!(
-            app_rows <= MAX_RECENT_APPS,
-            "expected <= {MAX_RECENT_APPS} app rows, got {app_rows}"
-        );
-    }
-
-    /// The startup guard, enforced rather than commented. Resolving every
-    /// app's icon eagerly cost 6.5s of warmup; only the rows actually shown
-    /// may pay for one.
-    #[test]
-    fn only_the_shown_rows_resolve_an_icon() {
-        let apps: Vec<(String, String)> = (0..10)
-            .map(|i| (format!("App{i}"), format!("/usr/bin/app{i}")))
-            .collect();
-        let refs: Vec<(&str, &str)> = apps.iter().map(|(n, e)| (n.as_str(), e.as_str())).collect();
-        let _idx = with_apps(&refs);
-
-        let db = crate::db::open_test_database();
-        for (name, _) in &apps {
-            frecency::record(&db, &name.to_lowercase()).unwrap();
-        }
-
-        let _ = suggest(&env(), Some(&db));
-
-        let resolved = index::app_index()
-            .entries
-            .iter()
-            .filter(|e| e.icon_path.get().is_some())
-            .count();
-        assert!(
-            resolved <= MAX_RECENT_APPS,
-            "resolved {resolved} icons for at most {MAX_RECENT_APPS} visible rows — \
-             the take-before-resolve ordering has been lost"
-        );
-    }
-
-    /// The screenshot bug: workspace memory offered `open Xfce Terminal` as a
-    /// raw command row (lightning bolt, "Recent in <project>") ABOVE the real
-    /// Xfce Terminal app row. Two rows, one target, and the uglier one first.
-    #[test]
-    fn workspace_memory_does_not_duplicate_an_app_row() {
-        let _idx = with_apps(&[("Xfce Terminal", "/usr/bin/xfce4-terminal")]);
-        let db = crate::db::open_test_database();
-        // The app itself, and a workspace memory of having launched it here.
-        frecency::record(&db, "xfce terminal").unwrap();
-        frecency::record_workspace(&db, "/home/u/proj", "open Xfce Terminal").unwrap();
-
-        // `MemoryProvider` keys on the project root or, failing that, the cwd.
-        let mut env = super::tests::dev_env();
-        env.cwd = Some("/home/u/proj".into());
-
-        let items = suggest(&env, Some(&db));
-        let raw = items
-            .iter()
-            .filter(|i| i.label.starts_with("open "))
-            .count();
-        assert_eq!(
-            raw, 0,
-            "an app launch is still shown as raw command text: {items:?}"
-        );
-    }
-
-    /// ...but workspace memory must keep offering real COMMANDS. Dropping app
-    /// launches must not gut the feature.
-    #[test]
-    fn workspace_memory_still_offers_commands() {
-        let _idx = with_apps(&[("Xfce Terminal", "/usr/bin/xfce4-terminal")]);
-        let db = crate::db::open_test_database();
-        frecency::record_workspace(&db, "/home/u/proj", "cargo test").unwrap();
-
-        let mut env = super::tests::dev_env();
-        env.cwd = Some("/home/u/proj".into());
-
-        let items = suggest(&env, Some(&db));
-        assert!(
-            items.iter().any(|i| i.label == "cargo test"),
-            "workspace memory stopped offering commands: {items:?}"
-        );
-    }
-
-    /// A brand-new user sees the honest hint, not an empty list.
-    #[test]
-    fn no_frecency_yields_the_hint() {
-        let _idx = with_apps(&[("Spotify", "/usr/bin/spotify")]);
-        let db = crate::db::open_test_database();
-        let items = suggest(&env(), Some(&db));
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].icon_path.as_deref(), Some("__info__"));
-    }
-}
-
-#[cfg(test)]
-mod app_lookup_boundary {
-    use super::*;
-    use crate::db::frecency;
-    use crate::desktop_apps::index;
-
-    /// The index lookup — not the `:`/`/` pre-filter — is what decides whether
-    /// a frecency key names an app. This pins that directly: a key that is NOT
-    /// an app name must produce no row even though it passes the pre-filter.
-    #[test]
-    fn a_plain_non_app_key_produces_no_row() {
-        let _g = index::test_index_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        index::set_app_index_for_test(vec![index::tests::make_entry(
-            "Spotify",
-            "/usr/bin/spotify",
-            &[],
-            None,
-            Some("spotify"),
-        )]);
-
-        let db = crate::db::open_test_database();
-        // No colon, no leading slash — sails past the pre-filter, and is still
-        // not an installed app.
-        frecency::record(&db, "definitely-not-an-app").unwrap();
-
-        let items = suggest(&super::tests::empty_env(), Some(&db));
-        assert!(
-            !items.iter().any(|i| i.run.is_some()),
-            "a key that is not an app produced a launchable row: {items:?}"
-        );
-
-        index::rebuild_app_index();
     }
 }

@@ -123,6 +123,22 @@ pub struct AiPresetEntry {
     pub sync_status: SyncStatus,
 }
 
+/// A user-pinned zero-state row. `run` keeps the exact-case command to execute;
+/// the table key is its normalized form (see `pins::normalize_run`), so unpin
+/// and is-pinned are O(1) lookups from any row's run string. `position` carries
+/// explicit pin order — table keys are lexicographic, not insertion-ordered.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PinEntry {
+    pub run: String,
+    pub label: String,
+    pub position: u32,
+    pub created_at: u64,
+    #[serde(default)]
+    pub deleted_at: Option<u64>,
+    #[serde(default)]
+    pub sync_status: SyncStatus,
+}
+
 /// Persisted timer/stopwatch, so a running countdown survives an app restart.
 ///
 /// The live `Timer` uses a monotonic `Instant` (not persistable across process

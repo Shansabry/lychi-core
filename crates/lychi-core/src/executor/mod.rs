@@ -1097,21 +1097,24 @@ impl Executor {
         raw: &str,
         cfg: &crate::config::schema::SuggestionsConfig,
     ) -> Option<Vec<CompletionItem>> {
-        let trimmed = raw.trim();
-        if trimmed.chars().count() > 1 || !cfg.zero_state_recents {
+        if !raw.trim().is_empty() {
             return None;
         }
-        let ctx = self.context.as_ref()?;
 
-        let mut items = crate::context::suggestions::suggest(ctx, Some(&self.db));
+        // NO context gate, deliberately: the first summon after launch runs
+        // before any context gather has landed, and it must still show pins
+        // and recent apps instead of a blank panel. Context only ENRICHES
+        // (clipboard action, workspace commands) — the composer handles both
+        // shapes. `zero_state_recents` is honoured inside the composer too,
+        // because pins survive the flag (explicit config, not history).
+        let items = crate::zero_state::compose(self.context.as_ref(), &self.db, cfg);
+
+        let Some(ctx) = self.context.as_ref() else {
+            return Some(items);
+        };
         self.note_suggestions(&items);
-        if !trimmed.is_empty() {
-            return None;
-        }
         self.record_impressions_debounced(ctx, &items);
-        if items.is_empty() {
-            return None;
-        }
+        let mut items = items;
 
         // Staleness is a FLAG, not a row: the `__context_stale__` sentinel
         // carries tooltip text the frontend renders as a dim glyph in the

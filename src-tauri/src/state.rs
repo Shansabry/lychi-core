@@ -962,6 +962,7 @@ mod sentinel_contract {
             "__info__",
             "__clipboard_image__",
             "__ai_chat__",
+            "__pinned__",
             "__media_panel__",
             "__notes_panel__",
             "__timer_panel__",

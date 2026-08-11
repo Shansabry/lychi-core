@@ -16,6 +16,7 @@ pub mod history;
 pub mod media;
 pub mod notes;
 pub mod open_uri;
+pub mod pins;
 pub mod preview;
 pub mod reminders;
 pub mod reveal_path;

@@ -899,7 +899,10 @@ mod tests {
             gather_ms: 0,
             ..Default::default()
         };
-        for item in suggestions::suggest(&test_ctx, None) {
+        let context_rows = suggestions::clipboard_action(&test_ctx)
+            .into_iter()
+            .chain(suggestions::workspace_commands(&test_ctx, None, 5));
+        for item in context_rows {
             println!(
                 "  {} — {}",
                 item.label,

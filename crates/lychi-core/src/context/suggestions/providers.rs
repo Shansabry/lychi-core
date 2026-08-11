@@ -80,6 +80,10 @@ pub enum ProviderTier {
     TypedOnly,
 }
 
+/// Minimum recorded uses before a workspace command may surface as a
+/// suggestion. See the gate in [`MemoryProvider::suggest`].
+pub const MIN_WORKSPACE_USES: u32 = 2;
+
 pub trait SuggestionProvider: Send + Sync {
     /// Stable id, used for the per-provider cap and debugging.
     fn id(&self) -> &'static str;
@@ -229,6 +233,24 @@ impl SuggestionProvider for ClipboardProvider {
     }
 }
 
+/// The clipboard row for the zero state — [`ClipboardProvider`] run once,
+/// outside the provider registry walk. One classifier, one row shape, whether
+/// the row is reached from typed matching or the empty prompt.
+pub(super) fn clipboard_candidate(
+    env: &EnvironmentContext,
+    db: Option<&Arc<Database>>,
+) -> Option<Candidate> {
+    let ctx = SuggestCtx {
+        env,
+        db,
+        in_dev_window: env
+            .active_window
+            .as_ref()
+            .is_some_and(|w| w.is_terminal || w.is_ide),
+    };
+    ClipboardProvider.suggest(&ctx).into_iter().next()
+}
+
 // ── Navigation (project root, pinned workspace) ─────────────────────────
 
 struct NavigationProvider;
@@ -308,7 +330,17 @@ impl SuggestionProvider for MemoryProvider {
             return Vec::new();
         };
 
-        let scores = frecency::get_workspace_scores(db, root);
+        // The ≥2-uses quality bar lives HERE, so every consumer of workspace
+        // memory inherits it: a command run once is an event, not a habit, and
+        // a one-off `kill 1234` haunting the empty prompt for a week was the
+        // reported garbage. Counts, not scores — a single use minutes ago
+        // outscores five uses last week.
+        let scores: std::collections::HashMap<String, f64> =
+            frecency::get_workspace_stats(db, root)
+                .into_iter()
+                .filter(|(_, (_, count))| *count >= MIN_WORKSPACE_USES)
+                .map(|(cmd, (score, _))| (cmd, score))
+                .collect();
         if scores.is_empty() {
             return Vec::new();
         }

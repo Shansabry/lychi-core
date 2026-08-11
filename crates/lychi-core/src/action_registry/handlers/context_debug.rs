@@ -567,8 +567,17 @@ fn format_context(ctx: &EnvironmentContext) -> String {
         ));
     }
 
-    // Suggestions with provenance
-    let suggestions = crate::context::suggestions::suggest(ctx, None);
+    // Context-derived suggestions with provenance. This debug view has no db
+    // handle, so it shows the CONTEXT half of the zero state (clipboard action
+    // + workspace memory) — pins and app recents are plain data, inspectable
+    // in the UI itself.
+    let suggestions: Vec<crate::action_registry::CompletionItem> =
+        crate::context::suggestions::clipboard_action(ctx)
+            .into_iter()
+            .chain(crate::context::suggestions::workspace_commands(
+                ctx, None, 5,
+            ))
+            .collect();
     if !suggestions.is_empty() {
         lines.push(String::new());
         lines.push(format!("Suggestions: ({})", suggestions.len()));

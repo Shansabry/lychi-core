@@ -7,6 +7,7 @@ import {
 	Lightbulb,
 	LoaderCircle,
 	MessageSquare,
+	Pin,
 	Terminal,
 	TriangleAlert,
 	Zap,
@@ -198,6 +199,7 @@ function formatSize(bytes: number | null | undefined): string {
 		{@const isInfo = item?.icon_path === "__info__"}
 		{@const isClipImage = item?.icon_path === "__clipboard_image__"}
 		{@const isAiChat = item?.icon_path === "__ai_chat__"}
+		{@const isPinned = item?.icon_path === ICON.pinned}
 		{@const isWeb = item?.label?.startsWith("Search web:")}
 		{@const hideIcon = item?.icon_path === ICON.none || item?.icon_path === ICON.web || isWeb || isSeparator}
 		{@const hasCustomIcon = isCustomIcon(item?.icon_path)}
@@ -251,6 +253,9 @@ function formatSize(bytes: number | null | undefined): string {
 				</span>
 				<span style:visibility={isAiChat ? "visible" : "hidden"} class="icon-slot">
 					<MessageSquare size={19} strokeWidth={1.5} class="icon-ai-chat" />
+				</span>
+				<span style:visibility={isPinned ? "visible" : "hidden"} class="icon-slot">
+					<Pin size={20} strokeWidth={1.5} class="icon-pinned" />
 				</span>
 				<span style:visibility={isClipImage && item?.thumb_b64 ? "visible" : "hidden"} class="icon-slot clip-thumb-slot">
 					<img
@@ -550,6 +555,11 @@ function formatSize(bytes: number | null | undefined): string {
 	}
 	.icon :global(.icon-ai-chat) {
 		color: var(--accent);
+	}
+
+	.icon :global(.icon-pinned) {
+		color: var(--accent);
+		opacity: 0.9;
 	}
 
 	.icon :global(.icon-terminal) {

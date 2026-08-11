@@ -675,6 +675,11 @@ pub struct CompletionItem {
     /// needs special handling declares it here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<CompletionKind>,
+    /// This row is user-pinned to the zero state. The ⌘K panel switches its
+    /// action label on this (Pin ↔ Unpin); like `can_be_default` it is a
+    /// backend verdict carried across IPC, never re-derived from display text.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// Rows whose selection behaviour differs from "run the command".

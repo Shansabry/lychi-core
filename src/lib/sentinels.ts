@@ -36,6 +36,7 @@ export const ICON = {
 	info: "__info__",
 	clipboardImage: "__clipboard_image__",
 	aiChat: "__ai_chat__",
+	pinned: "__pinned__",
 } as const;
 
 export type IconSentinel = (typeof ICON)[keyof typeof ICON];
