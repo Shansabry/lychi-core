@@ -866,20 +866,22 @@ mod bench {
 
     #[test]
     fn flatten_conversation_renders_history_and_system() {
-        use crate::providers::{ChatMessage, Role, ToolCall};
+        use crate::providers::{ChatMessage, ToolCall};
         let msgs = vec![
             ChatMessage::system("You are helpful."),
             ChatMessage::user("open firefox"),
-            ChatMessage {
-                role: Role::Assistant,
-                content: "Opening it".into(),
-                tool_call_id: None,
-                tool_calls: vec![ToolCall {
+            {
+                // Constructor + mutation, NOT a struct literal: this test is
+                // feature-gated and was dead code in CI, so ChatMessage grew
+                // two fields (ContentPart content, display) without this
+                // literal compiling — the exact rot AI-4 exists to stop.
+                let mut m = ChatMessage::assistant("Opening it");
+                m.tool_calls = vec![ToolCall {
                     id: "t1".into(),
                     name: "open".into(),
                     args: "firefox".into(),
-                }],
-                is_error: false,
+                }];
+                m
             },
             ChatMessage::tool_result("t1", "opened", false),
         ];

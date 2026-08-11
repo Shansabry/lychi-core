@@ -242,6 +242,37 @@ jobs:
   #
   # Both only need lychi-core, so they skip the WebKit/GTK stack entirely and
   # use their own cache key.
+  # The release build REQUIRES local-ai, but the matrix above deliberately
+  # excludes it (llama.cpp dominates CI time when built for real). That gap let
+  # feature-gated code rot: ChatMessage grew two fields and the local-ai tests
+  # stopped compiling with nothing failing (AI-4). This job type-checks the
+  # feature — including its #[ignore]d model tests — without running anything.
+  # Its own cache key: llama.cpp's C++ objects rebuild only when the -sys crate
+  # bumps, so warm runs are minutes, not tens of minutes.
+  local-ai-check:
+    name: Rust / local-ai check
+    needs: quick
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev libgtk-layer-shell-dev \
+            libssl-dev libdbus-1-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: local-ai
+
+      - name: Check local-ai (lib + tests)
+        run: cargo check -p lychi-core --features local-ai --tests
+
   env-tests:
     name: Backend / ${{ matrix.backend }}
     needs: quick
