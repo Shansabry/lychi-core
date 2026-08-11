@@ -26,9 +26,10 @@ pub struct ResolvedIntent {
 
 /// Intent Resolver — converts raw user input into structured intents.
 ///
-/// Combines deterministic pattern matching with optional AI routing.
-/// `Clone` shares the router (`Arc`) — its route cache, health gate, and
-/// context hint are cross-clone state and must not fork with a snapshot.
+/// Purely deterministic (pattern match → weak fallback → web). `ai_router` is
+/// not consulted for routing any more — its presence is only the "AI is
+/// configured" flag (`has_ai`) that switches natural language between the agent
+/// and web. `Clone` shares it via `Arc`.
 #[derive(Clone)]
 pub struct IntentResolver {
     ai_router: Option<std::sync::Arc<AiRouter>>,
@@ -56,13 +57,13 @@ impl IntentResolver {
         self.ai_router = None;
     }
 
-    /// Resolve raw input into a structured intent.
+    /// Resolve raw input into a structured intent. Deterministic — the agent
+    /// (not this resolver) owns natural language.
     ///
-    /// Four-phase pipeline:
-    /// 1. Explicit/Strong match → dispatch immediately
-    /// 2. Weak match → try AI first, use weak match as fallback
-    /// 3. No match + AI available → ask AI
-    /// 4. No match + AI unavailable → AppIndex → web search
+    /// 1. Explicit/Strong pattern match → dispatch immediately
+    /// 2. Input that IS an app's name → launch it (identity, not mention)
+    /// 3. Weak pattern match → use it as the fallback
+    /// 4. Otherwise → web search (a safe, instant default)
     pub async fn resolve(&self, raw: &str, registry: &ActionRegistry) -> ResolvedIntent {
         // Phase 1: Deterministic match
         let (no_match_input, weak_fallback) = match patterns::route(raw, registry) {
