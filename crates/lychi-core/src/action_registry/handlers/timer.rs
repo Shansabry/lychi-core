@@ -749,6 +749,23 @@ impl TimerHandler {
     }
 }
 
+/// Credit wall-clock time that passed while the process was suspended to
+/// every RUNNING timer and stopwatch, by shifting `started_at` into the past.
+/// Paused timers must not accrue and are left alone. Returns how many shifted.
+fn reconcile_suspend(
+    timers: &mut std::collections::HashMap<String, Timer>,
+    slept: std::time::Duration,
+) -> usize {
+    let mut shifted = 0usize;
+    for t in timers.values_mut() {
+        if t.paused_at.is_none() {
+            t.started_at = t.started_at.checked_sub(slept).unwrap_or(t.started_at);
+            shifted += 1;
+        }
+    }
+    shifted
+}
+
 /// Background loop: checks timers every 500ms for completion, sends desktop notification.
 /// Also checks reminders every ~10s (every 20th tick).
 ///
@@ -795,10 +812,48 @@ fn timer_monitor_loop(
     use std::sync::atomic::Ordering;
     let reminder_store = crate::reminders::store::RemindersStore::new();
     let mut tick: u32 = 0;
+    // Suspend detection: `Instant` is CLOCK_MONOTONIC, which excludes suspend
+    // time on Linux — `timer 30m` plus an hour of lid-closed sleep fired an
+    // hour late, the UI showing minutes remaining that had already elapsed on
+    // the wall. Reminders in this same loop compare wall clock and were always
+    // correct; two clock disciplines in one module. Track a (wall, monotonic)
+    // pair per tick: the wall delta exceeding the monotonic delta by more than
+    // the threshold means the system slept, and every running timer's
+    // `started_at` shifts back by the gap — the same map-wall-elapsed-onto-
+    // Instant reconciliation `from_entry` performs at load.
+    let mut last_wall_ms = crate::db::now_millis();
+    let mut last_mono = Instant::now();
+    const SUSPEND_THRESHOLD_MS: u64 = 2_000; // ignore NTP nudges
 
     while running.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(500));
         tick = tick.wrapping_add(1);
+
+        // --- Suspend reconciliation (before the completion checks) ---
+        {
+            let wall_ms = crate::db::now_millis();
+            let mono = Instant::now();
+            let wall_delta = wall_ms.saturating_sub(last_wall_ms);
+            let mono_delta = mono.duration_since(last_mono).as_millis() as u64;
+            last_wall_ms = wall_ms;
+            last_mono = mono;
+
+            let slept_ms = wall_delta.saturating_sub(mono_delta);
+            if slept_ms > SUSPEND_THRESHOLD_MS {
+                let slept = std::time::Duration::from_millis(slept_ms);
+                let shifted = {
+                    let mut timers = state.lock().unwrap();
+                    reconcile_suspend(&mut timers, slept)
+                };
+                if shifted > 0 {
+                    tracing::info!(
+                        "[timer] system slept ~{}s — advanced {shifted} running timer(s)",
+                        slept_ms / 1000
+                    );
+                    persist_timers(state, db);
+                }
+            }
+        }
 
         // --- Timer checks (every tick) ---
         {
@@ -856,6 +911,71 @@ mod tests {
             Output::Text { body, .. } => Some(body.as_str()),
             _ => None,
         }
+    }
+
+    /// THE SUSPEND BUG (BLIND-3): `Instant` is CLOCK_MONOTONIC, which excludes
+    /// suspend time — a 30m timer plus an hour of lid-closed sleep fired an
+    /// hour late. Reconciliation credits the slept wall time to running timers
+    /// and stopwatches; paused timers must not accrue.
+    #[test]
+    fn suspend_reconciliation_credits_running_timers_only() {
+        let now = Instant::now();
+        let mut timers = HashMap::new();
+        timers.insert(
+            "running".to_string(),
+            Timer {
+                name: "tea".into(),
+                duration_secs: 1800, // 30m
+                started_at: now,
+                elapsed_before_secs: 0.0,
+                paused_at: None,
+                completed: false,
+            },
+        );
+        timers.insert(
+            "stopwatch".to_string(),
+            Timer {
+                name: "sw".into(),
+                duration_secs: 0,
+                started_at: now,
+                elapsed_before_secs: 0.0,
+                paused_at: None,
+                completed: false,
+            },
+        );
+        timers.insert(
+            "paused".to_string(),
+            Timer {
+                name: "paused".into(),
+                duration_secs: 1800,
+                started_at: now,
+                elapsed_before_secs: 60.0,
+                paused_at: Some(now),
+                completed: false,
+            },
+        );
+
+        // The lid was closed for an hour.
+        let shifted = reconcile_suspend(&mut timers, std::time::Duration::from_secs(3600));
+        assert_eq!(shifted, 2, "running timer + stopwatch, not the paused one");
+
+        let running = &timers["running"];
+        assert!(
+            running.elapsed_secs() >= 3600.0,
+            "the hour of sleep elapsed on the wall: {}",
+            running.elapsed_secs()
+        );
+        assert!(running.is_done(), "a 30m timer is long overdue after 1h");
+
+        let sw = &timers["stopwatch"];
+        assert!(sw.elapsed_secs() >= 3600.0, "stopwatches count wall time");
+
+        let paused = &timers["paused"];
+        assert!(
+            (paused.elapsed_secs() - 60.0).abs() < 1.0,
+            "paused time never accrues: {}",
+            paused.elapsed_secs()
+        );
     }
 
     #[test]
