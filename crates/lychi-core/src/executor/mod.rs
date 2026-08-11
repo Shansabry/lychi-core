@@ -2331,6 +2331,52 @@ mod tests {
         r
     }
 
+    /// An `open` mock with a FIXED app name — faithful to the real
+    /// `AppLauncher`, whose labels are APP NAMES from the index, never echoes
+    /// of the typed query. `CompletingHandler` title-cases its arg, so its
+    /// label always equals the typed text (Identity): it can reproduce
+    /// neither the strict-PREFIX shape ("spoti" → "Spotify", the
+    /// spoti-double-Enter bug) nor the mention shape ("how do i install
+    /// firefox" → label "Firefox", Subset).
+    struct FixedAppHandler {
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl ActionHandler for FixedAppHandler {
+        fn id(&self) -> &str {
+            "open"
+        }
+        fn description(&self) -> &str {
+            "mock open handler with one fixed app"
+        }
+        async fn execute(
+            &self,
+            _ctx: &crate::action_registry::ExecContext,
+            _args: &str,
+        ) -> Result<ActionResult, crate::error::LychiError> {
+            Ok(ActionResult::ok(
+                "open stub executed",
+                crate::action_registry::OutputType::Status,
+            ))
+        }
+        async fn completions(&self, _partial: &str) -> Vec<crate::action_registry::CompletionItem> {
+            vec![crate::action_registry::CompletionItem {
+                label: self.name.to_string(),
+                score: 100,
+                run: Some(format!("open {}", self.name)),
+                ..Default::default()
+            }]
+        }
+    }
+
+    fn registry_with_fixed_app_open(name: &'static str) -> ActionRegistry {
+        let mut r = ActionRegistry::new();
+        r.register(Box::new(FixedAppHandler { name }));
+        r.register(Box::new(StubHandler { id: "web" }));
+        r
+    }
+
     fn registry_open_succeeds() -> ActionRegistry {
         let mut r = ActionRegistry::new();
         r.register(Box::new(StubHandler { id: "open" }));
@@ -2545,12 +2591,41 @@ mod tests {
         );
     }
 
+    /// THE "spoti ⏎ ⏎" BUG end-to-end: typing a strict prefix of an app's
+    /// display name must make that row Enter-launchable, even though its
+    /// command (`open Spotify`) does not prefix-extend the typed text. Judged
+    /// by the command alone the row classified Subset, nothing was
+    /// defaultable, and the first Enter fell through to the typo corrector's
+    /// fill — launching took two Enters.
+    #[tokio::test]
+    async fn a_typed_app_name_prefix_is_enter_launchable() {
+        let ex = make_executor(registry_with_fixed_app_open("Spotify"));
+        let completions = ex
+            .completions(
+                "spoti",
+                &crate::config::schema::SuggestionsConfig::default(),
+            )
+            .await;
+        let row = completions
+            .iter()
+            .find(|c| c.label == "Spotify")
+            .unwrap_or_else(|| panic!("no app row: {completions:?}"));
+        assert!(
+            row.can_be_default,
+            "Enter would not launch the app whose name the user is typing: {row:?}"
+        );
+    }
+
     /// The protection that must survive: a NON-explicit route still classifies
     /// against the whole input, so a query that merely mentions an app cannot
     /// auto-launch it. This is the `dnf search firefox` shape.
     #[tokio::test]
     async fn a_query_that_merely_mentions_an_app_is_not_defaultable() {
-        let ex = make_executor(registry_with_completing_open());
+        // The fixed-name mock, not `CompletingHandler`: the real AppLauncher
+        // labels this row "Firefox" (the matched app), not an echo of the
+        // query — and the label tier must classify against what the real
+        // handler displays for the guard to be tested honestly.
+        let ex = make_executor(registry_with_fixed_app_open("Firefox"));
         // No registered keyword typed → the route is not explicit.
         let completions = ex
             .completions(

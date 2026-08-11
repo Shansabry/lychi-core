@@ -217,19 +217,35 @@ impl Suggestion {
 
     /// A suggestion whose tier is derived from the typed input.
     ///
-    /// Uses `run` when present, else `fill`, else `label` — the same precedence
-    /// the frontend uses to decide what a row actually does, so the tier
-    /// describes the thing that would execute rather than the thing displayed.
-    /// (A row labelled "Search YouTube: cats" runs `yt cats`; classifying the
-    /// label would be classifying prose.)
+    /// Classified against BOTH texts a row exposes, keeping the stronger:
+    ///
+    /// - what the row RUNS (`run` ?? `fill` ?? label, the same precedence the
+    ///   frontend uses to decide what a row does) — so a row labelled "Search
+    ///   YouTube: cats" that runs `yt cats` is Prefix for typed "yt", where
+    ///   its label would classify as prose; and
+    /// - what the row DISPLAYS (the label) — so typed "spoti" makes the app
+    ///   row labelled "Spotify" defaultable even though its command is
+    ///   `open Spotify`, which does not prefix-extend "spoti". Judged by the
+    ///   command alone, that row classified Subset and Enter refused to
+    ///   launch it — the user's first Enter fell through to the typo
+    ///   corrector, which FILLED "open Spotify", and only the second Enter
+    ///   launched (reported 2026-08-11; also the regression of this module's
+    ///   own "fir → Firefox" example from when app rows gained run strings).
+    ///
+    /// `min`, not `max`: `Tier`'s `Ord` is strongest-first, so the stronger
+    /// classification is the SMALLER value. Both containment directions
+    /// classify Subset in both calls, so "dnf search firefox" still never
+    /// defaults, and empty input is Fuzzy in both calls.
     pub fn matched(item: CompletionItem, source: Source, typed: &str) -> Self {
-        let text = item
+        let command = item
             .run
             .as_deref()
             .or(item.fill.as_deref())
-            .unwrap_or(&item.label)
-            .to_string();
-        let tier = Tier::classify(typed, &text);
+            .unwrap_or(&item.label);
+        let tier = std::cmp::min(
+            Tier::classify(typed, command),
+            Tier::classify(typed, &item.label),
+        );
         Self::new(item, source, tier)
     }
 
@@ -428,7 +444,10 @@ mod tests {
         assert!(!Tier::classify("", "firefox").can_be_default());
     }
 
-    /// Tier is classified against what the row RUNS, not what it displays.
+    /// Tier is AT LEAST as strong as the command classification — a prose
+    /// label ("Search YouTube: cats") must not weaken a row whose command
+    /// prefix-extends the typed text. This is one direction of the min();
+    /// written as max() this fails.
     #[test]
     fn tier_is_classified_against_the_command_not_the_label() {
         let it = CompletionItem::new("Search YouTube: cats", None, 50).with_run("yt cats");
@@ -437,6 +456,51 @@ mod tests {
             Suggestion::matched(it, Source::Handler, "yt").tier,
             Tier::Prefix
         );
+    }
+
+    /// THE "spoti ⏎ ⏎" BUG (reported 2026-08-11): the app row displays
+    /// "Spotify" but runs `open Spotify`; judged by the command alone the
+    /// typed prefix "spoti" classified Subset, the row was never defaultable,
+    /// and the first Enter fell through to the typo corrector's fill. The
+    /// label the user is visually completing toward must count too. (This is
+    /// the other direction of the min(); written as max() this fails.)
+    #[test]
+    fn a_label_that_prefix_extends_the_typed_text_is_defaultable() {
+        let it = CompletionItem::new("Spotify", None, 90).with_run("open Spotify");
+        let s = Suggestion::matched(it, Source::Handler, "spoti");
+        assert_eq!(s.tier, Tier::Prefix);
+        assert!(s.can_be_default());
+    }
+
+    /// Typing the full label is Identity — which confers nothing beyond
+    /// Prefix (both may default; neither bypasses risk gating downstream).
+    #[test]
+    fn typing_the_full_label_is_identity() {
+        let it = CompletionItem::new("Spotify", None, 90).with_run("open Spotify");
+        assert_eq!(
+            Suggestion::matched(it, Source::Handler, "spotify").tier,
+            Tier::Identity
+        );
+    }
+
+    /// The dnf-search guard survives label classification: a query that
+    /// CONTAINS the label is Subset through both texts — offered, never run.
+    #[test]
+    fn a_label_subset_match_still_never_defaults() {
+        let it = CompletionItem::new("Firefox", None, 90).with_run("open Firefox");
+        let s = Suggestion::matched(it, Source::Handler, "dnf search firefox");
+        assert_eq!(s.tier, Tier::Subset);
+        assert!(!s.can_be_default());
+    }
+
+    /// Empty input is Fuzzy through both texts — zero-state rows can never
+    /// ride the label path into being the default.
+    #[test]
+    fn empty_input_stays_fuzzy_with_both_texts() {
+        let it = CompletionItem::new("Spotify", None, 90).with_run("open Spotify");
+        let s = Suggestion::matched(it, Source::Handler, "");
+        assert_eq!(s.tier, Tier::Fuzzy);
+        assert!(!s.can_be_default());
     }
 
     // ── Ordering ────────────────────────────────────────────────────────
