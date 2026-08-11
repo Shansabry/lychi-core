@@ -97,10 +97,11 @@ enum RunOutcome {
     /// The user (or compositor) declined the bind. Retrying would re-prompt —
     /// respect the answer and leave the fallback UX in place.
     Declined,
-    /// The activation stream ended after a successful bind: the portal side
-    /// went away. Re-registration is warranted (and prompt-free — the stored
-    /// approval carries).
-    StreamEnded,
+    /// A successfully-bound session died: the portal frontend changed bus
+    /// owner (the signal that actually fires on a portal restart) or the
+    /// activation stream ended (connection-level failure). Re-registration is
+    /// warranted, and prompt-free — the stored approval carries.
+    SessionLost,
 }
 
 /// Delay before re-registering after a stream death, so we bind to the portal
@@ -124,7 +125,7 @@ pub async fn setup(app: tauri::AppHandle, configured_hotkey: String) {
     loop {
         match register_cycle(&app, &configured_hotkey).await {
             CycleOutcome::Done => return,
-            CycleOutcome::StreamEnded => {
+            CycleOutcome::SessionLost => {
                 tokio::time::sleep(std::time::Duration::from_secs(REREGISTER_DELAY_SECS)).await;
             }
         }
@@ -135,7 +136,7 @@ enum CycleOutcome {
     /// Nothing left to do: declined, or the schedule exhausted with no bind.
     Done,
     /// A working session died — re-register from scratch.
-    StreamEnded,
+    SessionLost,
 }
 
 /// One pass through the retry schedule. Extracted from `setup` so the loop
@@ -148,7 +149,7 @@ async fn register_cycle(app: &tauri::AppHandle, configured_hotkey: &str) -> Cycl
         }
         match run(app, configured_hotkey).await {
             Ok(RunOutcome::Declined) => return CycleOutcome::Done,
-            Ok(RunOutcome::StreamEnded) => return CycleOutcome::StreamEnded,
+            Ok(RunOutcome::SessionLost) => return CycleOutcome::SessionLost,
             Err(e) => {
                 let last = attempt + 1 == RETRY_SCHEDULE_SECS.len();
                 if last {
@@ -268,6 +269,22 @@ async fn run(app: &tauri::AppHandle, configured_hotkey: &str) -> ashpd::Result<R
         .await
         .map_err(ashpd::Error::from)?;
 
+    // Watch the portal frontend's bus name from the very start. A portal
+    // restart does NOT end the activation stream — measured 2026-08-11 by
+    // restarting xdg-desktop-portal under a bound session: the stream stays
+    // open and goes silent (the new portal process doesn't know our session),
+    // kglobalaccel keeps reporting the component active, and an
+    // `invokeShortcut` probe that summons the launcher on a healthy session
+    // delivers nothing. The only reliable death signal is NameOwnerChanged on
+    // the portal's bus name. Subscribed before the session is created so a
+    // restart in the bind window is buffered into the stream, not missed.
+    let mut portal_owner_changes = ashpd::zbus::fdo::DBusProxy::new(&conn)
+        .await
+        .map_err(ashpd::Error::from)?
+        .receive_name_owner_changed_with_args(&[(0, "org.freedesktop.portal.Desktop")])
+        .await
+        .map_err(ashpd::Error::from)?;
+
     // Identify ourselves to the portal FIRST (required on xdg-desktop-portal
     // ≥1.21, otherwise CreateSession is rejected with "An app id is required").
     // If this fails (portal not up yet at autostart), bail so the retry loop
@@ -339,25 +356,41 @@ async fn run(app: &tauri::AppHandle, configured_hotkey: &str) -> ashpd::Result<R
 
     // Service activations for the app's lifetime. The session must stay
     // alive — dropping it unbinds the shortcut for this run.
+    //
+    // TWO death signals, and the second is the one that fires in practice:
+    // - the activation stream ending (connection-level failure), and
+    // - the portal frontend's bus name changing owner (portal restart —
+    //   package upgrade, crash, `systemctl --user restart`). The stream does
+    //   NOT end for this one; it silently stops delivering (see the watch's
+    //   comment above for the measurement).
     let mut activated = shortcuts.receive_activated().await?;
     let _session = session;
-    while let Some(activation) = activated.next().await {
-        if activation.shortcut_id() == SHORTCUT_ID
-            && let Some(win) = app.get_webview_window("main")
-        {
-            tracing::debug!("[portal] activation → toggle");
-            // toggle_window is thread-safe: it debounces and posts the
-            // decision to the GTK main thread.
-            crate::window::toggle_window(&win);
+    let how = loop {
+        tokio::select! {
+            maybe = activated.next() => match maybe {
+                Some(activation) => {
+                    if activation.shortcut_id() == SHORTCUT_ID
+                        && let Some(win) = app.get_webview_window("main")
+                    {
+                        tracing::debug!("[portal] activation → toggle");
+                        // toggle_window is thread-safe: it debounces and posts
+                        // the decision to the GTK main thread.
+                        crate::window::toggle_window(&win);
+                    }
+                }
+                None => break "the activation stream ended",
+            },
+            _ = portal_owner_changes.next() => {
+                break "the portal frontend restarted (bus owner changed)";
+            }
         }
-    }
+    };
 
-    // The stream only ends because the portal side went away. The hotkey is
-    // dead from this instant until re-registration succeeds, and everything
-    // that answers "does the hotkey work?" must say so NOW — the caller will
-    // retry, but a Setup tab read during the gap (or after a failed retry
-    // cycle) must not repeat the stored "Reliable" from a session that no
-    // longer exists.
+    // The session is gone. The hotkey is dead from this instant until
+    // re-registration succeeds, and everything that answers "does the hotkey
+    // work?" must say so NOW — the caller will retry, but a Setup tab read
+    // during the gap (or after a failed retry cycle) must not repeat the
+    // stored "Reliable" from a session that no longer exists.
     {
         use std::sync::atomic::Ordering;
         let state = app.state::<AppState>();
@@ -365,8 +398,8 @@ async fn run(app: &tauri::AppHandle, configured_hotkey: &str) -> ashpd::Result<R
         state.hotkey_registered.store(false, Ordering::SeqCst);
     }
     crate::record_hotkey_binding(app, lychi_core::hotkey::Binding::PortalLost);
-    tracing::warn!("[portal] activation stream ended — the portal side went away; re-registering");
-    Ok(RunOutcome::StreamEnded)
+    tracing::warn!("[portal] {how} — the session is dead; re-registering");
+    Ok(RunOutcome::SessionLost)
 }
 
 /// Map Lychi's hotkey config format ("Super+Space", "Ctrl+Alt+K") to the
