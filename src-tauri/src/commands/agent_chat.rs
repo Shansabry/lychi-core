@@ -330,6 +330,7 @@ impl AgentEventDto {
 async fn build_coordinator(
     state: &AppState,
     with_tools: bool,
+    query: &str,
 ) -> Result<(Coordinator<ExecutorAdapter>, ()), LychiError> {
     let provider = state
         .ai_provider
@@ -340,17 +341,23 @@ async fn build_coordinator(
     let privacy = state.config.read().await.privacy.clone();
 
     // Tool catalog from the live registry — every handler is a callable tool.
-    // Empty for quick-AI (answer only, no acting).
+    // Empty for quick-AI (answer only, no acting). Conservatively filtered to
+    // what the query plausibly needs (core tools are always kept), trimming the
+    // per-turn token cost without starving the agent — an empty `query` (e.g. a
+    // resume) yields the full catalog.
     let tools: Vec<ToolDef> = if with_tools {
-        let exec = state.executor.read().await;
-        exec.registry
-            .command_catalog()
-            .into_iter()
-            .map(|c| ToolDef {
-                name: c.id,
-                description: c.description,
-            })
-            .collect()
+        let full: Vec<ToolDef> = {
+            let exec = state.executor.read().await;
+            exec.registry
+                .command_catalog()
+                .into_iter()
+                .map(|c| ToolDef {
+                    name: c.id,
+                    description: c.description,
+                })
+                .collect()
+        };
+        lychi_core::coordinator::select_tools(query, full)
     } else {
         Vec::new()
     };
@@ -559,6 +566,10 @@ pub async fn agent_chat_start(
         }
     }
 
+    // Keep the query for tool-catalog filtering before `user` is moved into the
+    // session below.
+    let query = user.clone();
+
     // Continue the running conversation (follow-up) or start fresh. A fresh start
     // mints a new conversation id (for history persistence); a follow-up reuses
     // the existing one so it upserts the same history row.
@@ -598,7 +609,7 @@ pub async fn agent_chat_start(
     let mut session = session;
     session.set_last_user_display(display);
 
-    let (coord, ()) = match build_coordinator(&state, with_tools).await {
+    let (coord, ()) = match build_coordinator(&state, with_tools, &query).await {
         Ok(c) => c,
         Err(e) => {
             // Failed before the loop ever ran (e.g. AI disabled
@@ -645,7 +656,9 @@ pub async fn agent_approve(
     *state.ai_cancel.write().await = Some(cancel.clone());
 
     // Approval resumes the full agent (a tool was pending), so tools stay on.
-    let (coord, ()) = match build_coordinator(&state, true).await {
+    // Empty query → full catalog: mid-task we must not drop a tool the ongoing
+    // plan may still call.
+    let (coord, ()) = match build_coordinator(&state, true, "").await {
         Ok(c) => c,
         Err(e) => {
             // Restore the taken session: the approval is still pending and the
