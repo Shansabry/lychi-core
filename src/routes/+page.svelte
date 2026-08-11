@@ -1230,12 +1230,12 @@ async function handleConfirm() {
 	if (isExecuting || !lastResult?.needs_confirmation) return;
 	isExecuting = true;
 	try {
-		// C6: If this is a privacy consent confirmation, grant and persist it
-		const reason = lastResult.needs_confirmation;
-		if (reason.includes("freeipapi.com")) {
-			await grantPrivacyConsent("ip_geolocation");
-		} else if (reason.includes("ifconfig.me")) {
-			await grantPrivacyConsent("public_ip");
+		// C6: a consent confirmation carries its TYPED feature key from the
+		// backend (the one place that knows which gate fired). This used to be
+		// recovered by substring-matching the prompt prose ("freeipapi.com" /
+		// "ifconfig.me") — rewording a sentence silently broke persistence.
+		if (lastResult.consent_feature) {
+			await grantPrivacyConsent(lastResult.consent_feature);
 		}
 
 		// G1: execute the EXACT action that was assessed (stored backend-side),

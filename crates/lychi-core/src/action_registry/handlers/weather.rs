@@ -445,8 +445,8 @@ impl ActionHandler for WeatherHandler {
         // only ""/"here" while execute normalized the full LOCAL_QUALIFIERS
         // list — `weather now` geolocated without consent.
         if normalize_weather_location(args).is_empty() {
-            // The frontend matches "freeipapi.com" in this prompt to persist
-            // the grant — keep the domain in the text (FE-4 tracks typing it).
+            // The grant persists via the typed consent_feature on the result
+            // DTO; the domain stays in the prompt for the user's sake.
             RiskAssessment::level(self.default_risk()).with_consent(
                 ConsentKind::IpGeolocation,
                 "Weather will detect your location by sending your IP to freeipapi.com. \

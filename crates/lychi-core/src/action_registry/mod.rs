@@ -61,6 +61,23 @@ pub enum ConsentKind {
     LargeTransfer,
 }
 
+impl ConsentKind {
+    /// The feature key the frontend passes to `grant_privacy_consent` when the
+    /// user confirms with "Allow and remember". `None` = nothing to remember
+    /// (LargeTransfer asks every run). These strings are the wire contract
+    /// with `commands/config.rs`'s grant endpoint — the frontend used to
+    /// recover this fact by substring-matching the confirmation PROSE
+    /// ("freeipapi.com" / "ifconfig.me"), so rewording a sentence silently
+    /// broke consent persistence.
+    pub fn feature_key(self) -> Option<&'static str> {
+        match self {
+            ConsentKind::IpGeolocation => Some("ip_geolocation"),
+            ConsentKind::PublicIp => Some("public_ip"),
+            ConsentKind::LargeTransfer => None,
+        }
+    }
+}
+
 /// A consent requirement: what kind, and the exact prompt to show. The prompt
 /// lives with the declaration for the same reason `reason` lives on
 /// [`RiskAssessment`] — the handler owns its user-facing wording.
@@ -451,6 +468,12 @@ pub struct CommandResultDto {
     pub open_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub needs_confirmation: Option<String>,
+    /// When the pending confirmation is a PRIVACY CONSENT prompt: the feature
+    /// key to persist on "Allow and remember" (`grant_privacy_consent`).
+    /// Typed here because the frontend used to substring-match the prompt
+    /// prose to recover it — rewording a sentence broke consent persistence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consent_feature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub risk_level: Option<RiskLevel>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -476,6 +499,8 @@ pub struct CommandResultDto {
 pub struct ResultEnvelope {
     pub routed_by: Option<String>,
     pub needs_confirmation: Option<String>,
+    /// See [`CommandResultDto::consent_feature`].
+    pub consent_feature: Option<String>,
     pub risk_level: Option<RiskLevel>,
     pub executed_args: Option<String>,
 }
@@ -489,6 +514,7 @@ impl CommandResultDto {
             duration_ms: result.duration_ms,
             routed_by: envelope.routed_by,
             needs_confirmation: envelope.needs_confirmation,
+            consent_feature: envelope.consent_feature,
             // Result-level risk (handler-set, e.g. app-control) takes precedence;
             // otherwise the executor's assessed risk (for confirm prompts).
             risk_level: result.risk_level.or(envelope.risk_level),

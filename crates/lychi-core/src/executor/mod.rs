@@ -809,6 +809,19 @@ impl Executor {
             }
             ValidationDecision::Confirm { reason } if !confirmed => {
                 envelope.needs_confirmation = Some(reason);
+                // When this confirmation IS a consent prompt, ship the typed
+                // feature key so the FE can persist the grant without
+                // substring-matching the prose. Exact, not heuristic: consent
+                // is checked FIRST in RulesEngine::decide, so an ungranted
+                // consent on the assessment means this Confirm is the consent
+                // prompt (pinned by a rules test). `consent_granted` is the
+                // same single mapping the gate itself uses.
+                envelope.consent_feature = risk
+                    .consent
+                    .as_ref()
+                    .filter(|c| !crate::rules::consent_granted(c.kind, privacy))
+                    .and_then(|c| c.kind.feature_key())
+                    .map(str::to_string);
                 envelope.risk_level = Some(risk.level);
                 pending_intent = Some(intent.clone());
                 // A pending-confirmation result: not yet run, no error, no output.
@@ -2227,6 +2240,70 @@ mod tests {
             HistoryStore::new(500, true),
             crate::db::open_test_database(),
         )
+    }
+
+    /// A consent-needing confirmation ships its TYPED feature key on the
+    /// envelope; granting the consent removes both prompt and key. The FE
+    /// persists the grant from this field — it used to substring-match the
+    /// prompt prose, so rewording a sentence silently broke persistence.
+    #[tokio::test]
+    async fn a_consent_confirmation_carries_its_typed_feature_key() {
+        struct NetHandler;
+        #[async_trait]
+        impl ActionHandler for NetHandler {
+            fn id(&self) -> &str {
+                "netprobe"
+            }
+            fn description(&self) -> &str {
+                "test"
+            }
+            fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+                static T: &[crate::action_registry::Trigger] =
+                    &[crate::action_registry::Trigger::keywords(&["netprobe"])];
+                T
+            }
+            fn assess_risk(
+                &self,
+                _args: &str,
+                _ctx: &crate::action_registry::RiskContext<'_>,
+            ) -> crate::action_registry::RiskAssessment {
+                crate::action_registry::RiskAssessment::level(RiskLevel::Low).with_consent(
+                    crate::action_registry::ConsentKind::PublicIp,
+                    "This will look up your public IP. Allow and remember?",
+                )
+            }
+            async fn execute(
+                &self,
+                _ctx: &crate::action_registry::ExecContext,
+                _args: &str,
+            ) -> Result<ActionResult, crate::error::LychiError> {
+                Ok(ActionResult::ok(
+                    "ran",
+                    crate::action_registry::OutputType::Status,
+                ))
+            }
+        }
+        let mut reg = ActionRegistry::new();
+        reg.register(Box::new(NetHandler));
+        let ex = make_executor(reg);
+        let inputs = RunInputs::default();
+
+        // Ungranted: pending confirmation + the typed key.
+        let r = ex
+            .run("netprobe", false, &PrivacyConfig::default(), &inputs)
+            .await
+            .unwrap();
+        assert!(r.envelope.needs_confirmation.is_some());
+        assert_eq!(r.envelope.consent_feature.as_deref(), Some("public_ip"));
+
+        // Granted: executes, no prompt, no key.
+        let granted = PrivacyConfig {
+            allow_public_ip: true,
+            ..PrivacyConfig::default()
+        };
+        let r = ex.run("netprobe", false, &granted, &inputs).await.unwrap();
+        assert!(r.envelope.needs_confirmation.is_none());
+        assert!(r.envelope.consent_feature.is_none());
     }
 
     /// The Clone contract that keeps snapshot-and-release sound: cross-run

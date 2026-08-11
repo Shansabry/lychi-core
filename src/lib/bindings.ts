@@ -1648,7 +1648,14 @@ category_order: number }
  * builds this from an `ActionResult` plus the executor's envelope
  * (risk/confirmation/executed_args/routed_by).
  */
-export type CommandResultDto = { success: boolean; output?: string | null; error?: string | null; duration_ms: number; routed_by?: string | null; open_url?: string | null; needs_confirmation?: string | null; risk_level?: RiskLevel | null; output_type?: OutputType | null; executed_args?: string | null; launch_desktop?: string | null; focus_app?: string | null; auto_open: boolean; 
+export type CommandResultDto = { success: boolean; output?: string | null; error?: string | null; duration_ms: number; routed_by?: string | null; open_url?: string | null; needs_confirmation?: string | null; 
+/**
+ * When the pending confirmation is a PRIVACY CONSENT prompt: the feature
+ * key to persist on "Allow and remember" (`grant_privacy_consent`).
+ * Typed here because the frontend used to substring-match the prompt
+ * prose to recover it — rewording a sentence broke consent persistence.
+ */
+consent_feature?: string | null; risk_level?: RiskLevel | null; output_type?: OutputType | null; executed_args?: string | null; launch_desktop?: string | null; focus_app?: string | null; auto_open: boolean; 
 /**
  * Structured rows, when the handler produced them. Typed all the way to
  * TypeScript rather than serialised into `output` — see `Output::Rows`.

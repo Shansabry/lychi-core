@@ -90,9 +90,9 @@ impl ActionHandler for SysInfoHandler {
         // about a public-IP lookup it never performs. `alias_consent_matches_
         // dispatch` pins the pairing.
         match args.trim().to_lowercase().as_str() {
-            // read_network fetches the public IP via ifconfig.me. The frontend
-            // matches "ifconfig.me" in this prompt to persist the grant —
-            // keep the domain in the text (FE-4 tracks typing that properly).
+            // read_network fetches the public IP via ifconfig.me. The grant
+            // persists via the typed consent_feature on the result DTO; the
+            // domain stays in the prompt for the user's sake, not the code's.
             "net" | "network" => RiskAssessment::level(RiskLevel::Low).with_consent(
                 ConsentKind::PublicIp,
                 "This will look up your public IP via ifconfig.me. Allow and remember?",

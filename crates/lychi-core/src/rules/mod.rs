@@ -74,19 +74,12 @@ impl RulesEngine {
         // already granted. The engine used to keep its own list of sensitive
         // args, and the two parsers drifted three ways: `sysinfo speed` and
         // `sysinfo network` bypassed consent, `sysinfo ip` prompted falsely.
-        if let Some(consent) = &req.risk.consent {
-            let granted = match consent.kind {
-                ConsentKind::IpGeolocation => privacy.allow_ip_geolocation,
-                ConsentKind::PublicIp => privacy.allow_public_ip,
-                // Deliberately no remember-flag: a bulk transfer is consented
-                // per run, every run.
-                ConsentKind::LargeTransfer => false,
+        if let Some(consent) = &req.risk.consent
+            && !consent_granted(consent.kind, privacy)
+        {
+            return ValidationDecision::Confirm {
+                reason: consent.prompt.clone(),
             };
-            if !granted {
-                return ValidationDecision::Confirm {
-                    reason: consent.prompt.clone(),
-                };
-            }
         }
 
         // Cross-cutting policy the Rules Engine genuinely owns (not handler-local):
@@ -127,6 +120,19 @@ impl RulesEngine {
 impl Default for RulesEngine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// THE one mapping from a consent kind to its privacy-config flag. Used by
+/// `RulesEngine::decide` (the gate) AND by the executor when stamping
+/// `consent_feature` on a pending confirmation — a second copy of this match
+/// is exactly how the EXEC-3 alias drift happened. LargeTransfer has no flag:
+/// it is consented per run, every run.
+pub fn consent_granted(kind: ConsentKind, privacy: &PrivacyConfig) -> bool {
+    match kind {
+        ConsentKind::IpGeolocation => privacy.allow_ip_geolocation,
+        ConsentKind::PublicIp => privacy.allow_public_ip,
+        ConsentKind::LargeTransfer => false,
     }
 }
 
@@ -355,6 +361,50 @@ mod tests {
         // Other sysinfo subcommands are fine regardless
         let result = validate_real("sysinfo", "cpu", &privacy());
         assert_eq!(result, ValidationDecision::Execute);
+    }
+
+    /// The invariant the executor's `consent_feature` stamp relies on: consent
+    /// is checked FIRST in decide(), so when an assessment carries an
+    /// UNGRANTED consent, the Confirm that comes back IS the consent prompt —
+    /// even when the risk level would produce its own confirmation. Reordering
+    /// decide() breaks the typed-consent wire field; this test is the tripwire.
+    #[test]
+    fn an_ungranted_consent_wins_over_a_risk_confirmation() {
+        use crate::action_registry::{ConsentKind, RiskLevel};
+        let risk = RiskAssessment::confirm("risky either way")
+            .with_consent(ConsentKind::PublicIp, "consent prompt");
+        assert_eq!(risk.level, RiskLevel::Medium);
+        let decision = RulesEngine::new().validate(
+            &ValidationRequest {
+                action_id: "anything",
+                args: "",
+                routed_by: "explicit",
+                risk: &risk,
+            },
+            &privacy(),
+        );
+        assert_eq!(
+            decision,
+            ValidationDecision::Confirm {
+                reason: "consent prompt".to_string()
+            }
+        );
+        // Once granted, the risk-level confirmation takes over.
+        let decision = RulesEngine::new().validate(
+            &ValidationRequest {
+                action_id: "anything",
+                args: "",
+                routed_by: "explicit",
+                risk: &risk,
+            },
+            &privacy_all_allowed(),
+        );
+        assert_eq!(
+            decision,
+            ValidationDecision::Confirm {
+                reason: "risky either way".to_string()
+            }
+        );
     }
 
     #[test]
