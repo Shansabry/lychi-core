@@ -52,27 +52,20 @@ pre-commit:
 pre-push:
   parallel: true
   commands:
-    # The suite is ~2s, so it belongs on push rather than in CI-only. Pushing a
-    # red main is the thing this exists to prevent.
-    tests:
-      run: cargo test --workspace --quiet
-
-    # Deliberately WITHOUT `-D warnings`, to match ci.yml exactly.
+    # Kept deliberately LIGHT: clippy only. The full test suite and svelte-check
+    # used to run here too, but on a cold `target/` (common right after an
+    # AppImage release build) that turned every push into a multi-minute compile
+    # — the exact "so slow everyone bypasses it" failure this file warns about up
+    # top. CI (`ci.yml`) runs `cargo test --workspace`, `pnpm check`, and the
+    # bindings-current check on every push regardless, so those are not lost —
+    # they move from "blocks the push" to "fails the PR a few minutes later",
+    # which is the right trade for a fast local loop. fmt + lint already run at
+    # pre-commit, so a push only adds the one guard commit-time doesn't: clippy.
     #
-    # Adding it here looked like a free improvement and was not: it failed on 19
-    # pre-existing style lints in test code that CI accepts, so the hook blocked
-    # a push CI would have passed. A local gate that is stricter than the remote
-    # one breaks the promise this file is built on — that a green hook means a
-    # green CI — and the only way through is `--no-verify`, which disables every
-    # other check too.
-    #
-    # If those lints should be errors, make them errors in ci.yml and fix them
-    # there; the hook follows CI, not the other way round.
+    # Deliberately WITHOUT `-D warnings`, to match ci.yml's non-blocking style at
+    # this stage — a local gate stricter than CI blocks pushes CI would pass.
     clippy:
       run: cargo clippy --workspace --all-targets
-
-    frontend-check:
-      run: pnpm check
 
 commit-msg:
   commands:
