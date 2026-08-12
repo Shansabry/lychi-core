@@ -1,6 +1,8 @@
 <div align="center">
 
-# 🚀 Lychi
+<img src="docs/assets/lychi-logo.png" alt="Lychi" width="120" height="120" />
+
+# Lychi
 
 **A local-first command launcher for Linux.**
 Spotlight/Raycast energy — keyboard-driven, privacy-first, AI optional.
