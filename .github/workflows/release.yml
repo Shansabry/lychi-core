@@ -188,7 +188,7 @@ jobs:
       # release is what makes the updater endpoint resolve.
       - name: Publish release assets
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             target/release/bundle/appimage/*.AppImage
