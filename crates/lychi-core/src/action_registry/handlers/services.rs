@@ -313,6 +313,10 @@ impl ActionHandler for ServicesHandler {
         "service"
     }
 
+    fn mutates_state(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Control systemd services: list, status, start/stop/restart"
     }

@@ -12,7 +12,7 @@ use crate::error::LychiError;
 /// refreshed only when the shell config changes). Not part of `RunEnv`.
 static SHELL_ENV: RwLock<Option<(String, HashMap<String, String>)>> = RwLock::new(None);
 
-pub use crate::action_registry::{ExecContext, OutputMode, TerminalTarget};
+pub use crate::action_registry::{ExecContext, OutputMode, OutputSink, TerminalTarget};
 
 // ── Command validation ──────────────────────────────────────────────────
 
@@ -184,7 +184,10 @@ async fn capture_shell_output(
     env: HashMap<String, String>,
     timeout: std::time::Duration,
     max_bytes: usize,
+    sink: Option<&OutputSink>,
 ) -> Result<Capture, LychiError> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
     let start = Instant::now();
     let mut command = tokio::process::Command::new(shell);
     command
@@ -205,45 +208,111 @@ async fn capture_shell_output(
         command.current_dir(cwd);
     }
 
-    let child = command
+    let mut child = command
         .spawn()
         .map_err(|e| LychiError::ExecutionFailed(format!("shell spawn: {e}")))?;
     let pid = child.id();
 
-    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(out)) => out,
+    // Take the pipes and read them line-by-line as the command runs, rather than
+    // buffering everything and only seeing it at exit. Each line is pushed to the
+    // `sink` live (so the UI streams it) AND accumulated into a capped buffer for
+    // the final result the model/history need. Two concurrent readers — stdout
+    // and stderr — because a command that only writes one must not block on the
+    // other. `spawn_line_reader` returns the accumulated (capped) text via a
+    // oneshot when its pipe reaches EOF.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    // A line reader: drains one pipe, streams each line to the sink, accumulates
+    // up to `max_bytes` (then keeps counting but stops storing — the "truncated"
+    // marker is appended by the caller from `capped`). Runs as its own task so
+    // the two pipes are read concurrently and neither can deadlock the other.
+    async fn read_pipe<R>(
+        reader: Option<R>,
+        max_bytes: usize,
+        sink: Option<OutputSink>,
+        stream: &'static str,
+    ) -> String
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let Some(reader) = reader else {
+            return String::new();
+        };
+        let mut lines = BufReader::new(reader).lines();
+        let mut acc = String::new();
+        let mut truncated = false;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(s) = &sink {
+                // Stream the line live. Best-effort — a dropped receiver just
+                // stops the UI stream, never the command.
+                s.push(format!("{line}\n"));
+            }
+            if truncated {
+                continue; // past the cap: keep draining (so the pipe/child can
+                // finish) but store nothing more.
+            }
+            let remaining = max_bytes.saturating_sub(acc.len());
+            // `< remaining` (not `+ 1 <= remaining`) leaves room for the newline
+            // we append — equivalent for integers, and clippy-clean.
+            if line.len() < remaining {
+                acc.push_str(&line);
+                acc.push('\n');
+            } else {
+                // This line overflows the cap. Keep as much of it as fits
+                // (char-safe), then mark truncated — matching the old byte-slice
+                // cap's "keep the first max_bytes" behaviour, including for a
+                // single enormous line with no newlines.
+                let mut end = remaining.min(line.len());
+                while end > 0 && !line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                acc.push_str(&line[..end]);
+                truncated = true;
+            }
+        }
+        if truncated {
+            acc.push_str("\n… (output truncated)");
+        }
+        // `stream` is only for a future per-stream tag; unused label today.
+        let _ = stream;
+        acc
+    }
+
+    let out_task = tokio::spawn(read_pipe(stdout, max_bytes, sink.cloned(), "stdout"));
+    let err_task = tokio::spawn(read_pipe(stderr, max_bytes, sink.cloned(), "stderr"));
+
+    // Race the child's completion against the deadline. The readers finish when
+    // their pipes close (which happens when the child exits or is killed).
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => status,
         Ok(Err(e)) => return Err(LychiError::ExecutionFailed(format!("shell wait: {e}"))),
         Err(_) => {
-            // The dropped wait future has SIGKILLed the shell (kill_on_drop).
-            // Take the rest of its process group too — the group leader's pid
-            // is the child's own, courtesy of process_group(0) above.
+            // Deadline passed. Kill the whole process group (the group leader's
+            // pid is the child's own, courtesy of process_group(0)); kill_on_drop
+            // also takes the child. The reader tasks then hit EOF and end.
             if let Some(pid) = pid {
                 let _ = nix::sys::signal::kill(
                     nix::unistd::Pid::from_raw(-(pid as i32)),
                     nix::sys::signal::Signal::SIGKILL,
                 );
             }
+            out_task.abort();
+            err_task.abort();
             return Ok(Capture::TimedOut);
         }
     };
 
-    // Cap output at max_bytes (char-safe) to protect against a chatty command.
-    let cap = |bytes: &[u8]| -> String {
-        let s = String::from_utf8_lossy(bytes);
-        if s.len() <= max_bytes {
-            return s.into_owned();
-        }
-        let mut end = max_bytes;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}\n… (output truncated)", &s[..end])
-    };
+    // Child exited — collect whatever the readers accumulated. They finish
+    // promptly once the pipes close; a join error (task panicked) degrades to an
+    // empty string rather than failing the whole run.
+    let stdout = out_task.await.unwrap_or_default();
+    let stderr = err_task.await.unwrap_or_default();
 
     Ok(Capture::Completed(CapturedOutput {
-        stdout: cap(&output.stdout),
-        stderr: cap(&output.stderr),
-        success: output.status.success(),
+        stdout,
+        stderr,
+        success: status.success(),
         duration_ms: start.elapsed().as_millis() as u64,
     }))
 }
@@ -271,7 +340,7 @@ pub(crate) async fn run_captured(
         stderr,
         success,
         duration_ms,
-    } = match capture_shell_output(shell, cmd, cwd, env, timeout, max_bytes).await? {
+    } = match capture_shell_output(shell, cmd, cwd, env, timeout, max_bytes, None).await? {
         Capture::Completed(out) => out,
         Capture::TimedOut => {
             return Ok(ActionResult {
@@ -736,6 +805,7 @@ impl ShellExec {
         cmd: &str,
         cwd: Option<&str>,
         clearance: Clearance,
+        sink: Option<&OutputSink>,
     ) -> Result<ActionResult, LychiError> {
         check_shell_authorization(cmd, clearance)?;
         let start = Instant::now();
@@ -753,6 +823,7 @@ impl ShellExec {
             env,
             INLINE_TIMEOUT,
             INLINE_MAX_OUTPUT_BYTES,
+            sink,
         )
         .await?
         {
@@ -923,6 +994,10 @@ impl ActionHandler for ShellExec {
         "run"
     }
 
+    fn mutates_state(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Execute a shell command"
     }
@@ -970,7 +1045,10 @@ impl ActionHandler for ShellExec {
         //    set (defense-in-depth) while honoring the already-granted confirm.
         let clearance = Clearance::UserConfirmed;
         match mode {
-            RunMode::Inline => self.execute_inline(cmd, cwd, clearance).await,
+            RunMode::Inline => {
+                self.execute_inline(cmd, cwd, clearance, ctx.sink.as_ref())
+                    .await
+            }
             RunMode::Terminal => {
                 // Prefer routing into an already-open terminal; else a fresh one.
                 if ctx.routing_mode() != "off"
@@ -1046,6 +1124,7 @@ mod tests {
             test_env(),
             std::time::Duration::from_millis(200),
             4096,
+            None,
         )
         .await
         .expect("capture must not error on timeout");
@@ -1079,6 +1158,7 @@ mod tests {
             test_env(),
             std::time::Duration::from_secs(30),
             1000,
+            None,
         )
         .await
         .expect("capture failed");

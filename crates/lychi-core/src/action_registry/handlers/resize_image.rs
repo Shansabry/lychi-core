@@ -66,6 +66,10 @@ impl ActionHandler for ResizeImageHandler {
         "resize"
     }
 
+    fn mutates_state(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Resize an image: resize <path> to <800x600 | 800 | x600 | 50%>"
     }

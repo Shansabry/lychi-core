@@ -128,21 +128,102 @@ fn result_summary_and_artifact(
     (result_text(res), None)
 }
 
-#[async_trait]
-impl ToolExecutor for ExecutorAdapter {
-    async fn execute(&self, name: &str, args: &str) -> Result<ToolOutcome, LychiError> {
+/// The sentinel the model prefixes onto a `run` command when it wants an
+/// external terminal window instead of inline capture.
+///
+/// Why a prefix and not a JSON field: every Lychi tool speaks the wire layer's
+/// uniform `{ args: string }` schema (see `providers/wire.rs::anthropic_tools`),
+/// so a per-tool typed parameter does not exist to hang a boolean on. A leading
+/// keyword the adapter strips keeps the single-string contract intact while
+/// still letting the model choose per command. Documented to the model in the
+/// `run` tool description (see `ExecutorAdapter::describe_run`).
+const TERMINAL_PREFIX: &str = "--terminal";
+
+/// Decide how an agent `run` should surface its output, and return the command
+/// with any control sentinel stripped.
+///
+/// Default is **inline capture**: the model must be able to read what it ran,
+/// and an agent command dumped into an external terminal is both invisible to
+/// the model and a focus thief that dismisses the launcher (the multi-step bug).
+/// The model opts into a real terminal — for `ssh`, an editor, a REPL, a
+/// long-running foreground process the user wants to watch — with the
+/// [`TERMINAL_PREFIX`] sentinel.
+/// Returns the executor input string, the `RunInputs`, and whether this
+/// dispatch will open an EXTERNAL terminal window (`opens_terminal`).
+///
+/// `opens_terminal` is an explicit signal, NOT inferred from `RunInputs.inline`:
+/// every non-`run` tool leaves `inline` at its `false` default but spawns no
+/// terminal, so inferring from `inline` would raise the focus-theft guard for
+/// `web`, `open`, `system`, etc. Only a `run` carrying the terminal sentinel
+/// actually opens a window, and only that returns `true`.
+fn agent_run_inputs(name: &str, args: &str) -> (String, RunInputs, bool) {
+    // Only `run` has the inline/terminal duality; every other tool ignores
+    // RunInputs.inline, so the default is fine and the sentinel never applies.
+    if name != "run" {
         let input = if args.is_empty() {
             name.to_string()
         } else {
             format!("{name} {args}")
         };
+        return (input, RunInputs::default(), false);
+    }
+
+    let trimmed = args.trim_start();
+    let (want_terminal, cmd) = match trimmed.strip_prefix(TERMINAL_PREFIX) {
+        // Strip the sentinel AND the whitespace after it, so the shell never
+        // sees a stray leading space. A bare `--terminal` with no command falls
+        // through to shell_exec's own "Usage: run …" guard.
+        Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => {
+            (true, rest.trim_start())
+        }
+        _ => (false, trimmed),
+    };
+
+    (
+        format!("{name} {cmd}"),
+        RunInputs {
+            inline: !want_terminal,
+            // An agent terminal launch opens a FRESH window rather than routing
+            // into the user's currently-focused terminal: hijacking a terminal
+            // the user is working in to run the agent's command is surprising,
+            // and routing is a user-summoned convenience, not an agent one.
+            terminal_routing: "off".to_string(),
+            ..RunInputs::default()
+        },
+        want_terminal,
+    )
+}
+
+#[async_trait]
+impl ToolExecutor for ExecutorAdapter {
+    async fn execute(
+        &self,
+        name: &str,
+        args: &str,
+        output: Option<lychi_core::coordinator::ToolOutputChannel>,
+    ) -> Result<ToolOutcome, LychiError> {
+        let (input, mut run_inputs, _opens_terminal) = agent_run_inputs(name, args);
+        // Bridge the coordinator's live-output channel into the executor's
+        // `OutputSink` on RunInputs, so a captured `run` streams each line into
+        // the chat as it happens. Only for INLINE runs — a `--terminal` command's
+        // output goes to the external terminal, not the chat. The sink (and thus
+        // the sender) is dropped when this method returns, which closes the
+        // channel and lets the coordinator's forwarder task finish.
+        if let Some(ch) = output
+            && run_inputs.inline
+        {
+            run_inputs.sink = Some(lychi_core::action_registry::OutputSink::new(ch));
+        }
+        // The launcher's dismiss guard (the `agent_busy` flag) is owned by
+        // `drive` for the whole run's lifetime, so an external terminal, a
+        // `pkexec` polkit dialog, a file picker — any focus thief a tool
+        // triggers — is covered without the adapter tracking spawns.
+        //
         // Snapshot-then-release, same as execute_command: an agent tool can be
         // a slow shell command, and holding the guard across it queued every
         // launcher keystroke behind the next config save's blocking_write.
         let exec = self.executor.read().await.clone();
-        let res = exec
-            .run(&input, false, &self.privacy, &RunInputs::default())
-            .await?;
+        let res = exec.run(&input, false, &self.privacy, &run_inputs).await?;
 
         // Destructive → the Rules Engine flagged it; pause for approval. Carry the
         // exact assessed intent in the resume token so approval runs THAT action.
@@ -153,6 +234,11 @@ impl ToolExecutor for ExecutorAdapter {
             let token = ResumeToken(serde_json::json!({
                 "action_id": intent.action_id,
                 "args": intent.args,
+                // Preserve the output-surface decision across the approval: an
+                // approved inline `run` must stay inline, not silently revert to
+                // an external terminal (the default) when resumed.
+                "inline": run_inputs.inline,
+                "terminal_routing": run_inputs.terminal_routing,
             }));
             return Ok(ToolOutcome::NeedsApproval {
                 reason,
@@ -181,11 +267,24 @@ impl ToolExecutor for ExecutorAdapter {
             args,
             routing: lychi_core::intent::RoutingMethod::Ai,
         };
+        // Restore the output-surface decision the token captured at assess time.
+        // Default to inline when the field is absent (an older token, or a
+        // non-`run` action that never wrote it): inline is the inert default —
+        // it spawns no terminal and only `run` reads the field anyway, so an
+        // absent value can never spuriously open a terminal window.
+        let run_inputs = RunInputs {
+            inline: resume.0["inline"].as_bool().unwrap_or(true),
+            terminal_routing: resume.0["terminal_routing"]
+                .as_str()
+                .unwrap_or("off")
+                .to_string(),
+            ..RunInputs::default()
+        };
         // Snapshot-then-release (see `execute` above) — approved actions are
         // the destructive ones, i.e. exactly the slow-shell candidates.
         let exec = self.executor.read().await.clone();
         let res = exec
-            .run_confirmed(intent, &self.privacy, &RunInputs::default())
+            .run_confirmed(intent, &self.privacy, &run_inputs)
             .await?;
         Ok(result_text(&res.result))
     }
@@ -200,7 +299,7 @@ pub struct AgentEventDto {
     #[serde(rename = "gen")]
     pub generation: u64,
     /// One of: turn_started | text | reasoning | tool_started | tool_completed |
-    /// tool_failed | awaiting_approval | final | stopped | error.
+    /// tool_output_delta | tool_failed | awaiting_approval | final | stopped | error.
     pub kind: String,
     /// Text payload (text/reasoning delta, final text, stop/error reason).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -270,6 +369,11 @@ impl AgentEventDto {
                 d.call_id = Some(call_id);
                 d.tool_name = Some(name);
                 d.tool_args = Some(args);
+            }
+            AgentEvent::ToolOutputDelta { call_id, chunk } => {
+                d.kind = "tool_output_delta".into();
+                d.call_id = Some(call_id);
+                d.text = Some(chunk);
             }
             AgentEvent::ToolCallCompleted {
                 call_id,
@@ -351,9 +455,29 @@ async fn build_coordinator(
             exec.registry
                 .command_catalog()
                 .into_iter()
-                .map(|c| ToolDef {
-                    name: c.id,
-                    description: c.description,
+                .map(|c| {
+                    // The `run` tool captures output inline by default so the
+                    // model can read what it ran. Teach the model how to ask for
+                    // a real terminal on the few commands that need one — the
+                    // adapter honours the sentinel (see `agent_run_inputs`).
+                    let description = if c.id == "run" {
+                        format!(
+                            "{}. Output is captured and returned to you. For an \
+                             interactive or long-running foreground command that \
+                             needs a real terminal window (ssh, an editor like vim, \
+                             a REPL such as python or node, top/htop), prefix the \
+                             command with `{TERMINAL_PREFIX} ` to open it in an \
+                             external terminal instead.",
+                            c.description
+                        )
+                    } else {
+                        c.description
+                    };
+                    ToolDef {
+                        name: c.id,
+                        description,
+                        mutates: c.mutates,
+                    }
                 })
                 .collect()
         };
@@ -380,9 +504,16 @@ fn drive(
     pending_session: Arc<RwLock<Option<Session>>>,
     db: Arc<redb::Database>,
     conversation_id: Arc<RwLock<Option<String>>>,
+    agent_busy: Arc<std::sync::atomic::AtomicBool>,
     mut stream: lychi_core::coordinator::AgentEventStream,
     handle: lychi_core::coordinator::OutcomeHandle,
 ) {
+    // The agent run is now in flight: hold the launcher's dismiss-on-blur for its
+    // whole lifetime, so any focus thief a tool triggers (a spawned terminal, a
+    // pkexec/polkit password dialog for a package install, a file picker) can't
+    // dismiss the chat out from under the user. Lowered when the run reaches a
+    // final outcome below. Escape still dismisses deliberately.
+    agent_busy.store(true, Ordering::SeqCst);
     tauri::async_runtime::spawn(async move {
         while let Some(ev) = stream.next().await {
             if state_generation.load(Ordering::Relaxed) != generation {
@@ -394,11 +525,29 @@ fn drive(
         // the full history (for a follow-up), on `AwaitingApproval` the paused
         // state (for `agent_approve`). Only an error/stop clears it.
         let outcome = handle.wait().await;
+        // Lower the busy guard when the run REACHES A FINAL state
+        // (Done/Stopped/Error) or is superseded — no more of this run's tool
+        // calls can fire, so the launcher may self-dismiss on blur again. An
+        // `AwaitingApproval` is NOT final (the run continues once the user
+        // decides, and a focus thief may still be up), so it deliberately keeps
+        // the guard raised. A superseded generation (match skipped) still clears
+        // via this default, so the flag can never stay stuck for the session.
+        let is_awaiting = matches!(outcome, Outcome::AwaitingApproval { .. });
+        if !is_awaiting {
+            agent_busy.store(false, Ordering::SeqCst);
+        }
         if state_generation.load(Ordering::Relaxed) == generation {
             match outcome {
-                Outcome::AwaitingApproval { session, .. } | Outcome::Done { session } => {
-                    // A completed (or waiting) turn — persist it to history so it
-                    // can be recalled later, then stash for the next turn.
+                Outcome::AwaitingApproval { session, .. } => {
+                    // Paused awaiting the user's approval — the run is still in
+                    // flight, so the busy guard stays raised and the chat (with
+                    // its approval prompt) can't be dismissed by focus loss.
+                    persist_conversation(&db, &conversation_id, &session).await;
+                    *pending_session.write().await = Some(session);
+                }
+                Outcome::Done { session } => {
+                    // A completed turn — persist it to history so it can be
+                    // recalled later, then stash for the next turn.
                     persist_conversation(&db, &conversation_id, &session).await;
                     *pending_session.write().await = Some(session);
                 }
@@ -629,6 +778,7 @@ pub async fn agent_chat_start(
         state.agent_session.clone(),
         state.db.clone(),
         state.agent_conversation_id.clone(),
+        state.agent_busy.clone(),
         stream,
         handle,
     );
@@ -680,8 +830,99 @@ pub async fn agent_approve(
         state.agent_session.clone(),
         state.db.clone(),
         state.agent_conversation_id.clone(),
+        state.agent_busy.clone(),
         stream,
         handle,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_run_is_inline_by_default() {
+        let (input, inputs, opens_terminal) = agent_run_inputs("run", "zip -r out.zip src");
+        assert_eq!(input, "run zip -r out.zip src");
+        assert!(
+            inputs.inline,
+            "the agent must capture output, not open a terminal"
+        );
+        assert!(!opens_terminal, "a plain run opens no window");
+    }
+
+    #[test]
+    fn the_terminal_sentinel_opens_a_terminal_and_is_stripped() {
+        let (input, inputs, opens_terminal) = agent_run_inputs("run", "--terminal ssh nimbus");
+        assert_eq!(
+            input, "run ssh nimbus",
+            "the sentinel must not reach the shell"
+        );
+        assert!(
+            !inputs.inline,
+            "an explicit --terminal must open a real terminal"
+        );
+        assert!(
+            opens_terminal,
+            "the guard must know this dispatch opens a window"
+        );
+        assert_eq!(
+            inputs.terminal_routing, "off",
+            "an agent terminal is a fresh window, never a hijack of the user's"
+        );
+    }
+
+    #[test]
+    fn a_bare_terminal_word_in_a_command_is_not_the_sentinel() {
+        // A mid-command "--terminal" must NOT be treated as the control prefix —
+        // only a leading, whitespace- or end-delimited token counts.
+        let (input, inputs, opens_terminal) = agent_run_inputs("run", "echo --terminal is a flag");
+        assert_eq!(input, "run echo --terminal is a flag");
+        assert!(inputs.inline);
+        assert!(!opens_terminal);
+
+        // "--terminals" (no delimiter after the word) is a different token.
+        let (_, inputs, opens_terminal) = agent_run_inputs("run", "--terminals foo");
+        assert!(
+            inputs.inline,
+            "--terminals is a different token, not the sentinel"
+        );
+        assert!(!opens_terminal);
+    }
+
+    #[test]
+    fn a_non_run_tool_never_opens_a_terminal_despite_inline_false() {
+        // The critical guard case: every non-`run` tool leaves inline at its
+        // `false` default but spawns NO terminal, so `opens_terminal` must be
+        // false — inferring the focus-theft guard from `inline` here would raise
+        // it for web/open/system and wrongly suppress a real click-away dismiss.
+        let (input, inputs, opens_terminal) = agent_run_inputs("web", "rust async");
+        assert_eq!(input, "web rust async");
+        assert!(
+            !inputs.inline,
+            "non-run tools carry the inline=false default"
+        );
+        assert!(
+            !opens_terminal,
+            "a non-run tool opens no terminal regardless of the inline default"
+        );
+
+        // Even when the text happens to start with the sentinel word — only
+        // `run` interprets it; every other tool passes it through untouched.
+        let (input, _, opens_terminal) = agent_run_inputs("web", "--terminal something");
+        assert_eq!(input, "web --terminal something");
+        assert!(!opens_terminal);
+    }
+
+    #[test]
+    fn an_empty_run_falls_through_to_the_usage_guard() {
+        // A bare `--terminal` with no command leaves an empty command; the
+        // handler's own "Usage: run …" guard reports it — we don't second-guess.
+        // It still counts as a terminal dispatch (the sentinel was present).
+        let (input, inputs, opens_terminal) = agent_run_inputs("run", "--terminal");
+        assert_eq!(input, "run ");
+        assert!(!inputs.inline);
+        assert!(opens_terminal);
+    }
 }

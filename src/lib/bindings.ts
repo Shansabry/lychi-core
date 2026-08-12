@@ -1631,7 +1631,13 @@ category_title: string;
 /**
  * The category's display order (lower sorts earlier).
  */
-category_order: number }
+category_order: number; 
+/**
+ * Whether this command mutates external state (see
+ * [`ActionHandler::mutates_state`]). Surfaced so the AI coordinator can
+ * refuse to run two mutating tools in one turn.
+ */
+mutates: boolean }
 /**
  * Flat wire DTO sent to the frontend. Deliberately mirrors the historical
  * field layout so the generated TS bindings and the ~19 frontend consumer sites

@@ -88,6 +88,7 @@ mod tests {
         ToolDef {
             name: name.into(),
             description: desc.into(),
+            mutates: false,
         }
     }
 

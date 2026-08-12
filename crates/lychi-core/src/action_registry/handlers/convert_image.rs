@@ -60,6 +60,10 @@ impl ActionHandler for ConvertImageHandler {
         "convert"
     }
 
+    fn mutates_state(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Convert an image: convert <path> to <png | jpg | webp | gif | bmp | tiff>"
     }

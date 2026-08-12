@@ -10,6 +10,7 @@ fn command_info(
     keyword: &str,
     description: &str,
     category: CommandCategory,
+    mutates: bool,
 ) -> CommandInfo {
     CommandInfo {
         id: id.to_string(),
@@ -18,6 +19,7 @@ fn command_info(
         category,
         category_title: category.title().to_string(),
         category_order: category.order(),
+        mutates,
     }
 }
 
@@ -160,7 +162,13 @@ impl ActionRegistry {
                     .iter()
                     .flat_map(|t| t.prefixes.iter().copied())
                     .next()?;
-                Some(command_info(h.id(), keyword, h.description(), h.category()))
+                Some(command_info(
+                    h.id(),
+                    keyword,
+                    h.description(),
+                    h.category(),
+                    h.mutates_state(),
+                ))
             })
             .collect();
         // Group by category order, then alphabetise within each group.
@@ -184,7 +192,13 @@ impl ActionRegistry {
 
         // Structural sigils first (in declared order — most common at top).
         for &(sigil, desc) in SIGIL_TRIGGERS {
-            items.push(command_info("", sigil, desc, CommandCategory::General));
+            items.push(command_info(
+                "",
+                sigil,
+                desc,
+                CommandCategory::General,
+                false,
+            ));
         }
 
         // Colon shorthands, description + category sourced from the live handler.
@@ -197,6 +211,7 @@ impl ActionRegistry {
                     prefix,
                     h.description(),
                     h.category(),
+                    h.mutates_state(),
                 ))
             })
             .collect();

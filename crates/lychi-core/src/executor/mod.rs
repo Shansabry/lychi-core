@@ -95,6 +95,11 @@ pub struct RunInputs {
     pub terminal_routing: String,
     /// Capture the next `run`'s output inline (Shift+Enter) instead of a terminal.
     pub inline: bool,
+    /// Optional live-output sink threaded to the handler's `ExecContext` (see
+    /// [`crate::action_registry::OutputSink`]). `None` — every non-agent path —
+    /// keeps today's buffered behaviour; the AI coordinator sets it so a captured
+    /// `run` streams its output into the chat as it happens.
+    pub sink: Option<crate::action_registry::OutputSink>,
 }
 
 /// Outcome of resolving which repo a `run` command targets.
@@ -421,6 +426,10 @@ impl Executor {
             } else {
                 OutputMode::Terminal
             },
+            // Carry the live-output sink through to the handler. Cloned (cheap —
+            // an mpsc sender handle) because `inputs` is borrowed; `None` on
+            // every non-agent path leaves buffered behaviour unchanged.
+            sink: inputs.sink.clone(),
         }
     }
 

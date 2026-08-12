@@ -124,6 +124,9 @@ pub async fn execute_command(
             terminal: Some(config.commands.terminal.clone()),
             terminal_routing: config.commands.terminal_routing.clone(),
             inline: run_inline.unwrap_or(false),
+            // No live sink on the direct-execute path — its captured output goes
+            // to the result panel, not a streaming chat block.
+            sink: None,
         }
     };
 
@@ -338,6 +341,7 @@ pub async fn confirm_execution(
             terminal: Some(config.commands.terminal.clone()),
             terminal_routing: config.commands.terminal_routing.clone(),
             inline: false,
+            sink: None,
         }
     };
 

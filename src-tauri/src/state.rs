@@ -146,6 +146,23 @@ pub struct AppState {
     /// Stable id for the current conversation, so follow-ups upsert the SAME
     /// history row (Phase 4). Set on a fresh start, reused on continue/approve.
     pub agent_conversation_id: Arc<RwLock<Option<String>>>,
+    /// Raised while an AI agent run is IN FLIGHT — from the moment it starts
+    /// driving until it fully resolves (a tool is executing, or an approval is
+    /// pending). A synchronous atomic, not a lock, because the GTK focus-out
+    /// handler reads it inline and must not block.
+    ///
+    /// While the agent is working it can trigger any number of focus-stealing
+    /// external windows — a spawned terminal, a `pkexec`/polkit password dialog
+    /// for a package install, a file picker — each a genuine
+    /// `focus_lost && interacted` that would otherwise dismiss the launcher and
+    /// take the in-progress chat (and any pending approval prompt) with it. The
+    /// right rule is simply: while the agent is running, the launcher does not
+    /// self-dismiss on focus loss. The user can still dismiss deliberately with
+    /// Escape. It does NOT affect the ordinary "launch an app, launcher hides"
+    /// path — it is set only while an agent run is active. Set in `drive` when a
+    /// run starts and cleared when it reaches a final outcome (Done/Stopped/Error
+    /// or a superseded generation), so it can never stay stuck.
+    pub agent_busy: Arc<AtomicBool>,
     /// The action awaiting user confirmation (G1). Captured when the pipeline
     /// returns `needs_confirmation`; the `confirm_execution` command executes
     /// THIS exact resolved intent rather than re-resolving raw input, closing the
@@ -196,6 +213,11 @@ pub struct AppState {
     /// reported every X11 grab as reliable, exactly the case that silently
     /// fails.
     pub hotkey_verdict: Arc<std::sync::Mutex<lychi_core::hotkey::HotkeyVerdict>>,
+    /// The tray's "Show/Hide" menu item, stored so its label can track the
+    /// window state (it read a static "Show" even when the launcher was open).
+    /// `None` until the tray is built (and stays `None` if the tray failed to
+    /// build — the launcher works without a tray). See [`update_tray_label`].
+    pub tray_toggle_item: Arc<std::sync::Mutex<Option<tauri::menu::MenuItem<tauri::Wry>>>>,
     /// Shutdown signal for the clipboard monitor OS thread. Set to false on exit
     /// to stop the monitor before D-Bus/arboard teardown begins.
     pub clipboard_running: Arc<AtomicBool>,
@@ -444,6 +466,7 @@ impl AppState {
             ai_cancel: Arc::new(RwLock::new(None)),
             agent_session: Arc::new(RwLock::new(None)),
             agent_conversation_id: Arc::new(RwLock::new(None)),
+            agent_busy: Arc::new(AtomicBool::new(false)),
             pending_execution: Arc::new(RwLock::new(None)),
             active_file_search: Arc::new(AtomicU64::new(0)),
             live_search: Arc::new(lychi_core::file_search::live::LiveSearch::new(Arc::new(
@@ -463,6 +486,7 @@ impl AppState {
                     lychi_core::context::is_wayland(),
                 ),
             )),
+            tray_toggle_item: Arc::new(std::sync::Mutex::new(None)),
             clipboard_running: Arc::new(AtomicBool::new(true)),
             timer_running: Arc::new(AtomicBool::new(true)),
             app_index_watcher_running: Arc::new(AtomicBool::new(true)),

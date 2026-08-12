@@ -408,6 +408,7 @@ pub fn run() {
                     app_state.dismiss_armed.clone(),
                     app_state.summon_seq.clone(),
                     app_state.armed_seq.clone(),
+                    app_state.agent_busy.clone(),
                 );
                 platform::setup_escape_handler(&win);
                 // --hidden: autostarted at login — stay in the background
@@ -706,6 +707,13 @@ pub fn run() {
                     .separator()
                     .item(&quit)
                     .build()?;
+                // Stash the toggle item so its label can track window state
+                // (see `window::update_tray_label`). Set to the correct starting
+                // label right away — the launcher shows at startup unless `--hidden`.
+                if let Ok(mut slot) = app.state::<AppState>().tray_toggle_item.lock() {
+                    *slot = Some(show.clone());
+                }
+                window::update_tray_label(app.handle());
                 let tray_icon = app
                     .default_window_icon()
                     .cloned()
@@ -720,7 +728,16 @@ pub fn run() {
                             }
                         }
                         "quit" => {
-                            app.exit(0);
+                            // `app.exit(0)` tears down the Tauri app but returns
+                            // to the event loop; under an AppImage the outer
+                            // runtime (which mounted the squashfs and is
+                            // `waitpid`-ing on us) can then linger with a lingering
+                            // WebKit/GStreamer child keeping the mount pinned — the
+                            // "wrapper survives Quit" bug. Run Tauri's cleanup, then
+                            // hard-exit the whole process so the wrapper's wait
+                            // returns and it unmounts and exits with us.
+                            app.cleanup_before_exit();
+                            std::process::exit(0);
                         }
                         _ => {}
                     })

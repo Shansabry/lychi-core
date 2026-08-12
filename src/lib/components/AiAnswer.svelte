@@ -234,12 +234,37 @@ function onWindowKeydown(e: KeyboardEvent) {
 	{#if steps.length > 0}
 		<div class="tool-steps">
 			{#each steps as step (step.callId)}
+				{@const hasOutput = !!step.output && step.output.length > 0}
+				{@const streaming = step.status === "running" && hasOutput}
+				<!-- Auto-open while output is streaming in, so you watch the command
+				     work live; once it's done it collapses back to a clickable row
+				     unless you explicitly expanded it. A manual toggle always wins. -->
+				{@const open = expanded.has(step.callId) || streaming}
 				<div class="tool-step" class:failed={step.status === "failed"}>
-					<span class="tool-icon">
-						{#if step.status === "running"}⟳{:else if step.status === "failed"}✗{:else}✓{/if}
-					</span>
-					<span class="tool-name">{step.name}</span>
-					<span class="tool-args">{step.args}</span>
+					<!-- The row is a button when there's captured output to reveal, so
+					     you can click a tool call to see exactly what the AI ran and
+					     what came back. Non-interactive (a plain row) while it's still
+					     running or produced nothing to show. -->
+					<button
+						type="button"
+						class="tool-step-head"
+						class:expandable={hasOutput}
+						disabled={!hasOutput}
+						aria-expanded={hasOutput ? open : undefined}
+						onclick={() => hasOutput && toggleChip(step.callId)}
+					>
+						<span class="tool-icon">
+							{#if step.status === "running"}⟳{:else if step.status === "failed"}✗{:else}✓{/if}
+						</span>
+						<span class="tool-name">{step.name}</span>
+						<span class="tool-args">{step.args}</span>
+						{#if hasOutput}
+							<span class="tool-caret" aria-hidden="true">{open ? "▾" : "▸"}</span>
+						{/if}
+					</button>
+					{#if hasOutput && open}
+						<pre class="tool-output" class:live={streaming}>{step.output}</pre>
+					{/if}
 				</div>
 				{#if step.artifactKind === "svg" && step.artifactContent}
 					<!-- Inline rich tool output (e.g. a QR code). Sanitized SVG. -->
@@ -719,7 +744,7 @@ function onWindowKeydown(e: KeyboardEvent) {
 	.tool-steps {
 		display: flex;
 		flex-direction: column;
-		gap: 4px;
+		gap: 6px;
 		margin-bottom: 10px;
 	}
 	/* Inline rich tool output — e.g. a QR code. White plate so a dark-theme
@@ -739,14 +764,37 @@ function onWindowKeydown(e: KeyboardEvent) {
 	}
 	.tool-step {
 		display: flex;
-		align-items: center;
-		gap: 7px;
+		flex-direction: column;
 		font-family: var(--font-mono);
 		font-size: 12px;
 		color: var(--fg-muted);
 	}
 	.tool-step.failed {
 		color: var(--error);
+	}
+	/* The clickable header row. A bare button reset — it must read as the
+	   plain step row it replaced, gaining affordance only when expandable. */
+	.tool-step-head {
+		display: flex;
+		align-items: center;
+		gap: 7px;
+		width: 100%;
+		padding: 3px 6px;
+		margin: 0 -6px;
+		background: none;
+		border: none;
+		border-radius: 5px;
+		font: inherit;
+		color: inherit;
+		text-align: left;
+		cursor: default;
+		transition: background 0.12s ease;
+	}
+	.tool-step-head.expandable {
+		cursor: pointer;
+	}
+	.tool-step-head.expandable:hover {
+		background: color-mix(in srgb, var(--fg) 6%, transparent);
 	}
 	.tool-icon {
 		width: 14px;
@@ -761,6 +809,44 @@ function onWindowKeydown(e: KeyboardEvent) {
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+		flex: 1;
+	}
+	.tool-caret {
+		flex-shrink: 0;
+		color: var(--fg-muted);
+		font-size: 10px;
+	}
+	/* The revealed captured output — exactly what the tool returned to the
+	   model. Scrolls on both axes so a long or wide result never blows out
+	   the bubble; capped height so a huge dump stays a pane, not a wall. */
+	.tool-output {
+		margin: 6px 0 2px 21px;
+		padding: 9px 11px;
+		max-height: 280px;
+		overflow: auto;
+		background: var(--bg-secondary);
+		border: 1px solid var(--border);
+		border-left: 2px solid var(--accent-blue);
+		border-radius: 6px;
+		font-family: var(--font-mono);
+		font-size: 11.5px;
+		line-height: 1.55;
+		color: var(--fg);
+		white-space: pre-wrap;
+		word-break: break-word;
+		tab-size: 2;
+	}
+	.tool-output.live {
+		animation: tool-output-pulse 1.4s ease-in-out infinite;
+	}
+	@keyframes tool-output-pulse {
+		0%,
+		100% {
+			border-left-color: var(--accent-blue);
+		}
+		50% {
+			border-left-color: color-mix(in srgb, var(--accent-blue) 35%, transparent);
+		}
 	}
 
 	.thinking {

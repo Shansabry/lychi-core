@@ -574,6 +574,10 @@ impl ActionHandler for PackagesHandler {
         "packages"
     }
 
+    fn mutates_state(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Search, install, remove & upgrade system packages (dnf/apt/pacman/zypper/flatpak)"
     }

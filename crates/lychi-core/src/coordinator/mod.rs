@@ -28,5 +28,5 @@ pub use loop_::{
     AgentEvent, AgentEventStream, Coordinator, MaxSteps, Outcome, OutcomeHandle, StopCondition,
 };
 pub use session::{ApprovalDecision, ApprovalRequest, PendingApproval, Session};
-pub use tool_executor::{ResumeToken, ToolArtifact, ToolExecutor, ToolOutcome};
+pub use tool_executor::{ResumeToken, ToolArtifact, ToolExecutor, ToolOutcome, ToolOutputChannel};
 pub use tool_filter::select_tools;

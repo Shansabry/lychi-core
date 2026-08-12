@@ -414,6 +414,8 @@ pub fn hide_launcher(app: AppHandle) {
                     state
                         .launcher
                         .apply(crate::launcher_state::Event::HideCompleted, "hide_launcher");
+                    // Window is down → the tray toggle reads "Show".
+                    crate::window::update_tray_label(&app);
                 }
                 Err(e) => tracing::error!("[hide] window.hide() FAILED: {e}"),
             }

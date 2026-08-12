@@ -82,6 +82,10 @@ impl ActionHandler for ExtractHandler {
         "extract"
     }
 
+    fn mutates_state(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Extract an archive: extract <archive.zip|.tar.gz> [to <dir>]"
     }

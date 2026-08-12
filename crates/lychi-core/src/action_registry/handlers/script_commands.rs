@@ -79,6 +79,10 @@ impl ActionHandler for ScriptCommandsHandler {
         "script"
     }
 
+    fn mutates_state(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Run a Script Command from ~/.config/lychi/scripts/"
     }

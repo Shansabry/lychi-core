@@ -13,10 +13,13 @@ use crate::providers::{ChatMessage, Role};
 pub const RETENTION_DAYS: u64 = 30;
 const RETENTION_MS: u64 = RETENTION_DAYS * 24 * 60 * 60 * 1000;
 
-/// Hard ceiling as a backstop, so a single very busy period can't blow up the DB
-/// even within the retention window. Time is the primary rule; this only bites in
-/// the extreme.
-pub const MAX_CONVERSATIONS: usize = 500;
+/// How many conversations to keep — the newest `MAX_CONVERSATIONS` survive, the
+/// rest are pruned on upsert (`list` is newest-first, so this is "keep the 20
+/// most recent"). A launcher's chat history is a short recall list, not an
+/// archive; 20 keeps the recall panel scannable and the DB small. The 30-day
+/// retention still prunes *older* conversations even when there are fewer than
+/// this, so both rules only ever remove — never keep more than 20.
+pub const MAX_CONVERSATIONS: usize = 20;
 
 #[derive(Default)]
 pub struct AiHistoryStore;
@@ -159,8 +162,12 @@ impl AiHistoryStore {
         Ok(())
     }
 
-    /// Prune conversations older than the retention window (by `updated_at`),
-    /// plus a hard-count backstop. Time is the primary rule.
+    /// Prune the history down to policy on every upsert. Two rules, either of
+    /// which removes a conversation: it is beyond the newest `MAX_CONVERSATIONS`
+    /// (the hard count cap — `list` is newest-first, so index >= the cap means
+    /// "older than the 20 we keep"), or it is older than the retention window.
+    /// Neither rule can ever KEEP more than `MAX_CONVERSATIONS`; the count is the
+    /// hard ceiling and the time rule only trims further.
     fn prune(&self, db: &Arc<Database>) -> Result<(), LychiError> {
         let summaries = self.list(db)?; // already newest-first
         let now = db::now_millis();
@@ -170,8 +177,8 @@ impl AiHistoryStore {
             .into_iter()
             .enumerate()
             .filter(|(idx, s)| {
-                // Older than the retention window, OR beyond the hard ceiling.
-                s.updated_at < cutoff || *idx >= MAX_CONVERSATIONS
+                // Beyond the hard count cap, OR older than the retention window.
+                *idx >= MAX_CONVERSATIONS || s.updated_at < cutoff
             })
             .map(|(_, s)| s.id)
             .collect();
@@ -304,6 +311,68 @@ mod tests {
         let ids: Vec<String> = store.list(&db).unwrap().into_iter().map(|s| s.id).collect();
         assert!(!ids.contains(&"ancient".to_string()));
         assert!(ids.contains(&"recent".to_string()));
+    }
+
+    #[test]
+    fn keeps_only_the_newest_max_conversations() {
+        let db = open_test_database();
+        let store = AiHistoryStore::new();
+
+        // Hand-write MAX_CONVERSATIONS + 5 conversations with strictly increasing
+        // `updated_at`, so newest-first ordering is unambiguous (a real upsert
+        // loop could collide within one millisecond and make the assertion
+        // flaky). All timestamps are recent, so the count cap — not the retention
+        // rule — is what prunes.
+        let now = db::now_millis();
+        let total = MAX_CONVERSATIONS + 5;
+        for i in 0..total {
+            let conv = Conversation {
+                id: format!("c{i}"),
+                title: format!("t{i}"),
+                turn_count: 2,
+                messages: conv_messages(&format!("q{i}"), "a"),
+                created_at: now,
+                updated_at: now + i as u64, // strictly increasing → i=total-1 newest
+            };
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(db::AI_CONVERSATIONS).unwrap();
+                let bytes = crate::db::wrap_body(&serde_json::to_vec(&conv).unwrap());
+                table.insert(conv.id.as_str(), bytes.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        assert_eq!(store.list(&db).unwrap().len(), total, "all inserted first");
+
+        // Any upsert triggers prune → the store is bounded to the hard cap.
+        store
+            .upsert(&db, "trigger", &conv_messages("q", "a"))
+            .unwrap();
+
+        let ids: std::collections::HashSet<String> =
+            store.list(&db).unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids.len(),
+            MAX_CONVERSATIONS,
+            "the hard cap must bound the stored conversation count"
+        );
+        // total+1 conversations existed (25 + "trigger"); the cap keeps the 20
+        // newest. "trigger" (newest) survives; the 6 oldest (c0..c5) fall off;
+        // c6.. survive.
+        assert!(
+            ids.contains("trigger"),
+            "the just-added conversation survives"
+        );
+        assert!(!ids.contains("c0"), "the oldest conversation was pruned");
+        assert!(
+            !ids.contains("c5"),
+            "the 6th-oldest fell off (26 total, cap 20)"
+        );
+        assert!(ids.contains("c6"), "the newest survivors are kept");
+        assert!(
+            ids.contains(&format!("c{}", total - 1)),
+            "the most recent inserted conversation survives"
+        );
     }
 
     /// The field bug ("[history] failed to persist conversation: schema v123"):

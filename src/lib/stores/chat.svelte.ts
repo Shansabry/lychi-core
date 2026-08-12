@@ -490,6 +490,18 @@ class ChatSession {
 					},
 				];
 				break;
+			case "tool_output_delta": {
+				// A live chunk from a still-running tool — append it to the
+				// matching step's output so the chat block fills in real time.
+				// The final tool_completed carries the full output and replaces
+				// this (idempotent: it equals what we streamed), so a dropped or
+				// out-of-order delta self-heals at completion.
+				const chunk = ev.text ?? "";
+				this.toolSteps = this.toolSteps.map((s) =>
+					s.callId === ev.call_id ? { ...s, output: (s.output ?? "") + chunk } : s,
+				);
+				break;
+			}
 			case "tool_completed":
 			case "tool_failed": {
 				const status = ev.kind === "tool_failed" ? "failed" : "done";

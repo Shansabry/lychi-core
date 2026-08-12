@@ -9,6 +9,26 @@ fn tid() -> String {
     std::thread::current().name().unwrap_or("?").to_string()
 }
 
+/// Update the tray's toggle item so its label matches the window: "Hide" while
+/// the launcher is open, "Show" while it's closed. The item always TOGGLED
+/// correctly; only its text was static ("Show" even when open). Called from the
+/// show and hide paths. A no-op when the tray failed to build (item is `None`)
+/// or its text can't be set — the tray is best-effort, never load-bearing.
+pub fn update_tray_label(app: &tauri::AppHandle) {
+    use crate::launcher_state::LauncherState;
+    let state = app.state::<AppState>();
+    let open = matches!(
+        state.launcher.get(),
+        LauncherState::Visible | LauncherState::Showing
+    );
+    let label = if open { "Hide" } else { "Show" };
+    if let Ok(guard) = state.tray_toggle_item.lock()
+        && let Some(item) = guard.as_ref()
+    {
+        let _ = item.set_text(label);
+    }
+}
+
 /// Minimum gap between accepted toggle requests. Absorbs double-delivery of
 /// one physical keypress (DE-bound `lychi --toggle` + the X11 shortcut plugin
 /// both firing over XWayland windows, duplicate IPC lines, key autorepeat).
@@ -67,6 +87,8 @@ pub fn toggle_window(window: &WebviewWindow) {
             state
                 .launcher
                 .apply(crate::launcher_state::Event::HideCompleted, "toggle-hide");
+            let handle = win.app_handle();
+            update_tray_label(handle);
         } else {
             // show_window does blocking context work (KWin D-Bus snapshot) —
             // it must not run on the GTK thread. Hand it to a worker; its own
@@ -186,6 +208,7 @@ pub fn show_window(window: &WebviewWindow) {
     }
 
     tracing::info!("[show] === show_window END (seq={seq}) ===");
+    update_tray_label(window.app_handle());
 
     // Fast path: emit last-known context immediately so suggestions appear
     // before the fresh gather completes (typically saves 50-200ms).

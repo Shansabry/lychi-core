@@ -250,6 +250,13 @@ mod content_string_or_seq {
 pub struct ToolDef {
     pub name: String,
     pub description: String,
+    /// Whether calling this tool mutates external state (writes/deletes files,
+    /// changes system state, installs packages). The coordinator uses it to
+    /// refuse a second mutating tool in the same turn — a model that hedges by
+    /// emitting several variants of one destructive operation at once should run
+    /// one, not all. Read-only tools (`false`) stay freely parallel.
+    #[serde(default)]
+    pub mutates: bool,
 }
 
 /// A tool invocation the model requested. `id` correlates the eventual

@@ -935,6 +935,7 @@ pub fn setup_dismiss_on_blur(
     dismiss_armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     summon_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
     armed_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    agent_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let gtk_win = match window.gtk_window() {
         Ok(w) => w,
@@ -1072,6 +1073,7 @@ pub fn setup_dismiss_on_blur(
     let focusin_gen_out = focusin_generation.clone();
     let summon_seq_out = summon_seq.clone();
     let has_focused_out = has_focused.clone();
+    let agent_busy = agent_busy.clone();
     let started = std::time::Instant::now();
     gtk_win.connect_focus_out_event(move |w, _| {
         let seq = summon_seq.load(Ordering::SeqCst);
@@ -1172,6 +1174,29 @@ pub fn setup_dismiss_on_blur(
                 },
                 &format!("{ctx} seq={seq}"),
             );
+            return glib::Propagation::Proceed;
+        }
+
+        // While an AI agent run is in flight, the launcher does not self-dismiss
+        // on focus loss. A running agent can trigger any focus-stealing external
+        // window — a spawned terminal, a `pkexec`/polkit password dialog for a
+        // package install, a file picker — each a genuine `focus_lost &&
+        // interacted` that would otherwise dismiss the chat out from under the
+        // user (and take a pending approval prompt with it). The guard is raised
+        // when the run starts driving and lowered when it resolves. We do NOT
+        // step the machine: the launcher legitimately stays `Visible`, so no
+        // deferred cancel can strand it. This does NOT touch the ordinary "launch
+        // an app, launcher hides" path — it applies only while the agent is
+        // working, and Escape still dismisses deliberately.
+        //
+        // Deliberately LEVEL-triggered, not one-shot: Mutter bleeds spurious
+        // focus-outs several times a second (see the diagnostics note above), so
+        // consuming the guard on the first focus-out would risk spending it on a
+        // spurious one and letting the real focus theft dismiss the launcher.
+        // The cost is that while the agent is working a deliberate click-away
+        // also won't dismiss; the flag clears the instant the run resolves.
+        if agent_busy.load(Ordering::SeqCst) {
+            tracing::info!("[dismiss] seq={seq} focus-out suppressed — agent run in flight  {ctx}");
             return glib::Propagation::Proceed;
         }
 

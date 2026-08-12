@@ -311,6 +311,10 @@ impl ActionHandler for AppControlHandler {
         "appctl"
     }
 
+    fn mutates_state(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Focus, quit, or kill running applications"
     }

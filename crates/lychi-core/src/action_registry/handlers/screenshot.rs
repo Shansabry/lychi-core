@@ -605,6 +605,10 @@ impl ActionHandler for ScreenshotHandler {
         "screenshot"
     }
 
+    fn mutates_state(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Capture a screenshot (full screen, region, or window)"
     }

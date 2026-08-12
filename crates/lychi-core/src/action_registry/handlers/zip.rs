@@ -59,6 +59,10 @@ impl ActionHandler for ZipHandler {
         "zip"
     }
 
+    fn mutates_state(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Zip files/folders: zip <path...> [to <out.zip>]"
     }

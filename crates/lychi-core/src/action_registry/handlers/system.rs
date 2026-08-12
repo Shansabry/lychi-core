@@ -709,6 +709,10 @@ impl ActionHandler for SystemCommand {
         "system"
     }
 
+    fn mutates_state(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "System controls (power, audio, brightness, wifi, bluetooth)"
     }

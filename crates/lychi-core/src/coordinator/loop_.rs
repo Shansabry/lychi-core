@@ -42,6 +42,12 @@ pub enum AgentEvent {
         name: String,
         args: String,
     },
+    /// A chunk of live output from a still-running tool (e.g. a shell command's
+    /// stdout/stderr, streamed line-by-line). Purely additive UI sugar — the
+    /// final, complete output still arrives in `ToolCallCompleted`; these let the
+    /// user watch the work happen instead of waiting for the end. Not every tool
+    /// streams; those that don't simply never emit this.
+    ToolOutputDelta { call_id: String, chunk: String },
     /// A tool finished. `output` is what was fed back to the model; `artifact`
     /// is an optional rich result (QR/weather/image) the UI renders inline.
     ToolCallCompleted {
@@ -304,17 +310,24 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                 return Outcome::Done { session };
             }
 
-            // Collapse duplicate calls the model emitted in ONE turn — same tool
-            // name + same args. Small/fast models (seen with groq llama-3.3)
-            // sometimes request an identical tool twice in a single turn;
-            // running a side-effecting tool (a screenshot, a shell command)
-            // twice is never what the user wanted, and it doubles the round-trip
-            // token cost that then trips rate limits. We keep the FIRST call to
-            // actually execute, and answer each later identical call with the
-            // first's result — the API contract still holds (every tool_use id
-            // gets a tool_result) without acting twice. Dedup is per-turn only:
-            // a later turn legitimately re-calling the same tool is untouched.
-            let calls = self.dedup_calls(&mut session, calls);
+            // Filter the batch the model emitted in ONE turn, in order:
+            //   1. Exact dedup — same tool name + same args. Fast models
+            //      sometimes request an identical tool twice; running a side
+            //      effect twice is never wanted and doubles token cost.
+            //   2. Mutating-tool hold — at most ONE state-mutating tool
+            //      (`run`, `zip`, `service`, …) runs per turn. A model that
+            //      hedges by emitting several VARIANTS of one destructive
+            //      operation at once (three ways to resize the same photos —
+            //      convert vs magick, differing only by flags, so exact dedup
+            //      can't catch them) would otherwise run all of them: wasted
+            //      tokens → rate limits, and a corrupted result. The
+            //      "don't parallelize non-idempotent tools" principle.
+            // Read-only tools stay fully parallel (two file searches, two
+            // definitions in one turn are fine). Both are per-turn only — a
+            // later turn legitimately re-calling a tool is untouched. Every
+            // held call is answered with a tool_result so the provider contract
+            // holds (each tool_use id gets a result).
+            let calls = self.filter_batch(&mut session, calls);
 
             // Execute the batch IN FULL before suspending. The provider
             // contract is unforgiving here: every tool_use id in the assistant
@@ -462,7 +475,42 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
             args: call.args.clone(),
         });
 
-        match self.executor.execute(&call.name, &call.args).await {
+        // Wire a live-output channel: a streaming tool (a captured shell command)
+        // pushes each output line into `out_tx`; a forwarder task turns those into
+        // `ToolOutputDelta` events tagged with this call's id, so the UI streams
+        // the output as it happens. The task ends when the tool drops its sender
+        // (the channel closes) — i.e. when the command finishes. Non-streaming
+        // tools never push, so the task simply ends at once. The FINAL output
+        // still comes back in the `Ran` outcome below, unchanged.
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let forward = {
+            let ev_tx = self.ev_tx.clone();
+            let call_id = call.id.clone();
+            tokio::spawn(async move {
+                while let Some(chunk) = out_rx.recv().await {
+                    if ev_tx
+                        .send(AgentEvent::ToolOutputDelta {
+                            call_id: call_id.clone(),
+                            chunk,
+                        })
+                        .is_err()
+                    {
+                        break; // UI dropped the stream — stop forwarding.
+                    }
+                }
+            })
+        };
+
+        let result = self
+            .executor
+            .execute(&call.name, &call.args, Some(out_tx))
+            .await;
+        // The tool has returned, so its sender is dropped and the forwarder will
+        // drain any last buffered chunks and end. Await it so all deltas are
+        // emitted BEFORE the completion event (ordering the UI relies on).
+        let _ = forward.await;
+
+        match result {
             Ok(ToolOutcome::Ran {
                 output,
                 is_error,
@@ -586,40 +634,80 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
         None
     }
 
-    /// Collapse identical tool calls within a single turn (same name + args).
+    /// Whether a tool name is a state-mutating tool, per its `ToolDef.mutates`
+    /// (declared by the handler). Unknown names default to non-mutating — the
+    /// hold is a safety cap, and a tool absent from the catalog is one the
+    /// executor will reject anyway, so it is never worth blocking a sibling for.
+    fn is_mutating(&self, name: &str) -> bool {
+        self.tools
+            .iter()
+            .find(|t| t.name == name)
+            .is_some_and(|t| t.mutates)
+    }
+
+    /// Filter a single turn's tool batch before execution: exact-duplicate
+    /// dedup, then a one-mutating-tool-per-turn hold.
     ///
-    /// Returns the calls to actually execute (first occurrence of each unique
-    /// name+args), having already answered every DUPLICATE with a tool_result
-    /// so the provider contract holds. The duplicate's UI events are emitted
-    /// too, so the panel shows it resolved rather than pending. A tool the
-    /// model calls again in a LATER turn is unaffected — this is per-batch only.
-    fn dedup_calls(&self, session: &mut Session, calls: Vec<ToolCall>) -> Vec<ToolCall> {
+    /// Returns the calls to actually execute. Every dropped call is answered
+    /// with a tool_result (and its UI lifecycle events emitted, so the panel
+    /// shows it resolved rather than pending) so the provider contract holds —
+    /// each tool_use id gets a result. Per-batch only: a tool the model calls
+    /// again in a LATER turn is unaffected.
+    fn filter_batch(&self, session: &mut Session, calls: Vec<ToolCall>) -> Vec<ToolCall> {
         let mut seen: Vec<(String, String)> = Vec::new();
-        let mut unique = Vec::with_capacity(calls.len());
+        let mut ran_mutating = false;
+        let mut kept = Vec::with_capacity(calls.len());
         for call in calls {
             let key = (call.name.clone(), call.args.clone());
             if seen.contains(&key) {
                 // A repeat of a call already accepted this turn. Don't run the
                 // side effect again — answer its id and show it resolved.
-                self.emit(AgentEvent::ToolCallStarted {
-                    call_id: call.id.clone(),
-                    name: call.name.clone(),
-                    args: call.args.clone(),
-                });
-                let note =
-                    "Skipped: an identical tool call was already made in this turn.".to_string();
-                session.push_tool_result(&call.id, note.clone(), false);
-                self.emit(AgentEvent::ToolCallCompleted {
-                    call_id: call.id,
-                    output: note,
-                    artifact: None,
-                });
-            } else {
-                seen.push(key);
-                unique.push(call);
+                self.answer_dropped(
+                    session,
+                    call,
+                    "Skipped: an identical tool call was already made in this turn.",
+                );
+                continue;
             }
+            seen.push(key);
+
+            if self.is_mutating(&call.name) {
+                if ran_mutating {
+                    // A second state-mutating tool in the same turn. The model
+                    // is almost certainly hedging (variants of one operation);
+                    // run only the first and tell it to sequence the rest.
+                    self.answer_dropped(
+                        session,
+                        call,
+                        "Held: a state-changing command already ran in this turn. Issue \
+                         only one file/system-modifying command at a time — wait for its \
+                         result, then run the next. If you meant to try alternatives, pick \
+                         one.",
+                    );
+                    continue;
+                }
+                ran_mutating = true;
+            }
+            kept.push(call);
         }
-        unique
+        kept
+    }
+
+    /// Answer a call the batch filter dropped: emit its start/complete UI events
+    /// and push a non-error tool_result carrying `note`, so the model sees why it
+    /// was not run and the provider still gets a result for the tool_use id.
+    fn answer_dropped(&self, session: &mut Session, call: ToolCall, note: &str) {
+        self.emit(AgentEvent::ToolCallStarted {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            args: call.args.clone(),
+        });
+        session.push_tool_result(&call.id, note.to_string(), false);
+        self.emit(AgentEvent::ToolCallCompleted {
+            call_id: call.id,
+            output: note.to_string(),
+            artifact: None,
+        });
     }
 }
 
@@ -633,6 +721,7 @@ struct TurnResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordinator::tool_executor::ToolOutputChannel;
     use async_trait::async_trait;
     use futures_util::stream;
     use std::sync::Mutex;
@@ -774,16 +863,30 @@ mod tests {
     }
     #[async_trait]
     impl ToolExecutor for MockExecutor {
-        async fn execute(&self, name: &str, _args: &str) -> Result<ToolOutcome, LychiError> {
+        async fn execute(
+            &self,
+            name: &str,
+            _args: &str,
+            output_ch: Option<ToolOutputChannel>,
+        ) -> Result<ToolOutcome, LychiError> {
             *self.execute_calls.lock().unwrap() += 1;
             match self.outcomes.get(name) {
                 Some(ToolOutcome::Ran {
                     output, is_error, ..
-                }) => Ok(ToolOutcome::Ran {
-                    output: output.clone(),
-                    is_error: *is_error,
-                    artifact: None,
-                }),
+                }) => {
+                    // Stream the output as two chunks when a channel is provided,
+                    // so a test can assert live deltas arrive before completion.
+                    if let Some(ch) = output_ch
+                        && !output.is_empty()
+                    {
+                        let _ = ch.send(output.clone());
+                    }
+                    Ok(ToolOutcome::Ran {
+                        output: output.clone(),
+                        is_error: *is_error,
+                        artifact: None,
+                    })
+                }
                 Some(ToolOutcome::NeedsApproval { reason, resume }) => {
                     Ok(ToolOutcome::NeedsApproval {
                         reason: reason.clone(),
@@ -809,6 +912,26 @@ mod tests {
             vec![ToolDef {
                 name: "weather".into(),
                 description: "get weather".into(),
+                mutates: false,
+            }],
+        )
+    }
+
+    /// A coordinator whose catalog has a single named tool with a chosen
+    /// `mutates` flag — for tests that exercise one specific tool.
+    fn coordinator_with_tool(
+        provider: Arc<MockProvider>,
+        executor: Arc<MockExecutor>,
+        name: &str,
+        mutates: bool,
+    ) -> Coordinator<MockExecutor> {
+        Coordinator::new(
+            provider,
+            executor,
+            vec![ToolDef {
+                name: name.into(),
+                description: name.into(),
+                mutates,
             }],
         )
     }
@@ -934,6 +1057,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_tools_output_streams_as_deltas_before_completion() {
+        // A streaming tool (the mock pushes its output into the live channel)
+        // must produce ToolOutputDelta events tagged with the call id, and they
+        // must arrive BEFORE the ToolCallCompleted — the ordering the UI relies
+        // on to fill the block live and then finalise it.
+        let provider = MockProvider::new(vec![call_tool("t1", "run", "echo hi"), answer("Done.")]);
+        let exec = Arc::new(MockExecutor::new().ran("run", "hi\n", false));
+        let (stream, handle) = coordinator_with_tool(provider, exec, "run", false)
+            .run(Session::new("sys", "run it"), CancellationToken::new());
+        let events = drain(stream).await;
+
+        // A delta for this call arrived, carrying the streamed output.
+        let delta_idx = events.iter().position(|e| {
+            matches!(e, AgentEvent::ToolOutputDelta { call_id, chunk }
+                if call_id == "t1" && chunk == "hi\n")
+        });
+        assert!(delta_idx.is_some(), "a ToolOutputDelta must be emitted");
+
+        // The completion for the same call came AFTER the delta.
+        let done_idx = events.iter().position(
+            |e| matches!(e, AgentEvent::ToolCallCompleted { call_id, .. } if call_id == "t1"),
+        );
+        assert!(done_idx.is_some(), "the tool still completes");
+        assert!(
+            delta_idx.unwrap() < done_idx.unwrap(),
+            "deltas must stream before the completion event"
+        );
+
+        assert!(matches!(handle.wait().await, Outcome::Done { .. }));
+    }
+
+    #[tokio::test]
     async fn duplicate_tool_calls_in_one_turn_run_once() {
         // The model emits the SAME call (name+args) twice in one turn — the
         // groq-llama double-screenshot case. The side effect must run once; both
@@ -973,6 +1128,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_one_mutating_tool_runs_per_turn() {
+        // The hedge case: the model emits THREE variants of one destructive
+        // operation in a single turn (resize the same photos three ways — the
+        // args differ, so exact dedup can't catch them). Only the first
+        // mutating call must run; the other two are held with a note, and all
+        // three ids still get a tool_result so no tool_use dangles.
+        let provider = MockProvider::new(vec![
+            call_tools(&[
+                ("t1", "run", "magick a -resize 50%"),
+                ("t2", "run", "convert a -resize 50%"),
+                ("t3", "run", "magick a resize 50%"),
+            ]),
+            answer("Resized."),
+        ]);
+        let exec = Arc::new(MockExecutor::new().ran("run", "ok", false));
+        let e = exec.clone();
+        let coord = Coordinator::new(
+            provider,
+            exec,
+            vec![ToolDef {
+                name: "run".into(),
+                description: "shell".into(),
+                mutates: true,
+            }],
+        );
+        let (stream, handle) = coord.run(
+            Session::new("sys", "resize my photos"),
+            CancellationToken::new(),
+        );
+        let events = drain(stream).await;
+
+        // Exactly one of the three mutating calls actually executed.
+        assert_eq!(
+            *e.execute_calls.lock().unwrap(),
+            1,
+            "a second/third mutating tool in one turn must be held, not run"
+        );
+        assert!(has_text(&events, "Resized."));
+        match handle.wait().await {
+            Outcome::Done { session } => {
+                let ids = result_ids(&session);
+                // All three ids answered — provider contract holds.
+                for id in ["t1", "t2", "t3"] {
+                    assert!(ids.contains(&id.to_string()), "id {id} must have a result");
+                }
+                let held = session
+                    .messages
+                    .iter()
+                    .filter(|m| m.content_text().contains("Held:"))
+                    .count();
+                assert_eq!(held, 2, "the two extra mutating calls were held");
+            }
+            _ => panic!("expected Done"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_tools_stay_parallel_in_one_turn() {
+        // The hold is scoped to MUTATING tools. Two different read-only calls in
+        // one turn (two weather lookups) must both run — Lychi stays smart.
+        let provider = MockProvider::new(vec![
+            call_tools(&[("t1", "weather", "London"), ("t2", "weather", "Paris")]),
+            answer("Done."),
+        ]);
+        let exec = Arc::new(MockExecutor::new().ran("weather", "sunny", false));
+        let e = exec.clone();
+        // Default `coordinator` helper registers weather with mutates:false.
+        let (stream, handle) = coordinator(provider, exec)
+            .run(Session::new("sys", "weather?"), CancellationToken::new());
+        drain(stream).await;
+        assert_eq!(
+            *e.execute_calls.lock().unwrap(),
+            2,
+            "two distinct read-only calls in one turn must both run"
+        );
+        assert!(matches!(handle.wait().await, Outcome::Done { .. }));
+    }
+
+    #[tokio::test]
     async fn tool_error_is_fed_back_not_fatal() {
         let provider = MockProvider::new(vec![
             call_tool("t1", "weather", "Nowhere"),
@@ -999,6 +1233,7 @@ mod tests {
             vec![ToolDef {
                 name: "delete".into(),
                 description: "delete".into(),
+                mutates: false,
             }],
         );
         let (stream, handle) =
@@ -1029,6 +1264,7 @@ mod tests {
             vec![ToolDef {
                 name: "delete".into(),
                 description: "delete".into(),
+                mutates: false,
             }],
         );
         let (s1, h1) = coord.run(Session::new("sys", "delete all"), CancellationToken::new());
@@ -1046,6 +1282,7 @@ mod tests {
             vec![ToolDef {
                 name: "delete".into(),
                 description: "delete".into(),
+                mutates: false,
             }],
         );
         let (s2, h2) = coord2.resume(session, ApprovalDecision::Approve, CancellationToken::new());
@@ -1067,6 +1304,7 @@ mod tests {
             vec![ToolDef {
                 name: "delete".into(),
                 description: "delete".into(),
+                mutates: false,
             }],
         );
         let (s1, h1) = coord.run(Session::new("sys", "delete all"), CancellationToken::new());
@@ -1083,6 +1321,7 @@ mod tests {
             vec![ToolDef {
                 name: "delete".into(),
                 description: "delete".into(),
+                mutates: false,
             }],
         );
         let (s2, h2) = coord2.resume(
@@ -1134,10 +1373,12 @@ mod tests {
                 ToolDef {
                     name: "delete".into(),
                     description: "delete".into(),
+                    mutates: false,
                 },
                 ToolDef {
                     name: "weather".into(),
                     description: "get weather".into(),
+                    mutates: false,
                 },
             ],
         );
@@ -1166,6 +1407,7 @@ mod tests {
             vec![ToolDef {
                 name: "delete".into(),
                 description: "delete".into(),
+                mutates: false,
             }],
         );
         let (s2, h2) = coord2.resume(session, ApprovalDecision::Approve, CancellationToken::new());
@@ -1199,10 +1441,12 @@ mod tests {
             ToolDef {
                 name: "delete".into(),
                 description: "delete".into(),
+                mutates: false,
             },
             ToolDef {
                 name: "format".into(),
                 description: "format".into(),
+                mutates: false,
             },
         ];
         let coord = Coordinator::new(provider, exec.clone(), tools.clone());
@@ -1275,6 +1519,7 @@ mod tests {
             vec![ToolDef {
                 name: "delete".into(),
                 description: "delete".into(),
+                mutates: false,
             }],
         );
         let (stream, handle) = coord.run(Session::new("sys", "go"), CancellationToken::new());

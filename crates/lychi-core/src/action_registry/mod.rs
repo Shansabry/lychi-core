@@ -615,6 +615,10 @@ pub struct CommandInfo {
     pub category_title: String,
     /// The category's display order (lower sorts earlier).
     pub category_order: u8,
+    /// Whether this command mutates external state (see
+    /// [`ActionHandler::mutates_state`]). Surfaced so the AI coordinator can
+    /// refuse to run two mutating tools in one turn.
+    pub mutates: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, specta::Type)]
@@ -801,6 +805,45 @@ pub enum OutputMode {
 /// architecture review flagged). Being per-call and immutable, tests construct a
 /// fresh context instead of serializing on a global lock, and no cross-invocation
 /// state can leak.
+/// A live sink for progressive command output. A handler that produces output
+/// over time (a shell command, a build, a deploy) pushes each chunk here as it
+/// arrives; whoever built the context (the AI coordinator) forwards those chunks
+/// to the UI so the user watches the work happen instead of waiting for one blob
+/// at the end.
+///
+/// A thin wrapper over an unbounded mpsc sender: `Clone` (so a handler can move a
+/// copy into a spawned reader task), cheap, and non-blocking (`push` never awaits
+/// — a full or closed channel silently drops, because streaming is best-effort
+/// UI sugar and must never stall or fail the actual command). The FINAL,
+/// complete output is still returned normally by the handler; the sink is purely
+/// additive, for the human watching.
+#[derive(Clone)]
+pub struct OutputSink(tokio::sync::mpsc::UnboundedSender<String>);
+
+impl OutputSink {
+    /// Wrap a sender. The paired receiver is drained by the context's builder
+    /// (e.g. the agent adapter) and turned into UI events.
+    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<String>) -> Self {
+        Self(tx)
+    }
+
+    /// Push one chunk of output. Non-blocking and infallible from the caller's
+    /// view: if the receiver is gone (the user navigated away, the run was
+    /// cancelled) the chunk is dropped rather than propagating an error into the
+    /// command's own execution.
+    pub fn push(&self, chunk: impl Into<String>) {
+        let _ = self.0.send(chunk.into());
+    }
+}
+
+impl std::fmt::Debug for OutputSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The channel handle has no useful Debug; hide it so ExecContext stays
+        // `Debug` (used in traces) without leaking an opaque sender.
+        f.write_str("OutputSink(..)")
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ExecContext {
     /// Working directory for a shell command (from context/multi-repo resolution).
@@ -813,6 +856,13 @@ pub struct ExecContext {
     pub terminal_target: Option<TerminalTarget>,
     /// How the command's output should be delivered.
     pub output_mode: OutputMode,
+    /// Optional live-output sink (see [`OutputSink`]). `None` — the default and
+    /// every non-streaming path — means "no live streaming"; the handler runs
+    /// exactly as before and returns its full output at the end. `Some` is wired
+    /// by the AI coordinator so a captured `run` streams its output into the chat
+    /// as it happens. Any handler can honour it; those that don't simply ignore
+    /// it, so it is backward-compatible by construction.
+    pub sink: Option<OutputSink>,
 }
 
 impl ExecContext {
@@ -873,6 +923,28 @@ pub trait ActionHandler: Send + Sync {
     /// completions). Override for long/cancellable or destructive/exclusive work.
     fn execution_mode(&self) -> ExecutionMode {
         ExecutionMode::Immediate
+    }
+
+    /// Whether an invocation of this handler MUTATES external state — writes or
+    /// deletes files, changes system/service state, installs packages, etc. —
+    /// as opposed to being read-only or idempotent (search, calc, open a URL,
+    /// define a word).
+    ///
+    /// The AI coordinator uses this to refuse to run two mutating calls in the
+    /// SAME turn: a tool-calling model sometimes hedges, emitting several
+    /// variants of one destructive operation at once (three ways to resize the
+    /// same photos). Running all of them wastes tokens (→ rate limits) and can
+    /// corrupt the result — the "don't parallelize non-idempotent tools"
+    /// principle. Read-only handlers stay `false` and remain freely parallel
+    /// (two file searches, two definitions in one turn are fine).
+    ///
+    /// Declared HERE, by the handler, for the same reason as `default_risk` and
+    /// the consent kinds: the code that decides what an invocation *does* is the
+    /// one place that knows whether it mutates. A central list in the coordinator
+    /// would be a second, drift-prone parser of that question. Default `false`
+    /// (read-only); the mutating handlers override to `true`.
+    fn mutates_state(&self) -> bool {
+        false
     }
 
     /// Keyword triggers that route to this handler, with their arg transforms.

@@ -45,6 +45,15 @@ pub enum ToolOutcome {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ResumeToken(pub serde_json::Value);
 
+/// A live-output channel the coordinator hands to `execute` so a streaming tool
+/// (a shell command) can push its output line-by-line while it runs. A plain
+/// tokio sender of `String` chunks — deliberately NOT `action_registry`'s
+/// `OutputSink`, so the coordinator brick keeps its clean dependency surface
+/// (`error` + `providers` only). The adapter that bridges to the real executor
+/// wraps this into whatever the handler layer expects. `None` = the tool runs
+/// without streaming (tests, non-streaming tools), exactly as before.
+pub type ToolOutputChannel = tokio::sync::mpsc::UnboundedSender<String>;
+
 /// Runs individual tools for the coordinator. Implemented by the real `Executor`
 /// adapter and by test mocks.
 #[async_trait]
@@ -53,7 +62,17 @@ pub trait ToolExecutor: Send + Sync {
     /// shape). Returns `Ran` on completion (or tool error) or `NeedsApproval` if
     /// the Rules Engine gated it. Infrastructure failures (not tool-logic errors)
     /// surface as `Err`.
-    async fn execute(&self, name: &str, args: &str) -> Result<ToolOutcome, LychiError>;
+    ///
+    /// `output` is an optional live channel: a tool that produces progressive
+    /// output pushes each chunk into it as it runs, so the coordinator can stream
+    /// it to the UI. A tool that doesn't stream ignores it; the FINAL output is
+    /// always still returned in `ToolOutcome::Ran` regardless.
+    async fn execute(
+        &self,
+        name: &str,
+        args: &str,
+        output: Option<ToolOutputChannel>,
+    ) -> Result<ToolOutcome, LychiError>;
 
     /// Run a previously-paused tool after the user approved it, using the
     /// `resume` token captured in the `NeedsApproval` outcome. Returns the tool
