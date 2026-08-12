@@ -34,6 +34,7 @@ pub mod rules;
 pub mod script_commands;
 pub mod setup;
 pub mod snippets;
+pub mod spawn_env;
 pub mod suggestions;
 pub mod text;
 pub mod zero_state;

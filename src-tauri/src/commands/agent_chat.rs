@@ -169,7 +169,7 @@ fn agent_run_inputs(name: &str, args: &str) -> (String, RunInputs, bool) {
     }
 
     let trimmed = args.trim_start();
-    let (want_terminal, cmd) = match trimmed.strip_prefix(TERMINAL_PREFIX) {
+    let (forced_terminal, cmd) = match trimmed.strip_prefix(TERMINAL_PREFIX) {
         // Strip the sentinel AND the whitespace after it, so the shell never
         // sees a stray leading space. A bare `--terminal` with no command falls
         // through to shell_exec's own "Usage: run …" guard.
@@ -178,6 +178,15 @@ fn agent_run_inputs(name: &str, args: &str) -> (String, RunInputs, bool) {
         }
         _ => (false, trimmed),
     };
+    // The single "does this need a terminal?" rule lives in the `run` handler
+    // and applies to the typed command and the agent alike. We consult the SAME
+    // function here only so the agent's own `inline` flag (and thus whether a
+    // streaming sink is wired) matches what the handler will actually do — an
+    // `ssh` should report inline=false so no chat-stream sink is set up for
+    // output that will go to a terminal. This is not a second decider: it calls
+    // the one decider. `--terminal` remains a hard override.
+    let want_terminal =
+        forced_terminal || lychi_core::action_registry::handlers::shell_exec::needs_terminal(cmd);
 
     (
         format!("{name} {cmd}"),
@@ -850,6 +859,20 @@ mod tests {
             "the agent must capture output, not open a terminal"
         );
         assert!(!opens_terminal, "a plain run opens no window");
+    }
+
+    #[test]
+    fn an_interactive_command_auto_routes_to_a_terminal_without_the_prefix() {
+        // `ssh` needs a real TTY, so it must open a terminal even though the
+        // model did NOT prefix `--terminal` — the auto TTY-detection (shared with
+        // the typed `run` command) decides. inline=false → no chat-stream sink.
+        let (input, inputs, opens_terminal) = agent_run_inputs("run", "ssh nimbus");
+        assert_eq!(input, "run ssh nimbus");
+        assert!(
+            !inputs.inline,
+            "an interactive command is not captured inline"
+        );
+        assert!(opens_terminal, "ssh auto-opens a terminal");
     }
 
     #[test]

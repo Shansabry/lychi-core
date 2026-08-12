@@ -81,6 +81,120 @@ fn command_head(cmd: &str) -> Option<&str> {
         .find(|word| !word.contains('=') || word.starts_with('='))
 }
 
+/// Programs that need a real interactive terminal (a controlling TTY): they read
+/// keystrokes while running, prompt for input, or paint a full-screen UI. Run
+/// them captured/piped and they either fail outright or hang waiting for input
+/// nobody can give. Matched on the command's FIRST binary (basename), so
+/// `/usr/bin/ssh` and `ssh` both hit.
+///
+/// This is the freedesktop-style "does it need a TTY?" split the whole
+/// inline-vs-terminal decision now rests on (see [`needs_terminal`]). The list is
+/// the common interactive tools; anything not here defaults to inline capture,
+/// and the caller's explicit `--terminal` override covers the long tail.
+const INTERACTIVE_BINARIES: &[&str] = &[
+    // Remote shells & multiplexers
+    "ssh",
+    "mosh",
+    "telnet",
+    "tmux",
+    "screen",
+    "et",
+    // Editors
+    "vi",
+    "vim",
+    "nvim",
+    "nano",
+    "emacs",
+    "emacsclient",
+    "helix",
+    "hx",
+    "micro",
+    "kak",
+    // Pagers & full-screen viewers
+    "less",
+    "more",
+    "most",
+    "bat",
+    // System monitors / TUIs
+    "top",
+    "htop",
+    "btop",
+    "btm",
+    "glances",
+    "atop",
+    "iotop",
+    "nvtop",
+    "ncdu",
+    "gdu",
+    "lazygit",
+    "lazydocker",
+    "k9s",
+    "gitui",
+    "ranger",
+    "yazi",
+    "nnn",
+    "vifm",
+    "mc",
+    "tig",
+    // Language REPLs & interactive interpreters
+    "python",
+    "python3",
+    "ipython",
+    "node",
+    "irb",
+    "pry",
+    "ghci",
+    "iex",
+    "clj",
+    "lua",
+    "R",
+    "julia",
+    "scala",
+    "sbt",
+    "erl",
+    "bc",
+    "sqlite3",
+    // Database clients (interactive prompts)
+    "psql",
+    "mysql",
+    "mariadb",
+    "redis-cli",
+    "mongosh",
+    "mongo",
+    "sqlplus",
+    // Interactive-by-nature utilities
+    "fzf",
+    "sudo",
+    "su",
+    "passwd",
+    "crontab",
+    "visudo",
+    "dialog",
+    "whiptail",
+];
+
+/// Whether a shell command needs an EXTERNAL interactive terminal rather than
+/// inline capture — the one decision the AI's terminal-vs-inline routing rests
+/// on. `true` when the command's first program is a known interactive/TTY tool
+/// (ssh, an editor, a REPL, a monitor, `sudo`, …); `false` for ordinary
+/// run-and-capture commands (`mkdir`, `ls`, `curl`, a build).
+///
+/// Public + pure so the AI adapter can call it without pulling in the handler,
+/// and so it is unit-testable in isolation. Deliberately conservative: an
+/// unknown interactive tool falls through to inline (where it may hang until the
+/// 120s timeout), and the caller's `--terminal` override is the escape hatch. It
+/// matches only the FIRST binary — a pipeline's first stage decides, which is
+/// the right call (`ssh host | grep x` still wants a terminal; `cat f | less`
+/// does not — but that is rare and the user can force it).
+pub fn needs_terminal(cmd: &str) -> bool {
+    let Some(head) = command_head(cmd) else {
+        return false;
+    };
+    // Match on the basename so an absolute path (`/usr/bin/vim`) still resolves.
+    let bin = head.rsplit('/').next().unwrap_or(head);
+    INTERACTIVE_BINARIES.contains(&bin)
+}
+
 /// How a `run` command's output is delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunMode {
@@ -191,7 +305,18 @@ async fn capture_shell_output(
     let start = Instant::now();
     let mut command = tokio::process::Command::new(shell);
     command
-        .args(["-ic", cmd])
+        // `-c`, NOT `-ic`: this path pipes stdout/stderr with no controlling
+        // terminal, and an INTERACTIVE shell (`-ic`) there tries to take job
+        // control of a TTY that doesn't exist — printing `cannot set terminal
+        // process group (-1): Inappropriate ioctl for device` / `no job control
+        // in this shell` into the captured output on every command. Those are
+        // shell-startup noise, not the command's output, and they confused the
+        // AI into retrying. The login ENV (functions, PATH, vars) still comes
+        // through: it is captured once via `-ilc` in `capture_shell_env` and
+        // passed in `env` below. The only thing `-c` drops is interactive ALIAS
+        // expansion, which captured execution neither needs nor should honour
+        // (a captured `run ls` should be plain `ls`, not the user's `ls`→`eza`).
+        .args(["-c", cmd])
         .env_clear()
         .envs(&env)
         .env("TERM", "xterm-256color")
@@ -524,6 +649,13 @@ fn launch_in_terminal(
         // the old code to guess "likely wrong launch flags" — a guess that was
         // wrong for the bug that motivated this rewrite.
         .stderr(Stdio::piped());
+
+    // Strip Lychi's AppImage env (GTK_PATH, LD_LIBRARY_PATH into the mount, …)
+    // so the terminal loads the SYSTEM's GTK/libs, not ours. Inheriting them made
+    // gnome-terminal crash intermittently right after launch (its GTK/D-Bus init
+    // picked up Lychi's bundled modules); Qt terminals were unaffected. No-op
+    // outside an AppImage. See `crate::spawn_env`.
+    crate::spawn_env::sanitize_command(&mut command);
 
     // Detach from Lychi's process group so it survives independently.
     #[cfg(unix)]
@@ -1031,10 +1163,23 @@ impl ActionHandler for ShellExec {
 
         let cwd = ctx.cwd.as_deref();
 
-        // 2. Pick mode from the context: inline (Shift+Enter) vs terminal (default).
-        let mode = match ctx.output_mode {
-            OutputMode::Inline => RunMode::Inline,
-            OutputMode::Terminal => RunMode::Terminal,
+        // 2. Pick mode — the ONE place inline-vs-terminal is decided, so the
+        //    typed `run` command and the AI agent behave identically.
+        //
+        //    A command that NEEDS an interactive TTY (ssh, an editor, a REPL,
+        //    `sudo`, a monitor) ALWAYS opens a terminal, even when the caller
+        //    asked for inline capture — captured/piped, it would fail or hang
+        //    waiting for input nobody can give. Otherwise the caller's
+        //    `output_mode` decides: Terminal is the default for the typed
+        //    command; the AI defaults to Inline (so it can read the output), and
+        //    Shift+Enter forces Inline for a quick read-only capture.
+        let mode = if needs_terminal(cmd) {
+            RunMode::Terminal
+        } else {
+            match ctx.output_mode {
+                OutputMode::Inline => RunMode::Inline,
+                OutputMode::Terminal => RunMode::Terminal,
+            }
         };
         tracing::debug!("shell_exec: mode={mode:?} for cmd={cmd}");
 
@@ -1181,6 +1326,34 @@ mod tests {
         assert_eq!(command_head("FOO=bar mycmd arg"), Some("mycmd"));
         assert_eq!(command_head("A=1 B=2 git status"), Some("git"));
         assert_eq!(command_head("   "), None);
+    }
+
+    #[test]
+    fn needs_terminal_detects_interactive_programs() {
+        // Interactive / TTY programs → external terminal.
+        assert!(needs_terminal("ssh nimbus"));
+        assert!(needs_terminal("vim ~/.bashrc"));
+        assert!(needs_terminal("top"));
+        assert!(needs_terminal("python"));
+        assert!(needs_terminal("sudo dnf install ripgrep"));
+        // Basename match: an absolute path still resolves.
+        assert!(needs_terminal("/usr/bin/nvim file.rs"));
+        // Leading env assignment is skipped, like command_head.
+        assert!(needs_terminal("EDITOR=nano crontab -e"));
+    }
+
+    #[test]
+    fn needs_terminal_leaves_ordinary_commands_inline() {
+        // Run-and-capture commands → inline (no terminal).
+        assert!(!needs_terminal("mkdir -p ~/Pictures/BG"));
+        assert!(!needs_terminal("ls -la"));
+        assert!(!needs_terminal("curl -s https://example.com"));
+        assert!(!needs_terminal("git status"));
+        assert!(!needs_terminal("cargo build"));
+        assert!(!needs_terminal(""));
+        // A substring of an interactive binary is NOT a match (basename, exact).
+        assert!(!needs_terminal("topgrade")); // not `top`
+        assert!(!needs_terminal("lessc styles.less")); // not `less`
     }
 
     #[test]

@@ -207,6 +207,24 @@ async fn finalize_exec(
                          Wayland activation token unavailable for {path}"
                     );
                 }
+                // Strip Lychi's AppImage env from the launched app's environment,
+                // so it loads the SYSTEM GTK/libs — not the bundled ones in our
+                // FUSE mount, which crashed GTK apps intermittently. GIO launches
+                // with the context's env, so apply the same overrides here as we
+                // do for subprocess spawns (see crate::spawn_env). Needs a context
+                // to carry them; build one if the display didn't provide it.
+                let context = context.or_else(|| Some(gio::AppLaunchContext::new()));
+                if let Some(ctx) = &context {
+                    use gio::prelude::AppLaunchContextExt;
+                    for (key, value) in
+                        lychi_core::spawn_env::desktop_env_overrides(|k| std::env::var(k).ok())
+                    {
+                        match value {
+                            Some(v) => ctx.setenv(&key, &v),
+                            None => ctx.unsetenv(&key),
+                        }
+                    }
+                }
                 app_info
                     .launch(&[], context.as_ref())
                     .map_err(|e| format!("GIO launch failed: {e}"))
@@ -243,14 +261,16 @@ async fn finalize_exec(
                     .into_iter()
                     .filter(|id| !id.is_empty())
                     .find_map(|id| {
-                        match std::process::Command::new("gtk-launch")
-                            .arg(&id)
+                        let mut cmd = std::process::Command::new("gtk-launch");
+                        cmd.arg(&id)
                             .stdin(Stdio::null())
                             .stdout(Stdio::null())
                             .stderr(Stdio::null())
-                            .process_group(0)
-                            .status()
-                        {
+                            .process_group(0);
+                        // Strip Lychi's AppImage env so the launched app loads the
+                        // system GTK/libs, not ours (see crate::spawn_env).
+                        lychi_core::spawn_env::sanitize_command(&mut cmd);
+                        match cmd.status() {
                             Ok(s) if s.success() => {
                                 tracing::info!("[open] gtk-launch {id} succeeded");
                                 Some(true)

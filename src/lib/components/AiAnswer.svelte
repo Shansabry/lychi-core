@@ -157,6 +157,68 @@ $effect(() => {
 	if (streaming && !wasStreaming) stick = true;
 	wasStreaming = streaming;
 });
+
+// A rotating status quip + a matching kaomoji face for the dead-air between tool
+// calls / before the first token — so the wait has personality instead of a
+// frozen blinking cursor. The face is paired to the joke (the shrug shrugs, the
+// table-flip flips). Shuffled once per gap so it doesn't feel scripted; cycled
+// every ~2.5s. Purely cosmetic; the real signal is still the Stop button.
+// Faces are chosen from the battle-tested set that renders on every OS/font
+// (Basic-Latin + a few ubiquitous marks): the classic shrug, Lenny, disapproval
+// ಠ_ಠ, table-flip, and the (x_x) family. No exotic glyphs that box out. Each is
+// paired to its joke — the shrug shrugs, the flip flips, the sleepy one sleeps.
+const THINKING_VERBS: { face: string; text: string }[] = [
+	{ face: "(•_•)", text: "Thinking real hard" },
+	{ face: "(o_O)", text: "Consulting the rubber duck" },
+	{ face: "( ͡° ͜ʖ ͡°)", text: "Bribing the compiler" },
+	{ face: "ʕ•ᴥ•ʔ", text: "Summoning daemons" },
+	{ face: "(⊙_⊙)", text: "Grepping the universe" },
+	{ face: "(╯°□°)╯", text: "Untangling spaghetti" },
+	{ face: "(ಠ_ಠ)", text: "Blaming DNS" },
+	{ face: "(x_x)", text: "Sacrificing a semicolon" },
+	{ face: "(⌐■_■)", text: "Reticulating splines" },
+	{ face: "(^_^)", text: "Petting the penguin" },
+	{ face: "¯\\_(ツ)_/¯", text: "Doing Linux things" },
+	{ face: "(>_<)", text: "Overthinking it" },
+	{ face: "\\(^o^)/", text: "Warming up the hamsters" },
+	{ face: "(*^_^*)", text: "Aligning the stars" },
+	{ face: "(¬_¬)", text: "Pretending to be busy" },
+	{ face: "(・_・)", text: "Reading the manual (for once)" },
+	{ face: "(￣_￣)", text: "Negotiating with sudo" },
+	{ face: "(•̀_•́)", text: "Herding processes" },
+	{ face: "(-_-)", text: "Waiting on the mutex" },
+	{ face: "(¬‿¬)", text: "Almost definitely working" },
+];
+// Start on a random quip and rotate through a shuffled order, so two runs in a
+// row don't open with the same word.
+let verbOrder = $state(shuffled(THINKING_VERBS.length));
+let verbIndex = $state(0);
+
+// A Fisher-Yates shuffle of [0..n) — Math.random is fine here (cosmetic only).
+function shuffled(n: number): number[] {
+	const a = Array.from({ length: n }, (_, i) => i);
+	for (let i = n - 1; i > 0; i--) {
+		const j = Math.floor(Math.random() * (i + 1));
+		[a[i], a[j]] = [a[j], a[i]];
+	}
+	return a;
+}
+// Show the rotating verb only in the genuine gap: streaming, no answer text yet,
+// no approval prompt up. Once prose starts arriving the cursor takes over.
+let showThinkingVerb = $derived(streaming && !text && !approval);
+$effect(() => {
+	if (!showThinkingVerb) return;
+	// Fresh shuffle + start each time the gap opens, so consecutive runs don't
+	// open with the same quip, then rotate through the shuffled order.
+	verbOrder = shuffled(THINKING_VERBS.length);
+	verbIndex = 0;
+	const id = setInterval(() => {
+		verbIndex = (verbIndex + 1) % verbOrder.length;
+	}, 2500);
+	return () => clearInterval(id);
+});
+// The quip (face + text) to show right now, via the shuffled order.
+let thinkingVerb = $derived(THINKING_VERBS[verbOrder[verbIndex]] ?? THINKING_VERBS[0]);
 // Re-runs whenever the streamed text / turns / tool steps change.
 $effect(() => {
 	// Touch the reactive inputs so the effect tracks them.
@@ -345,7 +407,12 @@ function onWindowKeydown(e: KeyboardEvent) {
 			<!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized above -->
 			<div class="ai-md md-body" role="presentation" onclick={onAnswerClick}>{@html html}</div>{#if streaming && !approval}<span class="cursor" aria-hidden="true"></span>{/if}
 		{:else if streaming && !approval}
-			<div class="thinking"><span class="cursor" aria-hidden="true"></span></div>
+			<div class="thinking" aria-live="polite">
+				{#key verbIndex}
+					<span class="thinking-face" aria-hidden="true">{thinkingVerb.face}</span>
+					<span class="thinking-verb">{thinkingVerb.text}<span class="thinking-ellipsis">…</span></span>
+				{/key}
+			</div>
 		{/if}
 
 		<!-- Answer actions. Only once the turn is settled: mid-stream the text is
@@ -850,7 +917,63 @@ function onWindowKeydown(e: KeyboardEvent) {
 	}
 
 	.thinking {
-		min-height: 1.2em;
+		min-height: 1em;
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		color: var(--fg-muted);
+		font-size: 9px;
+		opacity: 0.8;
+	}
+	/* The morphing ASCII face: monospace so the glyphs stay aligned, accent
+	   colour so it reads as the "live" element, and a springy bob on each swap
+	   (the {#key} in the template re-mounts it, replaying the animation). */
+	.thinking-face {
+		font-family: var(--font-mono);
+		color: var(--accent-blue);
+		flex-shrink: 0;
+		white-space: nowrap;
+		font-size: 9px;
+		animation: face-bob 0.45s cubic-bezier(0.34, 1.56, 0.64, 1);
+	}
+	@keyframes face-bob {
+		0% {
+			opacity: 0;
+			transform: translateY(-3px) scale(0.9);
+		}
+		60% {
+			transform: translateY(1px) scale(1.04);
+		}
+		100% {
+			opacity: 1;
+			transform: translateY(0) scale(1);
+		}
+	}
+	/* The quip fades in alongside the face. */
+	.thinking-verb {
+		animation: verb-fade-in 0.45s ease;
+	}
+	@keyframes verb-fade-in {
+		from {
+			opacity: 0;
+		}
+		to {
+			opacity: 1;
+		}
+	}
+	/* The trailing ellipsis breathes so there is always motion even between
+	   verb swaps (2.5s is a long time to hold still). */
+	.thinking-ellipsis {
+		animation: ellipsis-breathe 1.4s ease-in-out infinite;
+	}
+	@keyframes ellipsis-breathe {
+		0%,
+		100% {
+			opacity: 0.3;
+		}
+		50% {
+			opacity: 0.8;
+		}
 	}
 
 	/* Destructive-tool approval prompt. */
