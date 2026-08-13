@@ -3195,6 +3195,7 @@ dependencies = [
  "qrcode",
  "quick-xml 0.37.5",
  "redb",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

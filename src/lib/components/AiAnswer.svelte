@@ -1,5 +1,6 @@
 <script lang="ts">
-import { Check, Copy, Globe, RefreshCw, Sparkles, TriangleAlert } from "lucide-svelte";
+import { Check, Copy, FolderOpen, Globe, RefreshCw, Sparkles, TriangleAlert } from "lucide-svelte";
+import { answerRevealPath } from "$lib/answerActions";
 import { getComboString, matchesAction } from "$lib/keybindings";
 import { renderMarkdown } from "$lib/markdown";
 import { sanitizeSvg } from "$lib/sanitize";
@@ -54,6 +55,14 @@ let {
 	onstop,
 	/** Re-run the last question unchanged (empty/garbled answer, or just retry). */
 	onregenerate,
+	/** Reveal a path (the "Open folder" action) the answer produced, in the file
+	 * manager. Given the path string detected in the answer text. */
+	onreveal,
+	/** This conversation was preserved across a re-summon (a run was still active).
+	 * Shows the "Resumed your last run" banner with a Start-fresh escape. */
+	resumed = false,
+	/** Discard the resumed conversation and go back to a fresh launcher. */
+	onstartfresh,
 	/** Quick-AI fork card: show [Search web] / [Full chat] instead of a reply box. */
 	quick = false,
 	/** Fork-card: bail out to a plain web search. */
@@ -80,6 +89,9 @@ let {
 	onreply?: () => void;
 	onstop?: () => void;
 	onregenerate?: () => void;
+	onreveal?: (path: string) => void;
+	resumed?: boolean;
+	onstartfresh?: () => void;
 	quick?: boolean;
 	onwebsearch?: () => void;
 	onfullchat?: () => void;
@@ -90,6 +102,12 @@ let {
 
 const md = renderMarkdown;
 let html = $derived(md(text));
+
+// The filesystem path the answer produced (if any), so we can offer an "Open
+// folder" action instead of the model's "you can open it as needed" prose. The
+// detector lives in `answerActions` so this chip and the launcher's Enter
+// handler agree on the actionable path — one decider, two consumers.
+let revealPath = $derived(answerRevealPath(text));
 
 // Copy-answer feedback. Holds the key of the row that just flashed "Copied",
 // cleared on a timer — cheaper than a per-row boolean and self-resetting.
@@ -219,6 +237,18 @@ $effect(() => {
 });
 // The quip (face + text) to show right now, via the shuffled order.
 let thinkingVerb = $derived(THINKING_VERBS[verbOrder[verbIndex]] ?? THINKING_VERBS[0]);
+// A colour for the current quip, drawn from the app's own accent set (the Guide
+// category hues, which already adapt to light/dark). Cycling by verb index gives
+// a fresh colour on every swap without any random source.
+const THINKING_HUES = [
+	"var(--cat-files)",
+	"var(--cat-ai)",
+	"var(--cat-web)",
+	"var(--cat-system)",
+	"var(--cat-developer)",
+	"var(--cat-media)",
+];
+let thinkingHue = $derived(THINKING_HUES[verbOrder[verbIndex] % THINKING_HUES.length]);
 // Re-runs whenever the streamed text / turns / tool steps change.
 $effect(() => {
 	// Touch the reactive inputs so the effect tracks them.
@@ -247,6 +277,13 @@ function onReplyKeydown(e: KeyboardEvent) {
 	if (matchesAction(e, "submit") && !e.shiftKey) {
 		e.preventDefault();
 		e.stopPropagation();
+		// Empty box + the answer produced a path → Enter opens the folder (the
+		// primary action) rather than sending an empty follow-up. Any typed text
+		// means the user is asking a follow-up, which wins.
+		if (!reply.trim() && revealPath) {
+			onreveal?.(revealPath);
+			return;
+		}
 		onreply?.();
 	}
 }
@@ -286,7 +323,12 @@ function onWindowKeydown(e: KeyboardEvent) {
 			e.stopPropagation();
 			onfullchat?.();
 		}
+		return;
 	}
+	// NOTE: Enter-opens-folder for the main-input focus case is handled in the
+	// launcher's own submit path (`handleSubmit` in +page), which is the single
+	// authoritative Enter handler — doing it here too would race the input's own
+	// keydown. Here we only cover the reply box (`onReplyKeydown`).
 }
 </script>
 
@@ -371,6 +413,15 @@ function onWindowKeydown(e: KeyboardEvent) {
 {/snippet}
 
 <div class="ai-chat">
+	{#if resumed}
+		<!-- The run was still active when the user clicked away; we kept it rather
+		     than resetting. Continue is implicit (it's already restored / still
+		     streaming); this is the one-click way back to a fresh launcher. -->
+		<div class="resumed-banner">
+			<span class="resumed-label">⚡ Resumed your last run</span>
+			<button class="resumed-fresh" onclick={() => onstartfresh?.()}>Start fresh</button>
+		</div>
+	{/if}
 	<div class="ai-transcript" bind:this={transcriptEl} onscroll={onTranscriptScroll}>
 		<!-- Prior turns in this conversation. -->
 		{#each turns as turn, i (i)}
@@ -407,7 +458,7 @@ function onWindowKeydown(e: KeyboardEvent) {
 			<!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized above -->
 			<div class="ai-md md-body" role="presentation" onclick={onAnswerClick}>{@html html}</div>{#if streaming && !approval}<span class="cursor" aria-hidden="true"></span>{/if}
 		{:else if streaming && !approval}
-			<div class="thinking" aria-live="polite">
+			<div class="thinking" aria-live="polite" style:color={thinkingHue}>
 				{#key verbIndex}
 					<span class="thinking-face" aria-hidden="true">{thinkingVerb.face}</span>
 					<span class="thinking-verb">{thinkingVerb.text}<span class="thinking-ellipsis">…</span></span>
@@ -419,6 +470,19 @@ function onWindowKeydown(e: KeyboardEvent) {
 		     still changing, so copying it would capture a partial answer. -->
 		{#if !streaming && !approval && (text || error)}
 			<div class="answer-actions">
+				{#if revealPath}
+					<!-- The answer produced a path — offer to open it directly instead
+					     of the model's "you can open it as needed". Primary action, so
+					     Enter (with an empty follow-up box) triggers it (see +page). -->
+					<button
+						class="answer-action answer-action-primary"
+						onclick={() => revealPath && onreveal?.(revealPath)}
+						title={revealPath}
+					>
+						<FolderOpen size={12} strokeWidth={2} /> Open folder
+						<kbd>↵</kbd>
+					</button>
+				{/if}
 				{#if text}
 					<button class="answer-action" onclick={() => copyAnswer(text, "answer")}>
 						{#if copiedKey === "answer"}
@@ -584,6 +648,27 @@ function onWindowKeydown(e: KeyboardEvent) {
 		color: var(--fg);
 	}
 
+	/* The path "Open folder" action leads — it's the likely next step, and Enter
+	   is bound to it. Accent-tinted and full-opacity so it reads as primary. */
+	.answer-action-primary {
+		opacity: 1;
+		border-color: color-mix(in srgb, var(--accent-blue) 45%, var(--border));
+		color: var(--accent-blue);
+	}
+	.answer-action-primary:hover {
+		background: color-mix(in srgb, var(--accent-blue) 12%, transparent);
+		color: var(--accent-blue);
+	}
+	.answer-action-primary kbd {
+		font-family: var(--font-mono);
+		font-size: 10px;
+		line-height: 1;
+		padding: 1px 4px;
+		border-radius: 3px;
+		border: 1px solid color-mix(in srgb, var(--accent-blue) 35%, var(--border));
+		color: var(--accent-blue);
+	}
+
 	/* Code blocks get a copy affordance in the top-right corner (handled by a
 	   delegated click, since the markdown is injected HTML). The label is CSS-only
 	   so no interactive markup is inserted into sanitized output. */
@@ -599,6 +684,42 @@ function onWindowKeydown(e: KeyboardEvent) {
 		color: var(--warning-muted);
 		font-size: 12px;
 		line-height: 1.45;
+	}
+
+	/* "Resumed your last run" cue — a slim bar at the top of a preserved
+	   conversation. Accent-tinted (informational, not a warning) with the one
+	   escape hatch on the right. */
+	.resumed-banner {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 10px;
+		margin-bottom: 8px;
+		padding: 6px 10px;
+		border-radius: 6px;
+		border: 1px solid color-mix(in srgb, var(--accent-blue) 35%, var(--border));
+		background: color-mix(in srgb, var(--accent-blue) 10%, transparent);
+	}
+	.resumed-label {
+		font-size: 12px;
+		color: var(--accent-blue);
+	}
+	.resumed-fresh {
+		flex-shrink: 0;
+		padding: 3px 9px;
+		background: none;
+		border: 1px solid color-mix(in srgb, var(--accent-blue) 35%, var(--border));
+		border-radius: 5px;
+		color: var(--accent-blue);
+		font-family: var(--font-sans);
+		font-size: 11px;
+		cursor: pointer;
+		opacity: 0.85;
+		transition: opacity 120ms ease;
+	}
+	.resumed-fresh:hover {
+		opacity: 1;
+		background: color-mix(in srgb, var(--accent-blue) 14%, transparent);
 	}
 
 	.token-spend {
@@ -916,21 +1037,33 @@ function onWindowKeydown(e: KeyboardEvent) {
 		}
 	}
 
+	/* The whole line inherits its hue from the inline `style:color` (a per-quip
+	   accent from the app's palette, theme-tuned in both light and dark). Full
+	   strength — no muted colour or dimming — and a slow opacity pulse so the
+	   line reads as "alive" while the model works. */
 	.thinking {
 		min-height: 1em;
 		display: flex;
 		align-items: center;
 		gap: 5px;
-		color: var(--fg-muted);
 		font-size: 9px;
-		opacity: 0.8;
+		animation: thinking-pulse 1.6s ease-in-out infinite;
 	}
-	/* The morphing ASCII face: monospace so the glyphs stay aligned, accent
-	   colour so it reads as the "live" element, and a springy bob on each swap
-	   (the {#key} in the template re-mounts it, replaying the animation). */
+	@keyframes thinking-pulse {
+		0%,
+		100% {
+			opacity: 1;
+		}
+		50% {
+			opacity: 0.55;
+		}
+	}
+	/* The morphing ASCII face: monospace so the glyphs stay aligned. Colour is
+	   inherited from `.thinking` (the per-quip accent), with a springy bob on
+	   each swap (the {#key} in the template re-mounts it, replaying it). */
 	.thinking-face {
 		font-family: var(--font-mono);
-		color: var(--accent-blue);
+		color: inherit;
 		flex-shrink: 0;
 		white-space: nowrap;
 		font-size: 9px;

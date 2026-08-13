@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { AgentEventDto } from "$lib/ipc";
-import { chat } from "./chat.svelte";
+import { chat, shouldResume } from "./chat.svelte";
 
 /**
  * D3: `applyEvent` is the whole AI streaming lifecycle — staleness drops, tool
@@ -156,5 +156,35 @@ describe("chat.applyEvent", () => {
 		chat.applyEvent(ev("reasoning", { text: "thinking" }));
 		expect(chat.text).toBe("");
 		expect(chat.error).toBeFalsy();
+	});
+});
+
+describe("shouldResume", () => {
+	it("is true while streaming", () => {
+		expect(shouldResume({ streaming: true, approval: null })).toBe(true);
+	});
+	it("is true while awaiting an approval", () => {
+		expect(shouldResume({ streaming: false, approval: { any: "thing" } })).toBe(true);
+	});
+	it("is false for a settled or empty conversation", () => {
+		expect(shouldResume({ streaming: false, approval: null })).toBe(false);
+	});
+});
+
+describe("chat.resumed lifecycle", () => {
+	beforeEach(() => chat.reset());
+
+	it("reset() clears the resumed flag", () => {
+		chat.resumed = true;
+		chat.reset();
+		expect(chat.resumed).toBe(false);
+	});
+
+	it("cancel() clears the resumed flag", () => {
+		chat.resumed = true;
+		chat.streaming = true;
+		chat.cancel();
+		expect(chat.resumed).toBe(false);
+		expect(chat.streaming).toBe(false);
 	});
 });

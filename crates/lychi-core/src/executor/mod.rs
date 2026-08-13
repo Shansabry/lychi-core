@@ -194,6 +194,12 @@ impl Executor {
         self.quicklinks = links;
     }
 
+    /// Swap the Rules Engine — used to hot-reload the shell approval policy
+    /// (profile + user allow/deny rules) when the commands config changes.
+    pub fn set_rules(&mut self, rules: RulesEngine) {
+        self.rules = rules;
+    }
+
     /// Number of registered quicklinks (for logging).
     pub fn quicklink_count(&self) -> usize {
         self.quicklinks.len()

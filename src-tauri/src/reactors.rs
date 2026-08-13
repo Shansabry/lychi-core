@@ -64,7 +64,11 @@ impl EventHandler for CommandsReactor {
         ));
         let count = links.len();
         executor.set_quicklinks(links);
-        tracing::info!("[reactor] commands config applied (shell + {count} quicklinks)");
+        // Rebuild the shell approval policy (profile + user allow/deny rules) so
+        // a settings change takes effect without a restart.
+        let policy = lychi_core::rules::shell::ShellPolicy::from_config(&commands.shell_policy);
+        executor.set_rules(lychi_core::rules::RulesEngine::with_shell_policy(policy));
+        tracing::info!("[reactor] commands config applied (shell + {count} quicklinks + policy)");
     }
 }
 

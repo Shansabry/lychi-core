@@ -50,12 +50,26 @@ pub(crate) enum AuthStyle {
 /// wire layer stays free of storage concerns and remains testable in isolation.
 pub(crate) type ErrorObserver = Arc<dyn Fn(&super::errors::AiError) + Send + Sync>;
 
-/// How many times a rate-limited (429) request is retried before the error is
-/// surfaced. Small on purpose: a free-tier limit that won't clear in three
+/// How many times a transient (rate-limit / overload) request is retried before
+/// the error is surfaced. Small on purpose: a limit that won't clear in three
 /// backed-off attempts is not a transient blip, and the user is better told than
-/// left waiting. Only 429 is retried, and only before any tokens have streamed
-/// (see the retry loop) — a mid-stream failure can't be safely replayed.
+/// left waiting. Only retriable statuses are retried, and only before any tokens
+/// have streamed (see the retry loop) — a mid-stream failure can't be replayed.
 const MAX_RATE_LIMIT_RETRIES: u32 = 3;
+
+/// Whether an HTTP status is a transient "back off and try again" signal, common
+/// to every provider — not Groq- or Anthropic-specific:
+///   - 429 Too Many Requests — rate limit (all providers)
+///   - 529 — Anthropic "Overloaded" (their most common transient failure)
+///   - 503 Service Unavailable / 502 Bad Gateway / 504 Gateway Timeout — the
+///     provider or a proxy in front of it is momentarily unavailable
+///
+/// A non-transient failure (401 auth, 400 bad request, 404 model) is NOT here:
+/// retrying it just delays the same error. The `Retry-After` header (when the
+/// provider sends one) still drives the wait for any of these.
+fn is_retriable_status(status: u16) -> bool {
+    matches!(status, 429 | 529 | 503 | 502 | 504)
+}
 
 /// Backoff before retry attempt `n` (1-based) when the provider gave no
 /// `Retry-After` hint: 1s, 2s, 4s. Capped so a bad hint can't park the turn.
@@ -69,9 +83,9 @@ fn backoff_delay(attempt: u32) -> std::time::Duration {
 /// not silently freeze the launcher for five minutes.
 const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How long to wait before a 429 retry: the provider's `Retry-After` header when
-/// present and sane (seconds form; Groq/OpenAI send this), else our own
-/// exponential backoff for this attempt. Clamped to [`MAX_RETRY_AFTER`].
+/// How long to wait before a retry: the provider's `Retry-After` header when
+/// present and sane (seconds form; most providers send this on 429/503), else
+/// our own exponential backoff for this attempt. Clamped to [`MAX_RETRY_AFTER`].
 fn retry_delay(headers: &reqwest::header::HeaderMap, attempt: u32) -> std::time::Duration {
     let from_header = headers
         .get(reqwest::header::RETRY_AFTER)
@@ -161,14 +175,16 @@ impl WireClient {
                 req.json(&body)
             };
 
-            // Send, with a bounded backoff-retry ON RATE LIMIT (429) only. Free
-            // tiers (Groq) throttle mid-conversation; a 429 that clears in a
-            // second or two shouldn't kill the turn. We retry the SAME request up
-            // to MAX_RATE_LIMIT_RETRIES times, waiting the provider's Retry-After
-            // (or our own backoff), and tell the user we're waiting via a
-            // reasoning-channel notice so it reads as "working", not "frozen".
-            // Only safe HERE, before any token has streamed — once the byte
-            // stream starts, a failure can't be replayed. Every other error (auth,
+            // Send, with a bounded backoff-retry on a TRANSIENT status (rate
+            // limit or overload — see `is_retriable_status`), generic to every
+            // provider: a free tier throttling (429), Anthropic overloaded (529),
+            // or the endpoint momentarily unavailable (503/502/504). A blip that
+            // clears in a second or two shouldn't kill the turn. We retry the SAME
+            // request up to MAX_RATE_LIMIT_RETRIES times, waiting the provider's
+            // Retry-After (or our own backoff), and tell the user we're waiting via
+            // a reasoning-channel notice so it reads as "working", not "frozen".
+            // Only safe HERE, before any token has streamed — once the byte stream
+            // starts, a failure can't be replayed. Every other error (auth,
             // too-large, unknown model, transport) surfaces immediately, unchanged.
             let resp = {
                 let mut attempt: u32 = 0;
@@ -185,13 +201,21 @@ impl WireClient {
                     if status.is_success() {
                         break resp;
                     }
-                    if status.as_u16() == 429 && attempt < MAX_RATE_LIMIT_RETRIES {
+                    if is_retriable_status(status.as_u16()) && attempt < MAX_RATE_LIMIT_RETRIES {
                         attempt += 1;
                         let delay = retry_delay(resp.headers(), attempt);
+                        // Word it by cause: a 429 is a rate limit; a 529/503/502/504
+                        // is the provider being busy/unavailable. Same retry, honest
+                        // label.
+                        let cause = if status.as_u16() == 429 {
+                            "Rate limited"
+                        } else {
+                            "Provider busy"
+                        };
                         // Surface the wait as ephemeral reasoning text — visible,
                         // separate from the answer, and not baked into it.
                         yield StreamEvent::ReasoningDelta(format!(
-                            "Rate limited — retrying in {}s (attempt {attempt}/{MAX_RATE_LIMIT_RETRIES})…\n",
+                            "{cause} — retrying in {}s (attempt {attempt}/{MAX_RATE_LIMIT_RETRIES})…\n",
                             delay.as_secs().max(1)
                         ));
                         // Interruptible wait: Escape must not be stuck behind it.
@@ -823,6 +847,19 @@ mod tests {
             HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
         );
         assert_eq!(retry_delay(&h, 2), std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn retriable_statuses_are_transient_across_providers() {
+        // Rate limit (all), Anthropic overloaded, and gateway/unavailable — the
+        // provider-agnostic "back off and retry" set.
+        for s in [429, 529, 503, 502, 504] {
+            assert!(is_retriable_status(s), "{s} should be retriable");
+        }
+        // Hard errors must NOT be retried — retrying only delays the same failure.
+        for s in [200, 400, 401, 403, 404, 413, 500] {
+            assert!(!is_retriable_status(s), "{s} must not be retriable");
+        }
     }
 
     #[test]

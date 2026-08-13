@@ -25,6 +25,9 @@ redb = "4"
 uuid = { version = "1", features = ["v7", "v4"] }
 postcard = { version = "1", features = ["alloc"] }
 chrono-tz = "0.10"
+# User-configurable shell allow/deny rules compile to regexes. Already present
+# transitively (via other deps), so a direct dependency adds no new crates.
+regex = "1"
 # Type-introspection for generated TypeScript IPC bindings (tauri-specta).
 # Pinned to the exact RC the tauri-specta RC requires — they move in lockstep.
 specta = { version = "=2.0.0-rc.22", features = ["derive"] }

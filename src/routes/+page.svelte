@@ -2,6 +2,7 @@
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { onMount } from "svelte";
+import { answerRevealPath } from "$lib/answerActions";
 import ActionPanel from "$lib/components/ActionPanel.svelte";
 import AiAnswer from "$lib/components/AiAnswer.svelte";
 import AttachmentTray from "$lib/components/AttachmentTray.svelte";
@@ -58,7 +59,7 @@ import { hasVisibleOutput, resolveOutput } from "$lib/output";
 import { preloadAll } from "$lib/preloadCache";
 import { MARKER, PANEL, PREFIX } from "$lib/sentinels";
 import { attachments } from "$lib/stores/attachments.svelte";
-import { type AiTurn, chat, type UserAttachment } from "$lib/stores/chat.svelte";
+import { type AiTurn, chat, shouldResume, type UserAttachment } from "$lib/stores/chat.svelte";
 import { completions } from "$lib/stores/completions.svelte";
 import { context } from "$lib/stores/context.svelte";
 import { media } from "$lib/stores/media.svelte";
@@ -548,7 +549,14 @@ function handleInput(val: string) {
 			// identity or prefix match may). This used to be re-derived from
 			// display text with a `startsWith` check, which reimplemented one of
 			// those three conditions and dropped the other two.
-			completions.index = results.findIndex((c) => c.can_be_default === true);
+			const defaultable = results.findIndex((c) => c.can_be_default === true);
+			// When nothing real is defaultable, select the leading fallback (the
+			// backend orders "Ask AI" first when AI is on, else "Search web").
+			// These are safe to run on Enter — they only take the typed query —
+			// and a query that matched no command should still act on Enter, not
+			// leave the list with nothing selected.
+			const leadFallback = results.findIndex((c) => c.kind === "ask-ai" || c.kind === "search-web");
+			completions.index = defaultable >= 0 ? defaultable : leadFallback;
 		})
 		.catch((err) => {
 			if (gen === completions.completionGen) completions.pending = false;
@@ -692,11 +700,34 @@ function handleSummon() {
 	// no matching `[ui] summon` is now a fact, not a guess.
 	uiLog.info("[ui] summon — launcher surface ready");
 	launcherReady = true;
+
+	// Resume path: a run was still ACTIVE (streaming or awaiting approval) when the
+	// user clicked away. The backend agent never stopped (hiding doesn't cancel
+	// it), so instead of wiping the conversation we PRESERVE it and show a "resumed"
+	// banner. We keep the AI surface mounted (no ui.summonReset / chat.reset, so
+	// `chat.gen` is unchanged and the still-arriving agent events keep landing) and
+	// skip loadEmptySuggestions (the AI surface owns the view). This also removes
+	// the reset-after-paint "flash" for this case by construction. Esc/Stop, or the
+	// banner's Start-fresh, are the ways out.
+	if (shouldResume(chat)) {
+		uiLog.info("[ui] summon — resuming an active agent run (preserved)");
+		chat.resumed = true;
+		inputValue = "";
+		requestAnimationFrame(() => {
+			document.querySelector<HTMLInputElement>(".input-container input")?.focus();
+		});
+		setTimeout(() => {
+			document.querySelector<HTMLInputElement>(".input-container input")?.focus();
+		}, 50);
+		return;
+	}
+
 	inputValue = "";
 	lastResult = null;
 	// Pristine launcher surface: no panel, nothing parked.
 	ui.summonReset();
-	// Fresh AI conversation each summon (decision: reset-every-summon).
+	// Fresh AI conversation each summon (decision: reset-every-summon, unless a run
+	// was active — handled by the resume path above).
 	chat.reset();
 	// NOTE: preset keyword matching now lives in the backend classifier, so the
 	// FE no longer caches presets for routing. `aiEnabled` is NOT re-fetched here
@@ -729,6 +760,18 @@ function handleSummon() {
 	setTimeout(() => {
 		document.querySelector<HTMLInputElement>(".input-container input")?.focus();
 	}, 50);
+}
+
+/** Discard a resumed run from its banner: do the reset the summon deferred. */
+function startFreshFromResume() {
+	chat.cancel(); // stop the still-running backend agent — the user chose fresh
+	chat.reset();
+	ui.summonReset();
+	lastResult = null;
+	loadEmptySuggestions();
+	requestAnimationFrame(() => {
+		document.querySelector<HTMLInputElement>(".input-container input")?.focus();
+	});
 }
 
 /** Blur-dismiss (lychi://dismiss): respect hide-on-blur; an open Settings/Notes
@@ -889,6 +932,19 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 		if (opts?.ctrlKey) await quickWebSearch();
 		else await escalateToChat();
 		return;
+	}
+
+	// A settled AI answer that produced a path + an empty input → Enter opens the
+	// folder (the "Open folder" action's primary binding). Same detector the chip
+	// uses, so key and button always agree. A modifier or typed text falls through
+	// to normal routing. When focus is in the follow-up reply box instead, its own
+	// keydown handles this and stops propagation before we get here.
+	if (ui.aiVisible && !chat.streaming && !chat.quick && !inputValue.trim() && !opts?.ctrlKey) {
+		const path = answerRevealPath(chat.text);
+		if (path) {
+			await revealAnswerPath(path);
+			return;
+		}
 	}
 
 	// String CLASSIFICATION is the backend's job (the single source of truth):
@@ -1320,6 +1376,14 @@ function drillIntoFolder(item: CompletionItem) {
 	// already starts with `/`.
 	inputValue = path.startsWith("/") ? path : `/${path}`;
 	handleInput(inputValue);
+}
+
+/** Open the folder for a path an AI answer produced (the "Open folder" action,
+ * and Enter when the follow-up box is empty). `reveal_path` expands a leading
+ * `~` itself, so the answer's raw path string is passed straight through. */
+async function revealAnswerPath(path: string) {
+	await hide();
+	await revealPath(path);
 }
 
 /** Reveal the selected search result in the file manager (Ctrl+Enter). */
@@ -2111,6 +2175,9 @@ async function handleDismiss() {
 				onreply={chat.sendReply}
 				onstop={chat.cancel}
 				onregenerate={chat.regenerate}
+				onreveal={revealAnswerPath}
+				resumed={chat.resumed}
+				onstartfresh={startFreshFromResume}
 				quick={chat.quick}
 				onwebsearch={quickWebSearch}
 				onfullchat={escalateToChat}

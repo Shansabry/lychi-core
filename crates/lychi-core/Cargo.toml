@@ -29,6 +29,7 @@ toml = { workspace = true }
 redb = { workspace = true }
 uuid = { workspace = true }
 postcard = { workspace = true }
+regex = { workspace = true }
 urlencoding = "2.1"
 which = "8"
 nix = { version = "0.31", features = ["signal", "process"] }

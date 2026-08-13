@@ -228,6 +228,23 @@ async function handleTerminalChange(val: string) {
 		onsaveerror(`Failed to save: ${err}`);
 	}
 }
+
+// The agent's shell approval profile. Defaults to "ask-on-write" (today's
+// behaviour) when the config predates this setting.
+let shellProfile = $derived(commandsConfig.shell_policy?.profile ?? "ask-on-write");
+
+async function handleShellProfileChange(val: string) {
+	commandsConfig.shell_policy = {
+		...(commandsConfig.shell_policy ?? { allow: [], deny: [] }),
+		profile: val as typeof shellProfile,
+	};
+	try {
+		await saveCommandsConfig(commandsConfig);
+	} catch (err) {
+		console.error("[settings] Failed to save shell policy:", err);
+		onsaveerror(`Failed to save: ${err}`);
+	}
+}
 </script>
 
 <div class="field">
@@ -458,6 +475,25 @@ async function handleTerminalChange(val: string) {
 			onchange={handleTerminalChange}
 		/>
 	{/if}
+</div>
+<div class="section-label">Agent safety</div>
+<div class="field">
+	<label for="shell-profile">Command approval</label>
+	<Select
+		id="shell-profile"
+		value={shellProfile}
+		options={[
+			{ value: "strict", label: "Strict — confirm every command" },
+			{ value: "ask-on-write", label: "Ask before changes (recommended)" },
+			{ value: "auto-accept", label: "Auto-accept (only blocks the denylist)" },
+		]}
+		onchange={handleShellProfileChange}
+	/>
+</div>
+<div class="field-hint">
+	Controls when the AI must ask before running a shell command. Catastrophic
+	commands (wiping the disk, piping a download into a shell) are always blocked,
+	whatever the profile.
 </div>
 <div class="section-label">Privacy</div>
 <div class="field">

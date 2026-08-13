@@ -45,6 +45,15 @@ impl RulesEngine {
         }
     }
 
+    /// A Rules Engine using the user's shell policy (approval profile + custom
+    /// allow/deny rules), compiled from config. Built at startup and rebuilt on
+    /// config hot-reload so a changed policy takes effect without a restart.
+    pub fn with_shell_policy(policy: shell::ShellPolicy) -> Self {
+        Self {
+            shell_rules: ShellRules::with_policy(policy),
+        }
+    }
+
     /// Validate whether an action should execute, require confirmation, or be denied.
     /// Privacy config gates network calls that send user data to third parties (C6).
     pub fn validate(&self, req: &ValidationRequest, privacy: &PrivacyConfig) -> ValidationDecision {

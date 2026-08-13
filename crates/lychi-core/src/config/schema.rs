@@ -83,6 +83,52 @@ impl Default for GeneralConfig {
     }
 }
 
+/// How aggressively the agent must ask before running a shell command.
+///
+/// A profile can only make the gate STRICTER, never weaker: a hard `Deny` (the
+/// denylist, structural catastrophes, a user deny rule) is enforced in every
+/// profile regardless. What the profile tunes is the boundary between "runs
+/// immediately" and "asks first" for the non-denied commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShellProfile {
+    /// Confirm EVERY command before it runs, even a read-only `ls`. The most
+    /// cautious posture — nothing the agent proposes runs unattended.
+    Strict,
+    /// Confirm commands that mutate state or match a dangerous pattern;
+    /// read-only commands run immediately. Lychi's long-standing behaviour, and
+    /// the `#[default]` so every existing user's config keeps today's gate.
+    #[default]
+    AskOnWrite,
+    /// Auto-accept: every command runs without asking EXCEPT hard-denied ones
+    /// (the denylist, structural catastrophes, and user deny rules — those are
+    /// still blocked outright). The loosest posture; a Deny can never be
+    /// auto-accepted. Use only when you trust the agent in this environment.
+    AutoAccept,
+}
+
+/// User-tunable shell authorization: the approval profile plus custom
+/// allow/deny regex rules layered on top of the built-in policy.
+///
+/// Precedence (strongest first), mirroring Warp's model:
+///   1. built-in hard Deny (denylist / catastrophes) — absolute
+///   2. user `deny` rule — absolute for the user
+///   3. user `allow` rule — runs without asking (but never overrides 1 or 2)
+///   4. built-in Confirm/Allow under the active profile
+#[derive(Debug, Clone, Default, Serialize, Deserialize, specta::Type)]
+pub struct ShellPolicyConfig {
+    #[serde(default)]
+    pub profile: ShellProfile,
+    /// Regexes for commands the user always wants to run without confirmation.
+    /// Matched against the raw command string. A hard Deny still overrides.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Regexes for commands the user always wants blocked outright. Absolute for
+    /// the user — no approval prompt, like the built-in denylist.
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct CommandsConfig {
     pub default_search_engine: String,
@@ -132,6 +178,10 @@ pub struct CommandsConfig {
     /// [`crate::quicklinks`].
     #[serde(default)]
     pub quicklinks: Vec<crate::quicklinks::Quicklink>,
+    /// Shell approval policy: the confirmation profile + user allow/deny rules.
+    /// Defaults to the long-standing "ask before mutating" behaviour.
+    #[serde(default)]
+    pub shell_policy: ShellPolicyConfig,
 }
 
 /// Sensible built-in search shortcuts. Users add their own in config.toml.
@@ -165,6 +215,7 @@ impl Default for CommandsConfig {
             // `search_engines` and are merged in as URL quicklinks at load
             // time, so they aren't duplicated across both fields.
             quicklinks: Vec::new(),
+            shell_policy: ShellPolicyConfig::default(),
         }
     }
 }

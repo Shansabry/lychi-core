@@ -118,6 +118,14 @@ class ChatSession {
 	tokensIn = $state(0);
 	tokensOut = $state(0);
 
+	/**
+	 * The conversation was PRESERVED across a re-summon because a run was still
+	 * active when the user clicked away (see `shouldResume`). Drives the "⚡
+	 * Resumed your last run" banner. Transient: cleared on the next explicit
+	 * action (Start fresh, a follow-up, cancel, or a fresh reset).
+	 */
+	resumed = $state(false);
+
 	/** NON-reactive staleness guard (see file header). Bumped per run. */
 	gen = 0;
 
@@ -212,6 +220,7 @@ class ChatSession {
 		this.truncated = false;
 		this.tokensIn = 0;
 		this.tokensOut = 0;
+		this.resumed = false;
 		// The tray is per-conversation: a fresh start (or a re-summon) shouldn't
 		// leave files staged from a session the user has moved on from.
 		attachments.clear();
@@ -308,6 +317,7 @@ class ChatSession {
 		const text = this.reply.trim();
 		if (!text || this.streaming) return;
 		this.reply = "";
+		this.resumed = false; // a follow-up dismisses the "resumed" banner
 		await this.start(text, /* fresh */ false);
 	};
 
@@ -444,6 +454,7 @@ class ChatSession {
 	cancel = (): void => {
 		this.gen++; // drop late events on the frontend
 		this.streaming = false;
+		this.resumed = false; // cancelling ends the run — no "resumed" cue to keep
 		cancelAiChat().catch(() => {});
 	};
 
@@ -555,6 +566,23 @@ class ChatSession {
 			// turn_started / reasoning: no UI change for now.
 		}
 	};
+}
+
+/**
+ * Whether a re-summon should PRESERVE the conversation (and offer to continue)
+ * rather than reset to a fresh launcher.
+ *
+ * True only while a run is genuinely IN PROGRESS — the agent is streaming, or it
+ * is paused awaiting a destructive-tool approval. In both cases the backend task
+ * is still alive (hiding never cancels it), so preserving the frontend surface
+ * lets its events keep landing and the user pick up where they were. A FINISHED
+ * answer or an empty launcher is not "in progress" and resets as before.
+ *
+ * Pure and dependency-light (reads two fields) so the summon-path decision is
+ * unit-testable without a DOM.
+ */
+export function shouldResume(c: { streaming: boolean; approval: unknown | null }): boolean {
+	return c.streaming || c.approval !== null;
 }
 
 /** The single app-wide chat session. */

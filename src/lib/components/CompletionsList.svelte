@@ -199,12 +199,12 @@ function formatSize(bytes: number | null | undefined): string {
 		{@const isTerminal = item?.icon_path === "__terminal__"}
 		{@const isInfo = item?.icon_path === "__info__"}
 		{@const isClipImage = item?.icon_path === "__clipboard_image__"}
-		{@const isAiChat = item?.icon_path === "__ai_chat__"}
+		{@const isAiChat = item?.icon_path === ICON.aiChat}
 		{@const isPinned = item?.icon_path === ICON.pinned}
-		{@const isWeb = item?.icon_path === "__web__"}
+		{@const isWeb = item?.icon_path === ICON.web}
 		{@const isSearchWebLegacy = item?.label?.startsWith("Search web:")}
 		{@const isFallbackRow = item?.kind === "ask-ai" || item?.kind === "search-web"}
-		{@const hideIcon = item?.icon_path === ICON.none || item?.icon_path === ICON.web || isSearchWebLegacy || isSeparator}
+		{@const hideIcon = item?.icon_path === ICON.none || isSearchWebLegacy || isSeparator}
 		{@const hasCustomIcon = isCustomIcon(item?.icon_path)}
 		{@const noIcon = !item?.icon_path}
 		{@const iconKey = item?.icon_path ?? ""}

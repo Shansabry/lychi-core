@@ -1713,7 +1713,12 @@ search_engines: Partial<{ [key in string]: string }>;
  * selects which permission decider authorizes the expansion — see
  * [`crate::quicklinks`].
  */
-quicklinks?: Quicklink[] }
+quicklinks?: Quicklink[]; 
+/**
+ * Shell approval policy: the confirmation profile + user allow/deny rules.
+ * Defaults to the long-standing "ask before mutating" behaviour.
+ */
+shell_policy?: ShellPolicyConfig }
 export type CompletionItem = { label: string; icon_path: string | null; score: number; description?: string | null; 
 /**
  * Provenance — why this was suggested. Set by context suggestions,
@@ -2517,6 +2522,54 @@ tab: string | null;
  * The command `manual` should display.
  */
 command: string | null }
+/**
+ * User-tunable shell authorization: the approval profile plus custom
+ * allow/deny regex rules layered on top of the built-in policy.
+ * 
+ * Precedence (strongest first), mirroring Warp's model:
+ * 1. built-in hard Deny (denylist / catastrophes) — absolute
+ * 2. user `deny` rule — absolute for the user
+ * 3. user `allow` rule — runs without asking (but never overrides 1 or 2)
+ * 4. built-in Confirm/Allow under the active profile
+ */
+export type ShellPolicyConfig = { profile?: ShellProfile; 
+/**
+ * Regexes for commands the user always wants to run without confirmation.
+ * Matched against the raw command string. A hard Deny still overrides.
+ */
+allow?: string[]; 
+/**
+ * Regexes for commands the user always wants blocked outright. Absolute for
+ * the user — no approval prompt, like the built-in denylist.
+ */
+deny?: string[] }
+/**
+ * How aggressively the agent must ask before running a shell command.
+ * 
+ * A profile can only make the gate STRICTER, never weaker: a hard `Deny` (the
+ * denylist, structural catastrophes, a user deny rule) is enforced in every
+ * profile regardless. What the profile tunes is the boundary between "runs
+ * immediately" and "asks first" for the non-denied commands.
+ */
+export type ShellProfile = 
+/**
+ * Confirm EVERY command before it runs, even a read-only `ls`. The most
+ * cautious posture — nothing the agent proposes runs unattended.
+ */
+"strict" | 
+/**
+ * Confirm commands that mutate state or match a dangerous pattern;
+ * read-only commands run immediately. Lychi's long-standing behaviour, and
+ * the `#[default]` so every existing user's config keeps today's gate.
+ */
+"ask-on-write" | 
+/**
+ * Auto-accept: every command runs without asking EXCEPT hard-denied ones
+ * (the denylist, structural catastrophes, and user deny rules — those are
+ * still blocked outright). The loosest posture; a Deny can never be
+ * auto-accepted. Use only when you trust the agent in this environment.
+ */
+"auto-accept"
 export type SnippetItem = { id: string; name: string; body: string; created_at: number; updated_at: number }
 /**
  * Serializable timer status sent to the frontend.

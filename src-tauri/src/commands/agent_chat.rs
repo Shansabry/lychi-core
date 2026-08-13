@@ -41,14 +41,58 @@ struct ExecutorAdapter {
     privacy: lychi_core::config::PrivacyConfig,
 }
 
+/// Upper bound on the tool-result text fed BACK to the model, per call.
+///
+/// This is deliberately far tighter than the shell handler's 256KB *display*
+/// cap: that cap is about not jamming the WebView, whereas this is about not
+/// burning the context window (and the user's tokens) on output the model does
+/// not need. A chatty command — `zip` printing one `adding: …` line per file,
+/// a long `ls -l`, a verbose build — can emit tens of thousands of tokens of
+/// noise; the model only needs enough to see the shape of the result and any
+/// error. ~8KB ≈ ~2k tokens, plenty for that. See `truncate_for_model`.
+const MODEL_OUTPUT_MAX_BYTES: usize = 8 * 1024;
+
+/// Truncate long tool output to `MODEL_OUTPUT_MAX_BYTES`, keeping the HEAD and
+/// the TAIL (the two ends carry the signal — what a command started doing and
+/// how it finished, including a trailing error) with a marker in between saying
+/// how much was dropped. Short output is returned unchanged.
+fn truncate_for_model(text: &str) -> String {
+    if text.len() <= MODEL_OUTPUT_MAX_BYTES {
+        return text.to_string();
+    }
+    // Split the budget between head and tail. Use char_indices so we never cut a
+    // multi-byte char in half.
+    let half = MODEL_OUTPUT_MAX_BYTES / 2;
+    let head_end = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= half)
+        .last()
+        .unwrap_or(0);
+    let tail_start = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .rev()
+        .take_while(|&i| text.len() - i <= half)
+        .last()
+        .unwrap_or(text.len());
+    let omitted = tail_start.saturating_sub(head_end);
+    format!(
+        "{}\n\n… [{} bytes of output omitted] …\n\n{}",
+        &text[..head_end],
+        omitted,
+        &text[tail_start..]
+    )
+}
+
 /// Render an `ActionResult` into the plain text the model sees as a tool result.
 fn result_text(res: &lychi_core::action_registry::ActionResult) -> String {
     use lychi_core::action_registry::Output;
     if let Some(err) = &res.error {
-        return err.clone();
+        return truncate_for_model(err);
     }
     match &res.output {
-        Output::Text { body, .. } => body.clone(),
+        Output::Text { body, .. } => truncate_for_model(body),
         // The model reads tool results as text, so structured rows are
         // flattened HERE rather than by the handler. That is the point of the
         // split: the handler emits data once, and each consumer renders it for
@@ -73,7 +117,7 @@ fn result_text(res: &lychi_core::action_registry::ActionResult) -> String {
             if out.is_empty() {
                 "No results.".to_string()
             } else {
-                out.trim_end().to_string()
+                truncate_for_model(out.trim_end())
             }
         }
         Output::Navigate { url, .. } => format!("Opened: {url}"),
@@ -849,6 +893,39 @@ pub async fn agent_approve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_tool_output_is_passed_through_unchanged() {
+        let s = "adding: a.jpg\nadding: b.jpg\ndone";
+        assert_eq!(truncate_for_model(s), s);
+    }
+
+    #[test]
+    fn long_tool_output_is_truncated_head_and_tail() {
+        // Simulate a chatty `zip` — one line per file, far over the budget.
+        let body: String = (0..5000)
+            .map(|i| format!("  adding: file{i}.jpg\n"))
+            .collect();
+        assert!(
+            body.len() > MODEL_OUTPUT_MAX_BYTES,
+            "test setup: body too small"
+        );
+        let out = truncate_for_model(&body);
+        assert!(
+            out.len() < body.len(),
+            "truncated output must be smaller than the original"
+        );
+        assert!(
+            out.len() <= MODEL_OUTPUT_MAX_BYTES + 128,
+            "truncated output must be near the budget, was {}",
+            out.len()
+        );
+        // Head and tail are preserved so the model sees the shape + any trailing
+        // error, with a marker in between.
+        assert!(out.starts_with("  adding: file0.jpg"), "head kept");
+        assert!(out.trim_end().ends_with(".jpg"), "tail kept");
+        assert!(out.contains("bytes of output omitted"), "marker present");
+    }
 
     #[test]
     fn a_plain_run_is_inline_by_default() {
