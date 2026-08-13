@@ -39,6 +39,19 @@ renderer.code = ({ text, lang }: { text: string; lang?: string }): string => {
 
 marked.use({ renderer });
 
+// Wrap every rendered table in a horizontal-scroll box. The CSS fixes the table
+// to the panel width and WRAPS cell text (see `.md-body table` in app.css), so
+// this wrapper is only the fallback for the rare cell that can't wrap (a long
+// URL / inline code) — it scrolls inside its own box instead of widening the
+// launcher. Done as a post-parse string wrap rather than a `renderer.table`
+// override: marked injects `this.parser` on the renderer at parse time, so
+// reusing its built-in table renderer from an override is fragile across
+// environments (it crashed under jsdom). Wrapping the emitted `<table>` is
+// renderer-internals-free and preserves marked's column alignment exactly.
+export function wrapTables(html: string): string {
+	return html.replace(/<table>[\s\S]*?<\/table>/g, (t) => `<div class="table-scroll">${t}</div>`);
+}
+
 /**
  * Temporarily close markdown constructs left dangling by a MID-STREAM cut, so a
  * half-arrived answer parses to sane HTML instead of a broken layout.
@@ -82,7 +95,7 @@ export function repairStreamingMarkdown(src: string): string {
 export function renderMarkdown(src: string): string {
 	if (!src) return "";
 	try {
-		return sanitizeMarkdown(marked.parse(src) as string);
+		return sanitizeMarkdown(wrapTables(marked.parse(src) as string));
 	} catch {
 		return src.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c] ?? c);
 	}

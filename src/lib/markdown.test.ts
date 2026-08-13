@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { repairStreamingMarkdown } from "./markdown";
+import { repairStreamingMarkdown, wrapTables } from "./markdown";
 
 describe("repairStreamingMarkdown", () => {
 	it("closes an unclosed code fence so it doesn't swallow the rest", () => {
@@ -38,5 +38,29 @@ describe("repairStreamingMarkdown", () => {
 	it("is a no-op on empty / plain text", () => {
 		expect(repairStreamingMarkdown("")).toBe("");
 		expect(repairStreamingMarkdown("just a sentence")).toBe("just a sentence");
+	});
+});
+
+describe("wrapTables", () => {
+	// Note: the full renderMarkdown path can't be unit-tested here — DOMPurify has
+	// no callable `.sanitize` under jsdom/vitest — so we test the pure string
+	// transform that does the wrapping.
+	const table =
+		"<table>\n<thead><tr><th>A</th></tr></thead>\n<tbody><tr><td>one</td></tr></tbody></table>";
+
+	it("wraps a rendered table in a horizontal-scroll box", () => {
+		const out = wrapTables(table);
+		expect(out).toBe(`<div class="table-scroll">${table}</div>`);
+	});
+
+	it("wraps every table when there are several", () => {
+		const out = wrapTables(`${table}\n<p>gap</p>\n${table}`);
+		expect((out.match(/<div class="table-scroll">/g) ?? []).length).toBe(2);
+		expect(out).toContain("<p>gap</p>");
+	});
+
+	it("leaves table-free html untouched", () => {
+		const html = "<p>hello <strong>world</strong></p>";
+		expect(wrapTables(html)).toBe(html);
 	});
 });
