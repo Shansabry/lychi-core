@@ -181,6 +181,18 @@ impl Tier {
             Tier::Identity
         } else if candidate.starts_with(&typed) {
             Tier::Prefix
+        } else if typed.len() >= 2 && crate::desktop_apps::entry::make_acronym(&candidate) == typed
+        {
+            // The typed text is the candidate's ACRONYM — "vsc" for "Visual
+            // Studio Code". This is the user deliberately typing the app's
+            // shorthand, as intentional as a prefix, so it's defaultable (ranks
+            // as Prefix). Without this, the app INDEX matched "vsc" → VS Code by
+            // acronym and ranked it first, but this defaultability decider — which
+            // only knew literal prefix/contains — classified it Fuzzy, so Enter's
+            // highlight fell through to the "Ask AI" fallback instead of the app.
+            // (len>=2 so a single letter, which is every app's first initial,
+            // can't acronym-match half the menu.)
+            Tier::Prefix
         } else if candidate.contains(&typed) || typed.contains(&candidate) {
             // BOTH containment directions are `Subset`, and both are real:
             //
@@ -403,6 +415,23 @@ mod tests {
     #[test]
     fn an_extension_of_the_typed_text_is_prefix() {
         assert_eq!(Tier::classify("fir", "firefox"), Tier::Prefix);
+    }
+
+    /// An acronym of the candidate defaults like a prefix: "vsc" IS how a user
+    /// asks for "Visual Studio Code". Without this the app index ranked VS Code
+    /// first for "vsc" (it matches the acronym), but this decider called it Fuzzy
+    /// and Enter's highlight fell through to the Ask-AI fallback (the reported
+    /// bug: the middle row, not the first, was auto-selected).
+    #[test]
+    fn an_acronym_of_the_candidate_defaults_like_a_prefix() {
+        let t = Tier::classify("vsc", "Visual Studio Code");
+        assert_eq!(t, Tier::Prefix);
+        assert!(t.can_be_default());
+        // A single letter must NOT acronym-match a multi-word name (it's every
+        // app's first initial). Use a candidate the letter does NOT prefix, so
+        // the starts_with branch can't mask the acronym guard: "s" is the acronym
+        // of neither, and doesn't prefix "Studio Code" → Fuzzy, not Prefix.
+        assert_ne!(Tier::classify("s", "Kubernetes Studio"), Tier::Prefix);
     }
 
     /// The `dnf search firefox` case: the QUERY contains an app name, which is
