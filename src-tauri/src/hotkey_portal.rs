@@ -31,15 +31,51 @@ const SHORTCUT_ID: &str = "toggle-launcher";
 /// writes only if absent, points at the CURRENT executable, refreshes the
 /// desktop DB. Best-effort; any failure just means the portal path may not work
 /// (the fallback UX still applies).
+/// The exact contents the `app.lychi.desktop` file must have, given the current
+/// executable path. Pure, so the repair decision is testable without touching
+/// the real XDG applications dir. `%u` lets the deep-link handler reuse it too.
+///
+/// `TryExec` is the freedesktop-standard long-term guard for the exact failure a
+/// tester hit: if the AppImage is later moved or deleted, an absolute `TryExec`
+/// that no longer resolves makes the DE (and xdg-desktop-portal's app-info
+/// lookup) treat the entry as NOT installed and hide it — rather than resolving a
+/// dead `Exec` and rejecting portal registration with "App info not found". It
+/// points at the same binary as `Exec` (without the `%u` — `TryExec` is a bare
+/// path). Combined with the repair-on-mismatch above, the desktop file stays
+/// valid across moves/updates the way appimaged/AppImageLauncher keep it.
+fn app_desktop_contents(exec: &str) -> String {
+    format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=Lychi\n\
+         Comment=Local-first keyboard command launcher\n\
+         Exec={exec} %u\n\
+         TryExec={exec}\n\
+         Icon=lychi-app\n\
+         Terminal=false\n\
+         Categories=Utility;\n\
+         StartupWMClass=lychi-app\n\
+         MimeType=x-scheme-handler/lychi;\n"
+    )
+}
+
+/// Whether the desktop file needs (re)writing: true when ABSENT or its contents
+/// DIFFER from what we'd write. This is the fix for the GNOME "App info not
+/// found for 'app.lychi'" failure — a STALE file from an older build (its `Exec`
+/// pointing at a path that no longer exists) used to be left in place by an
+/// early-return, so the portal could never resolve app-info and the hotkey never
+/// bound. Pure, so both the absent and stale cases are unit-tested.
+fn desktop_file_needs_write(existing: Option<&str>, desired: &str) -> bool {
+    existing != Some(desired)
+}
+
 pub fn ensure_app_desktop_file() {
     let Some(dir) = dirs::data_dir() else { return };
     let apps = dir.join("applications");
     let target = apps.join(format!("{APP_ID}.desktop"));
-    if target.exists() {
-        return;
-    }
+
     // Point Exec at our own binary (the AppImage path via $APPIMAGE if set, else
-    // the resolved exe). `%u` lets the deep-link handler reuse it too.
+    // the resolved exe).
     let exec = std::env::var("APPIMAGE")
         .ok()
         .filter(|s| !s.is_empty())
@@ -50,25 +86,22 @@ pub fn ensure_app_desktop_file() {
         })
         .unwrap_or_else(|| "lychi-app".to_string());
 
-    let contents = format!(
-        "[Desktop Entry]\n\
-         Type=Application\n\
-         Name=Lychi\n\
-         Comment=Local-first keyboard command launcher\n\
-         Exec={exec} %u\n\
-         Icon=lychi-app\n\
-         Terminal=false\n\
-         Categories=Utility;\n\
-         StartupWMClass=lychi-app\n\
-         MimeType=x-scheme-handler/lychi;\n"
-    );
+    let contents = app_desktop_contents(&exec);
 
+    // REPAIR, don't skip-if-present — see `desktop_file_needs_write`.
+    let existing = std::fs::read_to_string(&target).ok();
+    if !desktop_file_needs_write(existing.as_deref(), &contents) {
+        return; // already correct — nothing to do
+    }
     if std::fs::create_dir_all(&apps).is_err() {
         return;
     }
-    match std::fs::write(&target, contents) {
+    match std::fs::write(&target, &contents) {
         Ok(()) => {
-            tracing::info!("[portal] wrote app-id desktop file: {}", target.display());
+            tracing::info!(
+                "[portal] wrote/repaired app-id desktop file: {}",
+                target.display()
+            );
             // Refresh the desktop database so the portal sees it immediately.
             let _ = std::process::Command::new("update-desktop-database")
                 .arg(&apps)
@@ -437,7 +470,7 @@ fn to_portal_trigger(hotkey: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::to_portal_trigger;
+    use super::{app_desktop_contents, desktop_file_needs_write, to_portal_trigger};
 
     #[test]
     fn maps_common_hotkeys() {
@@ -445,5 +478,50 @@ mod tests {
         assert_eq!(to_portal_trigger("Ctrl+Alt+K"), "CTRL+ALT+k");
         assert_eq!(to_portal_trigger("Ctrl+Shift+F5"), "CTRL+SHIFT+F5");
         assert_eq!(to_portal_trigger("Super+Enter"), "LOGO+Return");
+    }
+
+    #[test]
+    fn desktop_contents_carry_the_current_exec() {
+        let c = app_desktop_contents("/home/u/Apps/Lychi.AppImage");
+        assert!(c.contains("Exec=/home/u/Apps/Lychi.AppImage %u"));
+        // TryExec (bare path, no %u) lets the DE auto-hide the entry if the
+        // AppImage is moved/deleted — the long-term guard against a stale path.
+        assert!(c.contains("TryExec=/home/u/Apps/Lychi.AppImage\n"));
+        assert!(!c.contains("TryExec=/home/u/Apps/Lychi.AppImage %u"));
+        // The identity fields the portal keys off must always be present.
+        assert!(c.contains("[Desktop Entry]"));
+        assert!(c.contains("Type=Application"));
+        assert!(c.contains("Name=Lychi"));
+    }
+
+    #[test]
+    fn absent_desktop_file_needs_write() {
+        let desired = app_desktop_contents("/opt/lychi/Lychi.AppImage");
+        assert!(
+            desktop_file_needs_write(None, &desired),
+            "an absent file must be written"
+        );
+    }
+
+    #[test]
+    fn stale_desktop_file_gets_repaired() {
+        // The GNOME bug: an older build left a file whose Exec points at a path
+        // that no longer exists. The current exec differs → must be rewritten.
+        let stale = app_desktop_contents("/tmp/.mount_oldXYZ/Lychi.AppImage");
+        let desired = app_desktop_contents("/home/u/Applications/Lychi.AppImage");
+        assert_ne!(stale, desired, "test setup: the two must differ");
+        assert!(
+            desktop_file_needs_write(Some(&stale), &desired),
+            "a stale file with a different Exec must be repaired"
+        );
+    }
+
+    #[test]
+    fn correct_desktop_file_is_left_alone() {
+        let desired = app_desktop_contents("/home/u/Applications/Lychi.AppImage");
+        assert!(
+            !desktop_file_needs_write(Some(&desired), &desired),
+            "an already-correct file must NOT be rewritten"
+        );
     }
 }

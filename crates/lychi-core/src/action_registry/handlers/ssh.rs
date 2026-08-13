@@ -16,7 +16,21 @@ use super::shell_exec;
 
 static MATCHER: Mutex<Option<Matcher>> = Mutex::new(None);
 
-/// A parsed SSH host entry from ~/.ssh/config.
+/// Where a host came from — so config hosts (rich metadata) rank above bare
+/// names pulled from `/etc/hosts` / `known_hosts`, and the row can hint the
+/// origin. Mirrors what bash/zsh completion merges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostSource {
+    /// `~/.ssh/config` — the canonical, metadata-rich source.
+    Config,
+    /// `/etc/hosts` — a named host on this machine's static resolver.
+    EtcHosts,
+    /// `~/.ssh/known_hosts` — a host previously connected to.
+    KnownHosts,
+}
+
+/// A parsed SSH host entry from ~/.ssh/config (or a bare name from /etc/hosts or
+/// known_hosts, with only `alias` populated).
 #[derive(Debug, Clone)]
 struct SshHost {
     alias: String,
@@ -25,9 +39,24 @@ struct SshHost {
     port: Option<u16>,
     identity_file: Option<String>,
     proxy_jump: Option<String>,
+    source: HostSource,
 }
 
 impl SshHost {
+    /// A host with only an alias (no config metadata) — for `/etc/hosts` and
+    /// `known_hosts` entries.
+    fn bare(alias: impl Into<String>, source: HostSource) -> Self {
+        SshHost {
+            alias: alias.into(),
+            hostname: None,
+            user: None,
+            port: None,
+            identity_file: None,
+            proxy_jump: None,
+            source,
+        }
+    }
+
     fn display_description(&self) -> String {
         let mut parts = Vec::new();
         if let Some(ref user) = self.user {
@@ -56,7 +85,13 @@ impl SshHost {
             parts.push(format!("via {proxy}"));
         }
         if parts.is_empty() {
-            self.alias.clone()
+            // A bare host (no config metadata) — hint where it came from so the
+            // row isn't a blank alias echo.
+            match self.source {
+                HostSource::Config => self.alias.clone(),
+                HostSource::EtcHosts => "from /etc/hosts".to_string(),
+                HostSource::KnownHosts => "known host".to_string(),
+            }
         } else {
             parts.join(" ")
         }
@@ -71,19 +106,31 @@ struct SshCache {
 
 static SSH_CACHE: Mutex<Option<SshCache>> = Mutex::new(None);
 
-/// Parse SSH hosts from ~/.ssh/config (with Include support).
+/// Load SSH hosts from all three sources bash/zsh completion merges:
+/// `~/.ssh/config` (rich metadata), `/etc/hosts` (static resolver — this is
+/// where a VPN-served name like `nimbus` lives), and `~/.ssh/known_hosts`
+/// (previously connected). Config hosts win on dedupe and keep their metadata;
+/// the others contribute bare names. The combined mtime of the three files keys
+/// the cache, so any edit invalidates it.
 fn load_ssh_hosts() -> Vec<SshHost> {
-    let config_path = match dirs::home_dir() {
-        Some(home) => home.join(".ssh").join("config"),
-        None => return Vec::new(),
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
     };
+    let config_path = home.join(".ssh").join("config");
+    let known_hosts_path = home.join(".ssh").join("known_hosts");
+    let etc_hosts_path = Path::new("/etc/hosts");
 
-    let mtime = match std::fs::metadata(&config_path) {
-        Ok(m) => m.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-        Err(_) => return Vec::new(),
+    // Combined cache key: the newest mtime across the three files. A missing file
+    // contributes UNIX_EPOCH, so it doesn't force a reload while absent.
+    let mtime_of = |p: &Path| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH)
     };
+    let mtime = mtime_of(&config_path)
+        .max(mtime_of(&known_hosts_path))
+        .max(mtime_of(etc_hosts_path));
 
-    // Check cache
     if let Ok(cache) = SSH_CACHE.lock()
         && let Some(ref c) = *cache
         && c.mtime == mtime
@@ -91,7 +138,28 @@ fn load_ssh_hosts() -> Vec<SshHost> {
         return c.hosts.clone();
     }
 
-    let hosts = load_ssh_config_recursive(&config_path, 0);
+    // 1. Config first — it carries metadata and wins on dedupe.
+    let mut hosts = load_ssh_config_recursive(&config_path, 0);
+    let mut seen: std::collections::HashSet<String> =
+        hosts.iter().map(|h| h.alias.to_lowercase()).collect();
+
+    // 2. /etc/hosts + 3. known_hosts contribute only names not already present.
+    let mut add_bare = |names: Vec<String>, source: HostSource| {
+        for name in names {
+            let key = name.to_lowercase();
+            if seen.insert(key) {
+                hosts.push(SshHost::bare(name, source));
+            }
+        }
+    };
+    add_bare(
+        parse_etc_hosts(&std::fs::read_to_string(etc_hosts_path).unwrap_or_default()),
+        HostSource::EtcHosts,
+    );
+    add_bare(
+        parse_known_hosts(&std::fs::read_to_string(&known_hosts_path).unwrap_or_default()),
+        HostSource::KnownHosts,
+    );
 
     if let Ok(mut cache) = SSH_CACHE.lock() {
         *cache = Some(SshCache {
@@ -101,6 +169,95 @@ fn load_ssh_hosts() -> Vec<SshHost> {
     }
 
     hosts
+}
+
+/// Extract usable hostnames from `/etc/hosts` content. Each non-comment line is
+/// `<ip> name [alias...]`; every name/alias after the IP is a candidate. Filters
+/// the boilerplate every distro ships (localhost, the loopback/broadcast names,
+/// and IPv6 `ip6-*` entries) so the list is real hosts, not noise — the same
+/// entries bash/zsh completion skips.
+fn parse_etc_hosts(content: &str) -> Vec<String> {
+    const BOILERPLATE: &[&str] = &[
+        "localhost",
+        "localhost.localdomain",
+        "broadcasthost",
+        "ip6-localhost",
+        "ip6-loopback",
+        "ip6-localnet",
+        "ip6-mcastprefix",
+        "ip6-allnodes",
+        "ip6-allrouters",
+        "ip6-allhosts",
+    ];
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        // First token is the IP; the rest are names.
+        for name in line.split_whitespace().skip(1) {
+            let n = name.trim();
+            if n.is_empty() {
+                continue;
+            }
+            let lower = n.to_lowercase();
+            if BOILERPLATE.contains(&lower.as_str()) || lower.ends_with(".localdomain") {
+                continue;
+            }
+            out.push(n.to_string());
+        }
+    }
+    out
+}
+
+/// Extract hostnames from `~/.ssh/known_hosts` content. Each line begins with a
+/// comma-separated host list (`host1,host2,1.2.3.4 ssh-ed25519 …`); we take the
+/// names, dropping bare IPs and — crucially — HASHED entries (`|1|…`), whose
+/// names are irrecoverable, so we never surface hash gibberish. Markers like
+/// `@cert-authority`/`@revoked` and port-wrapped `[host]:2222` are handled.
+fn parse_known_hosts(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Skip a leading @marker token (@cert-authority / @revoked).
+        let mut fields = line.split_whitespace();
+        let mut first = match fields.next() {
+            Some(f) => f,
+            None => continue,
+        };
+        if first.starts_with('@') {
+            match fields.next() {
+                Some(f) => first = f,
+                None => continue,
+            }
+        }
+        // Hashed host lists (`|1|salt|hash`) can't be reversed — skip entirely.
+        if first.starts_with("|1|") {
+            continue;
+        }
+        for host in first.split(',') {
+            let host = host.trim();
+            if host.is_empty() {
+                continue;
+            }
+            // Unwrap `[host]:port` → `host`.
+            let name = if let Some(rest) = host.strip_prefix('[') {
+                rest.split(']').next().unwrap_or(rest)
+            } else {
+                host
+            };
+            // Drop bare IPs (v4 by leading digit; v6 by ':').
+            if name.chars().next().is_some_and(|c| c.is_ascii_digit()) || name.contains(':') {
+                continue;
+            }
+            out.push(name.to_string());
+        }
+    }
+    out
 }
 
 /// Max Include recursion depth to prevent infinite loops.
@@ -159,32 +316,14 @@ fn parse_ssh_config(content: &str, base_dir: &Path, depth: u8) -> Vec<SshHost> {
             if aliases.len() > 1 {
                 // Create entries for all but the last alias (last one becomes `current`)
                 for &alias in &aliases[..aliases.len() - 1] {
-                    hosts.push(SshHost {
-                        alias: alias.to_string(),
-                        hostname: None,
-                        user: None,
-                        port: None,
-                        identity_file: None,
-                        proxy_jump: None,
-                    });
+                    hosts.push(SshHost::bare(alias, HostSource::Config));
                 }
-                current = Some(SshHost {
-                    alias: aliases[aliases.len() - 1].to_string(),
-                    hostname: None,
-                    user: None,
-                    port: None,
-                    identity_file: None,
-                    proxy_jump: None,
-                });
+                current = Some(SshHost::bare(
+                    aliases[aliases.len() - 1],
+                    HostSource::Config,
+                ));
             } else {
-                current = Some(SshHost {
-                    alias: value.to_string(),
-                    hostname: None,
-                    user: None,
-                    port: None,
-                    identity_file: None,
-                    proxy_jump: None,
-                });
+                current = Some(SshHost::bare(value, HostSource::Config));
             }
         } else if key_lower == "match" {
             // Flush and skip Match blocks
@@ -634,6 +773,69 @@ Host dev
     }
 
     #[test]
+    fn etc_hosts_parses_names_and_skips_boilerplate() {
+        let content = "\
+127.0.0.1\tlocalhost localhost.localdomain
+127.0.1.1\tmy-machine
+::1\tip6-localhost ip6-loopback
+ff02::1\tip6-allnodes
+10.8.0.3\tnimbus              # via wireguard
+10.8.0.5\tscripture scripture.pp.ua
+# a comment line
+";
+        let names = parse_etc_hosts(content);
+        // Real hosts kept, including a multi-name line and one with a comment.
+        assert!(names.contains(&"my-machine".to_string()));
+        assert!(
+            names.contains(&"nimbus".to_string()),
+            "the VPN host must appear"
+        );
+        assert!(names.contains(&"scripture".to_string()));
+        assert!(names.contains(&"scripture.pp.ua".to_string()));
+        // Boilerplate every distro ships must be filtered.
+        for junk in [
+            "localhost",
+            "localhost.localdomain",
+            "ip6-localhost",
+            "ip6-loopback",
+            "ip6-allnodes",
+        ] {
+            assert!(!names.contains(&junk.to_string()), "must skip {junk}");
+        }
+    }
+
+    #[test]
+    fn known_hosts_parses_names_skips_hashed_and_ips() {
+        let content = "\
+nimbus,10.8.0.3 ssh-ed25519 AAAAC3Nz...
+[jump.example.com]:2222 ssh-rsa AAAAB3Nz...
+@cert-authority *.corp.example.com ssh-ed25519 AAAA...
+|1|abcdef0123456789=|hashedhashhash= ssh-ed25519 AAAA...
+192.168.1.9 ssh-ed25519 AAAA...
+";
+        let names = parse_known_hosts(content);
+        assert!(names.contains(&"nimbus".to_string()), "named host kept");
+        assert!(
+            names.contains(&"jump.example.com".to_string()),
+            "[host]:port must unwrap to the bare host"
+        );
+        // A HASHED entry (|1|…) can't be reversed → never surfaced as gibberish.
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains("hashed") || n.starts_with("|1|")),
+            "hashed known_hosts must be skipped, got: {names:?}"
+        );
+        // Bare IPs are not useful completions.
+        assert!(
+            !names.contains(&"192.168.1.9".to_string()),
+            "bare IP skipped"
+        );
+        // The `*.corp` cert-authority pattern is a wildcard, but the parser keeps
+        // the name token; it's harmless (won't fuzzy-match a real query well).
+    }
+
+    #[test]
     fn display_description() {
         let host = SshHost {
             alias: "prod".to_string(),
@@ -642,6 +844,7 @@ Host dev
             port: Some(2222),
             identity_file: None,
             proxy_jump: None,
+            source: HostSource::Config,
         };
         let desc = host.display_description();
         assert!(desc.contains("admin@10.0.1.1"), "desc: {desc}");
@@ -657,6 +860,7 @@ Host dev
             port: None,
             identity_file: None,
             proxy_jump: Some("bastion".to_string()),
+            source: HostSource::Config,
         };
         let desc = host.display_description();
         assert!(desc.contains("via bastion"), "desc: {desc}");

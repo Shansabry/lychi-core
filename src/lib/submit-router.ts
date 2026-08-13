@@ -51,8 +51,6 @@ export interface SubmitContext {
 	searchMode: boolean;
 	/** `@`-browse mode is active. */
 	atMode: boolean;
-	/** A destructive-action plan is showing (Enter is captured by it). */
-	pendingPlan: boolean;
 	/** The visible completions. */
 	completions: RouterCompletion[];
 	/** Index of the selected completion, or -1 if none. */
@@ -223,7 +221,7 @@ function fromDecision(decision: RouteDecision): SubmitAction {
  * Decide what a submit should do. PURE — no state, no IPC, no side effects.
  *
  * Precedence:
- *   1. guards (empty / plan showing)
+ *   1. guards (empty input with nothing selected)
  *   2. keyboard modifiers (Ctrl reveal / Ctrl web / Shift inline)
  *   3. a selected completion (calc/fill/@-search/drill, or its classified `run`)
  *   4. search-mode literal path
@@ -234,7 +232,6 @@ export function decideSubmit(ctx: SubmitContext): SubmitAction {
 	const hasSelected = completions.length > 0 && completionIndex >= 0;
 
 	// 1. Guards.
-	if (ctx.pendingPlan) return { kind: "noop" };
 	if (!trimmed && !hasSelected) {
 		// Attachments alone are a complete ask ("here's a screenshot — what is
 		// this?"). Send them to the full agent with a neutral instruction; the

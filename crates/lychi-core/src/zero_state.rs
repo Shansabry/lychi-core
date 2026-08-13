@@ -180,6 +180,9 @@ fn recent_apps(db: &Arc<Database>) -> Vec<CompletionItem> {
                 icon_path,
                 score: 0,
                 run: Some(format!("open {}", entry.name)),
+                // A recently-used app — unambiguously an app, so typed (see
+                // CompletionKind::App). Pins are NOT stamped (mixed app/URL).
+                kind: Some(crate::action_registry::CompletionKind::App),
                 ..Default::default()
             }
         })

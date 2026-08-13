@@ -31,6 +31,17 @@ let track = $derived.by(() => {
 	return players.find((p) => p.bus_name === selectedBusName) ?? null;
 });
 
+// Art URLs that failed to render (a corrupt data: URI, say) → fall back to the
+// note placeholder rather than a broken-image icon. Keyed by the exact src.
+let brokenArt = $state(new Set<string>());
+function onArtError(src: string | null) {
+	if (!src) return;
+	const next = new Set(brokenArt);
+	next.add(src);
+	brokenArt = next;
+}
+let artOk = $derived(!!track?.art_url && !brokenArt.has(track.art_url));
+
 let progress = $derived(track && track.length_us > 0 ? positionUs / track.length_us : 0);
 let positionStr = $derived(formatTime(positionUs));
 let durationStr = $derived(track ? formatTime(track.length_us) : "0:00");
@@ -137,8 +148,13 @@ function selectPlayer(busName: string) {
 		{/if}
 
 		<div class="now-playing">
-			{#if track.art_url}
-				<img class="album-art" src={track.art_url} alt="Album art" />
+			{#if artOk}
+				<img
+					class="album-art"
+					src={track.art_url}
+					alt="Album art"
+					onerror={() => onArtError(track.art_url)}
+				/>
 			{:else}
 				<div class="album-art-placeholder">♫</div>
 			{/if}

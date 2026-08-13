@@ -615,6 +615,38 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     hotkey_portal::setup(portal_handle, portal_hotkey).await;
                 });
+
+                // GNOME/Wayland ALSO gets the desktop-settings binding, not just
+                // the portal. On GNOME the GlobalShortcuts portal is unreliable —
+                // xdg-desktop-portal-gnome rejects app-id registration when it
+                // can't resolve app-info (the "App info not found" a tester hit,
+                // leaving no hotkey and no way to re-summon), and even when it
+                // binds it has an xdg-activation gap that can fail to raise the
+                // window. A gsettings custom-keybinding running `lychi --toggle`
+                // sidesteps both: it's owned by the desktop, works immediately
+                // (no portal round-trip), and is idempotent + refuses to clobber
+                // someone else's shortcut. `register` self-selects by desktop
+                // (GNOME/Cinnamon → gsettings; KDE → the portal path above, so it
+                // returns Unsupported here and we defer to the portal).
+                match hotkey_de::register(&hotkey) {
+                    hotkey_de::Outcome::Registered => {
+                        app.state::<AppState>()
+                            .hotkey_registered
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        record_hotkey_binding(app.handle(), hotkey::Binding::DesktopSettings);
+                        tracing::info!(
+                            "[hotkey] {hotkey} bound in the desktop's settings (Wayland)"
+                        );
+                    }
+                    hotkey_de::Outcome::Conflict(current) => {
+                        tracing::warn!(
+                            "[hotkey] {hotkey} already bound to something else ({current}) — leaving it; portal path still applies"
+                        );
+                    }
+                    // Unsupported (KDE — the portal owns it) or Failed: the portal
+                    // spawn above remains the path. No action.
+                    _ => {}
+                }
             } else {
                 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
                 let hotkey_str = hotkey.clone();
@@ -818,7 +850,11 @@ pub fn run() {
                     drop(guard);
 
                     tokio::pin!(stream);
-                    while let Some(track) = stream.next().await {
+                    while let Some(mut track) = stream.next().await {
+                        // Resolve album art to an inline data: URI before pushing,
+                        // so the WebView never makes a remote request (same as the
+                        // poll path in commands::media).
+                        crate::commands::media_art::resolve_track_art(&mut track).await;
                         let _ = media_handle.emit("lychi://media-track", &track);
                     }
                     tracing::info!("MPRIS D-Bus stream ended");

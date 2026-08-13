@@ -13,6 +13,8 @@ pub mod firebase_auth;
 pub mod frontend_log;
 pub mod history;
 pub mod media;
+#[cfg(feature = "mpris")]
+pub mod media_art;
 pub mod notes;
 pub mod open_uri;
 pub mod pins;

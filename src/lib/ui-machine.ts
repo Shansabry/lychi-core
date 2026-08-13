@@ -24,7 +24,7 @@
 export type Panel = "none" | "history" | "chat-history" | "notes" | "media" | "settings";
 
 /** What occupies the main stage when no panel overlays it. */
-export type Surface = "results" | "ai" | "plan";
+export type Surface = "results" | "ai";
 
 /** The complete visibility state. One value each — overlap is unrepresentable. */
 export interface UiSnapshot {
@@ -47,9 +47,6 @@ export const showAi = (s: UiSnapshot): boolean => s.panel === "none" && s.surfac
 /** The completions/result surface is visible. */
 export const showResults = (s: UiSnapshot): boolean =>
 	s.panel === "none" && s.surface === "results";
-
-/** The agent-plan surface is visible. */
-export const showPlan = (s: UiSnapshot): boolean => s.panel === "none" && s.surface === "plan";
 
 /**
  * An AI answer exists but is NOT the visible surface — i.e. it's parked behind a
@@ -103,11 +100,6 @@ export function restoreAi(s: UiSnapshot): UiSnapshot {
  *  was the surface, fall back to results. */
 export function clearAi(s: UiSnapshot): UiSnapshot {
 	return { ...s, aiExists: false, surface: s.surface === "ai" ? "results" : s.surface };
-}
-
-/** Show the agent-plan surface (closes any panel). */
-export function showPlanSurface(s: UiSnapshot): UiSnapshot {
-	return { ...s, surface: "plan", panel: "none" };
 }
 
 /** Force the plain launcher/results surface: close any panel, drop back to

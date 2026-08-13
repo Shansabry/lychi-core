@@ -181,6 +181,9 @@ impl ActionHandler for AppLauncher {
                     reason: None,
                     thumb_b64: None,
                     run: Some(format!("open {}", entry.name)),
+                    // Unambiguously an app (from the app index) — typed so the
+                    // ⌘K panel shows "Open / focus" without sniffing the `run`.
+                    kind: Some(crate::action_registry::CompletionKind::App),
                     ..Default::default()
                 }
             })

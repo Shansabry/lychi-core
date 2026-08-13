@@ -12,7 +12,6 @@ import {
 	restoreAi,
 	showAi,
 	showAiSurface,
-	showPlanSurface,
 	showResults,
 	togglePanel,
 	type UiSnapshot,
@@ -49,10 +48,10 @@ describe("ui-machine — the anti-overlap invariant (the presenting bug)", () =>
 	});
 
 	it("exactly one main surface is showable at a time (never two)", () => {
-		for (const surface of ["results", "ai", "plan"] as const) {
+		for (const surface of ["results", "ai"] as const) {
 			const s = snap({ surface, aiExists: surface === "ai" });
 			const shown = [showResults(s), showAi(s)].filter(Boolean).length;
-			// `plan` shows neither results nor ai; results/ai each show exactly themselves.
+			// results/ai each show exactly themselves; never both.
 			expect(shown).toBeLessThanOrEqual(1);
 		}
 	});
@@ -118,13 +117,7 @@ describe("ui-machine — AI parking lifecycle", () => {
 	});
 });
 
-describe("ui-machine — plan + reset", () => {
-	it("showPlanSurface closes panels and shows the plan", () => {
-		const s = showPlanSurface(openPanel(INITIAL, "media"));
-		expect(s.panel).toBe("none");
-		expect(s.surface).toBe("plan");
-	});
-
+describe("ui-machine — reset", () => {
 	it("reset returns a pristine empty launcher", () => {
 		const messy = openPanel(showAiSurface(INITIAL), "settings");
 		const s = reset();

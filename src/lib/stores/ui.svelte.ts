@@ -82,9 +82,6 @@ class UiState {
 	clearAi = (): void => {
 		this.snapshot = m.clearAi(this.snapshot);
 	};
-	showPlan = (): void => {
-		this.snapshot = m.showPlanSurface(this.snapshot);
-	};
 	/** Force the plain launcher surface (typing a fresh query). */
 	showLauncher = (): void => {
 		this.snapshot = m.showLauncher(this.snapshot);

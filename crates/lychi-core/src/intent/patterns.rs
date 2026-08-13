@@ -641,6 +641,29 @@ mod tests {
         super::route(raw, &test_registry())
     }
 
+    /// `ssh <host>` must reach the ssh handler (which opens a terminal), NEVER
+    /// the web handler. A tester once saw "ssh opens a browser" — the input was
+    /// routing to `web`. This pins that the ssh trigger wins for every common
+    /// host shape (bare alias, user@host, an IP, a dotted hostname), so a future
+    /// URL/web heuristic can't quietly steal it back.
+    #[test]
+    fn ssh_host_routes_to_ssh_not_web() {
+        for inp in [
+            "ssh nimbus",
+            "ssh myserver",
+            "ssh user@host.com",
+            "ssh 10.0.0.5",
+            "ssh box.example.com",
+        ] {
+            let r = route(inp).unwrap();
+            assert_eq!(
+                r.handler, "ssh",
+                "`{inp}` must route to ssh, got `{}`",
+                r.handler
+            );
+        }
+    }
+
     #[test]
     fn explicit_prefixes() {
         let r = route("web rust lang").unwrap();

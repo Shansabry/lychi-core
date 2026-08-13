@@ -2,6 +2,7 @@
 import { LoaderCircle } from "lucide-svelte";
 import { matchesAction, normalizeKey } from "$lib/keybindings";
 import { inputOwnsKey } from "$lib/modalKeys";
+import { atPartial, atToken } from "$lib/modes";
 
 let {
 	value = $bindable(""),
@@ -15,7 +16,6 @@ let {
 	ontogglesettings,
 	ontogglenotes,
 	disabled = false,
-	routing = false,
 	executing = false,
 	atMode = false,
 	atStart = -1,
@@ -50,7 +50,6 @@ let {
 	ontogglesettings: () => void;
 	ontogglenotes: () => void;
 	disabled: boolean;
-	routing: boolean;
 	executing: boolean;
 	atMode: boolean;
 	atStart: number;
@@ -76,16 +75,12 @@ let {
 	history: string[];
 } = $props();
 
-// Split the input value into segments for the highlight overlay
+// Split the input value into segments for the highlight overlay. The @-token
+// boundary is the shared `atToken` (see modes.ts), so the overlay and the
+// completion splices can never disagree about where the reference ends.
 let segments = $derived.by(() => {
 	if (!atMode || atStart < 0) return null;
-	const before = value.slice(0, atStart);
-	const afterAt = value.slice(atStart);
-	// Find end of @ reference (first space after @, or end of string)
-	const spaceIdx = afterAt.indexOf(" ", 1);
-	const atPart = spaceIdx === -1 ? afterAt : afterAt.slice(0, spaceIdx);
-	const after = spaceIdx === -1 ? "" : afterAt.slice(spaceIdx);
-	return { before, atPart, after };
+	return atToken(value, atStart);
 });
 
 // Ghost autofill from history — prefix match first, fuzzy fallback
@@ -96,10 +91,10 @@ type Ghost =
 	| null;
 
 let ghost: Ghost = $derived.by(() => {
-	if (!value || executing || routing) return null;
+	if (!value || executing) return null;
 	// In browse mode, ghost shows suffix to complete the highlighted path
 	if (atMode && browseGhost && atStart >= 0) {
-		const partial = value.slice(atStart + 1); // text after @
+		const partial = atPartial(value, atStart); // text after @, within the token
 		const ghostLabel = browseGhost.startsWith("~/") ? browseGhost.slice(2) : browseGhost;
 		if (
 			ghostLabel.toLowerCase().startsWith(partial.toLowerCase()) &&
@@ -195,7 +190,7 @@ function shuffle<T>(arr: T[]): T[] {
 }
 
 let placeholderText = $state("");
-let showPlaceholder = $derived(value === "" && !executing && !routing);
+let showPlaceholder = $derived(value === "" && !executing);
 
 // Run the typing animation loop as a side effect — fully timer-driven
 $effect(() => {
@@ -400,7 +395,7 @@ function handleKeydown(e: KeyboardEvent) {
 </script>
 
 <div class="input-container">
-	<span class="prompt" class:routing class:executing class:hidden-prompt={!executing && /^[>@/=]/.test(value)}>
+	<span class="prompt" class:executing class:hidden-prompt={!executing && /^[>@/=]/.test(value)}>
 		{#if executing}
 			<LoaderCircle size={18} strokeWidth={1.5} />
 		{:else}
@@ -434,7 +429,7 @@ function handleKeydown(e: KeyboardEvent) {
 			onkeydown={handleKeydown}
 			onpaste={handlePaste}
 			oninput={(e) => oninputchange(e.currentTarget.value)}
-			disabled={disabled || routing}
+			disabled={disabled}
 			type="text"
 			spellcheck="false"
 			autocomplete="off"
@@ -511,11 +506,6 @@ function handleKeydown(e: KeyboardEvent) {
 		display: none;
 	}
 
-	.prompt.routing {
-		color: var(--accent);
-		animation: prompt-pulse 800ms ease-in-out infinite;
-	}
-
 	.prompt.executing {
 		color: var(--fg-muted);
 	}
@@ -524,15 +514,6 @@ function handleKeydown(e: KeyboardEvent) {
 		animation: prompt-spin 700ms linear infinite;
 	}
 
-	@keyframes prompt-pulse {
-		0%,
-		100% {
-			opacity: 0.4;
-		}
-		50% {
-			opacity: 1;
-		}
-	}
 
 	@keyframes prompt-spin {
 		from {

@@ -17,7 +17,6 @@ import { getComboString } from "$lib/keybindings";
 let {
 	result = null,
 	executing = false,
-	routing = false,
 	historyOpen = false,
 	settingsOpen = false,
 	mediaOpen = false,
@@ -30,10 +29,8 @@ let {
 	ontogglenotes,
 	ontogglechathistory = () => {},
 	onshowresult,
-	onshowplan,
 	onshowai = () => {},
 	notesOpen = false,
-	hasPlan = false,
 	aiParked = false,
 	contextStale = false,
 	contextStaleHint = "",
@@ -44,7 +41,6 @@ let {
 }: {
 	result: CommandResult | null;
 	executing: boolean;
-	routing: boolean;
 	historyOpen: boolean;
 	settingsOpen: boolean;
 	mediaOpen: boolean;
@@ -57,10 +53,8 @@ let {
 	ontogglenotes: () => void;
 	ontogglechathistory?: () => void;
 	onshowresult: () => void;
-	onshowplan: () => void;
 	onshowai?: () => void;
 	notesOpen?: boolean;
-	hasPlan?: boolean;
 	aiParked?: boolean;
 	contextStale?: boolean;
 	contextStaleHint?: string;
@@ -79,12 +73,12 @@ let resultVisible = $derived(
 		!notesOpen,
 );
 
-// The left status-info slot has transient content to show (routing / running /
-// AI loading / a result / a context hint). When it does, the now-playing media
-// pill yields its space so that content is unobstructed; once the slot clears,
-// the pill slides back in. This keeps the busy state legible without crowding.
+// The left status-info slot has transient content to show (running / AI loading
+// / a result / a context hint). When it does, the now-playing media pill yields
+// its space so that content is unobstructed; once the slot clears, the pill
+// slides back in. This keeps the busy state legible without crowding.
 let statusBusy = $derived(
-	aiLoading || routing || executing || Boolean(result) || contextRefreshing || contextStale,
+	aiLoading || executing || Boolean(result) || contextRefreshing || contextStale,
 );
 
 async function togglePlayPause() {
@@ -97,8 +91,6 @@ async function togglePlayPause() {
 	<div class="status-info">
 		{#if aiLoading}
 			<span class="ai-loading"><Sparkles size={11} strokeWidth={2} /> Loading AI model…</span>
-		{:else if routing}
-			<span class="routing-text"><span class="traveler"><span class="dot"></span></span> Routing...</span>
 		{:else if executing}
 			<span class="executing-text"><span class="traveler"><span class="dot"></span></span> Running...</span>
 		{:else if result}
@@ -211,19 +203,7 @@ async function togglePlayPause() {
 				<SquareTerminal size={14} strokeWidth={1.5} />
 			</button>
 		{/if}
-		{#if hasPlan}
-			<button
-				class="bar-icon"
-				class:active={!settingsOpen && !mediaOpen && !historyOpen && !(result && (result.output || result.error))}
-				onmousedown={(e) => e.preventDefault()}
-				onclick={onshowplan}
-				title="AI Plan"
-				tabindex={-1}
-			>
-				<Sparkles size={14} strokeWidth={1.5} />
-			</button>
-		{/if}
-		{#if (result && (result.output || result.error)) || hasPlan || aiParked}
+		{#if (result && (result.output || result.error)) || aiParked}
 			<span class="toolbar-sep"></span>
 		{/if}
 		<button
@@ -556,7 +536,6 @@ async function togglePlayPause() {
 		margin-right: 2px;
 	}
 
-	.routing-text,
 	.executing-text,
 	.ai-loading {
 		display: flex;
@@ -572,11 +551,6 @@ async function togglePlayPause() {
 	@keyframes pulse {
 		0%, 100% { opacity: 1; }
 		50% { opacity: 0.5; }
-	}
-
-	.routing-text {
-		color: var(--accent);
-		opacity: 0.6;
 	}
 
 	.executing-text {

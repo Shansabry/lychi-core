@@ -24,7 +24,6 @@ function ctx(overrides: Partial<SubmitContext> = {}): SubmitContext {
 		runInline: false,
 		searchMode: false,
 		atMode: false,
-		pendingPlan: false,
 		completions: [],
 		completionIndex: -1,
 		...overrides,
@@ -46,10 +45,6 @@ const NL = (prompt: string, confident: boolean): RouteDecision => ({
 describe("decideSubmit — guards", () => {
 	it("empty input with no selection is a noop", () => {
 		expect(decideSubmit(ctx()).kind).toBe("noop");
-	});
-
-	it("a showing plan swallows Enter", () => {
-		expect(decideSubmit(ctx({ trimmed: "hi", pendingPlan: true })).kind).toBe("noop");
 	});
 
 	it("input with no decision yet is a noop (caller awaits classifyInput)", () => {
@@ -79,10 +74,6 @@ describe("decideSubmit — staged attachments (FE-only UI state)", () => {
 			ctx({ trimmed: "firefox", inputDecision: CMD("open firefox"), hasAttachments: true }),
 		);
 		expect(a.kind).toBe("command");
-	});
-
-	it("a showing plan still swallows Enter even with attachments", () => {
-		expect(decideSubmit(ctx({ pendingPlan: true, hasAttachments: true })).kind).toBe("noop");
 	});
 });
 

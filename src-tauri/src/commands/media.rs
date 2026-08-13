@@ -23,8 +23,16 @@ mod inner {
         }
 
         // Read lock for status — doesn't block completions
-        let guard = state.mpris.read().await;
-        Ok(guard.as_ref().unwrap().get_all_status().await)
+        let mut tracks = {
+            let guard = state.mpris.read().await;
+            guard.as_ref().unwrap().get_all_status().await
+        };
+        // Resolve each track's album art to an inline `data:` URI in-process, so
+        // the WebView never fetches a remote (Spotify) image — see media_art.
+        for track in &mut tracks {
+            crate::commands::media_art::resolve_track_art(track).await;
+        }
+        Ok(tracks)
     }
 
     /// Send a transport control action to a specific player.

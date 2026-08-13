@@ -1,7 +1,7 @@
 <script lang="ts">
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { onMount } from "svelte";
+import { flushSync, onMount } from "svelte";
 import { answerRevealPath } from "$lib/answerActions";
 import ActionPanel from "$lib/components/ActionPanel.svelte";
 import AiAnswer from "$lib/components/AiAnswer.svelte";
@@ -54,6 +54,16 @@ import {
 	startFileSearch,
 } from "$lib/ipc";
 import { getComboString, loadKeybindings } from "$lib/keybindings";
+import {
+	atPartial,
+	atToken,
+	isEmailAt,
+	parentAtPartial,
+	parentSearchInput,
+	parseSearchInput,
+	searchScope,
+	spliceAtToken,
+} from "$lib/modes";
 import { type BannerMode, bannerMode } from "$lib/onboarding";
 import { hasVisibleOutput, resolveOutput } from "$lib/output";
 import { preloadAll } from "$lib/preloadCache";
@@ -64,7 +74,13 @@ import { completions } from "$lib/stores/completions.svelte";
 import { context } from "$lib/stores/context.svelte";
 import { media } from "$lib/stores/media.svelte";
 import { ui } from "$lib/stores/ui.svelte";
-import { decideSubmit, presetDisplay, type RouteDecision, renderPreset } from "$lib/submit-router";
+import {
+	decideSubmit,
+	presetDisplay,
+	type RouteDecision,
+	renderPreset,
+	type SubmitAction,
+} from "$lib/submit-router";
 import { installUiLogging, uiLog } from "$lib/uiLog";
 
 let inputValue = $state("");
@@ -73,7 +89,6 @@ let isExecuting = $state(false);
 // resolution of the abandoned executeCommand promise is ignored instead of
 // clobbering fresh state.
 let executeGeneration = 0;
-let isRouting = $state(false);
 // Local-AI model warmup indicator now lives in the `ui` store (`ui.aiLoading`);
 // only fires for mode=local (BYOK/Ollama/Cloud have no local model to load).
 let backendReady = $state(false);
@@ -113,10 +128,12 @@ let searchPathContext = $derived.by(() => {
 	return `${completions.searchScopePath}/`;
 });
 
-// Derive breadcrumb path context for @ mode
+// Derive breadcrumb path context for @ mode. `atPartial` gives the text after
+// the @ (token-bounded, same boundary the splices use); the rest is
+// breadcrumb-specific display formatting (the ~/ prefix).
 let atPathContext = $derived.by(() => {
 	if (!completions.atMode || completions.atStart < 0) return "";
-	const partial = inputValue.slice(completions.atStart + 1);
+	const partial = atPartial(inputValue, completions.atStart);
 	const lastSlash = partial.lastIndexOf("/");
 	if (lastSlash === -1) return "~/";
 	const raw = partial.slice(0, lastSlash + 1);
@@ -288,8 +305,6 @@ function flashHint(msg: string) {
 }
 
 let resultPanelRef: ResultPanel | undefined = $state(undefined);
-// C1/C15: generation counter for AI routing — ESC increments to cancel stale responses
-let routingGeneration = 0;
 let pendingNoteText: string | null = $state(null);
 let initialNotesTab: "notes" | "todos" | "reminders" | "timers" | "snippets" | undefined =
 	$state(undefined);
@@ -409,12 +424,11 @@ function handleInput(val: string) {
 	if (val.startsWith("/")) {
 		const raw = val.slice(1);
 
-		// Parse path first: /folder/subfolder/query → scope=folder/subfolder, searchTerm=query
-		const lastSlash = raw.lastIndexOf("/");
-		const searchTermCandidate = lastSlash >= 0 ? raw.slice(lastSlash + 1) : raw;
+		// Parse path first: /folder/subfolder/query → folder=folder/subfolder, term=query
+		const parsed = parseSearchInput(raw);
 
-		// Only reject if the search term (part after last /) has a space — folder paths can have spaces
-		if (!searchTermCandidate.includes(" ")) {
+		// Only reject if the TERM (part after last /) has a space — folder paths can have spaces
+		if (!parsed.termHasSpace) {
 			// Exit @ mode if active
 			completions.atMode = false;
 			completions.atStart = -1;
@@ -431,19 +445,12 @@ function handleInput(val: string) {
 			completions.fileSearchId++;
 			const id = completions.fileSearchId;
 
-			let searchScope: string;
-			let searchTerm: string;
-			if (lastSlash >= 0) {
-				const folderPart = raw.slice(0, lastSlash); // e.g. "Documents/Agent agnes"
-				searchTerm = searchTermCandidate; // e.g. "q1" or ""
-				const baseScope = completions.activeScope || (completions.mountPoints[0]?.path ?? "");
-				searchScope = folderPart ? `${baseScope}/${folderPart}` : baseScope;
-				completions.searchScopePath = searchScope;
-			} else {
-				searchTerm = raw;
-				searchScope = completions.activeScope || (completions.mountPoints[0]?.path ?? "");
-				completions.searchScopePath = "";
-			}
+			const baseScope = completions.activeScope || (completions.mountPoints[0]?.path ?? "");
+			const scope = searchScope(baseScope, parsed);
+			const searchTerm = parsed.term;
+			// Only a folder-qualified search publishes its scope path (drives the
+			// breadcrumb); a top-level query leaves it empty as before.
+			completions.searchScopePath = parsed.hasFolder ? scope : "";
 
 			// Keep the current ROWS on screen until the replacement batch lands, but
 			// still drop the SELECTION.
@@ -459,16 +466,16 @@ function handleInput(val: string) {
 			// selected row via `items[index]`, so an index left pointing into the
 			// previous query's list makes Enter run a leftover row instead of what
 			// the user typed — which looked like "the AI never responds".
-			if (raw.length > 0 || lastSlash >= 0) {
+			if (raw.length > 0 || parsed.hasFolder) {
 				completions.index = -1;
 				completions.debounceTimer = setTimeout(() => {
-					if (searchScope) startFileSearch(searchTerm, searchScope, id);
+					if (scope) startFileSearch(searchTerm, scope, id);
 				}, 150);
 			} else {
 				// Just "/" typed — list the active scope immediately (home dir by default)
 				completions.items = [];
 				completions.index = -1;
-				if (searchScope) startFileSearch("", searchScope, id);
+				if (scope) startFileSearch("", scope, id);
 			}
 			return;
 		}
@@ -484,10 +491,8 @@ function handleInput(val: string) {
 	const atIdx = val.lastIndexOf("@");
 	if (atIdx !== -1) {
 		const partial = val.slice(atIdx + 1);
-		// Skip if it looks like an email (non-space chars before @)
-		const beforeAt = val.slice(0, atIdx);
-		const isEmail = beforeAt.length > 0 && !beforeAt.endsWith(" ");
-		if (!partial.includes(" ") && !isEmail) {
+		// Skip if it looks like an email (non-space chars before @) — see modes.ts
+		if (!partial.includes(" ") && !isEmailAt(val, atIdx)) {
 			completions.atMode = true;
 			completions.atStart = atIdx;
 			cancelFileSearch();
@@ -743,14 +748,19 @@ function handleSummon() {
 	completions.atMode = false;
 	completions.atStart = -1;
 	completions.searchMode = false;
-	// C15: Cancel any in-flight AI routing on summon reset
-	routingGeneration++;
-	isRouting = false;
 	cancelFileSearch();
 	// Load recents/suggestions IMMEDIATELY (don't wait for context-ready) so they're
 	// present as the window appears — no post-paint pop-in. Fresh context re-fetches
 	// to enrich in place. We keep the old completions until the new ones arrive.
 	loadEmptySuggestions();
+	// Commit ALL the above state (panels closed, surface reset, completions cleared)
+	// to the DOM synchronously, NOW — before the backend's post-summon `window.show()`
+	// maps the surface. The summon event fires pre-show precisely so the frontend can
+	// clear first, but Svelte flushes reactive DOM updates on a microtask by default,
+	// so without this the window could map showing the PREVIOUS session's panel
+	// (settings/history/media) or output for a frame, then snap to the launcher — the
+	// "flash on re-summon" a user saw across every panel, not just AI output.
+	flushSync();
 	// Force focus the input (layer shell may not auto-focus DOM elements). Double-tap:
 	// rAF for immediate attempt, setTimeout for a delayed retry in case the
 	// compositor grants surface focus slightly late.
@@ -1013,7 +1023,6 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 		runInline: opts?.runInline ?? false,
 		searchMode,
 		atMode,
-		pendingPlan: false,
 		completions: items,
 		completionIndex: index,
 		inputDecision,
@@ -1021,6 +1030,18 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 		hasAttachments: attachments.any,
 	});
 
+	await actuate(action);
+}
+
+/**
+ * Actuate a decided SubmitAction — the side-effecting half of submit. Extracted
+ * so BOTH the Enter path (handleSubmit) and the click path (handleCompletionSelect)
+ * run the SAME reducer→actuator pipeline; the click path no longer re-derives
+ * routing (correction/ask-ai/search-web/fill/run), which had already drifted from
+ * this switch. Pure UI gestures unique to a CLICK (@/search-mode open vs Enter's
+ * drill) stay in handleCompletionSelect and never reach here.
+ */
+async function actuate(action: SubmitAction): Promise<void> {
 	switch (action.kind) {
 		case "noop":
 			return;
@@ -1045,7 +1066,7 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 			return;
 
 		case "completion-select":
-			handleCompletionSelect(action.label, action.ctrlKey);
+			await handleCompletionSelect(action.label, action.ctrlKey);
 			return;
 
 		case "fill":
@@ -1466,8 +1487,15 @@ let panelActions = $derived.by((): PanelAction[] => {
 	const isFolder = item.icon_path === "__folder__";
 	const hasPath =
 		completions.searchMode || completions.atMode || completions.filePathMap.has(item.label);
-	const isApp = item.run?.startsWith("appctl") || item.run?.startsWith("open ");
+	// App rows carry a typed `kind: "app"` from the launcher + recent-apps (the
+	// unambiguous sources). Pins/history whose `run` merely starts with `open `
+	// have no kind — those keep the string check as an honest fallback, since a
+	// pin can be `open https://…` and shouldn't be typed as an app.
+	const isApp =
+		item.kind === "app" || item.run?.startsWith("appctl") || item.run?.startsWith("open ");
 	const isCalc = item.kind === "calc";
+	// Chat-recall has no backend row — the `__chat__:` run is assembled on the FE,
+	// so this stays a sentinel check (there is no kind to read).
 	const isAiChat = item.run?.startsWith(CHAT_RUN_PREFIX);
 
 	if (isAiChat) {
@@ -1641,7 +1669,7 @@ function runPanelAction(id: string) {
 	}
 }
 
-function handleCompletionSelect(label: string, forceOpen?: boolean) {
+async function handleCompletionSelect(label: string, forceOpen?: boolean) {
 	// Also an entry point: a CLICK on a row reaches here without passing through
 	// `handleSubmit`. Calling it twice on the Enter path is harmless — both read
 	// the same still-unchanged `inputValue`.
@@ -1670,10 +1698,10 @@ function handleCompletionSelect(label: string, forceOpen?: boolean) {
 		// A context source (@clipboard / @selection) isn't a path: complete the
 		// token in place and leave @ mode. The backend resolves it at send time.
 		if (clicked?.icon_path === "__context__") {
-			const before = inputValue.slice(0, completions.atStart);
-			const afterAt = inputValue.slice(completions.atStart);
-			const spaceIdx = afterAt.indexOf(" ", 1);
-			const after = spaceIdx === -1 ? "" : afterAt.slice(spaceIdx);
+			// A context source replaces the whole @-token with a bare label (no `@`,
+			// trailing space), so it needs the token's `before`/`after`, not the
+			// `@`-preserving splice.
+			const { before, after } = atToken(inputValue, completions.atStart);
 			inputValue = `${before}${label} ${after.trimStart()}`.trimEnd().concat(" ");
 			completions.atMode = false;
 			completions.atStart = -1;
@@ -1682,25 +1710,17 @@ function handleCompletionSelect(label: string, forceOpen?: boolean) {
 			return;
 		}
 		if (label.endsWith("/")) {
-			const before = inputValue.slice(0, completions.atStart);
-			const afterAt = inputValue.slice(completions.atStart);
-			const spaceIdx = afterAt.indexOf(" ", 1); // skip the @ itself
-			const after = spaceIdx === -1 ? "" : afterAt.slice(spaceIdx);
-			// Set input and immediately fetch — handleInput will also fire but
-			// debounce means our direct call wins
-			inputValue = `${before}@${label}${after}`;
+			// A folder: splice it in and keep browsing. Set input and immediately
+			// fetch — handleInput will also fire but debounce means our call wins.
+			inputValue = spliceAtToken(inputValue, completions.atStart, label);
 			clearTimeout(completions.debounceTimer);
 			fetchAtCompletions(label);
 			requestAnimationFrame(() => {
 				document.querySelector<HTMLInputElement>(".input-container input")?.focus();
 			});
 		} else {
-			// Insert the file path into the command, replacing the @partial
-			const before = inputValue.slice(0, completions.atStart);
-			const afterAt = inputValue.slice(completions.atStart);
-			const spaceIdx = afterAt.indexOf(" ", 1);
-			const after = spaceIdx === -1 ? "" : afterAt.slice(spaceIdx);
-			inputValue = `${before}@${label}${after}`;
+			// A file: splice the reference in and leave @ mode.
+			inputValue = spliceAtToken(inputValue, completions.atStart, label);
 			completions.atMode = false;
 			completions.atStart = -1;
 			completions.items = [];
@@ -1709,66 +1729,45 @@ function handleCompletionSelect(label: string, forceOpen?: boolean) {
 		return;
 	}
 
-	// Find the item by label (click passes label directly, may not match completions.index)
+	// Normal (non-file-mode) selection: route through the SAME reducer + actuator
+	// as Enter, with the clicked row FORCED as the selection. This is FE-1 — the
+	// click path used to re-derive correction/ask-ai/search-web/fill/run handling
+	// inline, which had already drifted from the Enter path (a recents row echoing
+	// an NL query dead-ended on click but reached the agent on Enter). Now there is
+	// one path: classify → decideSubmit → actuate.
 	const item =
 		completions.items.find((c) => c.label === label) ?? completions.items[completions.index];
-
-	// A correction row — fill the input with the corrected text. Identified by
-	// its typed `kind`, never by its label (labels get reworded/translated).
-	// A correction the user CHOSE — run it. Same as selecting it and pressing
-	// Enter; making a click merely fill the box would be the double-Enter
-	// friction in another guise.
-	if (item?.kind === "correction" && item.description) {
-		completions.items = [];
-		completions.index = -1;
-		inputValue = "";
-		runCommand(item.description);
+	if (!item) {
+		// No matching row (shouldn't happen) — fall back to opening the label.
+		runCommand(`open ${label}`);
 		return;
 	}
 
-	// "Ask AI" — send the query straight to the agent. Handled here as well as in
-	// the submit reducer so clicking the row behaves exactly like selecting it.
-	if (item?.kind === "ask-ai" && item.description) {
-		completions.items = [];
-		completions.index = -1;
-		inputValue = "";
-		lastResult = null;
-		chat.start(item.description, /* fresh */ true);
-		return;
-	}
+	const trimmed = inputValue.trim();
+	const selectedRun = item.run ?? undefined;
+	// Classify the raw input AND the row's `run` (when it differs), exactly as the
+	// Enter path does, so a replayed history/context command routes as if typed.
+	const classify = (q: string) => classifyInput(q).catch(() => undefined);
+	const [inputDecision, runDecision] = await Promise.all([
+		trimmed ? classify(trimmed) : Promise.resolve(undefined),
+		selectedRun && selectedRun !== trimmed ? classify(selectedRun) : Promise.resolve(undefined),
+	]);
 
-	// "Search web" — the other escape hatch. Runs through the normal `web`
-	// handler, so nothing special happens downstream.
-	if (item?.kind === "search-web" && item.description) {
-		completions.items = [];
-		completions.index = -1;
-		inputValue = "";
-		runCommand(`web ${item.description}`);
-		return;
-	}
-
-	// Argument-needing hint — fill the input rather than execute (matches
-	// Enter-submit behaviour). Tab-to-complete.
-	if (item?.fill) {
-		inputValue = item.fill;
-		handleInput(inputValue);
-		return;
-	}
-
-	// Backend-declared command wins — run it verbatim (search handlers, emoji,
-	// etc.). Keeps click-select identical to Enter-submit; no label parsing.
-	if (item?.run) {
-		runCommand(item.run);
-		return;
-	}
-
-	// Context suggestion — label is a complete command (e.g. "git commit", "run cargo build")
-	if (item?.icon_path === "__context__") {
-		runCommand(label);
-		return;
-	}
-
-	runCommand(`open ${label}`);
+	const action = decideSubmit({
+		trimmed,
+		ctrlKey: forceOpen ?? false,
+		runInline: false,
+		// NOT in @/search mode here (handled above), so decideSubmit can never
+		// return a `completion-select` — no recursion back into this function.
+		searchMode: false,
+		atMode: false,
+		completions: [item],
+		completionIndex: 0,
+		inputDecision,
+		runDecision,
+		hasAttachments: attachments.any,
+	});
+	await actuate(action);
 }
 
 function handleScopeChange(index: number) {
@@ -1782,23 +1781,14 @@ function handleScopeChange(index: number) {
 		completions.index = -1;
 		completions.searchScopePath = "";
 
-		const raw = inputValue.slice(1);
-		const lastSlash = raw.lastIndexOf("/");
+		const parsed = parseSearchInput(inputValue.slice(1));
 		const baseScope = completions.mountPoints[index]?.path ?? "";
+		const scope = searchScope(baseScope, parsed);
+		// A folder-qualified search publishes its scope path (breadcrumb); a
+		// top-level one leaves it empty, as before.
+		if (parsed.hasFolder) completions.searchScopePath = scope;
 
-		let searchScope: string;
-		let searchTerm: string;
-		if (lastSlash >= 0) {
-			const folderPart = raw.slice(0, lastSlash);
-			searchTerm = raw.slice(lastSlash + 1);
-			searchScope = folderPart ? `${baseScope}/${folderPart}` : baseScope;
-			completions.searchScopePath = searchScope;
-		} else {
-			searchTerm = raw;
-			searchScope = baseScope;
-		}
-
-		if (searchScope) startFileSearch(searchTerm, searchScope, id);
+		if (scope) startFileSearch(parsed.term, scope, id);
 	}
 }
 
@@ -1859,12 +1849,6 @@ function handleToggleNotes() {
 function handleShowResult() {
 	// Close any panel back to the results surface (parked AI stays parked).
 	ui.showLauncher();
-	completions.items = [];
-	completions.index = -1;
-}
-
-function handleShowPlan() {
-	ui.showPlan();
 	completions.items = [];
 	completions.index = -1;
 }
@@ -1988,12 +1972,6 @@ async function handleDismiss() {
 		return;
 	}
 
-	// C15: Cancel in-flight AI routing immediately on ESC
-	if (isRouting) {
-		routingGeneration++;
-		isRouting = false;
-	}
-
 	// Escape hatch for a stuck command. If a command is mid-execution (e.g. a
 	// screenshot whose portal call hung, or a backend task that died without
 	// resolving its IPC promise), the first Escape *cancels* the stuck state and
@@ -2040,9 +2018,8 @@ async function handleDismiss() {
 			ontogglemedia={handleToggleMedia}
 			ontogglesettings={handleToggleSettings}
 			ontogglenotes={handleToggleNotes}
-			disabled={isExecuting || isRouting}
+			disabled={isExecuting}
 			{decisionPending}
-			routing={isRouting}
 			executing={isExecuting}
 			contextPill={context.pill}
 			contextLoading={context.loading}
@@ -2080,36 +2057,16 @@ async function handleDismiss() {
 			}}
 			onshifttabback={() => {
 				if (completions.searchMode && inputValue.startsWith("/")) {
-					const raw = inputValue.slice(1);
-					// Find last slash, then the one before it to go up
-					const trimmed = raw.endsWith("/") ? raw.slice(0, -1) : raw;
-					const lastSlash = trimmed.lastIndexOf("/");
-					if (lastSlash > 0) {
-						inputValue = `/${trimmed.slice(0, lastSlash + 1)}`;
-					} else {
-						inputValue = "/";
-					}
+					// Go up a directory level (parentSearchInput handles the trailing
+					// slash + root stop; see modes.ts).
+					inputValue = parentSearchInput(inputValue.slice(1));
 					handleInput(inputValue);
 				} else if (completions.atMode && completions.atStart >= 0) {
-					const partial = inputValue.slice(completions.atStart + 1);
-					const afterAt = inputValue.slice(completions.atStart);
-					const spaceIdx = afterAt.indexOf(" ", 1);
-					const after = spaceIdx === -1 ? "" : afterAt.slice(spaceIdx);
-					const before = inputValue.slice(0, completions.atStart);
-
-					// Strip trailing slash, find parent
-					const trimmed = partial.endsWith("/") ? partial.slice(0, -1) : partial;
-					const lastSlash = trimmed.lastIndexOf("/");
-					if (lastSlash > 0) {
-						const parent = trimmed.slice(0, lastSlash + 1);
-						inputValue = `${before}@${parent}${after}`;
-						clearTimeout(completions.debounceTimer);
-						fetchAtCompletions(parent);
-					} else {
-						inputValue = `${before}@${after}`;
-						clearTimeout(completions.debounceTimer);
-						fetchAtCompletions("");
-					}
+					// Parent of the current @-partial, spliced back into its token.
+					const parent = parentAtPartial(atPartial(inputValue, completions.atStart));
+					inputValue = spliceAtToken(inputValue, completions.atStart, parent);
+					clearTimeout(completions.debounceTimer);
+					fetchAtCompletions(parent);
 				}
 			}}
 			searchGhost={completions.searchMode && completions.items.length > 0 && completions.index >= 0 ? completions.items[completions.index].label : ""}
@@ -2230,7 +2187,6 @@ async function handleDismiss() {
 		<StatusBar
 			result={lastResult}
 			executing={isExecuting}
-			routing={isRouting}
 			historyOpen={ui.panelVisible("history")}
 			settingsOpen={ui.panelVisible("settings")}
 			mediaOpen={ui.panelVisible("media")}
@@ -2245,9 +2201,7 @@ async function handleDismiss() {
 			ontogglenotes={handleToggleNotes}
 			ontogglechathistory={handleToggleChatHistory}
 		onshowresult={handleShowResult}
-		onshowplan={handleShowPlan}
 		onshowai={ui.restoreAi}
-		hasPlan={false}
 		contextStale={context.stale}
 		contextStaleHint={context.staleHint}
 		contextRefreshing={context.refreshing}

@@ -1819,7 +1819,18 @@ export type CompletionKind =
  * Same reasoning: the query lives in `description`, not in a command
  * string something downstream has to parse.
  */
-"search-web"
+"search-web" | 
+/**
+ * A launchable application row (`open <App>`). Set ONLY where the row is
+ * unambiguously an app — the app-launcher handler and the recent-apps
+ * shortlist. It is NOT stamped on pins or history rows whose `run` merely
+ * starts with `open ` (a pin can be `open https://…`, a history row is a
+ * past command), so the presence of this kind is an honest "this is an app",
+ * and the frontend keeps a string-check fallback for the ambiguous sources.
+ * Drives only a display choice (the ⌘K panel's "Open / focus" label), never
+ * routing — an app row still runs via its `run` string like any other.
+ */
+"app"
 export type ContainerInfo = { id: string; name: string; image: string; status: string }
 /**
  * One block of a message's content. A message is a sequence of these: prose

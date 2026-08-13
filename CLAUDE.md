@@ -40,7 +40,7 @@ core/
 │       ├── executor/              # BRICK: Execution Manager
 │       │   └── mod.rs             # Executor (resolve → validate → execute)
 │       ├── providers/             # BRICK: AI Providers
-│       │   ├── mod.rs             # AiProvider trait, AiRoute, AgentPlan
+│       │   ├── mod.rs             # AiProvider trait (chat/health_check/name)
 │       │   └── byo.rs             # BYOClient (OpenAI/Anthropic/Groq)
 │       ├── config/                # TOML config with serde defaults
 │       ├── history/               # JSON file persistence, dedup
