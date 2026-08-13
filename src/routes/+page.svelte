@@ -704,7 +704,6 @@ function handleSummon() {
 	// frontend was the part in trouble. One line per open means a summon with
 	// no matching `[ui] summon` is now a fact, not a guess.
 	uiLog.info("[ui] summon — launcher surface ready");
-	launcherReady = true;
 
 	// Resume path: a run was still ACTIVE (streaming or awaiting approval) when the
 	// user clicked away. The backend agent never stopped (hiding doesn't cancel
@@ -718,6 +717,8 @@ function handleSummon() {
 		uiLog.info("[ui] summon — resuming an active agent run (preserved)");
 		chat.resumed = true;
 		inputValue = "";
+		// The preserved AI surface is already in a clean state — reveal now.
+		launcherReady = true;
 		requestAnimationFrame(() => {
 			document.querySelector<HTMLInputElement>(".input-container input")?.focus();
 		});
@@ -753,13 +754,15 @@ function handleSummon() {
 	// present as the window appears — no post-paint pop-in. Fresh context re-fetches
 	// to enrich in place. We keep the old completions until the new ones arrive.
 	loadEmptySuggestions();
-	// Commit ALL the above state (panels closed, surface reset, completions cleared)
-	// to the DOM synchronously, NOW — before the backend's post-summon `window.show()`
-	// maps the surface. The summon event fires pre-show precisely so the frontend can
-	// clear first, but Svelte flushes reactive DOM updates on a microtask by default,
-	// so without this the window could map showing the PREVIOUS session's panel
-	// (settings/history/media) or output for a frame, then snap to the launcher — the
-	// "flash on re-summon" a user saw across every panel, not just AI output.
+	// Reveal the surface only AFTER the reset is fully applied. `launcherReady`
+	// gates both the wrapper's visibility AND whether the panels are even in the
+	// DOM (see the template), so panels mount for the first time in an
+	// already-clean state — they can never paint a stale/open panel from the
+	// previous session on the way in. Then flushSync commits panels-closed +
+	// surface-reset + completions-cleared + the reveal SYNCHRONOUSLY, before the
+	// backend's post-summon `window.show()` maps the window (Svelte otherwise
+	// flushes on a microtask, leaving a frame where the old state could show).
+	launcherReady = true;
 	flushSync();
 	// Force focus the input (layer shell may not auto-focus DOM elements). Double-tap:
 	// rAF for immediate attempt, setTimeout for a delayed retry in case the
@@ -2086,32 +2089,38 @@ async function handleDismiss() {
 				ondismiss={closeActionPanel}
 			/>
 		{/if}
-		<!-- Panels: always mounted, hidden via CSS (visibility:hidden) for instant toggle -->
-		<!-- Visibility derives from the `ui` surface machine — exactly one panel can
-		     be open, and it always wins the stage (overlap is unrepresentable). -->
-		<!-- Order matches shortcuts: Ctrl+1 History, Ctrl+2 Notes, Ctrl+3 Media, Ctrl+4 Settings -->
-		<div class:panel-hidden={!ui.panelVisible("history")}>
-			<HistoryPanel entries={historyEntries} onselect={handleHistorySelect} />
-		</div>
-		<div class:panel-hidden={!ui.panelVisible("chat-history")}>
-			<ChatHistoryPanel
-				{conversations}
-				visible={ui.panelVisible("chat-history")}
-				onselect={openConversation}
-				ondelete={deleteConversationEntry}
-				onclear={clearAllConversations}
-				ondismiss={ui.closePanel}
-			/>
-		</div>
-		<div class:panel-hidden={!ui.panelVisible("notes")}>
-			<NotesPanel ondismiss={() => { ui.closePanel(); pendingNoteText = null; initialNotesTab = undefined; }} {pendingNoteText} onpendingcleared={() => { pendingNoteText = null; }} {initialNotesTab} visible={ui.panelVisible("notes")} />
-		</div>
-		<div class:panel-hidden={!ui.panelVisible("media")}>
-			<MediaPanel visible={ui.panelVisible("media")} ondismiss={ui.closePanel} players={media.players} />
-		</div>
-		<div class="settings-wrapper" class:panel-hidden={!ui.panelVisible("settings")}>
-			<SettingsPanel bind:this={settingsPanel} ondismiss={ui.closePanel} />
-		</div>
+		<!-- Panels: mounted only ONCE the launcher is ready, so nothing but the
+		     launcher (input + suggestions + status bar) exists in the DOM on the
+		     first paint / re-summon. They were previously always-mounted and
+		     merely CSS-hidden, which flashed on load before the reset committed.
+		     Guarding on `launcherReady` costs the first panel-open a one-time mount
+		     (negligible) and eliminates the flash entirely; a panel still toggles
+		     instantly after that first mount. Exactly one is ever visible (the `ui`
+		     surface machine makes overlap unrepresentable). -->
+		{#if launcherReady}
+			<div class:panel-hidden={!ui.panelVisible("history")}>
+				<HistoryPanel entries={historyEntries} onselect={handleHistorySelect} />
+			</div>
+			<div class:panel-hidden={!ui.panelVisible("chat-history")}>
+				<ChatHistoryPanel
+					{conversations}
+					visible={ui.panelVisible("chat-history")}
+					onselect={openConversation}
+					ondelete={deleteConversationEntry}
+					onclear={clearAllConversations}
+					ondismiss={ui.closePanel}
+				/>
+			</div>
+			<div class:panel-hidden={!ui.panelVisible("notes")}>
+				<NotesPanel ondismiss={() => { ui.closePanel(); pendingNoteText = null; initialNotesTab = undefined; }} {pendingNoteText} onpendingcleared={() => { pendingNoteText = null; }} {initialNotesTab} visible={ui.panelVisible("notes")} />
+			</div>
+			<div class:panel-hidden={!ui.panelVisible("media")}>
+				<MediaPanel visible={ui.panelVisible("media")} ondismiss={ui.closePanel} players={media.players} />
+			</div>
+			<div class="settings-wrapper" class:panel-hidden={!ui.panelVisible("settings")}>
+				<SettingsPanel bind:this={settingsPanel} ondismiss={ui.closePanel} />
+			</div>
+		{/if}
 		{#if ui.aiVisible}
 			<AiAnswer
 				bind:this={aiAnswerRef}

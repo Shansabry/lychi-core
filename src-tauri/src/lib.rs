@@ -586,6 +586,30 @@ pub fn run() {
             // Background timer + reminder monitor — owns its OS thread
             // (all notify-rust D-Bus calls serialized in this single thread)
             let timer_state = app.state::<AppState>().timer_state.clone();
+            // Rolling backup on an interval, not just at startup. `hourly_backup`
+            // self-throttles (takes one at most per hour), so a resident launcher
+            // that runs for days still gets fresh rolling snapshots instead of
+            // ageing on the single startup call. The 15-min tick just bounds how
+            // stale the rolling backup can get; most ticks are a cheap no-op.
+            {
+                let backup_db = app.state::<AppState>().db.clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut tick =
+                        tokio::time::interval(std::time::Duration::from_secs(15 * 60));
+                    // Skip the immediate first tick — the startup call in
+                    // AppState::new already covered "now".
+                    tick.tick().await;
+                    loop {
+                        tick.tick().await;
+                        if let Some(b) =
+                            lychi_core::backup::hourly_backup(&backup_db, env!("CARGO_PKG_VERSION"))
+                        {
+                            tracing::info!("[backup] rolling snapshot saved: {}", b.name);
+                        }
+                    }
+                });
+            }
+
             let monitor_db = app.state::<AppState>().db.clone();
             let timer_running = app.state::<AppState>().timer_running.clone();
             std::thread::Builder::new()

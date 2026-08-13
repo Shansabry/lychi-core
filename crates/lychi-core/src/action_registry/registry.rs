@@ -186,7 +186,9 @@ impl ActionRegistry {
     /// list uses — one source of truth, so a trigger and its command never drift.
     /// Colon-triggers whose handler is absent are skipped.
     pub fn trigger_catalog(&self) -> Vec<CommandInfo> {
-        use crate::intent::patterns::{COLON_TRIGGERS, SIGIL_TRIGGERS};
+        // From the leaf `triggers` module — NOT `intent`, which would be an
+        // upward action_registry → intent edge (EXEC-7).
+        use crate::triggers::{COLON_TRIGGERS, SIGIL_TRIGGERS};
 
         let mut items: Vec<CommandInfo> = Vec::new();
 

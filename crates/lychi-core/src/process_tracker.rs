@@ -16,6 +16,15 @@ pub struct TrackedProcess {
     pub command: String,
     pub cwd: Option<String>,
     pub started_at: u64,
+    /// The process's kernel start-time (field 22 of `/proc/<pid>/stat`, in clock
+    /// ticks since boot), captured at `track()`. This is the PID-REUSE guard: a
+    /// PID alone is not a stable identity — Linux reuses PIDs, so a tracked PID
+    /// whose process has exited can be handed to an INNOCENT new process. Before
+    /// killing, we re-read the start-time and refuse if it differs: same PID +
+    /// same start-time ≈ the same process; a mismatch means it was reused and the
+    /// thing we meant to kill is already gone. Not serialized (internal only).
+    #[serde(skip)]
+    start_time: Option<u64>,
 }
 
 static TRACKED: Mutex<Vec<TrackedProcess>> = Mutex::new(Vec::new());
@@ -30,6 +39,9 @@ pub fn track(pid: u32, command: &str, cwd: Option<&str>) {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
+        // Capture the kernel start-time NOW so a later kill can prove the PID
+        // hasn't been reused out from under us.
+        start_time: read_proc_starttime(pid),
     };
     if let Ok(mut guard) = TRACKED.lock() {
         guard.push(entry);
@@ -44,18 +56,19 @@ pub fn untrack(pid: u32) {
     }
 }
 
-/// List all tracked processes, pruning dead ones.
+/// List all tracked processes, pruning dead OR reused ones.
 ///
-/// Checks `/proc/<pid>` to determine if a process is still alive.
-/// Dead processes are automatically removed.
+/// A tracked entry is kept only if the PID still hosts the SAME process we
+/// tracked (same start-time). An exited process is dropped; so is one whose PID
+/// has since been reused by something else — otherwise it would show as "still
+/// running" and a kill would hit the innocent reuser.
 pub fn list() -> Vec<TrackedProcess> {
     let mut guard = match TRACKED.lock() {
         Ok(g) => g,
         Err(_) => return Vec::new(),
     };
 
-    // Prune dead processes
-    guard.retain(|p| is_alive(p.pid));
+    guard.retain(|p| is_same_process(p.pid, p.start_time));
 
     guard.clone()
 }
@@ -98,17 +111,26 @@ pub fn kill_by(query: &str) -> Result<String, String> {
 fn kill_pid(pid: u32) -> Result<String, String> {
     use nix::sys::signal::Signal;
 
-    if !is_alive(pid) {
+    // Look up the tracked entry: its command (for the message) AND the start-time
+    // we captured, which is what makes the kill PID-reuse-safe.
+    let (cmd_name, expected_start) = TRACKED
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.iter()
+                .find(|p| p.pid == pid)
+                .map(|p| (p.command.clone(), p.start_time))
+        })
+        .unwrap_or_else(|| (format!("pid {pid}"), None));
+
+    // Identity check: same PID AND same start-time. If the PID was reused by a
+    // different process (ours exited, the kernel handed the number to something
+    // innocent), REFUSE — killing it would take down an unrelated process. Untrack
+    // the stale entry rather than signalling.
+    if !is_same_process(pid, expected_start) {
         untrack(pid);
         return Err(format!("Process {pid} already exited"));
     }
-
-    // Get command name before killing
-    let cmd_name = TRACKED
-        .lock()
-        .ok()
-        .and_then(|g| g.iter().find(|p| p.pid == pid).map(|p| p.command.clone()))
-        .unwrap_or_else(|| format!("pid {pid}"));
 
     if let Err(e) = signal_kill(pid, Signal::SIGTERM) {
         untrack(pid);
@@ -117,7 +139,10 @@ fn kill_pid(pid: u32) -> Result<String, String> {
 
     std::thread::sleep(std::time::Duration::from_millis(200));
 
-    if is_alive(pid) {
+    // Re-verify identity before the escalation SIGKILL too: in the 200ms wait our
+    // process could have exited AND the PID been reused. Only SIGKILL if it's
+    // still the same process we started terminating.
+    if is_same_process(pid, expected_start) {
         let _ = signal_kill(pid, Signal::SIGKILL);
     }
 
@@ -128,6 +153,40 @@ fn kill_pid(pid: u32) -> Result<String, String> {
 /// Check if a process is alive via `/proc/<pid>`.
 fn is_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// The process start-time — field 22 of `/proc/<pid>/stat`, in clock ticks since
+/// boot. `None` if the process is gone or `/proc` is unreadable.
+///
+/// Parsing gotcha: field 2 (`comm`) is wrapped in parens and CAN CONTAIN spaces
+/// AND parens (e.g. `(a b) c`), so splitting the whole line on whitespace
+/// mis-counts fields. The robust approach — used by ps/htop — is to find the
+/// LAST `)` and count fields from there: everything after `") "` is a clean
+/// space-separated list starting at field 3 (`state`), so `starttime` (field 22)
+/// is index 19 in that tail.
+fn read_proc_starttime(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    // Fields from here: [state, ppid, pgrp, session, tty_nr, tpgid, flags,
+    // minflt, cminflt, majflt, cmajflt, utime, stime, cutime, cstime, priority,
+    // nice, num_threads, itrealvalue, starttime, ...]. starttime is index 19.
+    after_comm.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+/// Whether the process at `pid` is STILL the one we tracked — same PID and, when
+/// we captured it, the same start-time. If the start-time now differs, the PID
+/// was reused by a different process and must NOT be killed. When we have no
+/// captured start-time (an older entry, or `/proc` was unreadable at track()),
+/// fall back to plain aliveness — the old, less-safe behaviour, only for entries
+/// we genuinely can't verify.
+fn is_same_process(pid: u32, expected_start: Option<u64>) -> bool {
+    if !is_alive(pid) {
+        return false;
+    }
+    match expected_start {
+        Some(expected) => read_proc_starttime(pid) == Some(expected),
+        None => true,
+    }
 }
 
 // ── System-wide process scanning ────────────────────────────────────────
@@ -356,6 +415,52 @@ mod tests {
     fn test_kill_nonexistent() {
         let result = kill_by("999999999");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn starttime_reads_for_a_live_process() {
+        // Our own process is alive, so its start-time must parse. This also
+        // exercises the comm-parens-safe parse against a real /proc/self/stat.
+        let me = std::process::id();
+        assert!(
+            read_proc_starttime(me).is_some(),
+            "our own start-time must be readable"
+        );
+        // A definitely-dead PID has none.
+        assert!(read_proc_starttime(999_999_999).is_none());
+    }
+
+    #[test]
+    fn identity_holds_for_self_and_rejects_a_mismatch() {
+        let me = std::process::id();
+        let real = read_proc_starttime(me);
+        // Same PID + the real start-time → same process.
+        assert!(is_same_process(me, real));
+        // Same PID but a WRONG start-time → treated as reused → not the same.
+        // (This is the PID-reuse guard: an innocent reuser is spared.)
+        assert!(
+            !is_same_process(me, Some(real.unwrap().wrapping_add(1))),
+            "a start-time mismatch must NOT be treated as the same process"
+        );
+        // No captured start-time falls back to plain aliveness (still alive).
+        assert!(is_same_process(me, None));
+    }
+
+    #[test]
+    fn track_captures_a_start_time_for_a_live_pid() {
+        let me = std::process::id();
+        track(me, "self test", None);
+        let found = TRACKED
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|p| p.pid == me && p.command == "self test")
+            .and_then(|p| p.start_time);
+        untrack(me);
+        assert!(
+            found.is_some(),
+            "tracking a live PID captures its start-time"
+        );
     }
 
     #[test]

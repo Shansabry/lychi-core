@@ -175,6 +175,34 @@ fn remove_stale_sqlite_artifact(redb_path: &Path) {
 
 /// Open (or create) the redb database at the given path.
 /// If the file exists but uses an older format version, back it up and recreate.
+/// Whether a `DatabaseError` means the on-disk file is genuinely corrupt and
+/// won't get better — the ONLY case where renaming it away and starting fresh is
+/// the right call. Everything else (a pending format upgrade, a transient I/O
+/// error like a full disk, a poisoned lock) is fixable, and must surface as an
+/// error rather than cost the user their data.
+///
+/// The subtlety is redb's `Io` variant: it is OVERLOADED. A structurally-invalid
+/// file (garbage / truncated header) surfaces as `Io(InvalidData)` /
+/// `Io(UnexpectedEof)` — that IS corruption. But a genuine transient failure
+/// (a full disk) surfaces as `Io(StorageFull)` and MUST NOT trigger deletion. So
+/// we can't treat all `Io` the same: we inspect the `ErrorKind`.
+fn is_unrecoverable_corruption(e: &redb::DatabaseError) -> bool {
+    use redb::{DatabaseError as D, StorageError as S};
+    match e {
+        // Explicit corruption, or a repair redb attempted and gave up on.
+        D::Storage(S::Corrupted(_)) | D::RepairAborted => true,
+        // An `Io` error whose kind means "the bytes are wrong", not "the device
+        // failed". redb reports a garbage/truncated file as Io(InvalidData).
+        D::Storage(S::Io(io)) => matches!(
+            io.kind(),
+            std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+        ),
+        // UpgradeRequired (needs migration), a transient Io kind (StorageFull,
+        // PermissionDenied, …), LockPoisoned, etc. — never delete over these.
+        _ => false,
+    }
+}
+
 pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -199,15 +227,28 @@ pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
                 path.display()
             )));
         }
-        Err(e) if path.exists() => {
-            tracing::warn!("[db] cannot open database ({e}), backing up and recreating");
-            let backup = path.with_extension("redb.bak");
+        // Recover (rename-and-recreate) ONLY on genuine, unrecoverable
+        // corruption. The old branch caught EVERY error on an existing file, so
+        // a full disk (Io/ENOSPC), a pending format migration (UpgradeRequired),
+        // or a poisoned lock would ALSO rename the live DB away and hand the user
+        // an empty one — destroying data over a transient or fixable condition.
+        // Match narrowly on the two variants that actually mean "this file cannot
+        // be opened and won't get better": Corrupted, and RepairAborted (redb
+        // tried to repair and gave up).
+        Err(e) if path.exists() && is_unrecoverable_corruption(&e) => {
+            tracing::warn!("[db] database is corrupt ({e}), backing up and recreating");
+            // Unique, timestamped .bak so a SECOND incident can't overwrite the
+            // FIRST backup (the fixed `.redb.bak` name did exactly that).
+            let backup = path.with_extension(format!("redb.bak.{}", now_millis()));
             let _ = std::fs::rename(path, &backup);
-            // The backup is a full copy of the same user content.
+            // The backup is a full copy of the same (corrupt) user content.
             #[cfg(unix)]
             restrict(&backup, OWNER_ONLY_FILE);
             Database::create(path)?
         }
+        // Anything else — UpgradeRequired, Io/ENOSPC, LockPoisoned, an unexpected
+        // open error — is surfaced, NOT recovered-by-deletion. A transient or
+        // fixable problem must never cost the user their data.
         Err(e) => return Err(e.into()),
     };
     #[cfg(unix)]
@@ -817,6 +858,65 @@ mod stale_artifact_tests {
         drop(t);
         drop(txn);
         drop(first);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn only_corruption_variants_trigger_recovery() {
+        use redb::{DatabaseError, StorageError};
+        // Recover: genuine, unrecoverable corruption.
+        assert!(is_unrecoverable_corruption(&DatabaseError::Storage(
+            StorageError::Corrupted("bad magic".into())
+        )));
+        assert!(is_unrecoverable_corruption(&DatabaseError::RepairAborted));
+        // A structurally-invalid file surfaces as Io(InvalidData/UnexpectedEof)
+        // — that IS corruption and SHOULD recover.
+        assert!(
+            is_unrecoverable_corruption(&DatabaseError::Storage(StorageError::Io(
+                std::io::Error::from(std::io::ErrorKind::InvalidData)
+            ))),
+            "a garbage/truncated file (Io InvalidData) is corruption"
+        );
+        // NEVER recover (would destroy data over a transient/fixable condition):
+        assert!(
+            !is_unrecoverable_corruption(&DatabaseError::UpgradeRequired(3)),
+            "a pending format upgrade must NOT nuke the DB"
+        );
+        assert!(
+            !is_unrecoverable_corruption(&DatabaseError::Storage(StorageError::Io(
+                std::io::Error::from(std::io::ErrorKind::StorageFull)
+            ))),
+            "a full disk (Io StorageFull) must NOT nuke the DB"
+        );
+        assert!(!is_unrecoverable_corruption(&DatabaseError::Storage(
+            StorageError::PreviousIo
+        )));
+    }
+
+    #[test]
+    fn a_corrupt_database_is_recovered_with_a_timestamped_bak() {
+        let d = tmpdir("corrupt");
+        let path = d.join("lychi.redb");
+        // Garbage that isn't a valid redb file → redb reports Corrupted on open.
+        std::fs::write(&path, b"this is not a redb database, just garbage bytes").unwrap();
+
+        let db = open_database(&path);
+        assert!(db.is_ok(), "a corrupt file must recover to a fresh DB");
+
+        // The corrupt original was moved aside under a UNIQUE, timestamped name
+        // (not the old fixed `redb.bak`, which a second incident would clobber).
+        let baks: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("lychi.redb.bak."))
+            .collect();
+        assert_eq!(baks.len(), 1, "exactly one timestamped .bak, got: {baks:?}");
+        assert!(
+            !path.with_extension("redb.bak").exists(),
+            "the fixed-name .bak must no longer be used"
+        );
+
+        drop(db);
         let _ = std::fs::remove_dir_all(&d);
     }
 

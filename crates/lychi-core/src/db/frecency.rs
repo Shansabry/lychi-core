@@ -251,6 +251,17 @@ fn commit_write(txn: redb::WriteTransaction) -> Result<(), LychiError> {
     Ok(())
 }
 
+/// Force the read cache to re-read on the next access.
+///
+/// For writers that DON'T go through `commit_write` — notably backup restore,
+/// which replaces the FRECENCY table rows inside its own transaction. Without
+/// this bump the in-process cache keeps serving the pre-restore scores, so the
+/// launcher ranks by data the user just restored away. Cheap; the next
+/// `with_entries` re-reads once.
+pub fn invalidate() {
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
 /// Run `f` over every entry, reading from cache when the table has not changed.
 ///
 /// Takes a closure rather than returning the Vec so the cached entries are

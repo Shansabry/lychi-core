@@ -2,7 +2,7 @@
 import { Check, Copy, FolderOpen, Globe, RefreshCw, Sparkles, TriangleAlert } from "lucide-svelte";
 import { answerRevealPath } from "$lib/answerActions";
 import { getComboString, matchesAction } from "$lib/keybindings";
-import { renderMarkdown } from "$lib/markdown";
+import { renderMarkdown, renderStreamingMarkdown } from "$lib/markdown";
 import { sanitizeSvg } from "$lib/sanitize";
 
 type ToolStep = {
@@ -101,7 +101,44 @@ let {
 } = $props();
 
 const md = renderMarkdown;
-let html = $derived(md(text));
+
+// Rendering the streamed answer is the WebKitGTK hot path. `md()` runs
+// marked + highlight.js + DOMPurify over the WHOLE accumulated text, and the
+// naive `$derived(md(text))` re-ran it on EVERY token — O(n²) across a long
+// answer, and each pass re-highlights every code block already on screen.
+//
+// So THROTTLE while streaming: coalesce a burst of tokens into ONE render per
+// animation frame. `text` still updates every token (the state is live), but we
+// only re-`md()` once per frame — the eye can't see faster than that anyway. The
+// moment streaming ends we render the final text SYNCHRONOUSLY, so the settled
+// answer is always complete and correct (never a frame behind).
+let html = $state("");
+let renderScheduled = false;
+$effect(() => {
+	// Track the inputs so the effect re-runs when either changes.
+	const currentText = text;
+	const isStreaming = streaming;
+
+	if (!isStreaming) {
+		// Settled (or not streaming at all): render the FINAL text with the plain
+		// renderer (no streaming repair — the answer is complete), immediately,
+		// and drop any pending frame so a stale one can't overwrite it.
+		renderScheduled = false;
+		html = md(currentText);
+		return;
+	}
+	// Streaming: at most one render per frame, and repair dangling markdown first
+	// so a mid-token cut (unclosed code fence, half-link) doesn't flash a broken
+	// layout.
+	if (renderScheduled) return;
+	renderScheduled = true;
+	requestAnimationFrame(() => {
+		renderScheduled = false;
+		// Re-read the LATEST text at paint time, not the value captured when the
+		// frame was scheduled — several tokens may have arrived since.
+		html = renderStreamingMarkdown(text);
+	});
+});
 
 // The filesystem path the answer produced (if any), so we can offer an "Open
 // folder" action instead of the model's "you can open it as needed" prose. The
@@ -173,6 +210,13 @@ function onTranscriptScroll() {
 let wasStreaming = $state(false);
 $effect(() => {
 	if (streaming && !wasStreaming) stick = true;
+	// The answer just SETTLED (streaming → done) and the follow-up box is now the
+	// footer (not the quick fork card, not an approval prompt). Autofocus it so the
+	// natural next action — asking a follow-up — needs no click. Enter still sends;
+	// the empty-box + path case (Open folder) is handled in onReplyKeydown.
+	if (wasStreaming && !streaming && !quick && !approval) {
+		focusReply();
+	}
 	wasStreaming = streaming;
 });
 
@@ -262,14 +306,13 @@ $effect(() => {
 	});
 });
 
-// The reply box only shows when idle (not streaming, no pending approval) and
-// there's an answer to follow up on. Enter sends; the input keeps focus.
-// Focus does NOT auto-shift here — the launcher input stays primary. It's
-// shifted explicitly (via `focusReply`) only when the user acts: clicks
-// "Full chat" or opens a recalled conversation.
+// The reply box shows when idle (not streaming, no pending approval) with an
+// answer to follow up on. Enter sends. It is autofocused when the answer settles
+// (see the streaming-transition effect above) so a follow-up needs no click, and
+// also focused on explicit intent (Full chat / opening a recalled conversation).
 let replyEl: HTMLInputElement | undefined = $state();
 
-/** Move focus to the reply box. Called from the parent on explicit user intent. */
+/** Move focus to the reply box. */
 export function focusReply() {
 	requestAnimationFrame(() => replyEl?.focus());
 }

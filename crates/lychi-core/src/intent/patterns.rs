@@ -8,46 +8,12 @@
 
 use crate::action_registry::registry::ActionRegistry;
 
-/// Shorthand colon-prefix triggers → handler id. Longest match wins (multi-char
-/// prefixes are checked before single-char). This is the single source of truth
-/// for both routing (see `route`) and the dynamic Guide's Triggers list, so the
-/// two never drift.
-pub static COLON_TRIGGERS: &[(&str, &str)] = &[
-    ("bm:", "bm"),
-    ("cl:", "clip"),
-    ("sym:", "sym"),
-    ("sys:", "system"),
-    ("si:", "sysinfo"),
-    ("yt:", "yt"),
-    ("e:", "emoji"),
-    ("u:", "unicode"),
-    ("w:", "web"),
-    ("r:", "run"),
-    ("c:", "calc"),
-    ("f:", "file"),
-    ("o:", "open"),
-    ("n:", "note"),
-    ("m:", "media"),
-    ("p:", "project"),
-    ("tz:", "time"),
-    ("al:", "alias"),
-    ("sn:", "snip"),
-    ("tm:", "timer"),
-    ("rm:", "reminder"),
-];
-
-/// The structural (character-sigil) triggers — input shapes that route without a
-/// keyword. These are truly structural (defined in code below), so they're a
-/// small fixed set paired here with a human description for the Guide.
-pub static SIGIL_TRIGGERS: &[(&str, &str)] = &[
-    ("=", "Evaluate a math or unit/currency expression"),
-    (">", "Run a shell command"),
-    ("/", "Fuzzy-search files"),
-    ("~/", "Open a path from home"),
-    ("@", "Reference a file inside a command"),
-    ("#hex", "Preview a hex color"),
-    ("example.com", "Open a URL"),
-];
+// The trigger tables now live in the leaf `crate::triggers` module so the
+// action-registry's Guide catalog can read them without importing UP into
+// `intent` (which reverses the brick graph — see EXEC-7). Re-exported here so
+// `intent::patterns::{COLON_TRIGGERS, SIGIL_TRIGGERS}` still resolves for the
+// router below and its existing callers.
+pub use crate::triggers::{COLON_TRIGGERS, SIGIL_TRIGGERS};
 
 /// Common TLDs for URL detection.
 const TLDS: &[&str] = &[

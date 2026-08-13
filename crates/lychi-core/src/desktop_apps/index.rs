@@ -242,20 +242,16 @@ impl AppIndex {
 
     /// Best single match for a query. Returns `(id, score)`.
     /// Used by Phase 3: score ≥ AUTO_LAUNCH_THRESHOLD → route to "open".
+    ///
+    /// Delegates to `candidates()` so the tie-break is the SAME deterministic
+    /// comparator (score desc → shorter name → stable id). The old code did a
+    /// bare `max_by(partial_cmp().unwrap())` over candidates gathered from a
+    /// HashSet: with duplicate installs that score equally (flatpak + rpm both
+    /// 1.0) `max_by` returned whichever the set happened to yield last, so WHICH
+    /// variant launched varied run to run. `partial_cmp().unwrap()` also panics
+    /// on a NaN score. One decider now — no divergence, no panic.
     pub fn best_match(&self, query: &str) -> Option<(usize, f32)> {
-        let norm = query_norm(query);
-        if norm.is_empty() {
-            return None;
-        }
-
-        let candidates = self.gather_candidates(&norm);
-        if candidates.is_empty() {
-            return None;
-        }
-
-        let (id, score) = candidates
-            .into_iter()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())?;
+        let (id, score) = self.candidates(query, 1).into_iter().next()?;
         if score >= CANDIDATE_THRESHOLD {
             Some((id, score))
         } else {
@@ -278,8 +274,10 @@ impl AppIndex {
         // are meant to be resolved by frecency downstream and by the objective
         // app-nature nudge in score().
         scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            // `total_cmp`, not `partial_cmp().unwrap_or(Equal)`: a total order over
+            // f32 that's consistent even for NaN / signed zero, so the sort is
+            // fully deterministic. (b vs a → descending by score.)
+            b.1.total_cmp(&a.1)
                 .then_with(|| self.entry(a.0).name.len().cmp(&self.entry(b.0).name.len()))
                 .then_with(|| a.0.cmp(&b.0))
         });
@@ -610,6 +608,35 @@ pub(crate) mod tests {
                 Some("org.gnome.Nautilus"),
             ),
         ])
+    }
+
+    #[test]
+    fn best_match_is_deterministic_for_duplicate_installs() {
+        // Two installs of the same app (e.g. flatpak + native) — identical name,
+        // so both exact-match "signal" and score the same. The bug: `best_match`
+        // took `max_by` over a HashSet-ordered candidate list, so WHICH id won a
+        // tie varied by run. It must now resolve to the SAME id every call.
+        let idx = AppIndex::build(vec![
+            make_entry("Signal", "/usr/bin/signal-desktop", &["chat"], None, None),
+            make_entry(
+                "Signal",
+                "/var/lib/flatpak/exports/bin/org.signal.Signal",
+                &["chat"],
+                None,
+                None,
+            ),
+        ]);
+        let first = idx.best_match("signal").expect("signal must match");
+        // Many calls — a nondeterministic tie-break would eventually differ.
+        for _ in 0..50 {
+            assert_eq!(
+                idx.best_match("signal"),
+                Some(first),
+                "best_match must be stable across runs for a tied query"
+            );
+        }
+        // And it agrees with candidates()' top row (same comparator).
+        assert_eq!(idx.candidates("signal", 1).first().copied(), Some(first));
     }
 
     #[test]

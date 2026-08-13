@@ -41,6 +41,9 @@ pub const ARCHIVE_VERSION: u32 = 1;
 const MANIFEST_NAME: &str = "manifest.json";
 /// Directory inside the archive holding the exported database tables.
 const DB_DIR: &str = "db";
+/// Directory inside the archive holding clipboard image PNGs (their DB rows
+/// carry the on-disk paths, so the files must ride along or restore dangles).
+const CLIP_IMAGES_DIR: &str = "clipboard-images";
 
 /// How many automatic backups to keep. Manual ones are never auto-pruned —
 /// a user who clicked "Back up now" before doing something risky should not
@@ -96,6 +99,12 @@ pub struct Manifest {
     pub has_config: bool,
     #[serde(default)]
     pub has_scripts: bool,
+    /// Clipboard image PNGs. The DB rows only hold the image PATHS, so without
+    /// the files themselves a restore leaves dangling references — and the
+    /// startup orphan-GC then deletes the PNGs the restored (older) rows don't
+    /// mention. Archiving the dir keeps a restore round-trip lossless.
+    #[serde(default)]
+    pub has_clipboard_images: bool,
 }
 
 impl Manifest {
@@ -205,6 +214,7 @@ pub fn create(
 
     let config_path = crate::paths::config_file();
     let scripts_path = crate::paths::scripts_dir();
+    let clip_images_path = crate::paths::clipboard_images_dir();
     let manifest = Manifest {
         archive_version: ARCHIVE_VERSION,
         app_version: app_version.to_string(),
@@ -215,6 +225,7 @@ pub fn create(
         schema_version: crate::db::SCHEMA_VERSION,
         has_config: config_path.is_file(),
         has_scripts: scripts_path.is_dir(),
+        has_clipboard_images: dir_has_files(&clip_images_path),
     };
 
     {
@@ -239,6 +250,9 @@ pub fn create(
         }
         if manifest.has_scripts {
             append_dir(&mut tar, &scripts_path, "config/scripts")?;
+        }
+        if manifest.has_clipboard_images {
+            append_dir(&mut tar, &clip_images_path, CLIP_IMAGES_DIR)?;
         }
 
         // Finish the gzip stream and fsync before the rename, so the rename
@@ -396,6 +410,7 @@ pub fn restore(
     let mut dumps: Vec<TableDump> = Vec::new();
     let mut config: Option<Vec<u8>> = None;
     let mut scripts: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    let mut clip_images: Vec<(PathBuf, Vec<u8>)> = Vec::new();
 
     for entry in open_archive(archive)?.entries()? {
         let mut entry = entry?;
@@ -416,20 +431,14 @@ pub fn restore(
             dumps.push(dump);
         } else if name == "config/config.toml" {
             config = Some(buf);
-        } else if let Some(rest) = name.strip_prefix("config/scripts/") {
-            // Reject anything that would escape the scripts directory. An
-            // archive is untrusted input; `../` in a tar entry is the classic
-            // path-traversal write-anywhere bug.
-            let rel = Path::new(rest);
-            if rel.is_absolute()
-                || rel
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                tracing::warn!("[restore] refusing suspicious archive path: {name}");
-                continue;
-            }
-            scripts.push((rel.to_path_buf(), buf));
+        } else if let Some(rest) = name.strip_prefix("config/scripts/")
+            && let Some(rel) = safe_relative(rest, &name)
+        {
+            scripts.push((rel, buf));
+        } else if let Some(rest) = name.strip_prefix(&format!("{CLIP_IMAGES_DIR}/"))
+            && let Some(rel) = safe_relative(rest, &name)
+        {
+            clip_images.push((rel, buf));
         }
     }
 
@@ -503,6 +512,26 @@ pub fn restore(
             }
         }
     }
+
+    // Restore clipboard image PNGs so the restored rows' path references resolve
+    // (and the startup orphan-GC doesn't then delete them). Written into the SAME
+    // dir the DB rows point at, so no path rewriting is needed.
+    if !clip_images.is_empty() {
+        let base = crate::paths::clipboard_images_dir();
+        fs::create_dir_all(&base)?;
+        for (rel, bytes) in &clip_images {
+            let dest = base.join(rel);
+            if let Some(parent) = dest.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = write_atomic(&dest, bytes);
+        }
+    }
+
+    // Restore rewrote the FRECENCY table directly (not via frecency::commit_write),
+    // so the in-process read cache still holds the PRE-restore scores. Force it to
+    // re-read, or the launcher keeps ranking by data the user just restored away.
+    crate::db::frecency::invalidate();
 
     Ok(RestoreReport {
         tables_restored: dumps.len() as u64,
@@ -681,16 +710,10 @@ fn prune_automatic(dir: &Path) {
 /// Write via temp file + rename, so an interrupted write cannot truncate the
 /// file it was replacing.
 fn write_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = dest.with_extension(format!(
-        "{}.part",
-        dest.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
-    ));
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, dest)
+    // One implementation of the crash-safe write, shared with config::save. The
+    // crate helper also fsyncs the parent directory (this local copy used to skip
+    // that, so a rename could be lost on a crash after it returned).
+    crate::fs_atomic::write_atomic(dest, bytes)
 }
 
 fn append_bytes<W: Write>(
@@ -724,6 +747,33 @@ fn append_dir<W: Write>(
         append_bytes(tar, &name, &bytes)?;
     }
     Ok(())
+}
+
+/// Validate an archive-relative path before writing it under a restore
+/// destination dir. An archive is UNTRUSTED input; an absolute path or a `../`
+/// component in a tar entry is the classic path-traversal write-anywhere bug.
+/// Returns the safe relative path, or `None` (logged) if it must be refused.
+/// One decider, used by every extract-to-a-dir arm (scripts, clipboard images).
+fn safe_relative(rest: &str, full_name: &str) -> Option<PathBuf> {
+    let rel = Path::new(rest);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        tracing::warn!("[restore] refusing suspicious archive path: {full_name}");
+        return None;
+    }
+    Some(rel.to_path_buf())
+}
+
+/// Whether `dir` exists and contains at least one regular file. Used to skip
+/// archiving an empty clipboard-images dir (and to set the manifest flag), so a
+/// backup taken with no image clips doesn't carry an empty marker.
+fn dir_has_files(dir: &Path) -> bool {
+    fs::read_dir(dir)
+        .map(|rd| rd.flatten().any(|e| e.path().is_file()))
+        .unwrap_or(false)
 }
 
 /// `YYYYMMDD-HHMMSS` in UTC, so filenames sort chronologically.

@@ -2163,7 +2163,14 @@ schema_version?: number;
 /**
  * Which optional extras are present.
  */
-has_config?: boolean; has_scripts?: boolean }
+has_config?: boolean; has_scripts?: boolean; 
+/**
+ * Clipboard image PNGs. The DB rows only hold the image PATHS, so without
+ * the files themselves a restore leaves dangling references — and the
+ * startup orphan-GC then deletes the PNGs the restored (older) rows don't
+ * mention. Archiving the dir keeps a restore round-trip lossless.
+ */
+has_clipboard_images?: boolean }
 /**
  * The presentational split of a user turn: the instruction line shown in the
  * bubble plus the payload folded into a collapsed chip. Computed ONCE by the

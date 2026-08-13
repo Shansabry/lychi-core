@@ -263,6 +263,39 @@ fn config_and_scripts_round_trip() {
     assert!(scripts.join("hello.sh").exists());
 }
 
+/// DATA-8: clipboard image PNGs must ride along in the archive and come back on
+/// restore. Without this a restore round-trip leaves the rows' path references
+/// dangling and the startup orphan-GC deletes the images.
+#[test]
+fn clipboard_images_round_trip() {
+    let sb = Sandbox::new("clipimg");
+    let db = test_db(&sb);
+
+    let imgdir = crate::paths::clipboard_images_dir();
+    fs::create_dir_all(&imgdir).unwrap();
+    let png = imgdir.join("abc123.png");
+    // A minimal but real PNG signature + some bytes.
+    fs::write(&png, b"\x89PNG\r\n\x1a\nfake-image-bytes").unwrap();
+
+    let info = create(&db, BackupKind::Manual, "t", "0.1.0").unwrap();
+    assert!(
+        info.manifest.as_ref().unwrap().has_clipboard_images,
+        "the backup must record that it carries image files"
+    );
+
+    // Simulate the loss: the PNG is deleted (as the orphan-GC would).
+    fs::remove_file(&png).unwrap();
+    assert!(!png.exists());
+
+    restore(&db, Path::new(&info.path), "0.1.0").unwrap();
+    assert!(png.exists(), "the clipboard image must be restored to disk");
+    assert_eq!(
+        fs::read(&png).unwrap(),
+        b"\x89PNG\r\n\x1a\nfake-image-bytes",
+        "the exact bytes must round-trip"
+    );
+}
+
 /// An archive is untrusted input: a `../` entry must never write outside the
 /// scripts directory.
 #[test]
@@ -377,6 +410,7 @@ fn restorability_is_reported_for_the_ui() {
         schema_version: crate::db::SCHEMA_VERSION,
         has_config: false,
         has_scripts: false,
+        has_clipboard_images: false,
     };
     let ok = BackupInfo {
         path: "/x".into(),

@@ -7,6 +7,7 @@ import {
 	createBackup,
 	deleteBackup,
 	listBackups,
+	restartApp,
 	restoreBackup,
 	revealPath,
 } from "$lib/ipc";
@@ -23,6 +24,10 @@ let busy = $state(false);
 let confirmingRestore = $state<string | null>(null);
 let confirmingDelete = $state<string | null>(null);
 let status = $state("");
+/** A restore just landed. The running Executor still holds the PRE-restore
+ *  config (quicklinks, shell policy, project dirs — all baked in at startup), so
+ *  only a restart fully applies the restored state. Show a one-click restart. */
+let needsRestart = $state(false);
 
 async function refresh() {
 	[backups, appVersion, dir] = await Promise.all([listBackups(), appVersionString(), backupsDir()]);
@@ -57,6 +62,9 @@ const doRestore = (name: string) =>
 	run("Restoring", async () => {
 		confirmingRestore = null;
 		const r = await restoreBackup(name);
+		// The DB is restored live, but the executor's config-derived state is
+		// stale until a restart — surface the one-click restart below.
+		needsRestart = true;
 		// Name the safety backup: the user just overwrote their data and the
 		// single most useful thing to tell them is how to undo it.
 		return `Restored ${r.rows_restored} rows. Previous state saved as ${r.safety_backup}`;
@@ -134,6 +142,13 @@ function isNewer(a: string, b: string): boolean {
 
 		{#if status}
 			<p class="status">{status}</p>
+		{/if}
+
+		{#if needsRestart}
+			<div class="restart-note">
+				<span>Restart Lychi to finish applying the restored settings.</span>
+				<button class="restart-btn" onclick={() => restartApp()}>Restart now</button>
+			</div>
 		{/if}
 
 		{#if backups.length === 0}
@@ -248,6 +263,33 @@ function isNewer(a: string, b: string): boolean {
 		font-size: 11px;
 		font-family: var(--font-mono);
 		color: var(--accent);
+	}
+
+	.restart-note {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 10px;
+		padding: 8px 10px;
+		border-radius: 6px;
+		border: 1px solid color-mix(in srgb, var(--warning-muted) 40%, var(--border));
+		background: color-mix(in srgb, var(--warning-muted) 10%, transparent);
+		color: var(--warning-muted);
+		font-size: 12px;
+	}
+	.restart-btn {
+		flex-shrink: 0;
+		padding: 4px 10px;
+		border-radius: 5px;
+		border: 1px solid color-mix(in srgb, var(--warning-muted) 45%, var(--border));
+		background: none;
+		color: var(--warning-muted);
+		font-family: var(--font-sans);
+		font-size: 11px;
+		cursor: pointer;
+	}
+	.restart-btn:hover {
+		background: color-mix(in srgb, var(--warning-muted) 15%, transparent);
 	}
 
 	.list {

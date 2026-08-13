@@ -49,7 +49,12 @@ impl Config {
         }
         let toml_str =
             toml::to_string_pretty(self).map_err(|e| LychiError::Config(e.to_string()))?;
-        fs::write(path, toml_str)?;
+        // Crash-safe: a bare `fs::write` truncates in place, so a crash mid-write
+        // leaves a corrupt `config.toml` — and quicklinks (user-authored, NOT in
+        // the DB sync set) would be lost on the next start's reset-to-defaults.
+        // The atomic writer swaps the file in whole, fsync'd. (config → fs_atomic
+        // only; must NOT reach into `backup`, which depends on config.)
+        crate::fs_atomic::write_atomic(path, toml_str.as_bytes())?;
         Ok(())
     }
 
