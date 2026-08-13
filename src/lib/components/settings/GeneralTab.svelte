@@ -1,16 +1,9 @@
 <script lang="ts">
-import { Moon, Sun, X } from "lucide-svelte";
-import type {
-	CommandsConfig,
-	FontFamily,
-	GeneralConfig,
-	HotkeyStatus,
-	PrivacyConfig,
-} from "$lib/ipc";
+import { X } from "lucide-svelte";
+import type { CommandsConfig, GeneralConfig, HotkeyStatus, PrivacyConfig } from "$lib/ipc";
 import {
 	getAutostartEnabled,
 	getHotkeyStatus,
-	getInstalledFonts,
 	getInstalledTerminals,
 	recordHotkey,
 	restartApp,
@@ -20,9 +13,7 @@ import {
 	setAutostartEnabled,
 	setHotkey,
 } from "$lib/ipc";
-import { ACCENTS, resolveAccent, type Theme, type ThemeMode } from "$lib/theme";
 import Select from "../Select.svelte";
-import FontPicker from "./FontPicker.svelte";
 
 let {
 	generalConfig = $bindable(),
@@ -152,52 +143,6 @@ async function handleWindowStrategyChange(val: string) {
 	}
 }
 
-// Emit the full theme to the engine (in +layout.svelte) + persist. One helper
-// for both mode and accent so the applier stays centralized.
-// Installed font families, loaded once for the two pickers. Fire-and-forget:
-// enumerating shells out to fontconfig, and blocking the panel's first paint on
-// it would be a bad trade for a dropdown most users never open.
-let fontFamilies = $state<FontFamily[]>([]);
-$effect(() => {
-	getInstalledFonts()
-		.then((f) => {
-			fontFamilies = f;
-		})
-		.catch(() => {
-			// No fontconfig — the pickers stay empty and the CSS stack applies.
-		});
-});
-
-async function applyAndSaveTheme() {
-	const theme: Theme = {
-		mode: (generalConfig.theme as ThemeMode) ?? "dark",
-		accent: generalConfig.accent ?? "",
-		fontFamily: generalConfig.font_family ?? "",
-	};
-	window.dispatchEvent(new CustomEvent<Theme>("lychi-theme-change", { detail: theme }));
-	try {
-		await saveGeneralConfig(generalConfig);
-	} catch (err) {
-		console.error("[settings] Failed to save theme:", err);
-		onsaveerror(`Failed to save: ${err}`);
-	}
-}
-
-async function handleThemeChange(val: string) {
-	generalConfig.theme = val;
-	await applyAndSaveTheme();
-}
-
-async function handleAccentChange(val: string) {
-	generalConfig.accent = val;
-	await applyAndSaveTheme();
-}
-
-async function handleFontChange(val: string) {
-	generalConfig.font_family = val;
-	await applyAndSaveTheme();
-}
-
 function handleShellSelect(val: string) {
 	if (val === "__custom__") {
 		customShell = true;
@@ -277,64 +222,6 @@ async function handleTerminalChange(val: string) {
 		{/if}
 	</div>
 {/if}
-<div class="field">
-	<span class="field-label">Theme</span>
-	<div class="theme-toggle">
-		<button
-			class="theme-option"
-			class:active={generalConfig.theme === "dark"}
-			onclick={() => handleThemeChange("dark")}
-			title="Dark"
-		>
-			<Moon size={14} />
-		</button>
-		<button
-			class="theme-option"
-			class:active={generalConfig.theme === "light"}
-			onclick={() => handleThemeChange("light")}
-			title="Light"
-		>
-			<Sun size={14} />
-		</button>
-	</div>
-</div>
-<div class="field">
-	<span class="field-label">Accent</span>
-	<div class="accent-swatches">
-		{#each ACCENTS as swatch (swatch.id)}
-			{@const isDefault = swatch.id === "default"}
-			{@const preview = resolveAccent(swatch.id, (generalConfig.theme as ThemeMode) ?? "dark")}
-			<button
-				class="accent-swatch"
-				class:active={(generalConfig.accent ?? "") === swatch.id
-					|| (isDefault && !generalConfig.accent)}
-				class:is-default={isDefault}
-				style={preview ? `--swatch: ${preview}` : ""}
-				onclick={() => handleAccentChange(swatch.id === "default" ? "" : swatch.id)}
-				title={swatch.label}
-				aria-label={swatch.label}
-				aria-pressed={(generalConfig.accent ?? "") === swatch.id}
-			></button>
-		{/each}
-	</div>
-</div>
-<!-- One font for the whole interface. The list is what's actually installed
-     (via fontconfig) rather than a canned set, so every option is one this
-     machine can render, and the choice is prepended to the CSS stack so
-     uninstalling the font later degrades to the fallbacks instead of breaking. -->
-<div class="field">
-	<label for="font-family">Font</label>
-	<FontPicker
-		value={generalConfig.font_family ?? ""}
-		fonts={fontFamilies}
-		onchange={handleFontChange}
-	/>
-</div>
-<div class="field-hint font-hint">
-	Applies across the app. Each option is shown in its own typeface. Command
-	output stays fixed-width whatever you pick, so tables and
-	<code>git status</code> keep their columns.
-</div>
 <div class="field">
 	<label for="autostart">Start at login</label>
 	<button
@@ -679,69 +566,6 @@ async function handleTerminalChange(val: string) {
 		50% { opacity: 0.4; }
 	}
 
-	.theme-toggle {
-		display: flex;
-		border: 1px solid var(--border);
-		border-radius: 4px;
-		overflow: hidden;
-	}
-
-	.theme-option {
-		background: var(--bg-secondary);
-		color: var(--fg-muted);
-		border: none;
-		padding: 5px 14px;
-		font-family: var(--font-mono);
-		font-size: 12px;
-		cursor: pointer;
-		transition: background 100ms ease, color 100ms ease;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-	}
-
-	.theme-option:first-child {
-		border-right: 1px solid var(--border);
-	}
-
-	.theme-option:hover:not(.active) {
-		color: var(--fg);
-	}
-
-	.theme-option.active {
-		background: var(--border);
-		color: var(--fg);
-	}
-
-	.accent-swatches {
-		display: flex;
-		gap: 6px;
-		align-items: center;
-	}
-
-	.accent-swatch {
-		width: 18px;
-		height: 18px;
-		border-radius: 50%;
-		border: 1px solid var(--border);
-		background: var(--swatch, transparent);
-		cursor: pointer;
-		padding: 0;
-		transition: transform 100ms ease, box-shadow 100ms ease;
-	}
-
-	/* The "Default" (monochrome) swatch shows the current --accent + fg split. */
-	.accent-swatch.is-default {
-		background: linear-gradient(135deg, var(--accent) 50%, var(--fg-muted) 50%);
-	}
-
-	.accent-swatch:hover {
-		transform: scale(1.15);
-	}
-
-	.accent-swatch.active {
-		box-shadow: 0 0 0 2px var(--bg-secondary), 0 0 0 3px var(--fg);
-	}
 
 	.checkbox {
 		width: 18px;

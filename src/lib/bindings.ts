@@ -521,6 +521,19 @@ async hideLauncher() : Promise<void> {
     await TAURI_INVOKE("hide_launcher");
 },
 /**
+ * Toggle the launcher's frosted-glass blur, persist it, and apply it live to
+ * the current window (KWin only; a no-op elsewhere — the frontend's CSS frost
+ * fallback covers those compositors).
+ */
+async setCardBlur(enabled: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_card_blur", { enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Given the text after `@`, return filesystem completions.
  * 
  * - Empty or `~` → list home directory
@@ -2063,7 +2076,23 @@ accent: string;
  * Prepended to the CSS stack rather than replacing it, so a font that is
  * later uninstalled degrades to the same fallbacks instead of to nothing.
  */
-font_family?: string; hotkey: string; window_x: number | null; window_y: number | null; 
+font_family?: string; 
+/**
+ * Launcher card background opacity, 0.30–1.00 (1.0 = fully opaque). Drives
+ * the `--card-opacity` CSS variable. Below ~0.30 the text becomes unreadable
+ * over the desktop, so the UI clamps there. See `src/lib/theme.ts`.
+ */
+card_opacity?: number; 
+/**
+ * Launcher card corner radius in px, 0–24. Drives `--card-radius`.
+ */
+corner_radius?: number; 
+/**
+ * Frosted-glass background blur. On KWin it requests real compositor blur
+ * behind the launcher; elsewhere the frontend falls back to a CSS "frost"
+ * tint. Off by default (opt-in, and it only does something where supported).
+ */
+card_blur?: boolean; hotkey: string; window_x: number | null; window_y: number | null; 
 /**
  * Which monitor to open the launcher on: "cursor" or "primary"
  */

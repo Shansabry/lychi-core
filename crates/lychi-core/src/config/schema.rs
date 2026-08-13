@@ -53,6 +53,19 @@ pub struct GeneralConfig {
     /// later uninstalled degrades to the same fallbacks instead of to nothing.
     #[serde(default)]
     pub font_family: String,
+    /// Launcher card background opacity, 0.30–1.00 (1.0 = fully opaque). Drives
+    /// the `--card-opacity` CSS variable. Below ~0.30 the text becomes unreadable
+    /// over the desktop, so the UI clamps there. See `src/lib/theme.ts`.
+    #[serde(default = "default_card_opacity")]
+    pub card_opacity: f32,
+    /// Launcher card corner radius in px, 0–24. Drives `--card-radius`.
+    #[serde(default = "default_corner_radius")]
+    pub corner_radius: u8,
+    /// Frosted-glass background blur. On KWin it requests real compositor blur
+    /// behind the launcher; elsewhere the frontend falls back to a CSS "frost"
+    /// tint. Off by default (opt-in, and it only does something where supported).
+    #[serde(default)]
+    pub card_blur: bool,
     pub hotkey: String,
     pub window_x: Option<i32>,
     pub window_y: Option<i32>,
@@ -70,9 +83,12 @@ impl Default for GeneralConfig {
         Self {
             hide_on_blur: true,
             show_duration_ms: true,
-            theme: "dark".to_string(),
+            theme: "system".to_string(),
             accent: String::new(),
             font_family: String::new(),
+            card_opacity: default_card_opacity(),
+            corner_radius: default_corner_radius(),
+            card_blur: false,
             hotkey: "Super+Space".to_string(),
             window_x: None,
             window_y: None,
@@ -614,6 +630,12 @@ fn host_of(url: &str) -> Option<String> {
     if host.is_empty() { None } else { Some(host) }
 }
 
+fn default_card_opacity() -> f32 {
+    1.0
+}
+fn default_corner_radius() -> u8 {
+    12
+}
 fn default_ai_timeout() -> u64 {
     8
 }

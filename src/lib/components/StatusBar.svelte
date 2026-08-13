@@ -265,7 +265,8 @@ async function togglePlayPause() {
 		font-family: var(--font-mono);
 		font-size: 11px;
 		color: var(--fg-muted);
-		background: var(--bg);
+		/* Transparent — the card surface owns the background/opacity. */
+		background: transparent;
 		gap: 8px;
 	}
 

@@ -6,6 +6,7 @@ import {
 	FolderOpen,
 	Info,
 	Keyboard,
+	Palette,
 	SlidersHorizontal,
 	Sparkles,
 } from "lucide-svelte";
@@ -20,6 +21,7 @@ import type {
 import { KEYBINDINGS_DEFAULTS, PRIVACY_DEFAULTS } from "$lib/ipc";
 import { preloadSettings } from "$lib/preloadCache";
 import AboutTab from "./settings/AboutTab.svelte";
+import AppearanceTab from "./settings/AppearanceTab.svelte";
 import AiTab from "./settings/ai/AiTab.svelte";
 import DataTab from "./settings/DataTab.svelte";
 import GeneralTab from "./settings/GeneralTab.svelte";
@@ -28,7 +30,16 @@ import ProjectsTab from "./settings/ProjectsTab.svelte";
 import SetupTab from "./settings/SetupTab.svelte";
 import ShortcutsTab from "./settings/ShortcutsTab.svelte";
 
-type Tab = "general" | "ai" | "projects" | "shortcuts" | "data" | "guide" | "setup" | "about";
+type Tab =
+	| "general"
+	| "appearance"
+	| "ai"
+	| "projects"
+	| "shortcuts"
+	| "data"
+	| "guide"
+	| "setup"
+	| "about";
 
 let { ondismiss, onpresetchange }: { ondismiss: () => void; onpresetchange?: () => void } =
 	$props();
@@ -69,8 +80,11 @@ let aiConfig: AiConfig = $state({
 let generalConfig: GeneralConfig = $state({
 	hide_on_blur: true,
 	show_duration_ms: true,
-	theme: "dark",
+	theme: "system",
 	accent: "",
+	font_family: "",
+	card_opacity: 1,
+	corner_radius: 12,
 	hotkey: "Super+Space",
 	window_x: null,
 	window_y: null,
@@ -146,6 +160,14 @@ function handleKeydown(e: KeyboardEvent) {
 		</button>
 		<button
 			class="tab-btn"
+			class:active={activeTab === "appearance"}
+			onclick={() => (activeTab = "appearance")}
+		>
+			<Palette size={14} strokeWidth={1.5} />
+			<span>Appearance</span>
+		</button>
+		<button
+			class="tab-btn"
 			class:active={activeTab === "ai"}
 			onclick={() => (activeTab = "ai")}
 		>
@@ -214,6 +236,11 @@ function handleKeydown(e: KeyboardEvent) {
 				{layerShellSupported}
 				{activeWindowStrategy}
 				{screenComposited}
+				onsaveerror={(msg) => (saveError = msg)}
+			/>
+		{:else if activeTab === "appearance"}
+			<AppearanceTab
+				bind:generalConfig
 				onsaveerror={(msg) => (saveError = msg)}
 			/>
 		{:else if activeTab === "ai"}

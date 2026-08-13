@@ -107,6 +107,7 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::config::set_autostart_enabled,
         commands::execute::run_row_action,
         commands::config::hide_launcher,
+        commands::config::set_card_blur,
         commands::filesystem::list_path_completions,
         commands::filesystem::fuzzy_path_completions,
         commands::filesystem::list_directories,
@@ -407,6 +408,13 @@ pub fn run() {
                 // WebProcess and leave a blank window behind.
                 platform::harden_webview(&win);
                 platform::init_window(&win, &window_strategy);
+                // Seed the frosted-glass blur state from config so a user who had
+                // it on gets it applied on first show (the map-event hook re-applies
+                // it on every subsequent map). KWin-only; a no-op elsewhere.
+                let blur_on = app_state.config.blocking_read().general.card_blur;
+                if blur_on {
+                    platform::apply_card_blur(&win, true);
+                }
                 platform::setup_dismiss_on_blur(
                     &win,
                     app_state.dismiss_armed.clone(),

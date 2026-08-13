@@ -1,6 +1,8 @@
 #[cfg(target_os = "linux")]
 mod kde_taskbar;
 #[cfg(target_os = "linux")]
+pub mod kwin_blur;
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::*;

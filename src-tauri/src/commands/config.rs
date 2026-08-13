@@ -424,6 +424,31 @@ pub fn hide_launcher(app: AppHandle) {
     }
 }
 
+/// Toggle the launcher's frosted-glass blur, persist it, and apply it live to
+/// the current window (KWin only; a no-op elsewhere — the frontend's CSS frost
+/// fallback covers those compositors).
+#[tauri::command]
+#[specta::specta]
+pub async fn set_card_blur(
+    app: AppHandle,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<(), LychiError> {
+    {
+        let mut config = state.config.write().await;
+        config.general.card_blur = enabled;
+        config.save(&paths::config_file())?;
+        config_db::save_config_to_db(&state.db, &config)?;
+    }
+    // Apply on the GTK thread against the live window.
+    #[cfg(target_os = "linux")]
+    if let Some(win) = app.get_webview_window("main") {
+        crate::platform::apply_card_blur(&win, enabled);
+    }
+    let _ = &app;
+    Ok(())
+}
+
 /// Change the global hotkey at runtime: unregister old, register new, persist to config.
 #[tauri::command]
 #[specta::specta]

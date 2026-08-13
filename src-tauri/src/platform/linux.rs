@@ -845,10 +845,18 @@ pub fn init_window(window: &WebviewWindow, strategy: &str) {
                     } else {
                         tracing::debug!("[plasma-shell] skip-taskbar applied");
                     }
+                    // Frosted-glass blur (if the user enabled it) via the KWin blur
+                    // protocol — re-applied on every map since GTK recreates the
+                    // wl_surface. A no-op / graceful skip when blur is off or the
+                    // manager isn't offered.
+                    if let Err(e) = crate::platform::kwin_blur::apply_on_map(win) {
+                        tracing::debug!("[blur] apply skipped: {e}");
+                    }
                     glib::Propagation::Proceed
                 });
                 gtk_win.connect_unmap_event(|_, _| {
                     crate::platform::kde_taskbar::mark_unmapped();
+                    crate::platform::kwin_blur::mark_unmapped();
                     glib::Propagation::Proceed
                 });
             } else if wants_fullscreen() {
@@ -899,6 +907,23 @@ pub fn init_window(window: &WebviewWindow, strategy: &str) {
     if setup_ok.is_none() {
         tracing::error!("No GDK screen or monitor available — skipping window hints");
     }
+}
+
+/// Enable/disable the launcher's frosted-glass blur on the live window. Hops to
+/// the GTK thread (Wayland protocol calls must run there). KWin-only: a no-op
+/// where the blur manager isn't offered. Also re-applied on every map by the
+/// map-event hook in init_window, so this only handles the "change it now" case.
+pub fn apply_card_blur(window: &WebviewWindow, enabled: bool) {
+    // Wayland protocol calls must run on the GTK main thread. Tauri's
+    // run_on_main_thread hops there; the closure captures only `enabled` (Copy),
+    // and re-fetches the GTK window on the main thread (the wl pointers are not
+    // Send, so they must not cross the thread boundary).
+    let win = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        if let Ok(gtk_win) = win.gtk_window() {
+            crate::platform::kwin_blur::set_enabled(enabled, &gtk_win);
+        }
+    });
 }
 
 /// Focus and present the window using GTK APIs.

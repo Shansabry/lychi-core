@@ -465,7 +465,9 @@ function handleKeydown(e: KeyboardEvent) {
 		align-items: center;
 		gap: 12px;
 		padding: 16px 20px;
-		background: var(--bg);
+		/* Transparent so the card's (possibly translucent) surface shows through —
+		   the card `main` owns the background + opacity (see +page.svelte). */
+		background: transparent;
 		border-bottom: none;
 		-webkit-app-region: drag;
 	}

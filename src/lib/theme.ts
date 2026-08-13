@@ -11,7 +11,10 @@
  * recolors selection highlights, the prompt, and active states app-wide.
  */
 
-export type ThemeMode = "dark" | "light";
+export type ThemeMode = "dark" | "light" | "system";
+/** A concrete rendered mode — "system" resolved to what the OS is showing.
+ *  Accent/contrast math only ever operates on one of these two. */
+export type ResolvedMode = "dark" | "light";
 
 export interface Theme {
 	mode: ThemeMode;
@@ -33,7 +36,19 @@ export interface Theme {
 	 * falls back to the normal stack instead of to nothing.
 	 */
 	fontFamily?: string;
+	/** Launcher card background opacity, 0.30–1.00. Drives `--card-opacity`. */
+	opacity?: number;
+	/** Launcher card corner radius in px, 0–24. Drives `--card-radius`. */
+	cornerRadius?: number;
+	/** Frosted glass on/off. Real blur is requested from the compositor in the
+	 *  backend; this drives the CSS `--card-frost` tint fallback. */
+	blur?: boolean;
 }
+
+/** Opacity is clamped to a readable floor — below this the text over the desktop
+ *  is unusable — and to 1.0 (fully opaque). Shared by the UI and applyTheme. */
+export const MIN_CARD_OPACITY = 0.3;
+export const MAX_CORNER_RADIUS = 24;
 
 /** A named accent swatch for the settings picker. */
 export interface AccentSwatch {
@@ -82,7 +97,7 @@ export function isHexColor(s: string): boolean {
 // maintaining a second hardcoded palette.
 
 /** The theme background `--accent` text is shown against, per mode. */
-const THEME_BG: Record<ThemeMode, [number, number, number]> = {
+const THEME_BG: Record<ResolvedMode, [number, number, number]> = {
 	dark: [0x0a, 0x0a, 0x0a],
 	light: [0xf5, 0xf5, 0xf5],
 };
@@ -141,7 +156,7 @@ function lighten([r, g, b]: RGB, amount: number): RGB {
  * background. On light mode it darkens the accent; on dark mode it lightens it.
  * If already sufficient, the accent is returned unchanged.
  */
-export function contrastSafeAccent(hex: string, mode: ThemeMode): string {
+export function contrastSafeAccent(hex: string, mode: ResolvedMode): string {
 	const rgb = hexToRgb(hex);
 	if (!rgb) return hex;
 	const bg = THEME_BG[mode];
@@ -168,7 +183,7 @@ export function contrastSafeAccent(hex: string, mode: ThemeMode): string {
  * value; a raw hex is WCAG-adjusted for the mode; "" (or unknown) → null so the
  * base monochrome accent shows.
  */
-export function resolveAccent(accent: string, mode: ThemeMode): string | null {
+export function resolveAccent(accent: string, mode: ResolvedMode): string | null {
 	const a = accent.trim();
 	if (!a) return null;
 	const swatch = ACCENTS.find((s) => s.id === a);
@@ -186,6 +201,13 @@ export function resolveAccent(accent: string, mode: ThemeMode): string | null {
 	return null;
 }
 
+/** The OS's current color-scheme preference, for resolving "system" to a real
+ *  mode (accent values are per-theme, so this picks which one to use). */
+export function systemMode(): ResolvedMode {
+	if (typeof window === "undefined" || !window.matchMedia) return "dark";
+	return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+}
+
 /**
  * Apply a theme to the document. Idempotent; safe to call on every change.
  * - `mode` → `data-theme` (drives the light/dark variable set in app.css).
@@ -194,9 +216,19 @@ export function resolveAccent(accent: string, mode: ThemeMode): string | null {
  */
 export function applyTheme(theme: Theme): void {
 	const root = document.documentElement;
-	root.dataset.theme = theme.mode;
+	// "system" means: don't stamp a data-theme, so app.css's
+	// `@media (prefers-color-scheme)` blocks decide light vs dark (the theme-aware
+	// default state). An explicit "dark"/"light" wins via the [data-theme] rules.
+	if (theme.mode === "system") {
+		delete root.dataset.theme;
+	} else {
+		root.dataset.theme = theme.mode;
+	}
 
-	const value = resolveAccent(theme.accent, theme.mode);
+	// Accent values are per-theme, so resolve "system" to whichever the OS is
+	// currently showing before picking the swatch's light/dark value.
+	const effectiveMode = theme.mode === "system" ? systemMode() : theme.mode;
+	const value = resolveAccent(theme.accent, effectiveMode);
 	if (value) {
 		root.style.setProperty("--accent", value);
 	} else {
@@ -208,6 +240,36 @@ export function applyTheme(theme: Theme): void {
 	// fixed-width whatever the user picks.
 	applyFont(root, "--font-sans", theme.fontFamily, BASE_SANS);
 	applyFont(root, "--font-mono", theme.fontFamily, BASE_MONO);
+
+	// Card opacity: clamp to a readable floor and set as a 0–1 number the card's
+	// translucent background reads (see `main` in +page.svelte). 1.0 (the default)
+	// removes the override so the card is fully opaque as before.
+	const opacity = theme.opacity ?? 1;
+	if (opacity < 1) {
+		root.style.setProperty("--card-opacity", String(Math.max(MIN_CARD_OPACITY, opacity)));
+	} else {
+		root.style.removeProperty("--card-opacity");
+	}
+
+	// Corner radius: clamp to [0, MAX] and set in px. Undefined / the default 12
+	// removes the override so the stylesheet's own radius applies.
+	const radius = theme.cornerRadius;
+	if (radius != null && radius !== 12) {
+		root.style.setProperty(
+			"--card-radius",
+			`${Math.max(0, Math.min(MAX_CORNER_RADIUS, radius))}px`,
+		);
+	} else {
+		root.style.removeProperty("--card-radius");
+	}
+
+	// Frosted-glass CSS fallback tint. Real compositor blur is handled backend-
+	// side (KWin); this only drives the visual frost where blur isn't applied.
+	if (theme.blur) {
+		root.style.setProperty("--card-frost", "1");
+	} else {
+		root.style.removeProperty("--card-frost");
+	}
 }
 
 /**

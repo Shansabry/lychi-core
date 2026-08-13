@@ -2333,12 +2333,41 @@ async function handleDismiss() {
 		/* Positioning context for the ⌘K action panel, which anchors to the
 		   launcher's bottom-right rather than the viewport. */
 		position: relative;
-		background: var(--bg);
+		/* The card surface. Its opacity is user-configurable (--card-opacity, 0–1;
+		   default 1 = fully opaque) via color-mix, and its corner radius via
+		   --card-radius (default 12px). The child surfaces (input bar, panels,
+		   status bar) are transparent and show THIS background, so one translucent
+		   layer reads uniformly instead of stacking opacities. */
+		background: color-mix(
+			in srgb,
+			var(--bg) calc(var(--card-opacity, 1) * 100%),
+			transparent
+		);
 		border: 1px solid var(--border);
-		border-radius: 12px;
+		border-radius: var(--card-radius, 12px);
 		overflow: hidden;
 		box-shadow: 0 8px 32px var(--shadow-overlay);
 		animation: lychi-appear 120ms ease-out;
+	}
+	/* Frosted-glass fallback (--card-frost = 1). Real desktop blur is requested
+	   from the compositor (KWin) in the backend; where that isn't available this
+	   adds a faint light wash + inset highlight so "frost" still reads visually.
+	   A CSS `backdrop-filter` here would be a no-op (it can't see the desktop
+	   behind a transparent webview), so this is a tint, not real blur. */
+	main::before {
+		content: "";
+		position: absolute;
+		inset: 0;
+		pointer-events: none;
+		opacity: var(--card-frost, 0);
+		transition: opacity 150ms ease;
+		background: linear-gradient(
+			135deg,
+			color-mix(in srgb, var(--fg) 6%, transparent),
+			transparent 60%
+		);
+		box-shadow: inset 0 1px 0 color-mix(in srgb, var(--fg) 10%, transparent);
+		border-radius: inherit;
 	}
 
 	.panel-hidden {

@@ -497,6 +497,13 @@ export async function saveGeneralConfig(general: GeneralConfig): Promise<void> {
 	unwrap(await commands.saveGeneralConfig(general));
 }
 
+/** Toggle the launcher's frosted-glass blur (persists + applies live). Real
+ *  compositor blur on KWin; the CSS frost fallback covers other compositors. */
+export async function setCardBlur(enabled: boolean): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.setCardBlur(enabled));
+}
+
 export async function getLayerShellSupported(): Promise<boolean> {
 	if (!isTauri()) return false;
 	return commands.getLayerShellSupported();
