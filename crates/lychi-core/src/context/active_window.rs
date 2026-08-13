@@ -466,14 +466,15 @@ if (w && w.caption && w.pid > 0) {{
     let script_path = std::env::temp_dir().join("lychi_ctx_active.js");
     std::fs::write(&script_path, &script).ok()?;
 
-    let plugin_name = format!(
-        "lychi_ctx_active_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    );
+    // FIXED plugin name (not a unique per-poll one). A unique name meant a
+    // failed `unloadScript` stranded that script inside KWin forever — every
+    // poll added another, billing KWin ~43k compile cycles/day that were never
+    // attributed to us ("KDE feels slow"). With a stable name we unload-then-load
+    // (self-healing): any strand left by a previous poll's failed cleanup is
+    // removed before we load this one, so at most ONE lychi script is ever
+    // resident. Per-process suffix so two Lychi instances don't fight over one
+    // name (the second-instance guard makes that rare, but names must not collide).
+    let plugin_name = format!("lychi_ctx_active_{}", std::process::id());
 
     // 500ms per D-Bus call: these calls answer in single-digit ms on a healthy
     // KWin; 2s was hang detection masquerading as a latency budget, and five of
@@ -481,6 +482,15 @@ if (w && w.caption && w.pid > 0) {{
     // this probe at all (detect_kwin_for_summon), so this only bounds how long
     // the background thread can linger.
     let scripting = conn.with_proxy("org.kde.KWin", "/Scripting", Duration::from_millis(500));
+
+    // Self-heal: drop any strand from a prior poll whose cleanup failed. Ignored
+    // if nothing is loaded under this name (KWin returns an error we don't care
+    // about) — the point is that loadScript below starts from a clean slate.
+    let _ = scripting.method_call::<(), _, _, _>(
+        "org.kde.kwin.Scripting",
+        "unloadScript",
+        (&plugin_name,),
+    );
 
     let (script_id,): (i32,) = scripting
         .method_call(

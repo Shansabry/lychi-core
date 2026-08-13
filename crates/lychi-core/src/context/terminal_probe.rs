@@ -90,22 +90,49 @@ fn dispatch(wm_class: &str, pid: u32, title: &str) -> (Option<String>, ProbeSour
 
 /// Run a subprocess with a timeout, draining stdout via a thread to avoid
 /// pipe deadlock (child fills pipe buffer → blocks on write → never exits).
+///
+/// On timeout we KILL the child instead of abandoning it. The old version moved
+/// the `Child` into the reader thread and, on a wedged probe (e.g. a `kitty @`
+/// socket that never answers), left one stuck child + one blocked thread PER
+/// summon for the rest of uptime (RES-5). Now the outer scope keeps the child
+/// killable: the reader thread only drains stdout, and the timeout arm kills the
+/// child so the reader unblocks and both are reclaimed.
 fn run_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
-    let child = Command::new(cmd)
+    let mut child = Command::new(cmd)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
 
+    // Take stdout so the reader thread can drain it without owning the child.
+    let stdout = child.stdout.take()?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut stdout = stdout;
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(buf);
     });
 
     match rx.recv_timeout(timeout) {
-        Ok(Ok(output)) if output.status.success() => Some(output.stdout),
-        _ => None,
+        Ok(buf) => {
+            // Reader finished (pipe closed = child done). Reap it so it's not a
+            // zombie, then gate on exit status.
+            match child.wait() {
+                Ok(status) if status.success() => Some(buf),
+                _ => None,
+            }
+        }
+        Err(_) => {
+            // Timed out: kill the child so the reader thread's read_to_end returns
+            // and both are reclaimed. wait() reaps the killed child (no zombie).
+            tracing::debug!("terminal_probe: `{cmd}` timed out after {timeout:?} — killing");
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        }
     }
 }
 
@@ -587,5 +614,29 @@ mod tests {
         // Unknown wm_class with pid 0 → probe returns None → title-parse runs
         let result = super::super::cwd::detect(0, "unknown_terminal", "user@host:/tmp");
         assert_eq!(result, Some("/tmp".to_string()));
+    }
+
+    // -- run_with_timeout: no leaked child/thread on timeout (RES-5) --
+
+    #[test]
+    fn run_with_timeout_returns_fast_command_output() {
+        let out = run_with_timeout("echo", &["hello"], Duration::from_secs(2));
+        assert_eq!(out.as_deref(), Some(b"hello\n".as_slice()));
+    }
+
+    #[test]
+    fn run_with_timeout_kills_a_slow_child_and_returns_promptly() {
+        // `sleep 10` would run for 10s; a 150ms timeout must kill it and return
+        // well before then. We assert both the None result AND that we didn't
+        // block for the child's full runtime (proves the child was killed, not
+        // abandoned to finish).
+        let start = std::time::Instant::now();
+        let out = run_with_timeout("sleep", &["10"], Duration::from_millis(150));
+        let elapsed = start.elapsed();
+        assert!(out.is_none());
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "timed-out probe blocked too long ({elapsed:?}) — child not killed"
+        );
     }
 }

@@ -606,6 +606,10 @@ pub fn run() {
                         {
                             tracing::info!("[backup] rolling snapshot saved: {}", b.name);
                         }
+                        // Upkeep: reclaim TTL-expired workspace/context cache entries so
+                        // a long-running session doesn't accumulate entries for closed
+                        // windows (RES-4). Cheap retain over small maps.
+                        lychi_core::context::workspace_cache::sweep_expired();
                     }
                 });
             }
@@ -855,6 +859,17 @@ pub fn run() {
                         tracing::debug!("No MPRIS players found — listener idle");
                     }
 
+                    // Watch for players appearing/disappearing so the merged
+                    // change-stream can be rebuilt (RES-8). Built from the manager
+                    // BEFORE it's moved into the shared cache.
+                    let mut players_changed = match manager.watch_players().await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!("MPRIS player-watch error: {e}");
+                            return;
+                        }
+                    };
+
                     // Cache immediately so media commands work while we set up the stream
                     {
                         let mut guard = mpris_state.write().await;
@@ -862,26 +877,61 @@ pub fn run() {
                     }
                     tracing::info!("[mpris] Manager cached");
 
-                    // Subscribe to changes — read back from cache
-                    let guard = mpris_state.read().await;
-                    let stream = match guard.as_ref().unwrap().subscribe_all_changes().await {
-                        Err(e) => {
-                            tracing::warn!("MPRIS subscribe error: {e}");
-                            return;
+                    // Supervisor loop: consume the merged change-stream, and when the
+                    // set of players changes, refresh the manager and REBUILD the
+                    // stream so a player started after launch (the zero-players-at-
+                    // login case) is picked up instead of being ignored all session.
+                    let mut stream = {
+                        let guard = mpris_state.read().await;
+                        match guard.as_ref().unwrap().subscribe_all_changes().await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!("MPRIS subscribe error: {e}");
+                                return;
+                            }
                         }
-                        Ok(s) => s,
                     };
-                    drop(guard);
 
-                    tokio::pin!(stream);
-                    while let Some(mut track) = stream.next().await {
-                        // Resolve album art to an inline data: URI before pushing,
-                        // so the WebView never makes a remote request (same as the
-                        // poll path in commands::media).
-                        crate::commands::media_art::resolve_track_art(&mut track).await;
-                        let _ = media_handle.emit("lychi://media-track", &track);
+                    loop {
+                        tokio::select! {
+                            item = stream.next() => match item {
+                                Some(mut track) => {
+                                    // Resolve album art to an inline data: URI before
+                                    // pushing, so the WebView never makes a remote
+                                    // request (same as the poll path in commands::media).
+                                    crate::commands::media_art::resolve_track_art(&mut track).await;
+                                    let _ = media_handle.emit("lychi://media-track", &track);
+                                }
+                                // The merged stream ended (all players gone). Replace
+                                // it with a never-ready stream so this branch can't
+                                // busy-loop on None; the watcher wakes us when a
+                                // player reappears and rebuilds a live stream.
+                                None => {
+                                    tracing::debug!("[mpris] change-stream idle (no players)");
+                                    stream = Box::pin(futures_util::stream::pending());
+                                }
+                            },
+                            changed = players_changed.next() => {
+                                if changed.is_none() {
+                                    tracing::info!("[mpris] player watcher ended — supervisor exiting");
+                                    break;
+                                }
+                                // A player appeared or vanished: re-scan and rebuild.
+                                let mut guard = mpris_state.write().await;
+                                if let Some(mgr) = guard.as_mut()
+                                    && let Err(e) = mgr.refresh().await
+                                {
+                                    tracing::warn!("[mpris] refresh after player change failed: {e}");
+                                }
+                                if let Some(mgr) = guard.as_ref() {
+                                    match mgr.subscribe_all_changes().await {
+                                        Ok(s) => stream = s,
+                                        Err(e) => tracing::warn!("[mpris] resubscribe failed: {e}"),
+                                    }
+                                }
+                            }
+                        }
                     }
-                    tracing::info!("MPRIS D-Bus stream ended");
                 });
             }
 

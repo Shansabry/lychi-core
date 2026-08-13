@@ -494,6 +494,36 @@ impl MprisManager {
         }
         Ok(Box::pin(select_all))
     }
+
+    /// A stream that yields once every time an MPRIS player appears or
+    /// disappears on the bus (a `NameOwnerChanged` for `org.mpris.MediaPlayer2.*`).
+    ///
+    /// The push listener builds its merged change-stream over the players that
+    /// exist RIGHT NOW (`subscribe_all_changes`). Launched at login there are
+    /// usually zero, so that stream is empty forever and a player started later
+    /// is never observed (RES-8). The supervisor uses this to know WHEN to
+    /// `refresh()` + rebuild the merged stream.
+    pub async fn watch_players(
+        &self,
+    ) -> Result<std::pin::Pin<Box<dyn futures_core::Stream<Item = ()> + Send>>, LychiError> {
+        use futures_util::StreamExt;
+
+        let dbus = zbus::fdo::DBusProxy::new(&self.conn)
+            .await
+            .map_err(|e| LychiError::ExecutionFailed(e.to_string()))?;
+        let changes = dbus
+            .receive_name_owner_changed()
+            .await
+            .map_err(|e| LychiError::ExecutionFailed(e.to_string()))?;
+
+        let stream = changes.filter_map(|signal| async move {
+            match signal.args() {
+                Ok(args) if args.name().starts_with(MPRIS_PREFIX) => Some(()),
+                _ => None,
+            }
+        });
+        Ok(Box::pin(stream))
+    }
 }
 
 impl TrackInfo {
