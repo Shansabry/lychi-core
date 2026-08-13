@@ -239,12 +239,8 @@ pub fn classify_string(
             // NOT be corrected — that would convert the question into a command.
             // The completions list still offers it as a clickable row; routing
             // stays match-first, AI-last, and the user decides.
-            if let Some(corrected) = crate::intent::typo_suggest::suggest_kind(
-                trimmed,
-                registry,
-                crate::intent::typo_suggest::Kind::TypoOnly,
-            )
-            .and_then(|item| item.description)
+            if let Some(corrected) = crate::intent::typo_suggest::suggest(trimmed, registry)
+                .and_then(|item| item.description)
             {
                 return RouteDecision::Correct { corrected };
             }

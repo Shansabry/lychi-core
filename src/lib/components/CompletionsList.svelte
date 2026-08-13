@@ -2,11 +2,12 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
 	AppWindow,
+	Bot,
 	Clock,
 	Folder,
+	Globe,
 	Lightbulb,
 	LoaderCircle,
-	MessageSquare,
 	Pin,
 	Terminal,
 	TriangleAlert,
@@ -200,8 +201,10 @@ function formatSize(bytes: number | null | undefined): string {
 		{@const isClipImage = item?.icon_path === "__clipboard_image__"}
 		{@const isAiChat = item?.icon_path === "__ai_chat__"}
 		{@const isPinned = item?.icon_path === ICON.pinned}
-		{@const isWeb = item?.label?.startsWith("Search web:")}
-		{@const hideIcon = item?.icon_path === ICON.none || item?.icon_path === ICON.web || isWeb || isSeparator}
+		{@const isWeb = item?.icon_path === "__web__"}
+		{@const isSearchWebLegacy = item?.label?.startsWith("Search web:")}
+		{@const isFallbackRow = item?.kind === "ask-ai" || item?.kind === "search-web"}
+		{@const hideIcon = item?.icon_path === ICON.none || item?.icon_path === ICON.web || isSearchWebLegacy || isSeparator}
 		{@const hasCustomIcon = isCustomIcon(item?.icon_path)}
 		{@const noIcon = !item?.icon_path}
 		{@const iconKey = item?.icon_path ?? ""}
@@ -252,7 +255,10 @@ function formatSize(bytes: number | null | undefined): string {
 					<Lightbulb size={20} strokeWidth={1.5} class="icon-info" />
 				</span>
 				<span style:visibility={isAiChat ? "visible" : "hidden"} class="icon-slot">
-					<MessageSquare size={19} strokeWidth={1.5} class="icon-ai-chat" />
+					<Bot size={20} strokeWidth={1.5} class="icon-ai-chat" />
+				</span>
+				<span style:visibility={isWeb ? "visible" : "hidden"} class="icon-slot">
+					<Globe size={19} strokeWidth={1.5} class="icon-web" />
 				</span>
 				<span style:visibility={isPinned ? "visible" : "hidden"} class="icon-slot">
 					<Pin size={20} strokeWidth={1.5} class="icon-pinned" />
@@ -288,10 +294,10 @@ function formatSize(bytes: number | null | undefined): string {
 				<span class="label" class:label-history={isHistory}>{pathContext ? displayName(label) : label}</span>
 				<span
 					class="description"
-					class:confidence-badge={!isContext && !isWeb && !!item?.description}
-					class:web-hint={isWeb && !!item?.description}
-					style:visibility={item?.description ? "visible" : "hidden"}
-				>{item?.description ?? "\u00A0"}</span>
+					class:confidence-badge={!isContext && !isWeb && !isFallbackRow && !!item?.description}
+					class:web-hint={isWeb && !isFallbackRow && !!item?.description}
+					style:visibility={item?.description && !isFallbackRow ? "visible" : "hidden"}
+				>{isFallbackRow ? "\u00A0" : (item?.description ?? "\u00A0")}</span>
 				<span
 					class="description reason-highlight"
 					style:visibility={isContext && item?.reason ? "visible" : "hidden"}

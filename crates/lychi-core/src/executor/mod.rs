@@ -1316,10 +1316,16 @@ fn fallback_rows(raw: &str, has_ai: bool) -> Vec<CompletionItem> {
     if !Executor::wants_fallbacks(q) {
         return Vec::new();
     }
+    // Clean labels ("Ask AI" / "Search web"), with the query kept ONLY in
+    // `description` — NOT echoed into the label. The input is already visible in
+    // the prompt above, so repeating it in the label clutters the row. The
+    // `description` is not rendered as a pill for these fallback kinds (the
+    // frontend hides it — see CompletionsList); it stays because the submit
+    // router reads it to recover the query when the row is chosen.
     let mut rows = Vec::with_capacity(2);
     if has_ai {
         rows.push(CompletionItem {
-            label: format!("Ask AI: {q}"),
+            label: "Ask AI".to_string(),
             icon_path: Some("__ai_chat__".to_string()),
             score: 2,
             description: Some(q.to_string()),
@@ -1328,7 +1334,7 @@ fn fallback_rows(raw: &str, has_ai: bool) -> Vec<CompletionItem> {
         });
     }
     rows.push(CompletionItem {
-        label: format!("Search web: {q}"),
+        label: "Search web".to_string(),
         icon_path: Some("__web__".to_string()),
         score: 1,
         description: Some(q.to_string()),
@@ -2889,12 +2895,13 @@ mod tests {
         }
     }
 
-    /// A naturally-phrased request must surface a "Did you mean" row rather than
-    /// falling silently through to AI. This is the completions half of the
-    /// feature; the routing half deliberately ignores it (see
-    /// `intent::typo_suggest::Kind`), so the user is the one who decides.
+    /// A naturally-phrased request gets NO "Did you mean" row — it is prose for
+    /// the AI, not something to force-fit into a command (see `typo_suggest`,
+    /// which is now app-name-typo only). It still gets the fallback escape hatch,
+    /// and with NO AI configured that is the web fallback (an AI row that leads
+    /// nowhere would be worse than none, since it looks like an answer).
     #[tokio::test]
-    async fn natural_phrasing_offers_a_did_you_mean_row() {
+    async fn natural_phrasing_gets_the_fallback_not_a_correction() {
         let mut r = ActionRegistry::new();
         r.register(Box::new(KeywordHandler));
         r.register(Box::new(StubHandler { id: "web" }));
@@ -2906,16 +2913,16 @@ mod tests {
                 &crate::config::schema::SuggestionsConfig::default(),
             )
             .await;
-        let row = completions
-            .iter()
-            .find(|c| c.kind == Some(crate::action_registry::CompletionKind::Correction))
-            .unwrap_or_else(|| panic!("expected a suggestion row, got: {completions:?}"));
-        assert_eq!(row.description.as_deref(), Some("define gallop"));
 
-        // An escape hatch rides along so a wrong guess isn't a dead end. This
-        // executor has NO AI configured, so "Ask AI" is correctly absent and the
-        // web fallback stands in — an AI row that leads nowhere would be worse
-        // than none, since it looks like an answer.
+        // No correction: prose is not force-fit into a command anymore.
+        assert!(
+            completions
+                .iter()
+                .all(|c| c.kind != Some(crate::action_registry::CompletionKind::Correction)),
+            "prose must not produce a 'Did you mean' row, got: {completions:?}"
+        );
+
+        // No AI provider → "Ask AI" absent, web fallback stands in.
         assert!(!ex.has_ai(), "test executor should have no AI provider");
         assert!(
             completions
@@ -2933,8 +2940,6 @@ mod tests {
             web.run.is_none(),
             "a fallback row carries no `run` to re-parse"
         );
-        // …and ranked below the correction, so the likelier answer stays first.
-        assert!(web.score < row.score);
     }
 
     /// Every `run` string a completion offers must name a REAL registered
@@ -3090,30 +3095,6 @@ mod tests {
         }
     }
 
-    /// A handler that executes but never offers completions — lets a test reach
-    /// the tail of `completions()` (typo suggestion + fallbacks) on a route that
-    /// would otherwise return early with the handler's own rows.
-    struct SilentHandler {
-        id: &'static str,
-    }
-
-    #[async_trait]
-    impl ActionHandler for SilentHandler {
-        fn id(&self) -> &str {
-            self.id
-        }
-        fn description(&self) -> &str {
-            "silent stub"
-        }
-        async fn execute(
-            &self,
-            _ctx: &crate::action_registry::ExecContext,
-            _args: &str,
-        ) -> Result<ActionResult, crate::error::LychiError> {
-            Ok(ActionResult::default())
-        }
-    }
-
     /// A handler with a real trigger that never offers completions — models
     /// `packages` receiving an argument it has no hint for.
     struct SilentTriggerHandler;
@@ -3252,60 +3233,12 @@ mod tests {
         );
     }
 
-    /// An explicit `web` route suppresses the "Did you mean" offer.
-    ///
-    /// The user named the handler they wanted; second-guessing a deliberate
-    /// search with a correction row is the launcher arguing with an explicit
-    /// instruction.
-    #[tokio::test]
-    async fn an_explicit_web_route_suppresses_typo_suggestions() {
-        let mut r = ActionRegistry::new();
-        r.register(Box::new(KeywordHandler));
-        // A SILENT web handler, not the usual `StubHandler`. The guard lives in
-        // the tail of `completions()`, which is only reached when no handler
-        // produced anything; the stub's "Search web: …" row returns from the
-        // earlier branch, so the guard is never consulted and the test passes
-        // with the rule deleted. (Verified by mutation — the first version of
-        // this test did exactly that.)
-        r.register(Box::new(SilentHandler { id: "web" }));
-        let ex = make_executor(r);
-
-        // The SAME text without the route prefix DOES offer the correction, so
-        // the only difference between the two cases is the explicit route.
-        let bare = ex
-            .completions(
-                "definr gallop",
-                &crate::config::schema::SuggestionsConfig::default(),
-            )
-            .await;
-        assert!(
-            bare.iter()
-                .any(|c| c.kind == Some(crate::action_registry::CompletionKind::Correction)),
-            "control case must produce a correction, else this test proves \
-             nothing about suppression; got: {bare:?}"
-        );
-
-        // …but an explicit web route must not.
-        //
-        // The `?` prefix, NOT the `web` keyword: with `web definr gallop` the
-        // first word is itself a registered trigger, so `typo_suggest` declines
-        // on its own (`already_routed`) and the guard is never consulted — the
-        // test would pass with the rule deleted. `?` routes to web while
-        // leaving the first word unrecognised, which is the only shape that
-        // actually exercises the suppression.
-        let routed = ex
-            .completions(
-                "?definr gallop",
-                &crate::config::schema::SuggestionsConfig::default(),
-            )
-            .await;
-        assert!(
-            !routed
-                .iter()
-                .any(|c| c.kind == Some(crate::action_registry::CompletionKind::Correction)),
-            "an explicit web route must not be second-guessed, got: {routed:?}"
-        );
-    }
+    // NOTE: the former `an_explicit_web_route_suppresses_typo_suggestions` test
+    // was removed with the command-typo correction it exercised. "Did you mean"
+    // is now a single-word APP-name typo offer only (see `typo_suggest`), which
+    // depends on the process-global app index a unit test can't seed. The web
+    // suppression guard it protected still stands as the one-line `!is_web_route`
+    // check in `completions()`.
 
     /// The consent rule, end to end: a query that merely CONTAINS an app name
     /// must not produce an auto-selectable row.
@@ -3452,29 +3385,11 @@ mod tests {
         );
     }
 
-    /// The row must be identifiable by a TYPED field, not by its display text.
-    /// Labels get reworded and translated; routing that keys on them breaks
-    /// silently when they do.
-    #[tokio::test]
-    async fn a_correction_row_is_typed_not_label_matched() {
-        let mut r = ActionRegistry::new();
-        r.register(Box::new(KeywordHandler));
-        r.register(Box::new(StubHandler { id: "web" }));
-        let ex = make_executor(r);
-
-        let completions = ex
-            .completions(
-                "can you define gallop",
-                &crate::config::schema::SuggestionsConfig::default(),
-            )
-            .await;
-        let row = completions
-            .iter()
-            .find(|c| c.kind == Some(crate::action_registry::CompletionKind::Correction))
-            .expect("correction row must carry its kind");
-        // The correction to apply lives in a field, not parsed back out of the label.
-        assert_eq!(row.description.as_deref(), Some("define gallop"));
-    }
+    // NOTE: `a_correction_row_is_typed_not_label_matched` was removed — it built
+    // a correction from a multi-word command typo, which "Did you mean" no longer
+    // does (it is app-name-typo only now, needing the process-global app index a
+    // unit test can't seed). The typed-not-label-matched invariant it guarded is
+    // enforced at the source: `typo_suggest::row` always sets `kind: Correction`.
 
     // ── Golden Scenario: resolve_with_clipboard ───────────────────────────
 

@@ -442,16 +442,13 @@ pub async fn suggest_correction(
     state: State<'_, AppState>,
 ) -> Result<Option<String>, LychiError> {
     let executor = state.executor.read().await;
-    // `TypoOnly`: this returns a string the caller FILLS INTO the input, so only
-    // an actual misspelling qualifies. A correctly-spelled command word found
-    // inside a question is a display-only suggestion (see `typo_suggest::Kind`)
-    // and must not rewrite what the user typed.
-    Ok(lychi_core::intent::typo_suggest::suggest_kind(
-        &input,
-        &executor.registry,
-        lychi_core::intent::typo_suggest::Kind::TypoOnly,
+    // `suggest` only ever corrects a MISSPELLED command/app, so the string it
+    // returns is always safe to fill into the input — it never rewrites a
+    // correctly-typed question into a command.
+    Ok(
+        lychi_core::intent::typo_suggest::suggest(&input, &executor.registry)
+            .and_then(|item| item.description),
     )
-    .and_then(|item| item.description))
 }
 
 /// Dynamic command catalog for the Guide — generated from the live action
