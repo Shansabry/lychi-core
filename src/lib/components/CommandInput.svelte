@@ -190,9 +190,23 @@ function shuffle<T>(arr: T[]): T[] {
 }
 
 let placeholderText = $state("");
-let showPlaceholder = $derived(value === "" && !executing);
+// Track page visibility so the typing animation doesn't run while the launcher
+// is hidden (~99% of its life). The webview reports `hidden` when the window is
+// unmapped, so a ~40ms setTimeout loop repainting an off-screen placeholder is
+// pure waste. Resume on show. (FE-8)
+let pageVisible = $state(typeof document === "undefined" || document.visibilityState === "visible");
+$effect(() => {
+	if (typeof document === "undefined") return;
+	const onVis = () => {
+		pageVisible = document.visibilityState === "visible";
+	};
+	document.addEventListener("visibilitychange", onVis);
+	return () => document.removeEventListener("visibilitychange", onVis);
+});
+let showPlaceholder = $derived(value === "" && !executing && pageVisible);
 
-// Run the typing animation loop as a side effect — fully timer-driven
+// Run the typing animation loop as a side effect — fully timer-driven. Gated on
+// `showPlaceholder`, which now includes page visibility, so it stops while hidden.
 $effect(() => {
 	if (!showPlaceholder) {
 		placeholderText = "";

@@ -67,13 +67,23 @@ pub fn init() -> WorkerGuard {
         });
     let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
 
+    // Byte fuse (BLIND-2). Daily retention caps how many files pile up, but says
+    // nothing about ONE day's size — a hidden erroring loop chewed 51MB in a
+    // single day once, unbounded for the 24h until rotation. Wrap the file writer
+    // so that past a per-day byte budget it SAMPLES (keeps ~1 line in 64), which
+    // preserves evidence that the loop is happening while stopping it from filling
+    // the disk. The counter resets when the process restarts or a new day rotates
+    // in (a fresh day is a fresh budget); a genuinely busy-but-bounded day just
+    // rides under the cap.
+    let fused = ByteFuseWriter::new(file_writer, LOG_DAILY_BYTE_BUDGET);
+
     // Each layer gets its own env filter (they can't share one instance).
     let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // File: structured JSON (parseable, aggregatable, pipeline-ready).
     let file_layer = tracing_subscriber::fmt::layer()
         .json()
-        .with_writer(file_writer)
+        .with_writer(fused)
         .with_ansi(false)
         .with_filter(filter());
 
@@ -171,6 +181,90 @@ fn read_resources() -> ResourceSnapshot {
 /// not by the day they describe. Verified against the real crate rather than
 /// assumed: with equal ctimes the retained set is arbitrary.
 const LOG_RETENTION_DAYS: usize = 7;
+
+/// Per-run byte budget for the file log before the fuse starts sampling (BLIND-2).
+/// 20MB is far above a normal day (a healthy session writes single-digit MB) and
+/// well under the 51MB runaway that prompted this. Past it, only ~1 line in
+/// [`LOG_FUSE_SAMPLE`] is written, so a stuck loop leaves a trail without filling
+/// the disk.
+const LOG_DAILY_BYTE_BUDGET: u64 = 20 * 1024 * 1024;
+
+/// Once the budget is blown, keep 1 line in this many (drop the rest).
+const LOG_FUSE_SAMPLE: u64 = 64;
+
+/// A `MakeWriter` that caps how many bytes the file log can take in one run.
+///
+/// Under the budget it's a transparent pass-through. Over it, it samples: only
+/// every [`LOG_FUSE_SAMPLE`]th subsequent line is written, so a runaway loop
+/// leaves evidence (you can still see it's happening) without the file growing
+/// without bound. The byte + line counts are shared across every per-event writer
+/// instance the subscriber makes (`Arc<Atomic…>`), so the cap is process-global.
+#[derive(Clone)]
+struct ByteFuseWriter<W> {
+    inner: W,
+    bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    over_lines: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    budget: u64,
+}
+
+impl<W> ByteFuseWriter<W> {
+    fn new(inner: W, budget: u64) -> Self {
+        Self {
+            inner,
+            bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            over_lines: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            budget,
+        }
+    }
+}
+
+/// The per-event writer handed out by the `MakeWriter`. Each `write` is one log
+/// line; it accounts the bytes and drops the line if we're over budget and this
+/// isn't a sampled one.
+struct FusedLineWriter<W: Write> {
+    inner: W,
+    bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    over_lines: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    budget: u64,
+}
+
+impl<W: Write> Write for FusedLineWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use std::sync::atomic::Ordering;
+        let total = self.bytes.fetch_add(buf.len() as u64, Ordering::Relaxed) + buf.len() as u64;
+        if total <= self.budget {
+            return self.inner.write(buf);
+        }
+        // Over budget: sample. Keep 1 line in LOG_FUSE_SAMPLE so the loop is still
+        // visible; claim the rest as written so the subscriber doesn't error.
+        let n = self.over_lines.fetch_add(1, Ordering::Relaxed);
+        if n.is_multiple_of(LOG_FUSE_SAMPLE) {
+            self.inner.write(buf)
+        } else {
+            Ok(buf.len())
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<'a, W> tracing_subscriber::fmt::MakeWriter<'a> for ByteFuseWriter<W>
+where
+    W: tracing_subscriber::fmt::MakeWriter<'a>,
+{
+    type Writer = FusedLineWriter<W::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        FusedLineWriter {
+            inner: self.inner.make_writer(),
+            bytes: self.bytes.clone(),
+            over_lines: self.over_lines.clone(),
+            budget: self.budget,
+        }
+    }
+}
 
 /// How often [`Upkeep::tick`] runs, independent of the health-log interval.
 ///

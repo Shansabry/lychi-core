@@ -463,8 +463,9 @@ if (w && w.caption && w.pid > 0) {{
 "#
     );
 
-    let script_path = std::env::temp_dir().join("lychi_ctx_active.js");
-    std::fs::write(&script_path, &script).ok()?;
+    // Stage the script at a UNIQUE per-call path in XDG_RUNTIME_DIR (PLAT-4) so
+    // the watcher and the pre-summon snapshot can't overwrite each other's file.
+    let script_path = super::kwin_script::write_temp_script(&script)?;
 
     // FIXED plugin name (not a unique per-poll one). A unique name meant a
     // failed `unloadScript` stranded that script inside KWin forever — every

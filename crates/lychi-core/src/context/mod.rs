@@ -19,6 +19,7 @@ pub mod git;
 pub mod ide;
 pub mod ide_config;
 pub mod ide_proc;
+pub mod kwin_script;
 pub mod metrics;
 pub mod multi_repo;
 pub mod network;

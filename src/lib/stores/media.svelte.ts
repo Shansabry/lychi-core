@@ -46,12 +46,23 @@ class MediaState {
 	 * idle. Returns a disposer that stops the loop. Call once from onMount.
 	 */
 	start = (): (() => void) => {
+		const visible = () => typeof document === "undefined" || document.visibilityState === "visible";
+
 		const scheduleNext = () => {
+			// The launcher is hidden ~99% of its life, and the status pill isn't on
+			// screen then — so don't poll MPRIS over D-Bus while hidden. Keep a slow
+			// heartbeat (in case a visibilitychange is ever missed) but do the real
+			// poll only when visible; showing the window fires an immediate poll. (FE-8)
 			const hasActive = this.players.some((p) => p.status === "playing" || p.status === "paused");
-			this.pollTimer = setTimeout(poll, hasActive ? 5000 : 30000);
+			const delay = !visible() ? 60000 : hasActive ? 5000 : 30000;
+			this.pollTimer = setTimeout(poll, delay);
 		};
 
 		const poll = async () => {
+			if (!visible()) {
+				scheduleNext();
+				return;
+			}
 			try {
 				const players = await mediaGetStatus();
 				this.players = players.filter((p) => p.title || p.status !== "stopped");
@@ -61,8 +72,25 @@ class MediaState {
 			scheduleNext();
 		};
 
+		// On show, poll immediately so the pill is fresh the instant the launcher
+		// appears rather than up to 30s stale.
+		const onVis = () => {
+			if (visible()) {
+				clearTimeout(this.pollTimer);
+				poll();
+			}
+		};
+		if (typeof document !== "undefined") {
+			document.addEventListener("visibilitychange", onVis);
+		}
+
 		poll();
-		return () => clearTimeout(this.pollTimer);
+		return () => {
+			clearTimeout(this.pollTimer);
+			if (typeof document !== "undefined") {
+				document.removeEventListener("visibilitychange", onVis);
+			}
+		};
 	};
 }
 

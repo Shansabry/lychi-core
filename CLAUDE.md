@@ -42,11 +42,26 @@ core/
 │       ├── providers/             # BRICK: AI Providers
 │       │   ├── mod.rs             # AiProvider trait (chat/health_check/name)
 │       │   └── byo.rs             # BYOClient (OpenAI/Anthropic/Groq)
+│       ├── coordinator/           # The streaming tool-calling agent loop
+│       ├── suggestions/           # rank(): the ONE order/consent/default decider
+│       ├── intent/                # (see BRICK above) submit routing + classify
+│       ├── context/               # Window/IDE/terminal/git context gathering
+│       ├── file_search/           # nucleo-backed file index + ranking
+│       ├── desktop_apps/          # .desktop parsing + app match index
+│       ├── clipboard/             # Clipboard history (privacy-aware)
+│       ├── db/                    # redb store + frecency (postcard-encoded rows)
+│       ├── history/               # Command history (redb-backed, dedup)
 │       ├── config/                # TOML config with serde defaults
-│       ├── history/               # JSON file persistence, dedup
+│       ├── ai_history/ ai_presets/ notes/ reminders/ snippets/ pins/ aliases/
+│       │                          # Feature stores (each a small brick)
+│       ├── backup/ setup/ install/ hotkey/ events/                   # Supporting bricks
 │       ├── error.rs               # LychiError (thiserror)
 │       ├── mpris.rs               # MPRIS D-Bus media control (feature-gated)
+│       ├── process_tracker.rs     # PID+start-time process identity
+│       ├── fs_atomic.rs           # Crash-safe atomic file writes
 │       └── paths.rs               # XDG directory resolution
+│   (28 module dirs + ~14 top-level files; the above is the load-bearing subset —
+│    see docs/architecture.md for the full brick table)
 ├── src-tauri/                     # Tauri app — THIN bridge layer
 │   └── src/
 │       ├── lib.rs                 # Tauri Builder setup
@@ -230,7 +245,11 @@ cargo update                 # Update Cargo.lock
 ## Config & Data Paths
 
 - Config: `~/.config/lychi/config.toml` (TOML, serde defaults for all fields)
-- History: `~/.local/share/lychi/history.json`
+- State DB: `~/.local/share/lychi/lychi.redb` — a single redb database holding
+  history, frecency, clipboard, notes/todos, reminders, snippets, aliases, and
+  config mirror. Rows are postcard-encoded and versioned (`[ver][body]` envelope);
+  see `db/` and each feature's `store.rs`. (`0600`; a corrupt DB recovers to a
+  timestamped `.bak` rather than nuking state.)
 - Determined via `directories` crate (XDG-compliant)
 
 ## Key Design Decisions
@@ -241,6 +260,8 @@ cargo update                 # Update Cargo.lock
 4. **Executor is the single orchestrator** — resolve → validate → execute pipeline. Tauri bridge calls only the Executor
 5. **Feature flags for integrations** — compile-time inclusion without crate explosion (e.g. `mpris` feature for D-Bus media control)
 6. **Platform abstraction** — all platform-specific code (GTK, GDK, layer-shell, XDG sockets) lives in `src-tauri/src/platform/linux.rs`. Adding macOS/Windows means creating one new file per platform — zero changes to callers
-7. **Flat files for MVP** — JSON history, TOML config. SQLite in Phase 2+
+7. **redb for state, TOML for config** — one embedded `lychi.redb` (postcard rows,
+   versioned envelopes) holds all mutable state; config stays human-editable TOML.
+   (History began as a JSON file in the MVP; it moved into redb with the rest.)
 8. **SvelteKit SPA** — SSR disabled, adapter-static, single page app
 9. **No CSS framework** — minimal custom CSS, premium feel

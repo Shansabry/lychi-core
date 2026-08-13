@@ -28,6 +28,12 @@ pub struct FrontendLog {
     pub stack: Option<String>,
 }
 
+/// Collapses runs of the SAME frontend message (BLIND-2): a webview loop
+/// logging one line thousands of times shouldn't write thousands of identical
+/// lines. We suppress consecutive duplicates and, when the message finally
+/// changes, note how many were folded.
+static LAST_FRONTEND: std::sync::Mutex<Option<(String, u64)>> = std::sync::Mutex::new(None);
+
 /// Record a frontend event in the backend log.
 ///
 /// Never fails: a logging call that can error is a logging call that gets
@@ -40,6 +46,26 @@ pub fn log_frontend(entry: FrontendLog) {
         message,
         stack,
     } = entry;
+
+    // Collapse consecutive identical messages. On a repeat, bump the count and
+    // return without logging; on a change, flush "(previous message repeated N
+    // times)" then fall through to log the new one.
+    if let Ok(mut guard) = LAST_FRONTEND.lock() {
+        match guard.as_mut() {
+            Some((last, count)) if *last == message => {
+                *count += 1;
+                return;
+            }
+            Some((_, count)) if *count > 1 => {
+                tracing::info!(
+                    source = "frontend",
+                    "[ui] (previous message repeated {count}×)"
+                );
+                *guard = Some((message.clone(), 1));
+            }
+            _ => *guard = Some((message.clone(), 1)),
+        }
+    }
     // Tagged `[ui]` AND stamped with `source = "frontend"`.
     //
     // Both, because they serve different readers. The `[ui]` prefix is what a

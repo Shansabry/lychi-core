@@ -287,10 +287,10 @@ callDBus("{bus_name}", "/", "", "lychi_stack", result.join("\n"));
 "#
     );
 
-    let script_path = std::env::temp_dir().join("lychi_ctx_stack.js");
-    if std::fs::write(&script_path, &script).is_err() {
+    // Unique per-call path in XDG_RUNTIME_DIR (PLAT-4) — no fixed-name race.
+    let Some(script_path) = super::kwin_script::write_temp_script(&script) else {
         return Vec::new();
-    }
+    };
 
     let plugin_name = format!(
         "lychi_stack_{}_{}",
