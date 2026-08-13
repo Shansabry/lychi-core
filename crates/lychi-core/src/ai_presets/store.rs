@@ -260,21 +260,78 @@ impl AiPresetsStore {
         Ok(count)
     }
 
-    /// Seed the built-in presets on first run. Idempotent: only installs a
-    /// builtin whose keyword isn't already present (so it never clobbers a user's
-    /// edits or re-creates one they deleted-then-... actually a deleted builtin
-    /// WOULD reappear; that's acceptable for defaults and matches "reset to
-    /// defaults" expectations). Called once at startup.
+    /// Seed the built-in presets on every startup, keyed by a STABLE, memorable
+    /// id (`builtin:<keyword>`) rather than a random UUID.
+    ///
+    /// Why a fixed id: seeding by keyword-lookup then inserting a fresh UUID was
+    /// only idempotent if the lookup succeeded. An earlier build could — and for
+    /// some users did — write a builtin twice (each with its own UUID), which the
+    /// keyword guard then couldn't collapse, leaving `rewrite ×2` in the list. A
+    /// fixed key makes seeding idempotent at the STORAGE layer: re-seeding
+    /// `builtin:rewrite` overwrites the same row, so a duplicate is impossible.
+    ///
+    /// This also self-heals existing duplicates: any OTHER row (a stray UUID) that
+    /// shares a builtin keyword is removed, leaving only the canonical fixed-key
+    /// builtin. User-created presets (non-builtin keywords) are never touched.
+    ///
+    /// Called once at startup, but safe to call repeatedly.
     pub fn seed_builtins(&self, db: &Arc<Database>) -> Result<(), LychiError> {
-        for &(keyword, name, template) in BUILTIN_PRESETS {
-            if self.get_preset_by_keyword(db, keyword)?.is_none() {
-                // Ignore individual failures (e.g. limit reached) so one bad seed
-                // doesn't block the rest.
-                let _ = self.add_preset(db, keyword, name, template);
+        let now = db::now_millis();
+        let txn = db.begin_write()?;
+        {
+            let mut table = txn.open_table(db::AI_PRESETS)?;
+
+            // 1. De-dupe: drop any row whose keyword is a builtin's but whose key
+            //    is NOT the canonical `builtin:<keyword>` id. These are the stray
+            //    duplicates a past seeding bug left behind.
+            let mut stray_keys: Vec<String> = Vec::new();
+            for result in table.iter()? {
+                let (key, val) = result?;
+                let key = key.value().to_string();
+                let Some(entry) = db::decode_row::<AiPresetEntry>("ai_presets", &key, val.value())
+                else {
+                    continue;
+                };
+                if is_builtin_keyword(&entry.keyword) && key != builtin_id(&entry.keyword) {
+                    stray_keys.push(key);
+                }
+            }
+            for key in stray_keys {
+                table.remove(key.as_str())?;
+            }
+
+            // 2. Upsert each builtin at its fixed key. Preserve `created_at` if the
+            //    canonical row already exists so it isn't reset on every launch.
+            for &(keyword, name, template) in BUILTIN_PRESETS {
+                let id = builtin_id(keyword);
+                let created_at = table
+                    .get(id.as_str())?
+                    .and_then(|v| db::decode_value::<AiPresetEntry>(v.value()).ok())
+                    .map(|e| e.created_at)
+                    .unwrap_or(now);
+                let entry = AiPresetEntry {
+                    keyword: keyword.to_string(),
+                    name: name.to_string(),
+                    template: template.to_string(),
+                    created_at,
+                    updated_at: now,
+                    deleted_at: None,
+                    sync_status: SYNC_LOCAL,
+                };
+                let bytes = crate::db::encode_row(&entry)?;
+                table.insert(id.as_str(), bytes.as_slice())?;
             }
         }
+        txn.commit()?;
         Ok(())
     }
+}
+
+/// The stable, memorable DB key for a builtin preset: `builtin:<keyword>`. The
+/// `builtin:` namespace both makes the row self-identifying and guarantees it
+/// can never collide with a user preset (which is keyed by UUID v7).
+pub fn builtin_id(keyword: &str) -> String {
+    format!("builtin:{}", keyword.trim().to_lowercase())
 }
 
 /// Is this keyword one of the shipped defaults?
@@ -417,6 +474,90 @@ mod tests {
         // Re-seeding doesn't duplicate.
         store.seed_builtins(&db).unwrap();
         assert_eq!(store.presets_count(&db).unwrap(), n);
+    }
+
+    #[test]
+    fn seed_uses_fixed_builtin_ids() {
+        let db = open_test_database();
+        let store = AiPresetsStore::new();
+        store.seed_builtins(&db).unwrap();
+        // Each builtin lives at its stable, memorable id.
+        for &(keyword, _, _) in BUILTIN_PRESETS {
+            let p = store.get_preset_by_keyword(&db, keyword).unwrap().unwrap();
+            assert_eq!(
+                p.id,
+                builtin_id(keyword),
+                "builtin {keyword} must use its fixed id"
+            );
+            assert!(p.is_builtin);
+        }
+    }
+
+    #[test]
+    fn seed_dedupes_stray_builtin_rows() {
+        // Reproduce the bug: a past build wrote builtins under random UUIDs, some
+        // twice. Seeding must collapse them to one canonical fixed-key row each,
+        // WITHOUT touching a user's own preset.
+        let db = open_test_database();
+        let store = AiPresetsStore::new();
+        // Two stray "rewrite" rows (random UUIDs) + a real user preset.
+        store
+            .add_preset(&db, "rewrite", "Rewrite", "old A {input}")
+            .unwrap();
+        store
+            .add_preset(&db, "summarize", "Summarize", "old S {input}")
+            .unwrap();
+        let user = store
+            .add_preset(&db, "myown", "Mine", "keep {input}")
+            .unwrap();
+        // A second stray via the fixed path would collide; simulate the historical
+        // duplicate by inserting a raw row under another UUID.
+        {
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(db::AI_PRESETS).unwrap();
+                let entry = AiPresetEntry {
+                    keyword: "rewrite".into(),
+                    name: "Rewrite".into(),
+                    template: "dup {input}".into(),
+                    created_at: 1,
+                    updated_at: 1,
+                    deleted_at: None,
+                    sync_status: SYNC_LOCAL,
+                };
+                let bytes = crate::db::encode_row(&entry).unwrap();
+                table
+                    .insert(db::new_id().as_str(), bytes.as_slice())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        store.seed_builtins(&db).unwrap();
+
+        // Exactly one row per builtin keyword, all at fixed ids; the user preset
+        // survives untouched.
+        let rewrites: Vec<_> = store
+            .get_presets(&db)
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.keyword == "rewrite")
+            .collect();
+        assert_eq!(rewrites.len(), 1, "rewrite must be de-duplicated to one");
+        assert_eq!(rewrites[0].id, builtin_id("rewrite"));
+        assert!(
+            store.get_preset_by_keyword(&db, "myown").unwrap().is_some(),
+            "user preset must be preserved"
+        );
+        assert_eq!(
+            store
+                .get_preset_by_keyword(&db, "myown")
+                .unwrap()
+                .unwrap()
+                .id,
+            user.id,
+            "user preset id unchanged"
+        );
     }
 
     #[test]

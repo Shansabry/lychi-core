@@ -1,14 +1,16 @@
 <script lang="ts">
-import type { AiConfig } from "$lib/ipc";
+import type { AiConfig, CommandsConfig } from "$lib/ipc";
 import CommandsView from "./CommandsView.svelte";
 import ConnectionView from "./ConnectionView.svelte";
 
 let {
 	aiConfig = $bindable(),
+	commandsConfig = $bindable(),
 	onsaveerror,
 	onpresetchange,
 }: {
 	aiConfig: AiConfig;
+	commandsConfig: CommandsConfig;
 	onsaveerror: (msg: string) => void;
 	/** Called when the user adds/edits/deletes a preset (launcher reloads them). */
 	onpresetchange?: () => void;
@@ -138,7 +140,7 @@ function handleKeydown(e: KeyboardEvent) {
 	<div class="view">
 		<!-- Both views stay mounted so refs + listeners survive tab switches. -->
 		<div class:hidden={activeView !== "connection"}>
-			<ConnectionView bind:this={connectionRef} bind:aiConfig {onsaveerror} />
+			<ConnectionView bind:this={connectionRef} bind:aiConfig bind:commandsConfig {onsaveerror} />
 		</div>
 		<div class:hidden={activeView !== "commands"}>
 			<CommandsView

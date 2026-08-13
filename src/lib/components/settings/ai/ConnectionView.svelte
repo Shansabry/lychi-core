@@ -1,6 +1,12 @@
 <script lang="ts">
-import type { AiConfig } from "$lib/ipc";
-import { checkAiHealth, getMaskedApiKey, saveAiConfig, testAiConnection } from "$lib/ipc";
+import type { AiConfig, CommandsConfig } from "$lib/ipc";
+import {
+	checkAiHealth,
+	getMaskedApiKey,
+	saveAiConfig,
+	saveCommandsConfig,
+	testAiConnection,
+} from "$lib/ipc";
 import Select from "../../Select.svelte";
 import type ApiKeyField from "./ApiKeyField.svelte";
 import ConnectionStatus from "./ConnectionStatus.svelte";
@@ -12,11 +18,30 @@ import OllamaFields from "./modes/OllamaFields.svelte";
 
 let {
 	aiConfig = $bindable(),
+	commandsConfig = $bindable(),
 	onsaveerror,
 }: {
 	aiConfig: AiConfig;
+	commandsConfig: CommandsConfig;
 	onsaveerror: (msg: string) => void;
 } = $props();
+
+// The agent's shell approval profile lives in commandsConfig.shell_policy.
+// Defaults to "ask-on-write" (today's behaviour) when the config predates it.
+let shellProfile = $derived(commandsConfig.shell_policy?.profile ?? "ask-on-write");
+
+async function handleShellProfileChange(val: string) {
+	commandsConfig.shell_policy = {
+		...(commandsConfig.shell_policy ?? { allow: [], deny: [] }),
+		profile: val as typeof shellProfile,
+	};
+	try {
+		await saveCommandsConfig(commandsConfig);
+	} catch (err) {
+		console.error("[settings] Failed to save shell policy:", err);
+		onsaveerror(`Failed to save: ${err}`);
+	}
+}
 
 // Lychi Cloud is disabled for launch (flip when lychi-cloud ships, Phase 2.3).
 const CLOUD_ENABLED: boolean = false;
@@ -264,6 +289,30 @@ export function dismissConfirm(): boolean {
 			ontest={runConnectionTest}
 		/>
 	{/if}
+
+	<!-- Agent safety: how much the AI must ask before running a shell command.
+	     Lives on the AI page because it governs the AI agent's behaviour. -->
+	<div class="agent-safety">
+		<div class="section-label">Agent safety</div>
+		<div class="field">
+			<label for="shell-profile">Command approval</label>
+			<Select
+				id="shell-profile"
+				value={shellProfile}
+				options={[
+					{ value: "strict", label: "Strict — confirm every command" },
+					{ value: "ask-on-write", label: "Ask before changes (recommended)" },
+					{ value: "auto-accept", label: "Auto-accept (only blocks the denylist)" },
+				]}
+				onchange={handleShellProfileChange}
+			/>
+		</div>
+		<div class="hint">
+			When the AI must ask before running a shell command. Catastrophic commands
+			(wiping the disk, piping a download into a shell) are always blocked,
+			whatever the profile.
+		</div>
+	</div>
 {/if}
 
 <style>
@@ -283,5 +332,22 @@ export function dismissConfirm(): boolean {
 		color: var(--fg-muted);
 		line-height: 1.5;
 		padding: 4px 0 10px;
+	}
+	.agent-safety {
+		margin-top: 8px;
+		padding-top: 14px;
+		border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+	}
+	.section-label {
+		font-size: 11px;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		color: var(--fg-muted);
+		margin-bottom: 6px;
+	}
+	.hint {
+		font-size: 11.5px;
+		color: var(--fg-muted);
+		line-height: 1.5;
 	}
 </style>

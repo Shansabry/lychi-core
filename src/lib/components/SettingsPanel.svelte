@@ -220,6 +220,7 @@ function handleKeydown(e: KeyboardEvent) {
 			<AiTab
 				bind:this={aiTabRef}
 				bind:aiConfig
+				bind:commandsConfig
 				onsaveerror={(msg) => (saveError = msg)}
 				{onpresetchange}
 			/>
