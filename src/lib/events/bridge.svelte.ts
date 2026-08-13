@@ -33,6 +33,9 @@ export interface BridgeHandlers {
 	afterContextReady: () => void;
 	/** Blur-dismiss (respects hide-on-blur + open-panel-closes-first). */
 	dismiss: () => void;
+	/** Hotkey-toggle hide: blank + paint, then hide (the flash fix). The backend
+	 *  routes its hide here so every dismiss path clears the buffer before unmap. */
+	requestHide: () => void;
 	/** GTK-level Escape (focus-independent). */
 	escape: () => void;
 	/** Live AI availability (from the AiReactor). Keeps `aiEnabled` in sync so
@@ -92,6 +95,7 @@ export async function attachTauriEvents(h: BridgeHandlers): Promise<() => void> 
 	offs.push(await win.listen("lychi://shown", () => h.ready()));
 	offs.push(await win.listen("lychi://summon", () => h.summon()));
 	offs.push(await win.listen("lychi://dismiss", () => h.dismiss()));
+	offs.push(await win.listen("lychi://request-hide", () => h.requestHide()));
 	offs.push(await win.listen("lychi://gtk-escape", () => h.escape()));
 	offs.push(
 		await win.listen<boolean>("lychi://ai-status-changed", (e) => h.aiStatusChanged(e.payload)),

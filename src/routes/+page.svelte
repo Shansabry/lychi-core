@@ -665,6 +665,10 @@ onMount(() => {
 			loadEmptySuggestions();
 		},
 		dismiss: handleBlurDismiss,
+		requestHide: () => {
+			// Hotkey toggle asked us to hide: blank + paint, then hide (flash fix).
+			void blankThenHide();
+		},
 		escape: handleDismiss,
 		aiStatusChanged: (available) => {
 			aiEnabled = available;
@@ -809,7 +813,7 @@ function handleBlurDismiss() {
 		return;
 	}
 	uiLog.info("[dismiss] hiding window");
-	hideWindow().then(() => {
+	blankThenHide().then(() => {
 		if (completions.searchMode) {
 			cancelFileSearch();
 			completions.searchMode = false;
@@ -1919,6 +1923,27 @@ async function handleRowAction(handler: string, id: string, target: string) {
 	}
 }
 
+/**
+ * Blank the surface, let one real paint commit while still mapped, THEN unmap —
+ * the fix for the re-summon flash.
+ *
+ * The flash is WebKit's own compositor handing back its LAST rendered frame on
+ * re-map (the previous session's content) before the reset DOM rasterizes. By
+ * setting `launcherReady=false` (CSS `.not-ready{opacity:0}` → the card goes
+ * transparent) and waiting for a real paint cycle BEFORE `hideWindow()`, WebKit's
+ * last-held buffer becomes the transparent launcher, so the first post-map frame
+ * is clean. The double rAF fires here because the window is still mapped (a
+ * hidden window's frame clock is stopped — that's why the reset can't be done
+ * after hide). The ONE hide primitive; every dismiss path routes through it.
+ */
+async function blankThenHide() {
+	launcherReady = false;
+	await new Promise<void>((resolve) => {
+		requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+	});
+	await hideWindow();
+}
+
 async function hide() {
 	// Logged because this is the OTHER way the window closes, and it used to be
 	// silent. The backend records `[hide] window hidden`, but with no cause
@@ -1926,8 +1951,7 @@ async function hide() {
 	// log — which is exactly the ambiguity that made "it vanished while I typed"
 	// take so long to pin down. `handleBlurDismiss` names itself; so should this.
 	uiLog.info("[hide] user dismissed (escape/keybinding)");
-	launcherReady = false;
-	await hideWindow();
+	await blankThenHide();
 }
 
 // Quick screenshot trigger (bound to the `screenshot` keybinding). Lychi must

@@ -81,14 +81,31 @@ pub fn toggle_window(window: &WebviewWindow) {
             .apply(crate::launcher_state::Event::ToggleRequested, "toggle");
         if matches!(action, crate::launcher_state::Action::Hide) {
             state.dismiss_armed.store(false, Ordering::SeqCst);
-            // On the GTK thread this executes inline — the widget flag is
-            // updated synchronously, so a follow-up toggle decides correctly.
-            let _ = win.hide();
-            state
-                .launcher
-                .apply(crate::launcher_state::Event::HideCompleted, "toggle-hide");
-            let handle = win.app_handle();
-            update_tray_label(handle);
+            // Route the hide through the FRONTEND so it can blank + let one paint
+            // land before the surface unmaps (the re-summon-flash fix — see
+            // `blankThenHide` in +page.svelte). The frontend then calls the
+            // `hide_launcher` command, which does the real `win.hide()` and fires
+            // `HideCompleted`. We still flip the state machine to Hiding here (it
+            // already did on ToggleRequested), so a rapid follow-up toggle can't
+            // race a half-applied hide. A watchdog fallback hides directly if the
+            // frontend doesn't ack within a short budget, so a wedged webview can
+            // never leave the launcher stuck open.
+            let _ = win.emit("lychi://request-hide", ());
+            let watchdog = win.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(120), move || {
+                use crate::launcher_state::LauncherState;
+                let st = watchdog.app_handle().state::<AppState>();
+                // Only fire if the frontend hasn't already completed the hide.
+                if matches!(st.launcher.get(), LauncherState::Hiding) {
+                    tracing::warn!("[toggle] frontend hide not acked in 120ms — hiding directly");
+                    let _ = watchdog.hide();
+                    st.launcher.apply(
+                        crate::launcher_state::Event::HideCompleted,
+                        "toggle-hide-watchdog",
+                    );
+                    update_tray_label(watchdog.app_handle());
+                }
+            });
         } else {
             // show_window does blocking context work (KWin D-Bus snapshot) —
             // it must not run on the GTK thread. Hand it to a worker; its own
