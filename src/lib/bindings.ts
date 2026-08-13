@@ -677,6 +677,50 @@ async mediaSeek(busName: string, trackId: string, positionUs: number) : Promise<
 }
 },
 /**
+ * Relative seek (±seconds) within the current track — the ±10s buttons.
+ */
+async mediaSeekRelative(busName: string, offsetUs: number) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("media_seek_relative", { busName, offsetUs }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Toggle shuffle on a specific player.
+ */
+async mediaSetShuffle(busName: string, on: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("media_set_shuffle", { busName, on }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Set loop mode ("None"|"Track"|"Playlist") on a specific player.
+ */
+async mediaSetLoop(busName: string, mode: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("media_set_loop", { busName, mode }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Set volume (0.0–1.0) on a specific player.
+ */
+async mediaSetVolume(busName: string, volume: number) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("media_set_volume", { busName, volume }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Refresh the player list (discovers new/removed players).
  */
 async mediaRefresh() : Promise<Result<null, string>> {
@@ -2623,7 +2667,25 @@ bus_name: string;
 /**
  * Friendly player name (e.g. "Spotify", "Firefox").
  */
-player_name: string }
+player_name: string; 
+/**
+ * Whether the player supports next/previous/seek — the UI hides a control
+ * the active player can't honour rather than showing a dead button. All
+ * optional in MPRIS, so missing properties default to false/None.
+ */
+can_go_next: boolean; can_go_previous: boolean; can_seek: boolean; 
+/**
+ * Shuffle state, `None` if the player doesn't expose the `Shuffle` property.
+ */
+shuffle: boolean | null; 
+/**
+ * Loop mode, `None` if unsupported; otherwise "None" | "Track" | "Playlist".
+ */
+loop_status: string | null; 
+/**
+ * Volume 0.0–1.0, `None` if the player doesn't expose `Volume`.
+ */
+volume: number | null }
 /**
  * What the Settings tab needs to say about updates, in one round trip.
  */

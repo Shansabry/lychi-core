@@ -41,6 +41,18 @@ pub struct TrackInfo {
     pub bus_name: String,
     /// Friendly player name (e.g. "Spotify", "Firefox").
     pub player_name: String,
+    /// Whether the player supports next/previous/seek — the UI hides a control
+    /// the active player can't honour rather than showing a dead button. All
+    /// optional in MPRIS, so missing properties default to false/None.
+    pub can_go_next: bool,
+    pub can_go_previous: bool,
+    pub can_seek: bool,
+    /// Shuffle state, `None` if the player doesn't expose the `Shuffle` property.
+    pub shuffle: Option<bool>,
+    /// Loop mode, `None` if unsupported; otherwise "None" | "Track" | "Playlist".
+    pub loop_status: Option<String>,
+    /// Volume 0.0–1.0, `None` if the player doesn't expose `Volume`.
+    pub volume: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, specta::Type)]
@@ -136,6 +148,17 @@ impl MprisClient {
             _ => PlaybackStatus::Stopped,
         };
 
+        // Capabilities + extended state. All optional in the MPRIS spec, so a
+        // player that doesn't implement a property just yields the default —
+        // `false` for the Can* flags, `None` for shuffle/loop/volume — and the
+        // UI hides that control rather than showing one the player can't honour.
+        let can_go_next: bool = proxy.get_property("CanGoNext").await.unwrap_or(false);
+        let can_go_previous: bool = proxy.get_property("CanGoPrevious").await.unwrap_or(false);
+        let can_seek: bool = proxy.get_property("CanSeek").await.unwrap_or(false);
+        let shuffle: Option<bool> = proxy.get_property("Shuffle").await.ok();
+        let loop_status: Option<String> = proxy.get_property("LoopStatus").await.ok();
+        let volume: Option<f64> = proxy.get_property("Volume").await.ok();
+
         Ok(TrackInfo {
             title,
             artist,
@@ -147,6 +170,12 @@ impl MprisClient {
             status,
             bus_name: self.bus_name.clone(),
             player_name: self.player_name(),
+            can_go_next,
+            can_go_previous,
+            can_seek,
+            shuffle,
+            loop_status,
+            volume,
         })
     }
 
@@ -192,6 +221,58 @@ impl MprisClient {
                 LychiError::ExecutionFailed(format!("MPRIS SetPosition: {e}"))
             })?;
         tracing::debug!("[mpris] SetPosition succeeded");
+        Ok(())
+    }
+
+    /// Seek by a relative offset (µs; negative rewinds). MPRIS clamps to track
+    /// bounds itself — seeking past the end skips to the next track or stops,
+    /// past the start clamps to 0. Used by the ±10s buttons.
+    pub async fn seek_relative(&self, offset_us: i64) -> Result<(), LychiError> {
+        let proxy = self.player_proxy().await?;
+        proxy
+            .call_method("Seek", &(offset_us,))
+            .await
+            .map_err(|e| LychiError::ExecutionFailed(format!("MPRIS Seek: {e}")))?;
+        Ok(())
+    }
+
+    /// Toggle shuffle (the `Shuffle` bool property). No-op-safe: a player that
+    /// doesn't support it returns an error we surface, and the UI only shows the
+    /// control when `TrackInfo.shuffle` is `Some`.
+    pub async fn set_shuffle(&self, on: bool) -> Result<(), LychiError> {
+        let proxy = self.player_proxy().await?;
+        proxy
+            .set_property("Shuffle", on)
+            .await
+            .map_err(|e| LychiError::ExecutionFailed(format!("MPRIS set Shuffle: {e}")))?;
+        Ok(())
+    }
+
+    /// Set loop mode: "None" | "Track" | "Playlist" (the `LoopStatus` property).
+    pub async fn set_loop(&self, mode: &str) -> Result<(), LychiError> {
+        // Validate against the MPRIS enum so a typo can't set an invalid value.
+        if !matches!(mode, "None" | "Track" | "Playlist") {
+            return Err(LychiError::ExecutionFailed(format!(
+                "Invalid loop mode: {mode}"
+            )));
+        }
+        let proxy = self.player_proxy().await?;
+        proxy
+            .set_property("LoopStatus", mode)
+            .await
+            .map_err(|e| LychiError::ExecutionFailed(format!("MPRIS set LoopStatus: {e}")))?;
+        Ok(())
+    }
+
+    /// Set volume 0.0–1.0 (the `Volume` property). Clamped to the valid range —
+    /// MPRIS lets a player define its own max, but 1.0 is the spec's normal.
+    pub async fn set_volume(&self, volume: f64) -> Result<(), LychiError> {
+        let clamped = volume.clamp(0.0, 1.0);
+        let proxy = self.player_proxy().await?;
+        proxy
+            .set_property("Volume", clamped)
+            .await
+            .map_err(|e| LychiError::ExecutionFailed(format!("MPRIS set Volume: {e}")))?;
         Ok(())
     }
 
@@ -407,6 +488,42 @@ impl MprisManager {
             .get(bus_name)
             .ok_or_else(|| LychiError::ExecutionFailed(format!("Player not found: {bus_name}")))?
             .set_position(track_id, position_us)
+            .await
+    }
+
+    /// Relative seek (±µs) on a specific player — the ±10s buttons.
+    pub async fn seek_relative(&self, bus_name: &str, offset_us: i64) -> Result<(), LychiError> {
+        self.players
+            .get(bus_name)
+            .ok_or_else(|| LychiError::ExecutionFailed(format!("Player not found: {bus_name}")))?
+            .seek_relative(offset_us)
+            .await
+    }
+
+    /// Toggle shuffle on a specific player.
+    pub async fn set_shuffle(&self, bus_name: &str, on: bool) -> Result<(), LychiError> {
+        self.players
+            .get(bus_name)
+            .ok_or_else(|| LychiError::ExecutionFailed(format!("Player not found: {bus_name}")))?
+            .set_shuffle(on)
+            .await
+    }
+
+    /// Set loop mode ("None"|"Track"|"Playlist") on a specific player.
+    pub async fn set_loop(&self, bus_name: &str, mode: &str) -> Result<(), LychiError> {
+        self.players
+            .get(bus_name)
+            .ok_or_else(|| LychiError::ExecutionFailed(format!("Player not found: {bus_name}")))?
+            .set_loop(mode)
+            .await
+    }
+
+    /// Set volume (0.0–1.0) on a specific player.
+    pub async fn set_volume(&self, bus_name: &str, volume: f64) -> Result<(), LychiError> {
+        self.players
+            .get(bus_name)
+            .ok_or_else(|| LychiError::ExecutionFailed(format!("Player not found: {bus_name}")))?
+            .set_volume(volume)
             .await
     }
 

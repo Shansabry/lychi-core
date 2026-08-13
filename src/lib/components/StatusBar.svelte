@@ -10,6 +10,7 @@ import {
 	Sparkles,
 	SquareTerminal,
 } from "lucide-svelte";
+import MediaViz from "$lib/components/MediaViz.svelte";
 import type { CommandResult, TrackInfo } from "$lib/ipc";
 import { mediaControl } from "$lib/ipc";
 import { getComboString } from "$lib/keybindings";
@@ -142,15 +143,9 @@ async function togglePlayPause() {
 				tabindex={-1}
 				aria-label={nowPlaying.status === "playing" ? "Pause" : "Play"}
 			>
-				<!-- The waveform: animated while playing, frozen + muted when paused
-				     (animation-play-state: paused + dimmed). Click toggles playback. -->
-				<span
-					class="viz"
-					class:playing={nowPlaying.status === "playing"}
-					aria-hidden="true"
-				>
-					<span></span><span></span><span></span><span></span>
-				</span>
+				<!-- The waveform: animated while playing, frozen + muted when paused.
+				     Shared component (see MediaViz) so the panel and the pill match. -->
+				<MediaViz playing={nowPlaying.status === "playing"} />
 			</button>
 			<span class="now-playing-text">
 				{#if multiplePlayers}
@@ -417,86 +412,7 @@ async function togglePlayPause() {
 	   per bar so they drift out of phase forever. Springy cubic-bezier (never
 	   linear). Floors never hit 0 so bars stay alive. Paused = frozen mid + dim via
 	   animation-play-state. GPU-friendly: only transform animates. */
-	.viz {
-		display: inline-flex;
-		/* Center-anchored: bars scale from the middle (grow both ways). */
-		align-items: center;
-		gap: 2px;
-		height: 10px;
-		flex-shrink: 0;
-		/* Paused (default): frozen mid-height, dimmed + desaturated so it clearly
-		   reads "stopped" — a quiet, muted version of the playing waveform. */
-		opacity: 0.4;
-		filter: saturate(0.6);
-		transition: opacity 150ms ease, filter 150ms ease;
-	}
-
-	.viz span {
-		/* Whole-pixel width: a fractional (1.5px) width rounds to 1px on some bars
-		   and 2px on others, making them look uneven. 2px renders crisp + uniform. */
-		width: 2px;
-		height: 100%;
-		border-radius: 2px;
-		transform: scaleY(0.35);
-		transform-origin: center;
-		will-change: transform;
-		animation-iteration-count: infinite;
-		/* Smooth, gentle easing (not springy) — each keyframe segment eases in and
-		   out so there are no abrupt direction snaps. */
-		animation-timing-function: ease-in-out;
-		animation-play-state: paused;
-	}
-
-	/* Playing: full color, and the bars animate. */
-	.viz.playing {
-		opacity: 1;
-		filter: none;
-	}
-
-	.viz.playing span {
-		animation-play-state: running;
-	}
-
-	/* Per-bar: a distinct color + keyframe curve + duration + non-round negative
-	   delay (starts mid-cycle, never syncs into a wave). Colors span an accent-
-	   anchored gradient (accent → a warmer/cooler sibling) so it's multicolor but
-	   still on-theme; --accent stays the dominant hue. */
-	.viz span:nth-child(1) { background: var(--accent); animation-name: eq-a; animation-duration: 1.9s; animation-delay: -0.8s; }
-	.viz span:nth-child(2) { background: color-mix(in srgb, var(--accent) 60%, #ff5ea8); animation-name: eq-c; animation-duration: 2.4s; animation-delay: -1.7s; }
-	.viz span:nth-child(3) { background: color-mix(in srgb, var(--accent) 55%, #6ea8ff); animation-name: eq-b; animation-duration: 2.1s; animation-delay: -2.3s; }
-	.viz span:nth-child(4) { background: color-mix(in srgb, var(--accent) 65%, #ffcf5e); animation-name: eq-a; animation-duration: 2.6s; animation-delay: -0.4s; }
-
-	/* Keyframes LOOP SEAMLESSLY (0% == 100%) so there's no jump at the wrap, with
-	   evenly-spaced stops and gentle swings so the motion flows continuously. */
-	@keyframes eq-a {
-		0%   { transform: scaleY(0.40); }
-		25%  { transform: scaleY(1.00); }
-		50%  { transform: scaleY(0.55); }
-		75%  { transform: scaleY(0.80); }
-		100% { transform: scaleY(0.40); }
-	}
-	@keyframes eq-b {
-		0%   { transform: scaleY(0.85); }
-		25%  { transform: scaleY(0.45); }
-		50%  { transform: scaleY(1.00); }
-		75%  { transform: scaleY(0.55); }
-		100% { transform: scaleY(0.85); }
-	}
-	@keyframes eq-c {
-		0%   { transform: scaleY(0.55); }
-		25%  { transform: scaleY(0.90); }
-		50%  { transform: scaleY(0.40); }
-		75%  { transform: scaleY(0.95); }
-		100% { transform: scaleY(0.55); }
-	}
-
-	/* Respect reduced-motion: no bounce, steady mid height. */
-	@media (prefers-reduced-motion: reduce) {
-		.viz span {
-			animation: none;
-			transform: scaleY(0.6);
-		}
-	}
+	/* The now-playing waveform lives in the shared MediaViz component. */
 
 	/* Left slot: holds either the waveform (playing) or the play glyph (paused).
 	   Fixed width so the pill doesn't jump when swapping between them. */

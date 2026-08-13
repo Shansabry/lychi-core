@@ -936,6 +936,26 @@ export async function mediaSeek(
 	unwrap(await commands.mediaSeek(busName, trackId, positionUs));
 }
 
+export async function mediaSeekRelative(busName: string, offsetUs: number): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.mediaSeekRelative(busName, offsetUs));
+}
+
+export async function mediaSetShuffle(busName: string, on: boolean): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.mediaSetShuffle(busName, on));
+}
+
+export async function mediaSetLoop(busName: string, mode: string): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.mediaSetLoop(busName, mode));
+}
+
+export async function mediaSetVolume(busName: string, volume: number): Promise<void> {
+	if (!isTauri()) return;
+	unwrap(await commands.mediaSetVolume(busName, volume));
+}
+
 export async function mediaRefresh(): Promise<void> {
 	if (!isTauri()) return;
 	unwrap(await commands.mediaRefresh());

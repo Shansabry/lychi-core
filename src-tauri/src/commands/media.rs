@@ -80,6 +80,86 @@ mod inner {
         result
     }
 
+    /// Relative seek (±seconds) within the current track — the ±10s buttons.
+    #[tauri::command]
+    #[specta::specta]
+    pub async fn media_seek_relative(
+        bus_name: String,
+        offset_us: i64,
+        state: State<'_, AppState>,
+    ) -> Result<(), LychiError> {
+        {
+            let guard = state.mpris.read().await;
+            if let Some(manager) = guard.as_ref() {
+                return manager.seek_relative(&bus_name, offset_us).await;
+            }
+        }
+        let manager = MprisManager::connect().await?;
+        let result = manager.seek_relative(&bus_name, offset_us).await;
+        *state.mpris.write().await = Some(manager);
+        result
+    }
+
+    /// Toggle shuffle on a specific player.
+    #[tauri::command]
+    #[specta::specta]
+    pub async fn media_set_shuffle(
+        bus_name: String,
+        on: bool,
+        state: State<'_, AppState>,
+    ) -> Result<(), LychiError> {
+        {
+            let guard = state.mpris.read().await;
+            if let Some(manager) = guard.as_ref() {
+                return manager.set_shuffle(&bus_name, on).await;
+            }
+        }
+        let manager = MprisManager::connect().await?;
+        let result = manager.set_shuffle(&bus_name, on).await;
+        *state.mpris.write().await = Some(manager);
+        result
+    }
+
+    /// Set loop mode ("None"|"Track"|"Playlist") on a specific player.
+    #[tauri::command]
+    #[specta::specta]
+    pub async fn media_set_loop(
+        bus_name: String,
+        mode: String,
+        state: State<'_, AppState>,
+    ) -> Result<(), LychiError> {
+        {
+            let guard = state.mpris.read().await;
+            if let Some(manager) = guard.as_ref() {
+                return manager.set_loop(&bus_name, &mode).await;
+            }
+        }
+        let manager = MprisManager::connect().await?;
+        let result = manager.set_loop(&bus_name, &mode).await;
+        *state.mpris.write().await = Some(manager);
+        result
+    }
+
+    /// Set volume (0.0–1.0) on a specific player.
+    #[tauri::command]
+    #[specta::specta]
+    pub async fn media_set_volume(
+        bus_name: String,
+        volume: f64,
+        state: State<'_, AppState>,
+    ) -> Result<(), LychiError> {
+        {
+            let guard = state.mpris.read().await;
+            if let Some(manager) = guard.as_ref() {
+                return manager.set_volume(&bus_name, volume).await;
+            }
+        }
+        let manager = MprisManager::connect().await?;
+        let result = manager.set_volume(&bus_name, volume).await;
+        *state.mpris.write().await = Some(manager);
+        result
+    }
+
     /// Send a control action to all connected players (e.g. pause all).
     #[tauri::command]
     #[specta::specta]
