@@ -207,12 +207,24 @@ pub fn publish_policy(cfg: &crate::config::schema::ClipboardPrivacyConfig) {
 /// Falls back to [`Default`] — which protects — if nothing has been published
 /// or the lock was poisoned. A poisoned lock must not silently downgrade to
 /// recording passwords.
+///
+/// `respect_sensitive_hint` is forced **on** here, whatever the stored config
+/// says. Honouring a password manager's explicit "this is a secret, don't
+/// persist it" marker is a privacy contract, not a preference — there is no
+/// legitimate reason to record a selection the source app flagged, so it is not
+/// a user-facing toggle (the settings switch was removed). The struct field is
+/// kept only so an older `config.toml` that still carries
+/// `respect_sensitive_hint = false` deserializes without error; its value is
+/// deliberately ignored. `excluded_apps` remains a real, user-controlled
+/// preference and is passed through untouched.
 pub fn current_policy() -> crate::config::schema::ClipboardPrivacyConfig {
-    POLICY
+    let mut policy = POLICY
         .read()
         .ok()
         .and_then(|g| g.clone())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    policy.respect_sensitive_hint = true;
+    policy
 }
 
 #[cfg(test)]
@@ -366,6 +378,34 @@ mod tests {
             Some(SkipReason::SensitiveHint),
             "the unpublished fallback must fail closed"
         );
+    }
+
+    /// The sensitive-hint skip is enforced, not merely defaulted.
+    ///
+    /// A stored config that predates the removal of the settings toggle can
+    /// still carry `respect_sensitive_hint = false`. That value must be ignored:
+    /// `current_policy` forces the hint on regardless, so an old opt-out cannot
+    /// re-enable recording of password-manager-flagged copies. Publishes into
+    /// the shared static and restores it so no other test in this binary sees a
+    /// permissive policy leak across.
+    #[test]
+    fn stored_opt_out_cannot_disable_the_hint() {
+        let previous = POLICY.read().ok().and_then(|g| g.clone());
+        publish_policy(&cfg(false, &["keepassxc"]));
+        let effective = current_policy();
+        assert!(
+            effective.respect_sensitive_hint,
+            "a stored respect_sensitive_hint=false must not disable the skip"
+        );
+        assert_eq!(
+            effective.excluded_apps,
+            vec!["keepassxc".to_string()],
+            "the real preference (excluded_apps) must pass through untouched"
+        );
+        // Restore whatever was there (almost always None in the test binary).
+        if let Ok(mut guard) = POLICY.write() {
+            *guard = previous;
+        }
     }
 
     #[test]

@@ -6,7 +6,6 @@ import {
 	getHotkeyStatus,
 	getInstalledTerminals,
 	recordHotkey,
-	restartApp,
 	saveCommandsConfig,
 	saveGeneralConfig,
 	savePrivacyConfig,
@@ -19,16 +18,12 @@ let {
 	generalConfig = $bindable(),
 	commandsConfig = $bindable(),
 	privacyConfig = $bindable(),
-	layerShellSupported,
-	activeWindowStrategy,
 	screenComposited = true,
 	onsaveerror,
 }: {
 	generalConfig: GeneralConfig;
 	commandsConfig: CommandsConfig;
 	privacyConfig: PrivacyConfig;
-	layerShellSupported: boolean;
-	activeWindowStrategy: string;
 	screenComposited?: boolean;
 	onsaveerror: (msg: string) => void;
 } = $props();
@@ -62,8 +57,6 @@ async function handleAutostartToggle() {
 	}
 }
 
-let isWayland = $derived(hotkeyStatus?.session_type === "wayland");
-
 // Fetch installed terminals on mount (non-blocking)
 getInstalledTerminals().then((terminals) => {
 	terminalOptions = terminals.map((t) => ({ value: t, label: t }));
@@ -92,23 +85,6 @@ let shellOptions = $derived([
 	{ value: "__custom__", label: "Custom..." },
 ]);
 
-// Mirrors resolve_strategy() in platform/linux.rs
-function resolveStrategy(strategy: string): string {
-	if (strategy === "layer-shell")
-		return layerShellSupported ? "layer-shell" : isWayland ? "toplevel" : "x11";
-	if (strategy === "toplevel" || strategy === "toplevel-window") return "toplevel";
-	if (strategy === "x11") return "x11";
-	// auto
-	if (!hotkeyStatus) return activeWindowStrategy; // status not loaded yet
-	if (isWayland && hotkeyStatus.desktop.toUpperCase().includes("KDE")) return "toplevel";
-	if (layerShellSupported) return "layer-shell";
-	return isWayland ? "toplevel" : "x11";
-}
-
-let strategyNeedsRestart = $derived(
-	resolveStrategy(generalConfig.window_strategy) !== activeWindowStrategy,
-);
-
 export function initCustomShell(shell: string) {
 	customShell = !knownShells.includes(shell);
 }
@@ -129,16 +105,6 @@ async function handleMonitorModeChange(val: string) {
 		await saveGeneralConfig(generalConfig);
 	} catch (err) {
 		console.error("[settings] Failed to save monitor mode:", err);
-		onsaveerror(`Failed to save: ${err}`);
-	}
-}
-
-async function handleWindowStrategyChange(val: string) {
-	generalConfig.window_strategy = val;
-	try {
-		await saveGeneralConfig(generalConfig);
-	} catch (err) {
-		console.error("[settings] Failed to save window strategy:", err);
 		onsaveerror(`Failed to save: ${err}`);
 	}
 }
@@ -269,32 +235,6 @@ async function handleTerminalChange(val: string) {
 		onchange={handleMonitorModeChange}
 	/>
 </div>
-<div class="field">
-	<label for="window-strategy">Window strategy</label>
-	<Select
-		id="window-strategy"
-		value={generalConfig.window_strategy}
-		options={[
-			{ value: "auto", label: "Auto (recommended)" },
-			...(layerShellSupported
-				? [{ value: "layer-shell", label: "Layer shell (Wayland)" }]
-				: []),
-			...(isWayland || activeWindowStrategy === "toplevel" || layerShellSupported
-				? [{ value: "toplevel", label: "Toplevel window (Wayland)" }]
-				: []),
-			...(isWayland && !layerShellSupported
-				? [{ value: "toplevel-window", label: "Toplevel, no fullscreen (troubleshooting)" }]
-				: []),
-			{ value: "x11", label: "X11 fullscreen overlay" },
-		]}
-		onchange={handleWindowStrategyChange}
-	/>
-	{#if strategyNeedsRestart}
-		<button class="restart-btn" onclick={() => restartApp()}>
-			Restart to apply
-		</button>
-	{/if}
-</div>
 {#if !screenComposited}
 	<div class="field-error">
 		Your window manager has compositing disabled — the launcher background will
@@ -389,31 +329,6 @@ async function handleTerminalChange(val: string) {
 	</button>
 </div>
 <div class="field-hint">sysinfo net/ip via ifconfig.me</div>
-<div class="field">
-	<label for="clipboard-sensitive">Skip passwords in clipboard history</label>
-	<button
-		id="clipboard-sensitive"
-		class="checkbox"
-		class:checked={privacyConfig.clipboard.respect_sensitive_hint}
-		onclick={async () => {
-			privacyConfig.clipboard.respect_sensitive_hint =
-				!privacyConfig.clipboard.respect_sensitive_hint;
-			await savePrivacyConfig(privacyConfig);
-		}}
-		role="checkbox"
-		aria-checked={privacyConfig.clipboard.respect_sensitive_hint}
-	>
-		{#if privacyConfig.clipboard.respect_sensitive_hint}
-			<svg width="12" height="12" viewBox="0 0 12 12" fill="none">
-				<path d="M2 6L5 9L10 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-			</svg>
-		{/if}
-	</button>
-</div>
-<div class="field-hint">
-	Don't record copies that a password manager marked secret. Only works for apps
-	that set the marker.
-</div>
 
 <style>
 	.field {
@@ -461,22 +376,6 @@ async function handleTerminalChange(val: string) {
 		font-size: 11px;
 		color: var(--error);
 		padding: 2px 0 4px 0;
-	}
-
-	.restart-btn {
-		font-size: 11px;
-		padding: 2px 8px;
-		border-radius: 4px;
-		border: 1px solid var(--warning, #f59e0b);
-		background: transparent;
-		color: var(--warning, #f59e0b);
-		cursor: pointer;
-		flex-shrink: 0;
-	}
-
-	.restart-btn:hover {
-		background: var(--warning, #f59e0b);
-		color: var(--bg);
 	}
 
 	input[type="text"] {

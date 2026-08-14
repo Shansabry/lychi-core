@@ -2098,7 +2098,16 @@ card_blur?: boolean; hotkey: string; window_x: number | null; window_y: number |
  */
 monitor_mode: string; 
 /**
- * Window strategy: "auto", "layer-shell", "toplevel", "toplevel-window", or "x11"
+ * How the launcher window is drawn. Auto-detected per compositor and NOT
+ * surfaced in settings — no user should have to reason about display-server
+ * internals, and no comparable launcher exposes this in a GUI (they all
+ * auto-detect, keeping any override as a config-file knob). This is that
+ * knob: a file-only escape hatch for the rare case auto-detection is wrong.
+ * 
+ * "auto" (default; resolves via `platform::decide_strategy`), "layer-shell"
+ * (force wlr-layer-shell — wlroots), "toplevel" (force monitor-covering
+ * xdg_toplevel — KDE/GNOME Wayland), "toplevel-window" (toplevel without the
+ * fullscreen request), or "x11" (fullscreen override overlay).
  */
 window_strategy: string; 
 /**

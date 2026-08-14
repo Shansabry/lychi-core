@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, specta::Type)]
 pub struct Config {
+    /// Non-user bookkeeping: the schema version this file was written at. Drives
+    /// migration on load (see `config::migrate`). Serialized first so it sits at
+    /// the top of `config.toml`.
+    #[serde(default)]
+    pub meta: MetaConfig,
     pub general: GeneralConfig,
     pub commands: CommandsConfig,
     pub history: HistoryConfig,
@@ -11,6 +16,31 @@ pub struct Config {
     pub privacy: PrivacyConfig,
     pub keybindings: KeybindingsConfig,
     pub suggestions: SuggestionsConfig,
+}
+
+/// The current config schema version. Bump this by one whenever a field is
+/// **renamed, moved, or removed** in a way an old `config.toml` would otherwise
+/// lose silently, and add the matching step in `config::migrate::migrations()`.
+/// Adding a brand-new field needs NO bump — the default-overlay load already
+/// fills it in. This only exists for changes the overlay merge can't recover.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+/// File bookkeeping. Not shown in settings; carried so config.toml can be
+/// migrated across versions instead of silently dropping renamed/removed keys
+/// (the redb rows already version themselves with a `[ver][body]` envelope —
+/// this is the TOML equivalent).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, specta::Type)]
+pub struct MetaConfig {
+    /// Schema version this file was last written at. A file with no `[meta]`
+    /// (every config.toml written before this existed) deserializes to 0 via
+    /// `Default`, which the migrator treats as "legacy, run every migration".
+    ///
+    /// The derived default is deliberately 0 (`u32::default()`), NOT
+    /// `CURRENT_SCHEMA_VERSION`: a missing `[meta]` must read as a pre-versioning
+    /// file that may need migrating. `Config::load` stamps CURRENT once
+    /// migrations have run, so a 0 never reaches disk after a real load.
+    #[serde(default)]
+    pub schema_version: u32,
 }
 
 /// Controls the context-aware suggestion panel.
@@ -71,7 +101,16 @@ pub struct GeneralConfig {
     pub window_y: Option<i32>,
     /// Which monitor to open the launcher on: "cursor" or "primary"
     pub monitor_mode: String,
-    /// Window strategy: "auto", "layer-shell", "toplevel", "toplevel-window", or "x11"
+    /// How the launcher window is drawn. Auto-detected per compositor and NOT
+    /// surfaced in settings — no user should have to reason about display-server
+    /// internals, and no comparable launcher exposes this in a GUI (they all
+    /// auto-detect, keeping any override as a config-file knob). This is that
+    /// knob: a file-only escape hatch for the rare case auto-detection is wrong.
+    ///
+    /// "auto" (default; resolves via `platform::decide_strategy`), "layer-shell"
+    /// (force wlr-layer-shell — wlroots), "toplevel" (force monitor-covering
+    /// xdg_toplevel — KDE/GNOME Wayland), "toplevel-window" (toplevel without the
+    /// fullscreen request), or "x11" (fullscreen override overlay).
     pub window_strategy: String,
     /// Set true once the user has seen (and dismissed) the first-run
     /// onboarding hints, e.g. the Wayland hotkey banner.

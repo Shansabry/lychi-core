@@ -242,7 +242,8 @@ fn toplevel_plain() -> bool {
 /// that already fills the monitor has nowhere to be mispositioned to.
 ///
 /// KDE takes neither branch (it honours `move_()`, handled separately), and
-/// `toplevel-window` remains the user-facing escape hatch.
+/// `toplevel-window` remains a config-file-only escape hatch (there is no
+/// settings-UI strategy selector — auto-detection is the only path users see).
 fn wants_fullscreen() -> bool {
     !toplevel_plain() && !is_gnome_like()
 }
@@ -351,19 +352,36 @@ pub(crate) fn decide_strategy(strategy: &str, f: SessionFacts) -> WindowStrategy
         "toplevel" | "toplevel-window" => WindowStrategy::Toplevel,
         "x11" => WindowStrategy::X11,
         _ => {
-            // "auto"
+            // "auto" — the only path that ships. Ordered by decreasing
+            // specificity; each rung is a fact we can actually observe, never a
+            // guess about a compositor we haven't seen.
             //
-            // KDE is checked on `kde && wayland` rather than a combined helper
-            // so the Wayland fact has exactly one source. When that fact was
-            // wrong (XDG_SESSION_TYPE unset under autostart) this branch fell
-            // through to layer-shell ON KWIN, which I-008 says cannot take
-            // keyboard focus.
+            //   1. KDE Wayland → Toplevel. KWin advertises layer-shell but does
+            //      not give it keyboard focus (I-008), so layer-shell there is a
+            //      launcher you can't type into. Checked on `kde && wayland`
+            //      (not a combined helper) so the Wayland fact has exactly one
+            //      source: when it was wrong — XDG_SESSION_TYPE unset under
+            //      autostart — this rung was skipped and rule 2 selected
+            //      LayerShell on KWin, the one broken combination.
+            //   2. layer-shell present → LayerShell. This is the wlroots crowd
+            //      (Sway, Hyprland, river, Wayfire, labwc) — layer-shell is
+            //      their native protocol and focus works, so it's the premium
+            //      path. KDE is already peeled off above, so a true
+            //      `layer_shell` fact here means a compositor that honours it.
+            //   3. any other Wayland → Toplevel. GNOME/Mutter (no layer-shell
+            //      at all) and every unknown Wayland compositor. A monitor-
+            //      covering xdg_toplevel is the safe universal Wayland path; the
+            //      GNOME-specific fullscreen-backdrop quirk is handled downstream
+            //      in `wants_fullscreen`, not here — strategy selection needs no
+            //      GNOME fact, and adding one to guard a "GNOME with layer-shell"
+            //      case that stock Mutter never produces would be inventing a
+            //      heuristic for a session that does not exist.
+            //   4. X11 → X11 overlay.
             if f.wayland && f.kde {
                 WindowStrategy::Toplevel
             } else if f.layer_shell {
                 WindowStrategy::LayerShell
             } else if f.wayland {
-                // GNOME (Mutter has no layer-shell) and unknown compositors
                 WindowStrategy::Toplevel
             } else {
                 WindowStrategy::X11

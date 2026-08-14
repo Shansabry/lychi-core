@@ -27,7 +27,8 @@ export interface SettingsCache {
 	privacyConfig: PrivacyConfig;
 	keybindingsConfig: KeybindingsConfig;
 	appVersion: string;
-	layerShellSupported: boolean;
+	/** Resolved draw strategy ("x11" | "layer-shell" | "toplevel"). Consumed by
+	 *  +page.svelte to pick the compact window mode; NOT a user setting. */
 	activeWindowStrategy: string;
 	screenComposited: boolean;
 }
@@ -44,7 +45,6 @@ export function preloadSettings(): Promise<SettingsCache> {
 			privacyConfig: s.privacy,
 			keybindingsConfig: s.keybindings,
 			appVersion: s.app_version,
-			layerShellSupported: s.layer_shell_supported,
 			activeWindowStrategy: s.active_window_strategy,
 			screenComposited: s.screen_composited,
 		}));

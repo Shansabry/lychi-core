@@ -3,6 +3,7 @@ import type { AiConfig, OllamaModelInfo } from "$lib/ipc";
 import { listOllamaModels } from "$lib/ipc";
 import Select from "../../../Select.svelte";
 import AdvancedFields from "../AdvancedFields.svelte";
+import ExperimentalNote from "../ExperimentalNote.svelte";
 
 let {
 	aiConfig = $bindable(),
@@ -54,6 +55,13 @@ $effect(() => {
 });
 </script>
 
+<ExperimentalNote>
+	Ollama support is experimental, and answer quality depends on the model you
+	run — smaller local models may give simpler reasoning or miss on complex
+	commands. For the most capable results, run a larger model or connect a cloud
+	or API-key provider.
+</ExperimentalNote>
+
 <div class="field">
 	<label for="ollama-url">URL</label>
 	<input
@@ -98,6 +106,11 @@ $effect(() => {
 		border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
 	}
 	.field:first-child {
+		border-top: none;
+	}
+	/* The Experimental note now sits above the first field; keep the divider off
+	   the field that immediately follows it so the note reads as its own block. */
+	:global(.experimental) + .field {
 		border-top: none;
 	}
 	label {

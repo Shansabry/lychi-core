@@ -1,4 +1,5 @@
 pub mod db;
+mod migrate;
 pub mod schema;
 
 pub use schema::*;
@@ -8,10 +9,27 @@ use std::path::Path;
 
 use crate::error::LychiError;
 
+/// Comment banner prepended to every written `config.toml`. TOML has no way to
+/// attach a comment to a serialized field, so this is how the `schema_version`
+/// note reaches the file. Ends in a blank line so it sits cleanly above the
+/// first section (`[meta]`).
+const CONFIG_HEADER: &str = "\
+# Lychi configuration. Edit the settings below freely.
+#
+# The `schema_version` under [meta] is managed by Lychi — it records the config
+# format version so the app can migrate your settings across updates. Do not set
+# it by hand; leave it as written (deleting it is harmless — Lychi restamps it).
+
+";
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self, LychiError> {
         if !path.exists() {
-            return Ok(Config::default());
+            // Fresh install: defaults, stamped current so the first save writes
+            // the version rather than a legacy 0 that would trigger migration.
+            let mut config = Config::default();
+            config.meta.schema_version = schema::CURRENT_SCHEMA_VERSION;
+            return Ok(config);
         }
         let content = fs::read_to_string(path)?;
 
@@ -20,13 +38,32 @@ impl Config {
         // or hand-edited config.toml that omits any field/section loads fine —
         // the missing values come from the defaults, not from serde-default
         // attributes on every field. So the structs stay clean.
-        let user: toml::Value = toml::from_str(&content)?;
+        let mut user: toml::Value = toml::from_str(&content)?;
+
+        // Migrate the RAW value first, while renamed/removed keys still exist —
+        // after `try_into::<Config>()` they'd already be dropped. Adding a field
+        // needs no migration (the overlay below fills it); this only handles the
+        // structural changes the overlay can't recover. See `config::migrate`.
+        let migrated = migrate::migrate_value(&mut user);
+
         let mut base = toml::Value::try_from(Config::default())
             .map_err(|e| LychiError::Config(format!("serializing default config: {e}")))?;
         merge_toml(&mut base, user);
         let mut config: Config = base
             .try_into()
             .map_err(|e| LychiError::Config(e.to_string()))?;
+
+        // Stamp the current version so a save persists it and migrations don't
+        // re-run. Done unconditionally: a legacy file (no [meta] → version 0)
+        // and a just-migrated file both need bringing up to CURRENT, and a file
+        // already current is simply re-stamped to the same value.
+        config.meta.schema_version = schema::CURRENT_SCHEMA_VERSION;
+        if migrated > 0 {
+            tracing::info!(
+                "config: applied {migrated} migration(s), now at schema v{}",
+                schema::CURRENT_SCHEMA_VERSION
+            );
+        }
 
         // Drop any search-engine keyword that collides with a reserved command
         // (e.g. a hand-edited `open = "..."`) so it can't shadow a real command.
@@ -47,8 +84,15 @@ impl Config {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let toml_str =
-            toml::to_string_pretty(self).map_err(|e| LychiError::Config(e.to_string()))?;
+        let body = toml::to_string_pretty(self).map_err(|e| LychiError::Config(e.to_string()))?;
+        // TOML serializers emit no comments, so the guidance that would otherwise
+        // annotate `[meta] schema_version` is prepended here as a file header.
+        // `schema_version` is the one field a user might see and wrongly "fix":
+        // it is managed by Lychi (stamped on load, migrations key off it), and a
+        // hand-edit only risks a spurious migration — never edit it. `[meta]`
+        // sorts first in the serialized output, so this banner sits right above
+        // it. Regenerated on every save, so it can't drift or be lost.
+        let toml_str = format!("{CONFIG_HEADER}{body}");
         // Crash-safe: a bare `fs::write` truncates in place, so a crash mid-write
         // leaves a corrupt `config.toml` — and quicklinks (user-authored, NOT in
         // the DB sync set) would be lost on the next start's reset-to-defaults.
@@ -90,7 +134,9 @@ impl Config {
                         path.display()
                     );
                 }
-                Config::default()
+                let mut config = Config::default();
+                config.meta.schema_version = schema::CURRENT_SCHEMA_VERSION;
+                config
             }
         }
     }
@@ -167,6 +213,113 @@ mod tests {
         assert_eq!(cfg.ai.timeout_secs, AiConfig::default().timeout_secs);
         assert_eq!(cfg.ai.max_tokens, AiConfig::default().max_tokens);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_file_is_stamped_current_on_load() {
+        // A pre-versioning config.toml (no [meta]) must load AND come back
+        // stamped at the current schema version, so the next save persists it
+        // and migrations stop re-running. The user never writes this field.
+        let path = temp_path("legacy_stamp");
+        std::fs::write(&path, "[general]\ntheme = \"light\"\n").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.meta.schema_version, CURRENT_SCHEMA_VERSION);
+        // User data still intact through the migrate → merge → stamp pipeline.
+        assert_eq!(cfg.general.theme, "light");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fresh_install_carries_current_version() {
+        // No file on disk → defaults, but stamped current (not a legacy 0 that
+        // would needlessly trigger migration on the very first real load).
+        let path = temp_path("fresh_nonexistent");
+        let _ = std::fs::remove_file(&path);
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.meta.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn load_save_load_round_trips_and_persists_version() {
+        // The full lifecycle the app uses: load a legacy file, save it back
+        // (which writes the whole struct including the stamped [meta]), then
+        // reload and confirm the version is now on disk and data survived.
+        let path = temp_path("roundtrip");
+        std::fs::write(&path, "[general]\ntheme = \"light\"\n[ai]\nmodel = \"m\"\n").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        cfg.save(&path).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("schema_version"),
+            "save must persist [meta] schema_version to disk: {raw}"
+        );
+        // The managed-file header must be present and must precede the data, so
+        // a user opening config.toml sees the "don't hand-edit schema_version"
+        // note before the field itself.
+        assert!(
+            raw.starts_with("# Lychi configuration"),
+            "save must prepend the guidance header: {raw}"
+        );
+        // The guidance banner (all comment lines) must precede the actual data.
+        // Anchor on `schema_version = ` — the field ASSIGNMENT — which appears
+        // only in the serialized body, never in the comment prose (the header
+        // spells it in backticks, no `=`). Everything before it must be comment
+        // or blank, so the note is unmissable above the value.
+        let field_at = raw.find("schema_version = ").expect("field written");
+        for line in raw[..field_at].lines() {
+            let t = line.trim();
+            // Comment, blank, or the `[meta]` table header — never a data
+            // assignment. If any `key = value` appeared before the note, the
+            // banner would no longer be the first thing a reader sees.
+            assert!(
+                t.is_empty() || t.starts_with('#') || t.starts_with('['),
+                "only comments/blanks/section-headers may precede the data; found: {line:?}"
+            );
+        }
+        assert!(
+            raw.starts_with("# Lychi configuration"),
+            "the banner must be the very first thing in the file"
+        );
+
+        let reloaded = Config::load(&path).unwrap();
+        assert_eq!(reloaded.meta.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(reloaded.general.theme, "light");
+        assert_eq!(reloaded.ai.model, "m");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Developer guard: the set of top-level config sections is snapshotted here.
+    /// If a section is added, renamed, or removed, this test fails — a prompt to
+    /// decide whether the change needs a migration + a `CURRENT_SCHEMA_VERSION`
+    /// bump (a rename/removal does; a pure addition does not, but you still
+    /// acknowledge it by updating this list). It cannot detect field-level
+    /// changes inside a section, so it is a reminder, not a proof — but it
+    /// catches the coarse structural changes most likely to drop user data.
+    #[test]
+    fn top_level_sections_are_accounted_for() {
+        let default = toml::Value::try_from(Config::default()).unwrap();
+        let table = default.as_table().expect("config serializes to a table");
+        let mut sections: Vec<&str> = table.keys().map(String::as_str).collect();
+        sections.sort_unstable();
+        assert_eq!(
+            sections,
+            [
+                "ai",
+                "commands",
+                "general",
+                "history",
+                "keybindings",
+                "meta",
+                "privacy",
+                "projects",
+                "suggestions",
+                "weather",
+            ],
+            "top-level config sections changed — if this is a rename/removal, add \
+             a migration in config::migrate and bump CURRENT_SCHEMA_VERSION; if a \
+             pure addition, just update this list"
+        );
     }
 
     #[test]

@@ -55,8 +55,6 @@ export function showTab(tab: Tab) {
 	activeTab = tab;
 }
 let appVersion = $state("");
-let layerShellSupported = $state(false);
-let activeWindowStrategy = $state("auto");
 let screenComposited = $state(true);
 
 let aiConfig: AiConfig = $state({
@@ -123,8 +121,6 @@ onMount(() => {
 			keybindingsConfig = cached.keybindingsConfig;
 			projectDirs = cached.projectsConfig.directories;
 			appVersion = cached.appVersion;
-			layerShellSupported = cached.layerShellSupported;
-			activeWindowStrategy = cached.activeWindowStrategy;
 			screenComposited = cached.screenComposited;
 
 			generalTabRef?.initCustomShell(cached.commandsConfig.shell);
@@ -233,8 +229,6 @@ function handleKeydown(e: KeyboardEvent) {
 				bind:generalConfig
 				bind:commandsConfig
 				bind:privacyConfig
-				{layerShellSupported}
-				{activeWindowStrategy}
 				{screenComposited}
 				onsaveerror={(msg) => (saveError = msg)}
 			/>
