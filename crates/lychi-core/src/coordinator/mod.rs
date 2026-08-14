@@ -31,4 +31,4 @@ pub use loop_::{
 pub use manifest::{build_manifest, splice_manifest, with_manifest};
 pub use session::{ApprovalDecision, ApprovalRequest, PendingApproval, Session};
 pub use tool_executor::{ResumeToken, ToolArtifact, ToolExecutor, ToolOutcome, ToolOutputChannel};
-pub use tool_filter::select_tools;
+pub use tool_filter::{select_tools, select_tools_for_context};

@@ -146,6 +146,9 @@ impl StopCondition for MaxSteps {
 pub struct Coordinator<E: ToolExecutor + 'static> {
     provider: Arc<dyn AiProvider>,
     executor: Arc<E>,
+    /// The FULL tool catalog. The model-facing shortlist is re-selected from it
+    /// each turn (see the turn loop); this field stays the complete set so
+    /// re-selection and `is_mutating` always see every tool.
     tools: Vec<ToolDef>,
     stop: Arc<dyn StopCondition>,
 }
@@ -283,8 +286,17 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
             }
             self.emit(AgentEvent::TurnStarted { step });
 
+            // Re-select the tool shortlist from the CURRENT conversation before
+            // each turn, rather than freezing the opening query's set: a later
+            // step reaches a tool its own context now implies. `self.tools` is
+            // the FULL catalog; only the model-facing subset is trimmed. The
+            // executor still runs any tool by name, so a call for a shortlisted-
+            // out tool is not lost.
+            let step_tools =
+                crate::coordinator::select_tools_for_context(&session.messages, self.tools.clone());
+
             // Stream one model turn, forwarding prose + collecting tool calls.
-            let turn = match self.consume_turn(&session.messages).await {
+            let turn = match self.consume_turn(&session.messages, &step_tools).await {
                 Ok(t) => t,
                 Err((e, partial)) => {
                     // The prose that already streamed is on the user's screen —
@@ -406,10 +418,9 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
     async fn consume_turn(
         &self,
         messages: &[crate::providers::ChatMessage],
+        tools: &[ToolDef],
     ) -> Result<TurnResult, (LychiError, String)> {
-        let mut stream: ProviderStream =
-            self.provider
-                .chat(messages, &self.tools, self.cancel.clone());
+        let mut stream: ProviderStream = self.provider.chat(messages, tools, self.cancel.clone());
         let mut text = String::new();
         let mut calls: Vec<ToolCall> = Vec::new();
         let mut truncated = false;

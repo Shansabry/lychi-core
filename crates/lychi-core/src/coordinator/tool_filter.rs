@@ -80,6 +80,40 @@ pub fn select_tools(query: &str, catalog: Vec<ToolDef>) -> Vec<ToolDef> {
     selected
 }
 
+/// How many of the most recent messages feed the per-step tool re-selection.
+/// The shortlist should track where the plan IS now, not only where it began —
+/// a task that started "check my disk" and moved to "open the biggest folder"
+/// needs `open`/`file` by the later step even though the opening query never
+/// named them. Looking back a few turns keeps the recent sub-goal in scope
+/// without letting the whole transcript wash every tool back in.
+const CONTEXT_LOOKBACK_MESSAGES: usize = 6;
+
+/// Re-select the tool shortlist from the RECENT conversation, not a frozen
+/// opening query. Called before every model turn so the callable set tracks the
+/// evolving task (the frozen-per-task set is the documented failure mode: a
+/// later step can't reach a tool the first query didn't match).
+///
+/// The "query" handed to [`select_tools`] is the concatenation of the last few
+/// user/assistant text turns. Note this only shapes what the model is TOLD it
+/// can call — the executor dispatches any called tool by name regardless, so a
+/// tool that falls out of the shortlist is still runnable if the model asks for
+/// it (a free progressive-disclosure fallback).
+pub fn select_tools_for_context(
+    messages: &[crate::providers::ChatMessage],
+    catalog: Vec<ToolDef>,
+) -> Vec<ToolDef> {
+    use crate::providers::Role;
+    let context: String = messages
+        .iter()
+        .rev()
+        .filter(|m| matches!(m.role, Role::User | Role::Assistant))
+        .take(CONTEXT_LOOKBACK_MESSAGES)
+        .map(|m| m.content_text())
+        .collect::<Vec<_>>()
+        .join(" ");
+    select_tools(&context, catalog)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +201,22 @@ mod tests {
     fn ssh_query_keeps_ssh() {
         let out = select_tools("ssh into my production server", full_catalog());
         assert!(names(&out).contains(&"ssh"));
+    }
+
+    #[test]
+    fn context_selection_tracks_a_later_turn_not_just_the_first() {
+        use crate::providers::ChatMessage;
+        // The task OPENED on math (no screenshot in scope) but a later assistant
+        // turn moved to capturing the screen. Re-selecting from recent context
+        // must now surface `screenshot` — the frozen-first-query set never would.
+        let messages = vec![
+            ChatMessage::user("what is 2+2"),
+            ChatMessage::assistant("4. Want me to take a screenshot of the result?"),
+        ];
+        let out = select_tools_for_context(&messages, full_catalog());
+        assert!(
+            names(&out).contains(&"screenshot"),
+            "a tool named only in a later turn must come into scope"
+        );
     }
 }
