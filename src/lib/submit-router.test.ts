@@ -128,9 +128,15 @@ describe("decideSubmit — actuating the backend decision", () => {
 	});
 
 	it("a preset decision renders through", () => {
-		const d: RouteDecision = { kind: "preset", template: "Translate: {input}", input: "hola" };
+		const d: RouteDecision = {
+			kind: "preset",
+			keyword: "translate",
+			template: "Translate: {input}",
+			input: "hola",
+		};
 		expect(decideSubmit(ctx({ trimmed: "translate hola", inputDecision: d }))).toEqual({
 			kind: "preset",
+			keyword: "translate",
 			template: "Translate: {input}",
 			input: "hola",
 		});

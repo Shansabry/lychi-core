@@ -32,8 +32,13 @@ pub enum RouteDecision {
     /// true → straight to the full agent; false → the quick-ai fork card.
     Nl { prompt: String, confident: bool },
     /// An AI preset invocation. When `input` is empty the FE first tries the
-    /// PRIMARY selection (highlighted text) as `{input}`.
-    Preset { template: String, input: String },
+    /// PRIMARY selection (highlighted text) as `{input}`, and prompts inline
+    /// (re-filling `keyword `) when there is nothing to act on.
+    Preset {
+        keyword: String,
+        template: String,
+        input: String,
+    },
     /// A bare panel keyword (`settings`, `history`, `notes`, …). The FE actuates
     /// via `ui.openPanel`; the core carries no UI knowledge, just the tag.
     Panel {
@@ -182,6 +187,7 @@ pub fn classify_string(
             };
         }
         return RouteDecision::Preset {
+            keyword: first_word.to_string(),
             template,
             input: rest,
         };
@@ -473,6 +479,7 @@ mod tests {
         assert_eq!(
             classify_string("translate hola", &r, presets, true),
             RouteDecision::Preset {
+                keyword: "translate".into(),
                 template: "Translate: {input}".into(),
                 input: "hola".into()
             }

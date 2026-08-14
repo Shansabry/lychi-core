@@ -724,6 +724,17 @@ pub enum CompletionKind {
     /// Drives only a display choice (the ⌘K panel's "Open / focus" label), never
     /// routing — an app row still runs via its `run` string like any other.
     App,
+    /// An AI-command (preset) invocation — a keyword like `summarize` that maps
+    /// to a saved template run tool-free on the user's text or PRIMARY selection.
+    ///
+    /// A KIND rather than a `run` command string for the same reason as `AskAi`:
+    /// there is no `summarize` handler to pattern-route to. The row carries the
+    /// template in `run` and the already-typed argument in `description` (empty
+    /// when the user typed only the keyword — the actuator then falls back to the
+    /// selection, and prompts inline if there is nothing to act on). Unlike the
+    /// `AskAi`/`SearchWeb` escape hatches this is a concrete result, so it ranks
+    /// as an ordinary match and MAY be Enter's default.
+    Preset,
 }
 
 impl CompletionKind {

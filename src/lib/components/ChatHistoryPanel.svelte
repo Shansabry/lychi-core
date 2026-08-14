@@ -92,6 +92,18 @@ function ago(ms: number): string {
 	const d = Math.floor(h / 24);
 	return `${d}d`;
 }
+
+// A compact tag for the AI-command pill. `preset_label` is the full instruction
+// ("Summarize the following text in 2-3 concise sentences:"); the pill shows the
+// first word or two, with the full text kept as the row's tooltip.
+function presetTag(label: string): string {
+	const words = label
+		.trim()
+		.replace(/[:.]+$/, "")
+		.split(/\s+/);
+	const tag = words.slice(0, 2).join(" ");
+	return tag.length > 18 ? `${words[0]}` : tag;
+}
 </script>
 
 <svelte:window onkeydown={onKeydown} />
@@ -126,7 +138,12 @@ function ago(ms: number): string {
 						onmousedown={(e) => e.preventDefault()}
 						tabindex={-1}
 					>
-						<span class="ch-title">{c.title}</span>
+						<span class="ch-title-row">
+							{#if c.preset_label}
+								<span class="ch-pill" title={c.preset_label}>{presetTag(c.preset_label)}</span>
+							{/if}
+							<span class="ch-title">{c.title}</span>
+						</span>
 						<span class="ch-meta">{c.turn_count} turn{c.turn_count === 1 ? "" : "s"} · {ago(c.updated_at)}</span>
 					</button>
 					<button
@@ -224,6 +241,25 @@ function ago(ms: number): string {
 		text-align: left;
 		min-width: 0;
 	}
+	.ch-title-row {
+		display: flex;
+		align-items: center;
+		gap: 7px;
+		min-width: 0;
+	}
+	.ch-pill {
+		flex-shrink: 0;
+		font-family: var(--font-mono);
+		font-size: 9.5px;
+		line-height: 1;
+		text-transform: lowercase;
+		letter-spacing: 0.02em;
+		padding: 2px 6px;
+		border-radius: 4px;
+		color: var(--accent);
+		background: color-mix(in srgb, var(--accent) 12%, transparent);
+		border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+	}
 	.ch-title {
 		font-family: var(--font-sans, system-ui);
 		font-size: 13px;
@@ -231,6 +267,7 @@ function ago(ms: number): string {
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+		min-width: 0;
 	}
 	.ch-content:hover .ch-title {
 		color: var(--accent);

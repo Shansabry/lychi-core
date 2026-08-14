@@ -95,6 +95,7 @@ impl AiHistoryStore {
                 Ok(meta) => out.push(ConversationSummary {
                     id: meta.id,
                     title: meta.title,
+                    preset_label: meta.preset_label,
                     turn_count: meta.turn_count,
                     created_at: meta.created_at,
                     updated_at: meta.updated_at,
@@ -144,6 +145,7 @@ impl AiHistoryStore {
         let conv = Conversation {
             id: id.to_string(),
             title: derive_title(messages),
+            preset_label: crate::ai_history::derive_preset_label(messages),
             turn_count: count_turns(messages),
             messages: messages.to_vec(),
             created_at,
@@ -315,6 +317,7 @@ mod tests {
         let ancient = Conversation {
             id: "ancient".into(),
             title: "old".into(),
+            preset_label: None,
             turn_count: 2,
             messages: conv_messages("old q", "old a"),
             created_at: 0,
@@ -346,6 +349,7 @@ mod tests {
             let conv = Conversation {
                 id: format!("c{i}"),
                 title: format!("t{i}"),
+                preset_label: None,
                 turn_count: 2,
                 messages: conv_messages(&format!("q{i}"), "a"),
                 created_at: now,

@@ -1082,12 +1082,26 @@ impl Executor {
             );
         }
 
+        // ── AI command (preset) ─────────────────────────────────────────
+        // A preset keyword (`summarize`, `translate`, …) is a concrete AI action,
+        // not an escape hatch: it ranks as an Identity match so Enter selects it,
+        // and it SUPPRESSES the generic Ask AI / Search web fallbacks — offering
+        // "Ask AI" next to a resolved AI command is both redundant and, since a
+        // fallback that sorts first would steal Enter, the exact bug this fixes.
+        let preset = self.preset_row(raw);
+        let has_preset = preset.is_some();
+        if let Some(item) = preset {
+            all.push(Suggestion::new(item, Source::Handler, Tier::Identity));
+        }
+
         // ── Escape hatches ──────────────────────────────────────────────
-        all.extend(
-            fallback_rows(raw, self.has_ai())
-                .into_iter()
-                .map(|i| Suggestion::new(i, Source::Fallback, Tier::Fuzzy)),
-        );
+        if !has_preset {
+            all.extend(
+                fallback_rows(raw, self.has_ai())
+                    .into_iter()
+                    .map(|i| Suggestion::new(i, Source::Fallback, Tier::Fuzzy)),
+            );
+        }
 
         // Learned query→command bindings for this exact query. Empty for a new
         // user or an unseen query, in which case ranking is unchanged.
@@ -1250,6 +1264,45 @@ impl Executor {
     /// input isn't a question yet — offering to search the web for "d" is noise.
     fn wants_fallbacks(raw: &str) -> bool {
         raw.trim().chars().count() >= 2
+    }
+
+    /// The AI-command (preset) suggestion for a query whose first word is a
+    /// preset keyword, or `None`. The row carries the template in `run` and the
+    /// already-typed argument (the words after the keyword) in `description`, so
+    /// the actuator can render `{input}` from it or fall back to the selection.
+    ///
+    /// Only offered when AI is on — a preset with no provider has nowhere to run,
+    /// and `classify` already downgrades that case to the web escape hatch. The
+    /// keyword lookup mirrors `classify`'s injected `preset_for`; keeping the
+    /// SAME lookup on both paths is what stops the suggestion and the Enter
+    /// verdict from ever disagreeing.
+    fn preset_row(&self, raw: &str) -> Option<CompletionItem> {
+        use crate::action_registry::CompletionKind;
+
+        if !self.has_ai() {
+            return None;
+        }
+        let trimmed = raw.trim();
+        let first_word = trimmed.split_whitespace().next()?;
+        let (template, name) = crate::ai_presets::store::AiPresetsStore::new()
+            .get_preset_by_keyword(&self.db, first_word)
+            .ok()
+            .flatten()
+            .map(|p| (p.template, p.name))?;
+        let arg = trimmed
+            .split_once(char::is_whitespace)
+            .map(|(_, r)| r.trim().to_string())
+            .unwrap_or_default();
+
+        Some(CompletionItem {
+            label: name,
+            icon_path: Some("__ai_chat__".to_string()),
+            score: 0,
+            description: Some(arg),
+            kind: Some(CompletionKind::Preset),
+            run: Some(template),
+            ..Default::default()
+        })
     }
 
     /// Whether AI is available.

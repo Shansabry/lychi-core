@@ -173,8 +173,11 @@ export type SubmitAction =
 	 * An AI preset invocation. `template` + the user's `input`; the dispatcher
 	 * renders it, and when `input` is empty it first tries the PRIMARY selection
 	 * (highlighted text) as `{input}` — so `summarize` alone acts on the selection.
+	 * `keyword` is the invoking word, kept so the dispatcher can re-fill the box
+	 * (`summarize `) and prompt inline when there is neither typed text nor a
+	 * selection to act on.
 	 */
-	| { kind: "preset"; template: string; input: string }
+	| { kind: "preset"; template: string; input: string; keyword: string }
 	/**
 	 * The user made an AI request but no provider is configured. Warn them, then
 	 * run `command` (a `web …` fallback the backend chose). `explicit` = they
@@ -201,7 +204,12 @@ function fromDecision(decision: RouteDecision): SubmitAction {
 				? { kind: "agent", prompt: decision.prompt }
 				: { kind: "quick-ai", prompt: decision.prompt };
 		case "preset":
-			return { kind: "preset", template: decision.template, input: decision.input };
+			return {
+				kind: "preset",
+				template: decision.template,
+				input: decision.input,
+				keyword: decision.keyword,
+			};
 		case "panel":
 			// `PanelKind` is already the FE panel name (`settings`…`chat-history`);
 			// `sub_tab` is the notes sub-tab when present.
@@ -318,6 +326,19 @@ function decideSelectedCompletion(ctx: SubmitContext, selected: RouterCompletion
 	// for AUTO-selected fallback rows and would otherwise substitute the input's
 	// own (possibly ambiguous, or AI-disabled → web) decision for the explicit
 	// choice just made.
+	// An AI command (preset) row: `run` is the template, `description` the typed
+	// argument (empty when only the keyword was entered — the actuator then reads
+	// the PRIMARY selection, and prompts inline if there is nothing to act on).
+	// A concrete AI action, not the open-ended agent — so it goes to `startPreset`
+	// (tool-free), never the Ask AI chat.
+	if (selected.kind === "preset" && selected.run) {
+		return {
+			kind: "preset",
+			template: selected.run,
+			input: selected.description ?? "",
+			keyword: trimmed.split(/\s+/)[0] ?? "",
+		};
+	}
 	if (selected.kind === "ask-ai" && selected.description) {
 		return { kind: "agent", prompt: selected.description };
 	}

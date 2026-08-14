@@ -1903,7 +1903,20 @@ export type CompletionKind =
  * Drives only a display choice (the ⌘K panel's "Open / focus" label), never
  * routing — an app row still runs via its `run` string like any other.
  */
-"app"
+"app" | 
+/**
+ * An AI-command (preset) invocation — a keyword like `summarize` that maps
+ * to a saved template run tool-free on the user's text or PRIMARY selection.
+ * 
+ * A KIND rather than a `run` command string for the same reason as `AskAi`:
+ * there is no `summarize` handler to pattern-route to. The row carries the
+ * template in `run` and the already-typed argument in `description` (empty
+ * when the user typed only the keyword — the actuator then falls back to the
+ * selection, and prompts inline if there is nothing to act on). Unlike the
+ * `AskAi`/`SearchWeb` escape hatches this is a concrete result, so it ranks
+ * as an ordinary match and MAY be Enter's default.
+ */
+"preset"
 export type ContainerInfo = { id: string; name: string; image: string; status: string }
 /**
  * One block of a message's content. A message is a sequence of these: prose
@@ -1927,6 +1940,13 @@ export type Conversation = { id: string;
  */
 title: string; 
 /**
+ * The invoking AI-command (preset) instruction when this conversation was
+ * started by a preset, e.g. `Summarize the following…`. `None` for an
+ * ordinary chat. Persisted so the recall list can badge preset runs without
+ * reading `messages`. `#[serde(default)]`: pre-field rows decode to `None`.
+ */
+preset_label?: string | null; 
+/**
  * Number of user+assistant turns. Persisted so `list`/`prune` never touch
  * `messages`. `#[serde(default)]`: rows written before this field existed
  * decode to 0, and are corrected on their next upsert.
@@ -1936,6 +1956,11 @@ turn_count?: number; created_at: number; updated_at: number; messages: ChatMessa
  * A lightweight row for the recall list — no message bodies, so listing is cheap.
  */
 export type ConversationSummary = { id: string; title: string; 
+/**
+ * The AI-command label when this was a preset run (`Summarize the following…`),
+ * else `None`. Lets the recall list badge "which command" beside the title.
+ */
+preset_label?: string | null; 
 /**
  * Number of user+assistant turns (excludes the system prompt & tool msgs).
  */
@@ -2547,9 +2572,10 @@ export type RouteDecision =
 { kind: "nl"; prompt: string; confident: boolean } | 
 /**
  * An AI preset invocation. When `input` is empty the FE first tries the
- * PRIMARY selection (highlighted text) as `{input}`.
+ * PRIMARY selection (highlighted text) as `{input}`, and prompts inline
+ * (re-filling `keyword `) when there is nothing to act on.
  */
-{ kind: "preset"; template: string; input: string } | 
+{ kind: "preset"; keyword: string; template: string; input: string } | 
 /**
  * A bare panel keyword (`settings`, `history`, `notes`, …). The FE actuates
  * via `ui.openPanel`; the core carries no UI knowledge, just the tag.

@@ -1160,18 +1160,27 @@ async function actuate(action: SubmitAction): Promise<void> {
 			return;
 
 		case "preset": {
-			// An AI preset. If the user typed no text after the keyword, fall back
-			// to the PRIMARY selection (highlighted text in the focused window) —
-			// so `summarize` alone acts on what you've selected in VSCode/browser.
-			// Runs tool-free (chat.startPreset) — a text transform needs no tools.
-			inputValue = "";
-			completions.items = [];
-			completions.index = -1;
+			// An AI command (preset). If the user typed no text after the keyword,
+			// fall back to the PRIMARY selection (highlighted text in the focused
+			// window) — so `summarize` alone acts on what you've selected in a
+			// browser/editor. Runs tool-free (chat.startPreset) — a text transform
+			// needs no tools, and it is NOT the open-ended Ask AI chat.
 			let input = action.input;
 			if (!input) {
 				const sel = await readSelection().catch(() => null);
 				if (sel) input = sel;
 			}
+			// Nothing to act on (no typed text, nothing selected): don't fire the
+			// model on an empty payload — it can only answer "provide the text".
+			// Re-fill the keyword and show its argument hint so the user can paste.
+			if (!input) {
+				inputValue = `${action.keyword} `;
+				flashHint(`Type or select text for ${action.keyword}`);
+				return;
+			}
+			inputValue = "";
+			completions.items = [];
+			completions.index = -1;
 			lastResult = null; // AI answer takes over the result area
 			// Model gets the full rendered prompt; the bubble folds a big selection
 			// into a collapsed attachment chip instead of dumping it inline.
