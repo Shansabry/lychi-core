@@ -259,6 +259,19 @@ pub struct ToolDef {
     /// one, not all. Read-only tools (`false`) stay freely parallel.
     #[serde(default)]
     pub mutates: bool,
+    /// Optional JSON Schema for the tool's `args`, for the BOUNDED tools whose
+    /// first token is a fixed verb (`system`, `media`, …). `None` → the uniform
+    /// free-text `{args: string}` every open-ended tool uses (`run`, `web`).
+    ///
+    /// When present it is emitted as the tool's real `input_schema`, so the
+    /// provider constrains the model to a valid verb — a cloud model via
+    /// `strict`/enum, and crucially a LOCAL llama.cpp model via grammar sampling
+    /// (an out-of-enum token is masked to `-INFINITY`, i.e. unemittable). This
+    /// is what lifts weak/local models, which fumble free-text args worst. The
+    /// wire `args` value stays a JSON *string* — the handler parses it — so no
+    /// downstream type (`ToolCall.args`, the FE contract) changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<serde_json::Value>,
 }
 
 /// A tool invocation the model requested. `id` correlates the eventual

@@ -54,6 +54,68 @@ pub const MUTATING_VERBS: &[&str] = crate::rules::verbs::MUTATING_SERVICE_VERBS;
 /// Read-only verbs that never need confirmation.
 const READONLY_VERBS: &[&str] = crate::rules::verbs::READONLY_SERVICE_VERBS;
 
+/// Every verb the dispatch match accepts — the mutating set plus the read-only
+/// set — as the machine-readable enum fed to the tool schema so a constrained
+/// model (cloud `enum` / local grammar) can only emit one `execute`/`parse`
+/// handle. Sourced from the same two central lists the parser and risk gate use,
+/// so the enum can't drift from dispatch.
+fn service_action_verbs() -> Vec<&'static str> {
+    MUTATING_VERBS
+        .iter()
+        .chain(READONLY_VERBS.iter())
+        .copied()
+        .collect()
+}
+
+/// The JSON Schema for `service`'s args: a required free `name` operand plus an
+/// optional `action` verb (constrained to [`service_action_verbs`]). `action` is
+/// optional because a bare `<name>` defaults to a status check. Emitted as the
+/// tool's `input_schema` so the model is constrained to a real verb.
+fn service_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string",
+                      "description": "The systemd unit/service name (e.g. \"nginx\", \"docker\")." },
+            "action": { "type": "string", "enum": service_action_verbs(),
+                        "description": "What to do with the service. Omit to check its status." }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+    })
+}
+
+/// Normalize the tool's `args` to the flat `"<name> [<verb>]"` string the parser
+/// already understands. A constrained model sends the structured JSON
+/// (`{"name":"nginx","action":"restart"}`); a human or legacy/flat caller sends
+/// the string directly. The name comes FIRST — matching `parse`'s canonical
+/// `<name> <verb>` form. A bare name (no `action`) flattens to just the name,
+/// which `parse` reads as a status check. Keeps `execute`/`assess_risk` on `&str`.
+fn service_args_to_flat(args: &str) -> String {
+    let t = args.trim();
+    if !t.starts_with('{') {
+        return t.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(t) {
+        Ok(v) => {
+            let name = v.get("name").and_then(|a| a.as_str()).unwrap_or("").trim();
+            let action = v
+                .get("action")
+                .and_then(|a| a.as_str())
+                .unwrap_or("")
+                .trim();
+            if action.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name} {action}")
+            }
+        }
+        // Not the JSON we expected — fall back to the raw string; `parse` will
+        // reject it with the usual usage message.
+        Err(_) => t.to_string(),
+    }
+}
+
 fn have(tool: &str) -> bool {
     which::which(tool).is_ok()
 }
@@ -323,6 +385,9 @@ impl ActionHandler for ServicesHandler {
     fn usage(&self) -> &str {
         "'<name>' or '<name> status' to check it; '<name> start|stop|restart|reload|enable|disable' to control it"
     }
+    fn input_schema(&self) -> Option<serde_json::Value> {
+        Some(service_input_schema())
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::System
     }
@@ -335,8 +400,12 @@ impl ActionHandler for ServicesHandler {
         // Read-only verbs (status/list) auto-execute; mutating verbs
         // (start/stop/restart/…) need confirmation. This decision lives here,
         // where the handler already knows its verbs — not in the Rules Engine.
-        if is_mutating(args) {
-            RiskAssessment::confirm(format!("Run 'systemctl {}'?", args.trim()))
+        // A constrained model sends `{"name":..,"action":..}`; flatten it (a
+        // plain-string caller passes through) so the gate sees the same verb
+        // execute will dispatch on.
+        let flat = service_args_to_flat(args);
+        if is_mutating(&flat) {
+            RiskAssessment::confirm(format!("Run 'systemctl {}'?", flat.trim()))
         } else {
             RiskAssessment::level(RiskLevel::Low)
         }
@@ -378,7 +447,11 @@ impl ActionHandler for ServicesHandler {
             ));
         }
 
-        let trimmed = args.trim();
+        // A constrained model sends `{"name":..,"action":..}`; flatten it (and a
+        // plain-string caller passes through) to the `<name> [verb]` form `parse`
+        // reads.
+        let flat = service_args_to_flat(args);
+        let trimmed = flat.trim();
 
         // Bare `service` (no args) lists running services, same as `services`.
         if trimmed.is_empty() {
@@ -567,6 +640,43 @@ mod tests {
             h.assess_risk("nginx status", &Default::default()).level,
             RiskLevel::Low
         );
+    }
+
+    #[test]
+    fn service_args_flatten_from_structured_json() {
+        // A constrained model sends the typed object; it flattens to the
+        // name-first string `parse` reads.
+        assert_eq!(
+            service_args_to_flat(r#"{"name":"nginx","action":"restart"}"#),
+            "nginx restart"
+        );
+        // Bare name (no action) → just the name, which parse reads as status.
+        assert_eq!(service_args_to_flat(r#"{"name":"docker"}"#), "docker");
+        // Empty action is treated as no action.
+        assert_eq!(
+            service_args_to_flat(r#"{"name":"sshd","action":""}"#),
+            "sshd"
+        );
+        // A plain-string caller (human, legacy) passes straight through.
+        assert_eq!(service_args_to_flat("nginx restart"), "nginx restart");
+        assert_eq!(service_args_to_flat("docker"), "docker");
+    }
+
+    #[test]
+    fn service_schema_enum_matches_the_real_verbs() {
+        // The schema's action enum must be exactly the mutating + read-only verb
+        // sets, so the model is constrained to verbs `parse`/`execute` handle.
+        let verbs = service_action_verbs();
+        let schema = service_input_schema();
+        let en = schema["properties"]["action"]["enum"].as_array().unwrap();
+        assert_eq!(en.len(), verbs.len());
+        for v in &verbs {
+            assert!(en.iter().any(|e| e == v), "enum missing {v}");
+        }
+        // The two source lists together are what the parser treats as verbs.
+        for v in MUTATING_VERBS.iter().chain(READONLY_VERBS.iter()) {
+            assert!(verbs.contains(v), "verb list missing {v}");
+        }
     }
 
     #[test]

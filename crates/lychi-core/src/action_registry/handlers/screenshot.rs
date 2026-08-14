@@ -69,6 +69,64 @@ impl Mode {
             Mode::Window => "active window",
         }
     }
+
+    /// The canonical name for this mode — the spelling the schema steers the
+    /// model toward (aliases like `region`/`win` still parse, but the model is
+    /// constrained to these three). One `&str` per `Mode` variant. Used by the
+    /// schema/parser round-trip test to prove [`SCREENSHOT_MODES`] can't drift.
+    #[cfg(test)]
+    fn canonical(self) -> &'static str {
+        match self {
+            Mode::Full => "full",
+            Mode::Area => "area",
+            Mode::Window => "window",
+        }
+    }
+}
+
+/// The canonical capture-mode VERBS the agent chooses between — the
+/// machine-readable enum fed to the tool schema so a constrained model (cloud
+/// `enum` / local grammar) can only emit one [`Mode::parse`] recognizes. Each is
+/// a distinct `Mode::canonical`, so the enum can't drift from the parser.
+const SCREENSHOT_MODES: &[&str] = &["full", "area", "window"];
+
+/// The JSON Schema for `screenshot`'s args: an optional `action` constrained to
+/// [`SCREENSHOT_MODES`], with no operand (a mode carries all the meaning).
+/// `action` is optional — empty args are a valid request (the full screen, the
+/// default). Emitted as the tool's `input_schema` so the model is constrained to
+/// a real mode.
+fn screenshot_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "action": { "type": "string", "enum": SCREENSHOT_MODES,
+                        "description": "What to capture. Omit or \"full\" for the whole screen." }
+        },
+        "additionalProperties": false
+    })
+}
+
+/// Normalize the tool's `args` to the flat mode string [`Mode::parse`] reads. A
+/// constrained model sends the structured JSON (`{"action":"area"}`); a human or
+/// legacy/flat caller sends the string directly. Screenshot has no operand, so
+/// the flattened form is just the mode (or `""` — parsed as the default full
+/// screen — when `action` is absent).
+fn screenshot_args_to_flat(args: &str) -> String {
+    let t = args.trim();
+    if !t.starts_with('{') {
+        return t.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(t) {
+        Ok(v) => v
+            .get("action")
+            .and_then(|a| a.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        // Not the JSON we expected — fall back to the raw string; Mode::parse
+        // treats anything unrecognized as the full-screen default.
+        Err(_) => t.to_string(),
+    }
 }
 
 /// Whether the tool copies to clipboard on its own, so we don't double-handle.
@@ -615,6 +673,9 @@ impl ActionHandler for ScreenshotHandler {
     fn usage(&self) -> &str {
         "empty or 'full' for the whole screen, 'area' (aliases: region, select) to select a region, 'window' for the active window"
     }
+    fn input_schema(&self) -> Option<serde_json::Value> {
+        Some(screenshot_input_schema())
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::System
     }
@@ -655,7 +716,10 @@ impl ActionHandler for ScreenshotHandler {
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        let mode = Mode::parse(args);
+        // A constrained model sends `{"action":..}`; flatten it (and a
+        // plain-string caller passes through) to the mode string Mode::parse reads.
+        let flat = screenshot_args_to_flat(args);
+        let mode = Mode::parse(&flat);
         let path = output_path();
         let path_str = path.to_string_lossy().to_string();
 
@@ -765,6 +829,37 @@ mod tests {
         assert_eq!(Mode::parse("window"), Mode::Window);
         assert_eq!(Mode::parse("win"), Mode::Window);
         assert_eq!(Mode::parse("everything else"), Mode::Full);
+    }
+
+    #[test]
+    fn screenshot_args_flatten_from_structured_json() {
+        // A constrained model sends the typed object; it flattens to the bare
+        // mode string Mode::parse reads. Screenshot has no operand.
+        assert_eq!(screenshot_args_to_flat(r#"{"action":"area"}"#), "area");
+        assert_eq!(screenshot_args_to_flat(r#"{"action":"window"}"#), "window");
+        assert_eq!(screenshot_args_to_flat(r#"{"action":"full"}"#), "full");
+        // No action → the full-screen-default empty string.
+        assert_eq!(screenshot_args_to_flat("{}"), "");
+        assert_eq!(screenshot_args_to_flat(r#"{"action":""}"#), "");
+        // A plain-string caller (human, legacy) passes straight through.
+        assert_eq!(screenshot_args_to_flat("area"), "area");
+        assert_eq!(screenshot_args_to_flat(""), "");
+    }
+
+    #[test]
+    fn screenshot_schema_enum_matches_the_real_modes() {
+        // The schema's action enum must be exactly SCREENSHOT_MODES, and each
+        // must be a distinct canonical Mode — so the model is constrained to
+        // modes Mode::parse recognizes and none collide.
+        let schema = screenshot_input_schema();
+        let en = schema["properties"]["action"]["enum"].as_array().unwrap();
+        assert_eq!(en.len(), SCREENSHOT_MODES.len());
+        for m in SCREENSHOT_MODES {
+            assert!(en.iter().any(|e| e == m), "enum missing {m}");
+            // The mode round-trips: parse(canonical) is a variant whose own
+            // canonical() is that same string.
+            assert_eq!(Mode::parse(m).canonical(), *m, "mode {m} not canonical");
+        }
     }
 
     #[test]

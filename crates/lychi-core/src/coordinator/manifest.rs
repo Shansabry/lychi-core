@@ -124,6 +124,7 @@ mod tests {
             category_title: "General".to_string(),
             category_order: 0,
             mutates,
+            input_schema: None,
         }
     }
 

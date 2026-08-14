@@ -924,6 +924,7 @@ mod tests {
                 name: "weather".into(),
                 description: "get weather".into(),
                 mutates: false,
+                input_schema: None,
             }],
         )
     }
@@ -943,6 +944,7 @@ mod tests {
                 name: name.into(),
                 description: name.into(),
                 mutates,
+                input_schema: None,
             }],
         )
     }
@@ -1162,6 +1164,7 @@ mod tests {
                 name: "run".into(),
                 description: "shell".into(),
                 mutates: true,
+                input_schema: None,
             }],
         );
         let (stream, handle) = coord.run(
@@ -1245,6 +1248,7 @@ mod tests {
                 name: "delete".into(),
                 description: "delete".into(),
                 mutates: false,
+                input_schema: None,
             }],
         );
         let (stream, handle) =
@@ -1276,6 +1280,7 @@ mod tests {
                 name: "delete".into(),
                 description: "delete".into(),
                 mutates: false,
+                input_schema: None,
             }],
         );
         let (s1, h1) = coord.run(Session::new("sys", "delete all"), CancellationToken::new());
@@ -1294,6 +1299,7 @@ mod tests {
                 name: "delete".into(),
                 description: "delete".into(),
                 mutates: false,
+                input_schema: None,
             }],
         );
         let (s2, h2) = coord2.resume(session, ApprovalDecision::Approve, CancellationToken::new());
@@ -1316,6 +1322,7 @@ mod tests {
                 name: "delete".into(),
                 description: "delete".into(),
                 mutates: false,
+                input_schema: None,
             }],
         );
         let (s1, h1) = coord.run(Session::new("sys", "delete all"), CancellationToken::new());
@@ -1333,6 +1340,7 @@ mod tests {
                 name: "delete".into(),
                 description: "delete".into(),
                 mutates: false,
+                input_schema: None,
             }],
         );
         let (s2, h2) = coord2.resume(
@@ -1385,11 +1393,13 @@ mod tests {
                     name: "delete".into(),
                     description: "delete".into(),
                     mutates: false,
+                    input_schema: None,
                 },
                 ToolDef {
                     name: "weather".into(),
                     description: "get weather".into(),
                     mutates: false,
+                    input_schema: None,
                 },
             ],
         );
@@ -1419,6 +1429,7 @@ mod tests {
                 name: "delete".into(),
                 description: "delete".into(),
                 mutates: false,
+                input_schema: None,
             }],
         );
         let (s2, h2) = coord2.resume(session, ApprovalDecision::Approve, CancellationToken::new());
@@ -1453,11 +1464,13 @@ mod tests {
                 name: "delete".into(),
                 description: "delete".into(),
                 mutates: false,
+                input_schema: None,
             },
             ToolDef {
                 name: "format".into(),
                 description: "format".into(),
                 mutates: false,
+                input_schema: None,
             },
         ];
         let coord = Coordinator::new(provider, exec.clone(), tools.clone());
@@ -1531,6 +1544,7 @@ mod tests {
                 name: "delete".into(),
                 description: "delete".into(),
                 mutates: false,
+                input_schema: None,
             }],
         );
         let (stream, handle) = coord.run(Session::new("sys", "go"), CancellationToken::new());

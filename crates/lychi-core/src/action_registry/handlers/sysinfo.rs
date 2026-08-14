@@ -38,6 +38,46 @@ const SUBCOMMANDS: &[&str] = &[
     "speedtest",
 ];
 
+/// The JSON Schema for `sysinfo`'s args: an optional `action` constrained to the
+/// real [`SUBCOMMANDS`], so a constrained model (cloud `enum` / local grammar)
+/// can only emit a subcommand the dispatch match actually handles. There is no
+/// operand — a subcommand carries all the meaning — so the schema has no `value`
+/// field. `action` is optional: empty args are a valid request (the full
+/// overview). Sourced from `SUBCOMMANDS` so the enum can't drift from dispatch.
+fn sysinfo_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "action": { "type": "string", "enum": SUBCOMMANDS,
+                        "description": "The info subcommand to run. Omit for a full system overview." }
+        },
+        "additionalProperties": false
+    })
+}
+
+/// Normalize the tool's `args` to the flat subcommand string `execute` parses.
+/// A constrained model sends the structured JSON (`{"action":"cpu"}`); a human
+/// or legacy/flat caller sends the string directly. sysinfo has no operand, so
+/// the flattened form is just the verb (or `""` for the overview when `action`
+/// is absent). Keeps `execute`/`assess_risk` on `&str`.
+fn sysinfo_args_to_flat(args: &str) -> String {
+    let t = args.trim();
+    if !t.starts_with('{') {
+        return t.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(t) {
+        Ok(v) => v
+            .get("action")
+            .and_then(|a| a.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        // Not the JSON we expected — fall back to the raw string; the dispatch
+        // match will reject it with the usual "unknown" message.
+        Err(_) => t.to_string(),
+    }
+}
+
 #[async_trait]
 impl ActionHandler for SysInfoHandler {
     fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
@@ -76,6 +116,9 @@ impl ActionHandler for SysInfoHandler {
     fn usage(&self) -> &str {
         "Subcommands: ip, cpu, mem, disk, temp, gpu, battery, net, audio, display, os. Empty args shows a full overview"
     }
+    fn input_schema(&self) -> Option<serde_json::Value> {
+        Some(sysinfo_input_schema())
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::System
     }
@@ -86,6 +129,11 @@ impl ActionHandler for SysInfoHandler {
         _ctx: &crate::action_registry::RiskContext<'_>,
     ) -> crate::action_registry::RiskAssessment {
         use crate::action_registry::{ConsentKind, RiskAssessment, RiskLevel};
+        // A constrained model sends `{"action":..}`; flatten it (a plain-string
+        // caller passes through) so the consent match sees the same verb execute
+        // will dispatch on.
+        let args = sysinfo_args_to_flat(args);
+        let args = args.as_str();
         // The consent declaration parses args EXACTLY as `execute` does (trim +
         // lowercase, same alias arms). This match and the dispatch match must
         // agree — the Rules Engine keeping its own alias list is how `sysinfo
@@ -112,7 +160,10 @@ impl ActionHandler for SysInfoHandler {
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let start = Instant::now();
-        let cmd = args.trim().to_lowercase();
+        // A constrained model sends `{"action":..}`; flatten it (and a
+        // plain-string caller passes through) to the subcommand the match parses.
+        let flat = sysinfo_args_to_flat(args);
+        let cmd = flat.trim().to_lowercase();
 
         let output = match cmd.as_str() {
             "" => {
@@ -1148,6 +1199,32 @@ mod tests {
         assert_eq!(strip_ansi(colored), "Output: 1 eDP-1 enabled");
         // Plain text is unchanged.
         assert_eq!(strip_ansi("no escapes here"), "no escapes here");
+    }
+
+    #[test]
+    fn sysinfo_args_flatten_from_structured_json() {
+        // A constrained model sends the typed object; it flattens to the bare
+        // subcommand the dispatch match parses. sysinfo has no operand.
+        assert_eq!(sysinfo_args_to_flat(r#"{"action":"cpu"}"#), "cpu");
+        assert_eq!(sysinfo_args_to_flat(r#"{"action":"battery"}"#), "battery");
+        // No action → the full-overview empty string.
+        assert_eq!(sysinfo_args_to_flat("{}"), "");
+        assert_eq!(sysinfo_args_to_flat(r#"{"action":""}"#), "");
+        // A plain-string caller (human, legacy) passes straight through.
+        assert_eq!(sysinfo_args_to_flat("cpu"), "cpu");
+        assert_eq!(sysinfo_args_to_flat(""), "");
+    }
+
+    #[test]
+    fn sysinfo_schema_enum_matches_the_real_verbs() {
+        // The schema's action enum must be exactly SUBCOMMANDS, so the model is
+        // constrained to subcommands the dispatch match actually handles.
+        let schema = sysinfo_input_schema();
+        let en = schema["properties"]["action"]["enum"].as_array().unwrap();
+        assert_eq!(en.len(), SUBCOMMANDS.len());
+        for v in SUBCOMMANDS {
+            assert!(en.iter().any(|e| e == v), "enum missing {v}");
+        }
     }
 
     #[test]

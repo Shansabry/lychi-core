@@ -123,6 +123,7 @@ mod tests {
             name: name.into(),
             description: desc.into(),
             mutates: false,
+            input_schema: None,
         }
     }
 

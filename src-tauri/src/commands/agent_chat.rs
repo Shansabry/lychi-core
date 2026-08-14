@@ -549,6 +549,7 @@ async fn build_coordinator(
                         name: c.id,
                         description,
                         mutates: c.mutates,
+                        input_schema: c.input_schema,
                     }
                 })
                 .collect()

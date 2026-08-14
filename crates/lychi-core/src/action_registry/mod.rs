@@ -613,6 +613,11 @@ pub struct CommandInfo {
     /// Empty when the handler declares none. Consumed by the capability manifest,
     /// not the Guide.
     pub usage: String,
+    /// Optional typed args schema ([`ActionHandler::input_schema`]). `None` for
+    /// the free-text `{args:string}` tools; `Some` for the bounded ones, whose
+    /// verb the provider then constrains. Not serialized to the frontend.
+    #[serde(skip)]
+    pub input_schema: Option<serde_json::Value>,
     /// The family this command belongs to (for Guide grouping).
     pub category: CommandCategory,
     /// The category's human-readable section title (so the frontend needn't map).
@@ -921,6 +926,25 @@ pub trait ActionHandler: Send + Sync {
     /// or self-evident use needs none.
     fn usage(&self) -> &str {
         ""
+    }
+
+    /// Optional JSON Schema for this tool's `args`, for the BOUNDED tools whose
+    /// first token is a fixed verb (`system`, `media`, `service`, …). `None`
+    /// (the default) means the uniform free-text `{args: string}` every open-
+    /// ended tool uses (`run`, `web`, `ask`).
+    ///
+    /// When present, the provider constrains the model to a valid verb: a cloud
+    /// model via the schema `enum`, and a LOCAL llama.cpp model via grammar-
+    /// constrained sampling (an out-of-enum token is masked, i.e. unemittable) —
+    /// which is what stops weak/local models fumbling free-text args. The value
+    /// the model then sends is a JSON object like `{"action":"volume","value":
+    /// "50"}`; the handler flattens it back to the string it already parses, so
+    /// `execute` keeps its `&str` contract and no downstream type changes.
+    ///
+    /// Derive the schema's `enum` from the same constant the handler matches on,
+    /// so the schema and the parser can never drift.
+    fn input_schema(&self) -> Option<serde_json::Value> {
+        None
     }
 
     /// The family this handler belongs to, for grouping in the Guide. Override to

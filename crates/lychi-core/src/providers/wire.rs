@@ -453,25 +453,45 @@ fn openai_content_parts(m: &ChatMessage) -> Vec<Value> {
         .collect()
 }
 
-/// Anthropic tool schema — uniform `{ args: string }` input for every Lychi tool.
+/// The JSON Schema for a tool's input: the handler's typed schema for a BOUNDED
+/// tool (`system`, …), else the uniform free-text `{ args: string }` every
+/// open-ended tool uses. Shared by both dialects so they can't diverge.
+fn tool_input_schema(t: &ToolDef) -> Value {
+    t.input_schema.clone().unwrap_or_else(|| {
+        json!({
+            "type": "object",
+            "properties": { "args": { "type": "string", "description": "The command arguments." } },
+            "required": ["args"],
+        })
+    })
+}
+
+/// Anthropic tool schema. Bounded tools carry a typed `input_schema` (enum verb);
+/// the rest use the uniform `{ args: string }`.
+///
+/// A typed tool also gets `"strict": true`, which makes Anthropic grammar-
+/// constrain sampling to schema-valid inputs — the cloud analogue of the local
+/// llama.cpp grammar, so a valid verb is guaranteed on both paths. Not set on the
+/// free-text tools: strict requires `additionalProperties:false`/all-required,
+/// and there is nothing to constrain on an open string anyway.
 pub(crate) fn anthropic_tools(tools: &[ToolDef]) -> Vec<Value> {
     tools
         .iter()
         .map(|t| {
-            json!({
+            let mut tool = json!({
                 "name": t.name,
                 "description": t.description,
-                "input_schema": {
-                    "type": "object",
-                    "properties": { "args": { "type": "string", "description": "The command arguments." } },
-                    "required": ["args"],
-                },
-            })
+                "input_schema": tool_input_schema(t),
+            });
+            if t.input_schema.is_some() {
+                tool["strict"] = json!(true);
+            }
+            tool
         })
         .collect()
 }
 
-/// OpenAI tool schema — same uniform `{ args: string }` shape.
+/// OpenAI tool schema — same per-tool schema, wrapped in the function shape.
 pub(crate) fn openai_tools(tools: &[ToolDef]) -> Vec<Value> {
     tools
         .iter()
@@ -481,11 +501,7 @@ pub(crate) fn openai_tools(tools: &[ToolDef]) -> Vec<Value> {
                 "function": {
                     "name": t.name,
                     "description": t.description,
-                    "parameters": {
-                        "type": "object",
-                        "properties": { "args": { "type": "string", "description": "The command arguments." } },
-                        "required": ["args"],
-                    },
+                    "parameters": tool_input_schema(t),
                 },
             })
         })
@@ -678,14 +694,22 @@ where
     .boxed()
 }
 
-/// Extract the single `args` string from a tool call's argument JSON. Every Lychi
-/// tool has the uniform schema `{ "args": string }`; on parse failure or a
-/// different shape, fall back to the raw buffer (best-effort).
+/// Normalize a tool call's argument JSON into the single string a handler's
+/// `execute(args: &str)` receives.
+///
+/// Two shapes reach here: the uniform `{ "args": string }` (free-text tools) and,
+/// for a BOUNDED tool with a typed `input_schema`, a structured object like
+/// `{ "action": "volume", "value": "50" }`. For the uniform shape we hand back
+/// the `args` string; for the typed shape there is no `args` key, so we pass the
+/// whole object JSON through — the handler flattens it (see `system_args_to_flat`).
+/// On a parse failure, best-effort return the raw buffer.
 pub(crate) fn unwrap_args(buf: &str) -> String {
     if buf.trim().is_empty() {
         return String::new();
     }
     match serde_json::from_str::<Value>(buf) {
+        // Uniform `{args: "..."}` → the string. A typed object has no string
+        // `args`, so fall through to the object JSON for the handler to parse.
         Ok(v) => v["args"]
             .as_str()
             .map(|s| s.to_string())
@@ -1297,6 +1321,7 @@ mod tests {
             name: "open".into(),
             description: "Open an app".into(),
             mutates: false,
+            input_schema: None,
         }];
         assert_eq!(
             anthropic_tools(&tools)[0]["input_schema"]["required"][0],
@@ -1309,12 +1334,43 @@ mod tests {
     }
 
     #[test]
+    fn a_typed_tool_emits_its_schema_and_strict_on_anthropic() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "action": { "type": "string", "enum": ["volume", "mute"] } },
+            "required": ["action"],
+            "additionalProperties": false
+        });
+        let tools = vec![ToolDef {
+            name: "system".into(),
+            description: "System controls".into(),
+            mutates: false,
+            input_schema: Some(schema),
+        }];
+        let a = &anthropic_tools(&tools)[0];
+        // The real schema flows through (not the uniform {args}).
+        assert_eq!(
+            a["input_schema"]["properties"]["action"]["enum"][0],
+            "volume"
+        );
+        // Typed tools get strict:true (the cloud enforcement); free-text don't.
+        assert_eq!(a["strict"], true);
+        // OpenAI carries the schema under function.parameters too.
+        let o = &openai_tools(&tools)[0];
+        assert_eq!(
+            o["function"]["parameters"]["properties"]["action"]["enum"][1],
+            "mute"
+        );
+    }
+
+    #[test]
     fn build_body_shapes_per_dialect() {
         let msgs = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
         let tools = vec![ToolDef {
             name: "open".into(),
             description: "d".into(),
             mutates: false,
+            input_schema: None,
         }];
 
         // Anthropic: system out-of-band, tools present, stream:true.

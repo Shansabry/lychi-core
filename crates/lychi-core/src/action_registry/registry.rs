@@ -5,11 +5,13 @@ use crate::action_registry::{ActionHandler, CommandCategory, CommandInfo, Comple
 
 /// Build a `CommandInfo`, denormalising the category's title + order so the
 /// frontend groups without needing its own category table.
+#[allow(clippy::too_many_arguments)]
 fn command_info(
     id: &str,
     keyword: &str,
     description: &str,
     usage: &str,
+    input_schema: Option<serde_json::Value>,
     category: CommandCategory,
     mutates: bool,
 ) -> CommandInfo {
@@ -18,6 +20,7 @@ fn command_info(
         keyword: keyword.to_string(),
         description: description.to_string(),
         usage: usage.to_string(),
+        input_schema,
         category,
         category_title: category.title().to_string(),
         category_order: category.order(),
@@ -169,6 +172,7 @@ impl ActionRegistry {
                     keyword,
                     h.description(),
                     h.usage(),
+                    h.input_schema(),
                     h.category(),
                     h.mutates_state(),
                 ))
@@ -202,6 +206,7 @@ impl ActionRegistry {
                 sigil,
                 desc,
                 "",
+                None,
                 CommandCategory::General,
                 false,
             ));
@@ -217,6 +222,7 @@ impl ActionRegistry {
                     prefix,
                     h.description(),
                     "",
+                    None,
                     h.category(),
                     h.mutates_state(),
                 ))

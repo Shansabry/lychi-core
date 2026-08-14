@@ -173,6 +173,67 @@ const MEDIA_SUBCOMMANDS: &[&str] = &[
     "pause all",
 ];
 
+/// The base transport VERBS the agent chooses between — the machine-readable
+/// enum fed to the tool schema so a constrained model (cloud `enum` / local
+/// grammar) can only emit one the transport match in `execute_media` handles.
+/// These are exactly the canonical arms of that match (aliases like `resume`,
+/// `skip`, `previous` are accepted on input but the model is steered to the
+/// canonical spelling). Kept next to the parser it feeds so the two can't drift.
+const MEDIA_ACTION_VERBS: &[&str] = &["play", "pause", "next", "prev", "toggle", "stop"];
+
+/// The JSON Schema for `media`'s args: a required transport `action` (constrained
+/// to [`MEDIA_ACTION_VERBS`]) plus an optional `provider` prefix that targets a
+/// specific player (e.g. "spotify", "yt"). Emitted as the tool's `input_schema`
+/// so the model is constrained to a real verb.
+fn media_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "action": { "type": "string", "enum": MEDIA_ACTION_VERBS,
+                        "description": "The media transport action to perform." },
+            "provider": { "type": "string",
+                          "description": "Optional player to target (e.g. \"spotify\", \"yt\"). Omit to target the currently-playing player." }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+/// Normalize the tool's `args` to the flat `"[<provider>] <action>"` string the
+/// parser already understands. A constrained model sends the structured JSON
+/// (`{"action":"pause","provider":"spotify"}`); a human or legacy/flat caller
+/// sends the string directly. The provider comes FIRST — matching
+/// [`parse_provider_and_args`], which reads the provider off the first token.
+/// Keeps `execute` on `&str`.
+fn media_args_to_flat(args: &str) -> String {
+    let t = args.trim();
+    if !t.starts_with('{') {
+        return t.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(t) {
+        Ok(v) => {
+            let action = v
+                .get("action")
+                .and_then(|a| a.as_str())
+                .unwrap_or("")
+                .trim();
+            let provider = v
+                .get("provider")
+                .and_then(|a| a.as_str())
+                .unwrap_or("")
+                .trim();
+            if provider.is_empty() {
+                action.to_string()
+            } else {
+                format!("{provider} {action}")
+            }
+        }
+        // Not the JSON we expected — fall back to the raw string; the parser
+        // will reject it with the usual "unknown action" message.
+        Err(_) => t.to_string(),
+    }
+}
+
 fn media_completions(partial: &str) -> Vec<CompletionItem> {
     let lower = partial.to_lowercase();
     MEDIA_SUBCOMMANDS
@@ -355,12 +416,19 @@ impl ActionHandler for MediaHandler {
     fn usage(&self) -> &str {
         "play, pause, next, prev, toggle, 'pause all'. Prefix with a provider to target a specific player (e.g. 'spotify pause', 'yt next')"
     }
+    fn input_schema(&self) -> Option<serde_json::Value> {
+        Some(media_input_schema())
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Media
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        let (target, action) = parse_provider_and_args(args);
+        // A constrained model sends `{"action":..,"provider":..}`; flatten it
+        // (and a plain-string caller passes through) to the provider-first form
+        // the parser reads.
+        let flat = media_args_to_flat(args);
+        let (target, action) = parse_provider_and_args(&flat);
         execute_media(&self.mpris, target, action).await
     }
 
@@ -482,5 +550,38 @@ mod tests {
         let (target, args) = parse_provider_and_args("spotify");
         assert!(matches!(target, Target::Spotify));
         assert_eq!(args, "");
+    }
+
+    #[test]
+    fn media_args_flatten_from_structured_json() {
+        // A constrained model sends the typed object; it flattens to the
+        // provider-first string parse_provider_and_args reads.
+        assert_eq!(
+            media_args_to_flat(r#"{"action":"pause","provider":"spotify"}"#),
+            "spotify pause"
+        );
+        // No provider → just the verb.
+        assert_eq!(media_args_to_flat(r#"{"action":"next"}"#), "next");
+        // Empty provider is treated as no provider.
+        assert_eq!(
+            media_args_to_flat(r#"{"action":"toggle","provider":""}"#),
+            "toggle"
+        );
+        // A plain-string caller (human, legacy) passes straight through.
+        assert_eq!(media_args_to_flat("spotify pause"), "spotify pause");
+        assert_eq!(media_args_to_flat("next"), "next");
+    }
+
+    #[test]
+    fn media_schema_enum_matches_the_real_verbs() {
+        // The schema's action enum must be exactly MEDIA_ACTION_VERBS, and each
+        // one must be a canonical arm the transport match handles — so the model
+        // is constrained to verbs execute_media actually dispatches.
+        let schema = media_input_schema();
+        let en = schema["properties"]["action"]["enum"].as_array().unwrap();
+        assert_eq!(en.len(), MEDIA_ACTION_VERBS.len());
+        for v in MEDIA_ACTION_VERBS {
+            assert!(en.iter().any(|e| e == v), "enum missing {v}");
+        }
     }
 }

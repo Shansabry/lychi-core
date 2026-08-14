@@ -331,6 +331,63 @@ const TIMER_SUBCOMMANDS: &[(&str, &str)] = &[
     ("clear", "Remove all timers"),
 ];
 
+/// The base timer VERBS the agent chooses between — the machine-readable enum
+/// fed to the tool schema so a constrained model (cloud `enum` / local grammar)
+/// can only emit one the `execute_verb` match handles. Derived from the verb
+/// column of [`TIMER_SUBCOMMANDS`] so the schema can't drift from that list.
+fn timer_action_verbs() -> Vec<&'static str> {
+    TIMER_SUBCOMMANDS.iter().map(|(verb, _)| *verb).collect()
+}
+
+/// The JSON Schema for `timer`'s args: a required `action` (constrained to the
+/// [`TIMER_SUBCOMMANDS`] verbs) plus an optional free `value` operand (a name
+/// and/or duration, e.g. "workout 5m", "25m"). Emitted as the tool's
+/// `input_schema` so the model is constrained to a real verb.
+fn timer_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "action": { "type": "string", "enum": timer_action_verbs(),
+                        "description": "The timer action to perform." },
+            "value": { "type": "string",
+                       "description": "Operand when the action needs one: a duration (\"25m\", \"1:30\"), an optional name plus duration (\"workout 5m\"), or a timer name for stop/pause/resume. Omit for status/clear." }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+/// Normalize the tool's `args` to the flat `"<action> <value>"` string the
+/// parser already understands. A constrained model sends the structured JSON
+/// (`{"action":"start","value":"25m"}`); a human or legacy/flat caller sends the
+/// string directly — including the bare-duration shorthand ("25m"), which is NOT
+/// JSON and so passes straight through to `execute`'s duration arm. Keeps
+/// `execute` on `&str`.
+fn timer_args_to_flat(args: &str) -> String {
+    let t = args.trim();
+    if !t.starts_with('{') {
+        return t.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(t) {
+        Ok(v) => {
+            let action = v
+                .get("action")
+                .and_then(|a| a.as_str())
+                .unwrap_or("")
+                .trim();
+            let value = v.get("value").and_then(|a| a.as_str()).unwrap_or("").trim();
+            if value.is_empty() {
+                action.to_string()
+            } else {
+                format!("{action} {value}")
+            }
+        }
+        // Not the JSON we expected — fall back to the raw string; the parser
+        // will handle it (or reject it) as usual.
+        Err(_) => t.to_string(),
+    }
+}
+
 #[async_trait]
 impl ActionHandler for TimerHandler {
     fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
@@ -352,13 +409,20 @@ impl ActionHandler for TimerHandler {
     fn usage(&self) -> &str {
         "'start [name] <duration>' (e.g. 'start 25m', 'start workout 5m'), 'stopwatch [name]' to start a count-up stopwatch, 'stop [name]', 'pause [name]', 'resume [name]', 'status', 'clear'. Shorthand: a bare duration like '25m' starts a timer"
     }
+    fn input_schema(&self) -> Option<serde_json::Value> {
+        Some(timer_input_schema())
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
     }
 
     async fn execute(&self, ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let start = Instant::now();
-        let trimmed = args.trim();
+        // A constrained model sends `{"action":..,"value":..}`; flatten it (and a
+        // plain-string caller, including the bare-duration shorthand, passes
+        // through) to the form the parser splits on.
+        let flat = timer_args_to_flat(args);
+        let trimmed = flat.trim();
 
         // No args → open timer view
         if trimmed.is_empty() {
@@ -917,6 +981,44 @@ fn timer_monitor_loop(
 mod tests {
     use super::*;
     use crate::action_registry::Output;
+
+    #[test]
+    fn timer_args_flatten_from_structured_json() {
+        // A constrained model sends the typed object; it flattens to the string
+        // the parser splits on.
+        assert_eq!(
+            timer_args_to_flat(r#"{"action":"start","value":"25m"}"#),
+            "start 25m"
+        );
+        assert_eq!(
+            timer_args_to_flat(r#"{"action":"start","value":"workout 5m"}"#),
+            "start workout 5m"
+        );
+        // No operand → just the verb.
+        assert_eq!(timer_args_to_flat(r#"{"action":"status"}"#), "status");
+        assert_eq!(
+            timer_args_to_flat(r#"{"action":"clear","value":""}"#),
+            "clear"
+        );
+        // A plain-string caller passes straight through — including the
+        // bare-duration shorthand, which is not JSON.
+        assert_eq!(timer_args_to_flat("start 25m"), "start 25m");
+        assert_eq!(timer_args_to_flat("25m"), "25m");
+        assert_eq!(timer_args_to_flat("status"), "status");
+    }
+
+    #[test]
+    fn timer_schema_enum_matches_the_real_verbs() {
+        // The schema's action enum must be exactly the TIMER_SUBCOMMANDS verbs,
+        // so the model is constrained to verbs execute_verb actually handles.
+        let verbs = timer_action_verbs();
+        let schema = timer_input_schema();
+        let en = schema["properties"]["action"]["enum"].as_array().unwrap();
+        assert_eq!(en.len(), verbs.len());
+        for v in &verbs {
+            assert!(en.iter().any(|e| e == v), "enum missing {v}");
+        }
+    }
 
     /// A handler that persists to a unique temp file, so timer subcommand tests
     /// never write the real `timers.json` or race each other on a shared path.

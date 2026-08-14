@@ -403,26 +403,63 @@ impl LocalClient {
 /// `{"tool": (<enum of tool names>), "args": <string>}` (call a tool) OR
 /// `{"answer": <string>}` (final answer). `tool` is enum-constrained to real
 /// tool names. Cached per tool-set. Empty tool set → answer-only grammar.
-fn tool_grammar(tools: &[String]) -> Result<String, LychiError> {
+/// Build the GBNF grammar constraining the local model to one tool call OR a
+/// plain answer. `tools` is (name, optional args-schema): a BOUNDED tool carries
+/// a typed schema (e.g. `system` → `{action: enum, value?: string}`), so the
+/// grammar forces a valid verb — an out-of-enum token is masked at the sampler,
+/// unemittable — which is what lifts weak local models on system commands. A
+/// tool with `None` keeps the free-text `{args: string}`.
+///
+/// One shallow `anyOf` over per-tool objects (each `{tool: const, args: <schema>}`)
+/// plus the answer branch — flat by design; a DEEP union would cost per-token
+/// grammar overhead on-device for no gain.
+fn tool_grammar(tools: &[(String, Option<serde_json::Value>)]) -> Result<String, LychiError> {
     static CACHE: OnceLock<Mutex<std::collections::HashMap<String, String>>> = OnceLock::new();
-    let key = tools.join("\u{1}");
+    // Cache key must distinguish schemas, not just names.
+    let key = serde_json::to_string(tools).unwrap_or_else(|_| {
+        tools
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join("\u{1}")
+    });
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     if let Some(g) = cache.lock().ok().and_then(|c| c.get(&key).cloned()) {
         return Ok(g);
     }
 
-    let answer_schema = r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}"#;
+    let answer_schema = serde_json::json!({
+        "type": "object",
+        "properties": { "answer": { "type": "string" } },
+        "required": ["answer"],
+        "additionalProperties": false
+    });
     let schema = if tools.is_empty() {
-        answer_schema.to_string()
+        answer_schema
     } else {
-        let enum_json = serde_json::to_string(tools)
-            .map_err(|e| LychiError::Ai(format!("build tool schema: {e}")))?;
-        let call_schema = format!(
-            r#"{{"type":"object","properties":{{"tool":{{"type":"string","enum":{enum_json}}},"args":{{"type":"string"}}}},"required":["tool","args"],"additionalProperties":false}}"#
-        );
-        format!(r#"{{"anyOf":[{call_schema},{answer_schema}]}}"#)
+        // A per-tool object pins `tool` to a const name and gives `args` that
+        // tool's real schema (typed) or the uniform string (free-text).
+        let uniform_args = serde_json::json!({ "type": "string" });
+        let mut branches: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|(name, schema)| {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "tool": { "type": "string", "const": name },
+                        "args": schema.clone().unwrap_or_else(|| uniform_args.clone()),
+                    },
+                    "required": ["tool", "args"],
+                    "additionalProperties": false
+                })
+            })
+            .collect();
+        branches.push(answer_schema);
+        serde_json::json!({ "anyOf": branches })
     };
-    let grammar = llama_cpp_2::json_schema_to_grammar(&schema)
+    let schema_str = serde_json::to_string(&schema)
+        .map_err(|e| LychiError::Ai(format!("build tool schema: {e}")))?;
+    let grammar = llama_cpp_2::json_schema_to_grammar(&schema_str)
         .map_err(|e| LychiError::Ai(format!("build tool grammar: {e}")))?;
     if let Ok(mut c) = cache.lock() {
         c.insert(key, grammar.clone());
@@ -465,8 +502,11 @@ impl AiProvider for LocalClient {
         let path = self.gguf_path.clone();
         let max = self.max_tokens;
         let model_id = self.spec.id.to_string();
-        let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
-        let has_tools = !tool_names.is_empty();
+        let tool_specs: Vec<(String, Option<serde_json::Value>)> = tools
+            .iter()
+            .map(|t| (t.name.clone(), t.input_schema.clone()))
+            .collect();
+        let has_tools = !tool_specs.is_empty();
 
         // Bounded channel → backpressure (the generation thread blocks on a slow
         // consumer instead of buffering unbounded tokens).
@@ -488,7 +528,7 @@ impl AiProvider for LocalClient {
             if has_tools {
                 // Tool mode: grammar-constrain to a tool call OR an answer (one
                 // shot — grammar JSON isn't meaningful to stream token-by-token).
-                let grammar = match tool_grammar(&tool_names) {
+                let grammar = match tool_grammar(&tool_specs) {
                     Ok(g) => Some(g),
                     Err(e) => {
                         let _ = tx.blocking_send(Err(e));
@@ -711,9 +751,9 @@ mod bench {
             "You are a tool-calling agent. Respond with a JSON object. {}",
             "Consider the available tools carefully. ".repeat(180)
         );
-        let tools: Vec<String> = ["open", "web", "calc"]
+        let tools: Vec<(String, Option<serde_json::Value>)> = ["open", "web", "calc"]
             .iter()
-            .map(|s| s.to_string())
+            .map(|s| (s.to_string(), None))
             .collect();
         let grammar = tool_grammar(&tools).expect("grammar builds");
         let (out, _) = generate_inner(&model, &big, "open firefox", 48, Some(&grammar), None, None)
@@ -771,7 +811,10 @@ mod bench {
     fn tool_grammar_constrains_to_tool_or_answer() {
         // Pure (no model): the tool grammar must mention the tool names and allow
         // an answer branch. Empty tool set → answer-only.
-        let tools: Vec<String> = ["weather", "open"].iter().map(|s| s.to_string()).collect();
+        let tools: Vec<(String, Option<serde_json::Value>)> = ["weather", "open"]
+            .iter()
+            .map(|s| (s.to_string(), None))
+            .collect();
         let g = tool_grammar(&tools).expect("tool grammar builds");
         assert!(
             g.contains("weather") && g.contains("open"),
@@ -779,9 +822,33 @@ mod bench {
         );
         assert!(g.contains("answer"), "answer branch present");
 
-        let empty: Vec<String> = vec![];
+        let empty: Vec<(String, Option<serde_json::Value>)> = vec![];
         let g0 = tool_grammar(&empty).expect("answer-only grammar builds");
         assert!(g0.contains("answer"));
+    }
+
+    #[test]
+    fn a_typed_tool_puts_its_action_enum_in_the_grammar() {
+        // A bounded tool's enum verbs must reach the grammar (so the sampler can
+        // mask out-of-enum tokens); a free-text tool stays an unconstrained arg.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "action": { "type": "string", "enum": ["volume", "mute"] } },
+            "required": ["action"]
+        });
+        let tools = vec![
+            ("system".to_string(), Some(schema)),
+            ("run".to_string(), None),
+        ];
+        let g = tool_grammar(&tools).expect("typed grammar builds");
+        assert!(
+            g.contains("volume") && g.contains("mute"),
+            "action enum constrained"
+        );
+        assert!(
+            g.contains("system") && g.contains("run"),
+            "both tools present"
+        );
     }
 
     #[test]
