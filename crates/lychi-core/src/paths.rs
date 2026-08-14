@@ -49,6 +49,13 @@ pub fn model_caps_file() -> PathBuf {
     data_dir().join("model-caps.jsonl")
 }
 
+/// AI chat transcripts — one `<id>.json` file per conversation. Large, append-y,
+/// arguably local; kept out of the user-data DB so deleting a conversation
+/// reclaims its disk immediately (unlink) and retention is a directory sweep.
+pub fn ai_history_dir() -> PathBuf {
+    data_dir().join("ai_history")
+}
+
 /// Where backup archives live. Inside the data dir so a user copying that one
 /// directory takes their backups with them, but excluded from the archive
 /// itself so backups never nest.

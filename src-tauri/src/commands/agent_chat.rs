@@ -555,7 +555,6 @@ fn drive(
     state_generation: Arc<std::sync::atomic::AtomicU64>,
     generation: u64,
     pending_session: Arc<RwLock<Option<Session>>>,
-    db: Arc<redb::Database>,
     conversation_id: Arc<RwLock<Option<String>>>,
     agent_busy: Arc<std::sync::atomic::AtomicBool>,
     mut stream: lychi_core::coordinator::AgentEventStream,
@@ -595,17 +594,17 @@ fn drive(
                     // Paused awaiting the user's approval — the run is still in
                     // flight, so the busy guard stays raised and the chat (with
                     // its approval prompt) can't be dismissed by focus loss.
-                    persist_conversation(&db, &conversation_id, &session).await;
+                    persist_conversation(&conversation_id, &session).await;
                     *pending_session.write().await = Some(session);
                 }
                 Outcome::Done { session } => {
                     // A completed turn — persist it to history so it can be
                     // recalled later, then stash for the next turn.
-                    persist_conversation(&db, &conversation_id, &session).await;
+                    persist_conversation(&conversation_id, &session).await;
                     *pending_session.write().await = Some(session);
                 }
                 Outcome::Stopped { session, .. } => {
-                    persist_conversation(&db, &conversation_id, &session).await;
+                    persist_conversation(&conversation_id, &session).await;
                     *pending_session.write().await = Some(session);
                 }
                 Outcome::Error { session, .. } => {
@@ -617,7 +616,7 @@ fn drive(
                     // upserted an empty session OVER the stored transcript.
                     match session {
                         Some(session) => {
-                            persist_conversation(&db, &conversation_id, &session).await;
+                            persist_conversation(&conversation_id, &session).await;
                             *pending_session.write().await = Some(session);
                         }
                         // The loop task itself was lost — nothing to save.
@@ -630,20 +629,15 @@ fn drive(
 }
 
 /// Upsert the conversation into history (best-effort; a persist failure never
-/// breaks the chat). Runs off the async runtime since redb is blocking.
-async fn persist_conversation(
-    db: &Arc<redb::Database>,
-    conversation_id: &Arc<RwLock<Option<String>>>,
-    session: &Session,
-) {
+/// breaks the chat). Runs off the async runtime since file I/O is blocking.
+async fn persist_conversation(conversation_id: &Arc<RwLock<Option<String>>>, session: &Session) {
     let Some(id) = conversation_id.read().await.clone() else {
         return;
     };
-    let db = db.clone();
     let messages = session.messages.clone();
     let _ = tauri::async_runtime::spawn_blocking(move || {
         let store = lychi_core::ai_history::store::AiHistoryStore::new();
-        if let Err(e) = store.upsert(&db, &id, &messages) {
+        if let Err(e) = store.upsert(&id, &messages) {
             tracing::warn!("[history] failed to persist conversation: {e}");
         }
     })
@@ -829,7 +823,6 @@ pub async fn agent_chat_start(
         state.ai_generation.clone(),
         generation,
         state.agent_session.clone(),
-        state.db.clone(),
         state.agent_conversation_id.clone(),
         state.agent_busy.clone(),
         stream,
@@ -881,7 +874,6 @@ pub async fn agent_approve(
         state.ai_generation.clone(),
         generation,
         state.agent_session.clone(),
-        state.db.clone(),
         state.agent_conversation_id.clone(),
         state.agent_busy.clone(),
         stream,

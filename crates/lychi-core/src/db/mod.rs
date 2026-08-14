@@ -40,11 +40,6 @@ pub const SNIPPETS: TableDefinition<&str, &[u8]> = TableDefinition::new("snippet
 /// User-defined saved prompt templates invoked by keyword (Phase 3 AI Commands).
 pub const AI_PRESETS: TableDefinition<&str, &[u8]> = TableDefinition::new("ai_presets");
 
-/// AI conversation history: key = UUID v7 string, value = postcard-serialized
-/// ConversationEntry. Completed agent conversations, recallable via `chat`
-/// (Phase 4). Capped + pruned so the DB doesn't grow unbounded.
-pub const AI_CONVERSATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("ai_conversations");
-
 /// User-pinned zero-state rows: key = normalized run string (lowercased,
 /// whitespace-collapsed), value = postcard-serialized PinEntry. The user's
 /// hand-chosen commands, always shown first on the empty prompt.
@@ -79,7 +74,7 @@ pub const SCHEMA_VERSION: u8 = 1;
 
 /// Every enveloped table — the migration and any future whole-table rewrite
 /// iterate this list, so a new table added here is versioned from birth.
-pub(crate) const ENVELOPED_TABLES: [&str; 12] = [
+pub(crate) const ENVELOPED_TABLES: [&str; 11] = [
     "history",
     "notes",
     "todos",
@@ -90,7 +85,6 @@ pub(crate) const ENVELOPED_TABLES: [&str; 12] = [
     "reminders",
     "snippets",
     "ai_presets",
-    "ai_conversations",
     "pins",
 ];
 
@@ -254,7 +248,6 @@ pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
     txn.open_table(REMINDERS)?;
     txn.open_table(SNIPPETS)?;
     txn.open_table(AI_PRESETS)?;
-    txn.open_table(AI_CONVERSATIONS)?;
     txn.open_table(PINS)?;
     txn.open_table(META)?;
     txn.commit()?;

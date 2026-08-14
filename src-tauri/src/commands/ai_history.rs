@@ -13,31 +13,26 @@ use crate::state::AppState;
 
 #[tauri::command]
 #[specta::specta]
-pub async fn get_conversations(
-    state: State<'_, AppState>,
-) -> Result<Vec<ConversationSummary>, LychiError> {
-    AiHistoryStore::new().list(&state.db)
+pub async fn get_conversations() -> Result<Vec<ConversationSummary>, LychiError> {
+    AiHistoryStore::new().list()
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn get_conversation(
-    id: String,
-    state: State<'_, AppState>,
-) -> Result<Option<Conversation>, LychiError> {
-    AiHistoryStore::new().get(&state.db, &id)
+pub async fn get_conversation(id: String) -> Result<Option<Conversation>, LychiError> {
+    AiHistoryStore::new().get(&id)
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn delete_conversation(id: String, state: State<'_, AppState>) -> Result<(), LychiError> {
-    AiHistoryStore::new().delete(&state.db, &id)
+pub async fn delete_conversation(id: String) -> Result<(), LychiError> {
+    AiHistoryStore::new().delete(&id)
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn clear_conversations(state: State<'_, AppState>) -> Result<(), LychiError> {
-    AiHistoryStore::new().clear(&state.db)
+pub async fn clear_conversations() -> Result<(), LychiError> {
+    AiHistoryStore::new().clear()
 }
 
 /// Load a stored conversation into the active agent session so the next message
@@ -49,7 +44,7 @@ pub async fn load_conversation(
     id: String,
     state: State<'_, AppState>,
 ) -> Result<Option<Conversation>, LychiError> {
-    let Some(conv) = AiHistoryStore::new().get(&state.db, &id)? else {
+    let Some(conv) = AiHistoryStore::new().get(&id)? else {
         return Ok(None);
     };
     let session = lychi_core::coordinator::Session {
