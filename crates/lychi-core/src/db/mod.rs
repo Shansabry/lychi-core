@@ -14,9 +14,6 @@ pub const NOTES: TableDefinition<&str, &[u8]> = TableDefinition::new("notes");
 /// Todos: key = UUID v7 string, value = postcard-serialized TodoEntry.
 pub const TODOS: TableDefinition<&str, &[u8]> = TableDefinition::new("todos");
 
-/// Clipboard history: key = UUID v7 string (time-ordered), value = postcard-serialized ClipboardEntry.
-pub const CLIPBOARD: TableDefinition<&str, &[u8]> = TableDefinition::new("clipboard");
-
 /// Settings: key = dotted path (e.g. "general.theme"), value = postcard-serialized SettingEntry.
 pub const SETTINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("settings");
 
@@ -76,10 +73,9 @@ pub const SCHEMA_VERSION: u8 = 1;
 
 /// Every enveloped table — the migration and any future whole-table rewrite
 /// iterate this list, so a new table added here is versioned from birth.
-pub(crate) const ENVELOPED_TABLES: [&str; 9] = [
+pub(crate) const ENVELOPED_TABLES: [&str; 8] = [
     "notes",
     "todos",
-    "clipboard",
     "settings",
     "aliases",
     "reminders",
@@ -240,7 +236,6 @@ pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
     let txn = db.begin_write()?;
     txn.open_table(NOTES)?;
     txn.open_table(TODOS)?;
-    txn.open_table(CLIPBOARD)?;
     txn.open_table(SETTINGS)?;
     txn.open_table(ALIASES)?;
     txn.open_table(REMINDERS)?;
@@ -486,7 +481,6 @@ fn sweep_stale_test_databases() {
 pub struct TableStats {
     pub notes: u64,
     pub todos: u64,
-    pub clipboard: u64,
     pub settings: u64,
     pub aliases: u64,
     pub reminders: u64,
@@ -499,7 +493,6 @@ pub fn table_stats(db: &Arc<Database>) -> Result<TableStats, LychiError> {
     Ok(TableStats {
         notes: txn.open_table(NOTES)?.len()?,
         todos: txn.open_table(TODOS)?.len()?,
-        clipboard: txn.open_table(CLIPBOARD)?.len()?,
         settings: txn.open_table(SETTINGS)?.len()?,
         aliases: txn.open_table(ALIASES)?.len()?,
         reminders: txn.open_table(REMINDERS)?.len()?,

@@ -71,6 +71,12 @@ pub fn history_file() -> PathBuf {
     data_dir().join("history.jsonl")
 }
 
+/// Clipboard history — a JSONL log (device-local, sensitive; image bytes live in
+/// `clipboard_images_dir`, this holds text + path + thumbnail). 0600.
+pub fn clipboard_file() -> PathBuf {
+    data_dir().join("clipboard.jsonl")
+}
+
 /// Where backup archives live. Inside the data dir so a user copying that one
 /// directory takes their backups with them, but excluded from the archive
 /// itself so backups never nest.

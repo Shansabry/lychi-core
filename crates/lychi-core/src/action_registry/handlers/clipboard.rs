@@ -1,7 +1,4 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
-use redb::Database;
 
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
@@ -9,16 +6,15 @@ use crate::action_registry::{
 use crate::clipboard::store::ClipboardStore;
 use crate::error::LychiError;
 
+#[derive(Default)]
 pub struct ClipboardHandler {
     store: ClipboardStore,
-    db: Arc<Database>,
 }
 
 impl ClipboardHandler {
-    pub fn new(db: Arc<Database>) -> Self {
+    pub fn new() -> Self {
         Self {
             store: ClipboardStore::new(),
-            db,
         }
     }
 
@@ -69,7 +65,7 @@ impl ActionHandler for ClipboardHandler {
 
         // "clear" subcommand
         if args == "clear" {
-            self.store.clear(&self.db)?;
+            self.store.clear()?;
             return Ok(ActionResult::ok(
                 "Clipboard history cleared",
                 OutputType::Status,
@@ -78,7 +74,7 @@ impl ActionHandler for ClipboardHandler {
 
         // Selection from completions — find matching entry and write it back to clipboard
         if !args.is_empty() {
-            let entries = self.store.get_entries(&self.db, 100)?;
+            let entries = self.store.get_entries(100)?;
             // Try UUID match first, then text prefix match (completions show truncated text)
             if let Some(entry) = entries.iter().find(|e| e.id == args).or_else(|| {
                 entries.iter().find(|e| {
@@ -87,7 +83,7 @@ impl ActionHandler for ClipboardHandler {
             }) {
                 // Image entry — re-paste the image file
                 if let Some(ref img) = entry.image {
-                    if let Some(path) = self.store.get_image_path(&self.db, &entry.id)? {
+                    if let Some(path) = self.store.get_image_path(&entry.id)? {
                         return match write_image_to_clipboard(&path) {
                             Ok(()) => Ok(ActionResult::ok(
                                 format!("Copied image ({}x{})", img.width, img.height),
@@ -116,7 +112,7 @@ impl ActionHandler for ClipboardHandler {
         }
 
         // Default: show clipboard count
-        let count = self.store.count(&self.db)?;
+        let count = self.store.count()?;
         Ok(ActionResult::ok(
             format!("{count} clipboard entries. Type 'clip' and browse, or 'clip clear' to erase."),
             OutputType::Status,
@@ -125,7 +121,7 @@ impl ActionHandler for ClipboardHandler {
 
     async fn completions(&self, partial: &str) -> Vec<CompletionItem> {
         let partial = partial.trim();
-        let entries = match self.store.get_entries(&self.db, 20) {
+        let entries = match self.store.get_entries(20) {
             Ok(e) => e,
             Err(_) => return Vec::new(),
         };

@@ -96,7 +96,10 @@ pub fn init() -> WorkerGuard {
     // `RUST_LOG` — a broad `debug` should still not re-enable this crate noise.
     let filter = || {
         let base = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-        EnvFilter::new(format!("{base},ignore=warn,zbus::proxy=error"))
+        // `globset` logs the compiled regex of every glob at DEBUG — the file
+        // indexer compiles hundreds, so it joins `ignore` as file-search log
+        // noise. Pinned to `warn` alongside it.
+        EnvFilter::new(format!("{base},ignore=warn,globset=warn,zbus::proxy=error"))
     };
 
     // File: structured JSON (parseable, aggregatable, pipeline-ready).

@@ -118,17 +118,12 @@ fn the_unified_scratch_list_survives_corruption_in_either_table() {
     assert_eq!(items.len(), 2, "one good note + one good todo must survive");
 }
 
-#[test]
-fn a_corrupt_clipboard_row_does_not_empty_the_history() {
-    let db = test_db();
-    let store = lychi_core::clipboard::store::ClipboardStore::new();
-    store.push(&db, "copied one").unwrap();
-    write_garbage(&db, db::CLIPBOARD, "bad");
-    store.push(&db, "copied two").unwrap();
-
-    let entries = store.get_entries(&db, 50).unwrap();
-    assert_eq!(entries.len(), 2, "both readable clips must survive");
-}
+// Clipboard history moved out of redb into a JSONL file, so "a corrupt row does
+// not empty the history" is now the file store's line-level resilience: a
+// garbage line between good ones is skipped, not fatal. Covered directly by
+// `filestore::tests::corrupt_middle_line_is_skipped_not_fatal` and the
+// clipboard store's own tests, so there is nothing to assert against the
+// database here.
 
 #[test]
 fn a_corrupt_snippet_does_not_hide_the_others() {

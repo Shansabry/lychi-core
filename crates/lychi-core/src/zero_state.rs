@@ -358,10 +358,6 @@ mod tests {
         frecency::record_workspace("/home/u/proj", "cargo test").unwrap();
         frecency::record_workspace("/home/u/proj", "cargo test").unwrap();
         frecency::record_workspace("/home/u/proj", "cargo test").unwrap();
-        // ...and a fresh clipboard capture.
-        crate::clipboard::store::ClipboardStore::new()
-            .push(&db, "https://example.com/x")
-            .unwrap();
 
         let items = compose(&db, &cfg());
         assert!(

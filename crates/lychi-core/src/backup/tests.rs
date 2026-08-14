@@ -64,7 +64,7 @@ fn round_trip_restores_every_row() {
     let db = test_db(&sb);
     put(&db, crate::db::TODOS, "h1", b"one");
     put(&db, crate::db::NOTES, "n1", b"a note");
-    put(&db, crate::db::CLIPBOARD, "c1", b"a clip");
+    put(&db, crate::db::SNIPPETS, "c1", b"a clip");
 
     let info = create(&db, BackupKind::Manual, "test", "0.1.0").unwrap();
     assert!(info.manifest.is_some());
@@ -93,7 +93,7 @@ fn round_trip_restores_every_row() {
         Some(&b"a note"[..])
     );
     assert_eq!(
-        get(&db, crate::db::CLIPBOARD, "c1").as_deref(),
+        get(&db, crate::db::SNIPPETS, "c1").as_deref(),
         Some(&b"a clip"[..])
     );
 }

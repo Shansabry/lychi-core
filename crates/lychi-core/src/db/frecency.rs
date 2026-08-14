@@ -26,7 +26,24 @@ use super::FRECENCY;
 static STORE: OnceLock<Arc<Database>> = OnceLock::new();
 
 /// Register the frecency database. Called once at app startup.
+///
+/// Ensures the FRECENCY table EXISTS before the store goes live. `open_database`
+/// creates the user-data tables (notes, todos, …) but not FRECENCY (which lives
+/// only in this database), so on a freshly created `frecency.redb` the first
+/// `get_scores` — a READ txn — would `open_table(FRECENCY)` on a table that no
+/// write has created yet and get nothing, silently zeroing all ranking until the
+/// first `record` happened to create it. That is the "frecency broke on the
+/// first run, then fixed itself" symptom. Creating the table here (an idempotent
+/// no-op once it exists) makes the very first read see a real, empty table.
 pub fn init_store(db: Arc<Database>) {
+    // Best-effort: a failure here just means the table is created lazily by the
+    // first write, i.e. the old (buggy) behaviour — never a startup failure.
+    if let Ok(txn) = db.begin_write() {
+        let created = txn.open_table(FRECENCY).is_ok();
+        if created && txn.commit().is_err() {
+            tracing::warn!("[frecency] could not commit table creation at startup");
+        }
+    }
     let _ = STORE.set(db);
 }
 
@@ -1087,6 +1104,60 @@ mod latch_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// First-run regression: on a freshly created `frecency.redb` the FRECENCY
+    /// table does not exist until something writes it, so a READ-first sequence
+    /// (file search calls `get_scores` before any `record`) used to see nothing
+    /// and silently zero all ranking until the first write created the table —
+    /// the "frecency broke on the first run, then fixed itself" report.
+    ///
+    /// `init_store` now creates the table on registration. This test simulates a
+    /// bare database registered WITHOUT pre-creating the table (the old
+    /// behaviour), runs `init_store`, and asserts a read-first-then-write cycle
+    /// works from the very first call.
+    #[test]
+    fn get_scores_works_on_a_freshly_created_database_before_any_write() {
+        // `open_test_database` goes through `open_database`, which no longer
+        // creates the FRECENCY table (it lives only in the frecency db), so this
+        // is exactly a freshly created frecency.redb with no frecency table yet.
+        let db = open_test_database();
+        // Precondition: this fresh db has NO frecency table — a read-txn open of
+        // it fails. (This is exactly what a freshly created frecency.redb looks
+        // like, and is what made the first cold read come back broken.)
+        {
+            let txn = db.begin_read().unwrap();
+            assert!(
+                txn.open_table(FRECENCY).is_err(),
+                "precondition: the fresh db has no frecency table yet"
+            );
+        }
+
+        // init_store must CREATE the table on registration, so the first read
+        // sees a real (empty) table rather than a missing one.
+        init_store(db.clone());
+        {
+            let txn = db.begin_read().unwrap();
+            assert!(
+                txn.open_table(FRECENCY).is_ok(),
+                "init_store must create the frecency table so the first read finds it"
+            );
+        }
+
+        TEST_STORE.with(|s| *s.borrow_mut() = Some(db));
+        invalidate();
+
+        // Read FIRST — the file-search path. Empty, not broken; no panic/hang.
+        assert!(
+            get_scores().is_empty(),
+            "cold read yields empty, not broken"
+        );
+        // A subsequent write is recorded and immediately visible.
+        record("firefox").unwrap();
+        assert!(
+            get_scores().contains_key("firefox"),
+            "the write is visible after the cold read"
+        );
+    }
 
     /// The cache must not outlive the data. A write bumps the generation, so
     /// the next read rebuilds — without this, a newly-recorded item would stay

@@ -1,7 +1,4 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
-use redb::Database;
 
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
@@ -20,13 +17,12 @@ const TARGETS: &[(&str, &str)] = &[
     ("all", "Clear history, clipboard, and suggestions"),
 ];
 
-pub struct ClearHandler {
-    db: Arc<Database>,
-}
+#[derive(Default)]
+pub struct ClearHandler;
 
 impl ClearHandler {
-    pub fn new(db: Arc<Database>) -> Self {
-        Self { db }
+    pub fn new() -> Self {
+        Self
     }
 
     fn clear_history(&self) -> Result<(), LychiError> {
@@ -35,7 +31,7 @@ impl ClearHandler {
     }
 
     fn clear_clipboard(&self) -> Result<(), LychiError> {
-        ClipboardStore::new().clear(&self.db)
+        ClipboardStore::new().clear()
     }
 
     fn clear_suggestions(&self) -> Result<usize, LychiError> {
@@ -131,7 +127,7 @@ mod tests {
 
     #[tokio::test]
     async fn completions_offer_all_targets() {
-        let h = ClearHandler::new(open_test_database());
+        let h = ClearHandler::new();
         let items = h.completions("").await;
         assert_eq!(items.len(), TARGETS.len());
         // Every completion carries an exact `clear <target>` run command.
@@ -143,7 +139,7 @@ mod tests {
 
     #[tokio::test]
     async fn completions_filter_by_prefix() {
-        let h = ClearHandler::new(open_test_database());
+        let h = ClearHandler::new();
         let items = h.completions("sug").await;
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].run.as_deref(), Some("clear suggestions"));
@@ -155,7 +151,7 @@ mod tests {
         frecency::set_store_for_test(db.clone());
         frecency::record("history:foo").unwrap();
         assert!(!frecency::get_scores().is_empty());
-        let h = ClearHandler::new(db.clone());
+        let h = ClearHandler::new();
         let result = h
             .execute(
                 &crate::action_registry::ExecContext::default(),
@@ -169,7 +165,7 @@ mod tests {
 
     #[tokio::test]
     async fn bare_clear_is_usage_error() {
-        let h = ClearHandler::new(open_test_database());
+        let h = ClearHandler::new();
         let result = h
             .execute(&crate::action_registry::ExecContext::default(), "")
             .await
@@ -182,7 +178,7 @@ mod tests {
     fn clear_is_confirmed_before_running() {
         use crate::action_registry::RiskLevel;
         // Every clear is irreversible → Medium risk → Rules Engine confirms.
-        let h = ClearHandler::new(open_test_database());
+        let h = ClearHandler::new();
         assert_eq!(h.default_risk(), RiskLevel::Medium);
     }
 }

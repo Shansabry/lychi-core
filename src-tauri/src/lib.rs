@@ -509,9 +509,8 @@ pub fn run() {
 
             // Orphan cleanup: remove image files not referenced by any clipboard entry
             {
-                let orphan_db = app.state::<AppState>().db.clone();
                 let store = lychi_core::clipboard::store::ClipboardStore::new();
-                if let Ok(paths) = store.collect_image_paths(&orphan_db) {
+                if let Ok(paths) = store.collect_image_paths() {
                     lychi_core::clipboard::image_utils::cleanup_orphans(&paths);
                 }
             }
@@ -527,12 +526,11 @@ pub fn run() {
             );
 
             // Background clipboard monitor — owns its OS thread (not the Tokio blocking pool)
-            let clip_db = app.state::<AppState>().db.clone();
             let clipboard_running = app.state::<AppState>().clipboard_running.clone();
             std::thread::Builder::new()
                 .name("lychi-clipboard".to_string())
                 .spawn(move || {
-                    lychi_core::clipboard::store::run_clipboard_monitor(clip_db, clipboard_running);
+                    lychi_core::clipboard::store::run_clipboard_monitor(clipboard_running);
                 })
                 .expect("failed to spawn clipboard monitor thread");
 

@@ -374,16 +374,14 @@ impl AppState {
         if let Ok(stats) = lychi_core::db::table_stats(&db) {
             let total = stats.notes
                 + stats.todos
-                + stats.clipboard
                 + stats.settings
                 + stats.aliases
                 + stats.reminders
                 + stats.snippets;
             tracing::info!(
-                "DB tables: {} notes, {} todos, {} clipboard, {} settings, {} aliases, {} reminders, {} snippets ({} total rows, {:.1} KB on disk)",
+                "DB tables: {} notes, {} todos, {} settings, {} aliases, {} reminders, {} snippets ({} total rows, {:.1} KB on disk)",
                 stats.notes,
                 stats.todos,
-                stats.clipboard,
                 stats.settings,
                 stats.aliases,
                 stats.reminders,
@@ -570,8 +568,8 @@ impl AppState {
         registry.register(Box::new(ServicesHandler::new()));
         registry.register(Box::new(ServicesListHandler::new()));
         registry.register(Box::new(PackagesHandler::new()));
-        registry.register(Box::new(ClipboardHandler::new(db.clone())));
-        registry.register(Box::new(ClearHandler::new(db.clone())));
+        registry.register(Box::new(ClipboardHandler::new()));
+        registry.register(Box::new(ClearHandler::new()));
         registry.register(Box::new(FileOpen::new()));
         registry.register(Box::new(UrlOpen::new()));
         #[cfg(feature = "mpris")]
