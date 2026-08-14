@@ -1,5 +1,5 @@
 <script lang="ts">
-import { Check, Copy, FolderOpen, Globe, RefreshCw, Sparkles, TriangleAlert } from "lucide-svelte";
+import { Check, Copy, FolderOpen, RefreshCw, TriangleAlert } from "lucide-svelte";
 import { answerRevealPath } from "$lib/answerActions";
 import { getComboString, matchesAction } from "$lib/keybindings";
 import { renderMarkdown, renderStreamingMarkdown } from "$lib/markdown";
@@ -63,12 +63,6 @@ let {
 	resumed = false,
 	/** Discard the resumed conversation and go back to a fresh launcher. */
 	onstartfresh,
-	/** Quick-AI fork card: show [Search web] / [Full chat] instead of a reply box. */
-	quick = false,
-	/** Fork-card: bail out to a plain web search. */
-	onwebsearch,
-	/** Fork-card: escalate to the full tool-calling agent. */
-	onfullchat,
 	/** The answer was cut off at the token cap — show a truncation notice. */
 	truncated = false,
 	/** Accumulated token spend for the conversation. */
@@ -92,9 +86,6 @@ let {
 	onreveal?: (path: string) => void;
 	resumed?: boolean;
 	onstartfresh?: () => void;
-	quick?: boolean;
-	onwebsearch?: () => void;
-	onfullchat?: () => void;
 	truncated?: boolean;
 	tokensIn?: number;
 	tokensOut?: number;
@@ -211,10 +202,10 @@ let wasStreaming = $state(false);
 $effect(() => {
 	if (streaming && !wasStreaming) stick = true;
 	// The answer just SETTLED (streaming → done) and the follow-up box is now the
-	// footer (not the quick fork card, not an approval prompt). Autofocus it so the
+	// footer (not an approval prompt). Autofocus it so the
 	// natural next action — asking a follow-up — needs no click. Enter still sends;
 	// the empty-box + path case (Open folder) is handled in onReplyKeydown.
-	if (wasStreaming && !streaming && !quick && !approval) {
+	if (wasStreaming && !streaming && !approval) {
 		focusReply();
 	}
 	wasStreaming = streaming;
@@ -352,19 +343,6 @@ function onWindowKeydown(e: KeyboardEvent) {
 			e.preventDefault();
 			e.stopPropagation();
 			onapprove?.(false);
-		}
-		return;
-	}
-	// Fork card is showing (idle quick answer with buttons).
-	if (quick && !streaming) {
-		if (matchesAction(e, "fork_web")) {
-			e.preventDefault();
-			e.stopPropagation();
-			onwebsearch?.();
-		} else if (matchesAction(e, "fork_chat")) {
-			e.preventDefault();
-			e.stopPropagation();
-			onfullchat?.();
 		}
 		return;
 	}
@@ -575,31 +553,11 @@ function onWindowKeydown(e: KeyboardEvent) {
 
 	<!-- Footer. Hidden during an approval (the user is deciding, not chatting).
 	     - streaming        → Stop button
-	     - quick fork card  → [Search web] / [Full chat] buttons
 	     - full agent chat  → the follow-up reply box -->
 	{#if !approval}
 		<div class="ai-footer">
 			{#if streaming}
 				<button class="stop-btn" onclick={() => onstop?.()}>■ Stop</button>
-			{:else if quick}
-				<button
-					class="fork-btn"
-					onclick={() => onwebsearch?.()}
-					title={`Search the web (${getComboString("fork_web")})`}
-				>
-					<Globe size={14} strokeWidth={2} />
-					<span>Search web</span>
-					<kbd>{getComboString("fork_web")}</kbd>
-				</button>
-				<button
-					class="fork-btn primary"
-					onclick={() => onfullchat?.()}
-					title={`Continue in full chat (${getComboString("fork_chat")})`}
-				>
-					<Sparkles size={14} strokeWidth={2} />
-					<span>Full chat</span>
-					<kbd>{getComboString("fork_chat")}</kbd>
-				</button>
 			{:else}
 				<input
 					class="reply-input"
@@ -614,7 +572,7 @@ function onWindowKeydown(e: KeyboardEvent) {
 		</div>
 	{/if}
 
-	{#if tokensOut > 0 && !quick}
+	{#if tokensOut > 0}
 		<div class="token-spend" title="Token spend this conversation">
 			{tokensIn.toLocaleString()} in · {tokensOut.toLocaleString()} out · {(tokensIn + tokensOut).toLocaleString()} tokens
 		</div>
@@ -914,57 +872,6 @@ function onWindowKeydown(e: KeyboardEvent) {
 	}
 	.stop-btn:hover {
 		background: color-mix(in srgb, var(--error) 12%, var(--bg-secondary));
-	}
-
-	/* Fork-card buttons: [Search web] / [Full chat]. Icon + label centered,
-	   with a right-aligned keyboard hint. */
-	.fork-btn {
-		flex: 1;
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		gap: 7px;
-		font-family: var(--font-sans, system-ui);
-		font-size: 12.5px;
-		font-weight: 500;
-		line-height: 1;
-		padding: 8px 12px;
-		border-radius: 6px;
-		border: 1px solid var(--border);
-		background: var(--bg-secondary);
-		color: var(--fg);
-		cursor: pointer;
-	}
-	.fork-btn :global(svg) {
-		flex-shrink: 0;
-	}
-	.fork-btn kbd {
-		font-family: var(--font-mono);
-		font-size: 10px;
-		line-height: 1;
-		padding: 2px 4px;
-		border-radius: 3px;
-		background: color-mix(in srgb, var(--fg) 10%, transparent);
-		color: var(--fg-muted);
-	}
-	.fork-btn:hover {
-		background: color-mix(in srgb, var(--fg) 8%, var(--bg-secondary));
-	}
-	.fork-btn.primary {
-		border-color: var(--accent);
-		color: var(--accent);
-	}
-	.fork-btn.primary kbd {
-		background: color-mix(in srgb, var(--accent) 18%, transparent);
-		color: var(--accent);
-	}
-	.fork-btn.primary:hover {
-		background: var(--accent);
-		color: var(--bg);
-	}
-	.fork-btn.primary:hover kbd {
-		background: color-mix(in srgb, var(--bg) 25%, transparent);
-		color: var(--bg);
 	}
 
 	/* The rendered markdown. `:global` because the HTML is injected, so scoped

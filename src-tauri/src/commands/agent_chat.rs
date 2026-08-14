@@ -487,10 +487,14 @@ impl AgentEventDto {
 /// Build the agent loop and the capability-manifest text for its system prompt.
 ///
 /// The returned `String` is the generated manifest (tools + AI commands) to fold
-/// into the session's system message; empty when tools are off (a preset/quick-AI
-/// run acts on nothing, so it needs no catalog). Generated from the FULL registry
-/// catalog + presets even though the callable tool SCHEMAS are filtered per query
-/// — the model should KNOW every capability exists; only the schemas cost tokens.
+/// into the session's system message. Present whenever `with_tools` is set — that
+/// covers BOTH the full agent and the quick-AI fork card, since both can call
+/// tools and so both benefit from knowing the menu. Empty only for a preset run
+/// (`with_tools = false`): a text transform calls nothing, so it needs no catalog.
+///
+/// Generated from the FULL registry catalog + presets even though the callable
+/// tool SCHEMAS are filtered per query — the model should KNOW every capability
+/// exists; only the schemas cost real tokens.
 async fn build_coordinator(
     state: &AppState,
     with_tools: bool,

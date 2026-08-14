@@ -54,24 +54,14 @@ describe("keybindings — the config is the single source of truth", () => {
 	});
 });
 
-describe("keybindings — web search is one binding everywhere", () => {
-	it("the fork card's web search shares the main web_search binding", () => {
-		// The reported bug: web search was Ctrl+Enter in the input but a
-		// hardcoded ⌘↵ on the fork card. Same intent, so same binding.
-		expect(KEYBINDINGS_DEFAULTS.fork_web).toBe(KEYBINDINGS_DEFAULTS.web_search);
-	});
-
-	it("the fork card's full-chat shares the submit binding", () => {
-		expect(KEYBINDINGS_DEFAULTS.fork_chat).toBe(KEYBINDINGS_DEFAULTS.submit);
-	});
-
-	it("deliberately shared bindings are not reported as conflicts", () => {
-		// They never compete: the fork card is modal, so the launcher input isn't
-		// listening while it's up. Warning here would train users to ignore the
-		// conflict warning that exists for real clashes.
+describe("keybindings — deliberately shared bindings", () => {
+	it("a modal action sharing a key is not reported as a conflict", () => {
+		// The approval prompt is modal — while it's up the launcher input isn't
+		// listening, so `approve_action` sharing Ctrl+Enter with `web_search` is
+		// deliberate. Warning here would train users to ignore the conflict
+		// warning that exists for real clashes.
 		const shared = findConflicts(KEYBINDINGS_DEFAULTS).flat();
-		expect(shared).not.toContain("fork_web");
-		expect(shared).not.toContain("fork_chat");
+		expect(shared).not.toContain("approve_action");
 	});
 
 	it("a genuine clash IS still reported", () => {
@@ -109,7 +99,7 @@ describe("keybindings — ActionId coverage", () => {
 	it("the actions added for the AI surface are bindable", () => {
 		// These were raw key checks in AiAnswer.svelte with no config entry, so
 		// they could be neither rebound nor displayed consistently.
-		const added: ActionId[] = ["approve_action", "reject_action", "fork_web", "fork_chat"];
+		const added: ActionId[] = ["approve_action", "reject_action"];
 		for (const a of added) {
 			expect(ALL_ACTIONS).toContain(a);
 			expect(getComboString(a)).toBeTruthy();

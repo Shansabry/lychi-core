@@ -28,9 +28,11 @@ use crate::intent::patterns::{self, PatternResult};
 pub enum RouteDecision {
     /// A deterministic handler command — run verbatim through the executor.
     Command { command: String },
-    /// Natural language → AI. `confident` mirrors the old `isClearQuestion`:
-    /// true → straight to the full agent; false → the quick-ai fork card.
-    Nl { prompt: String, confident: bool },
+    /// Natural language → the full tool-calling agent. Every NL query (a clear
+    /// question or an ambiguous phrase alike) goes straight to the agent, which
+    /// answers and can act. (There was once a `confident` flag that sent vague
+    /// input to a quick-answer "fork card" first; that path was removed.)
+    Nl { prompt: String },
     /// An AI preset invocation. When `input` is empty the FE first tries the
     /// PRIMARY selection (highlighted text) as `{input}`, and prompts inline
     /// (re-filling `keyword `) when there is nothing to act on.
@@ -82,60 +84,6 @@ fn panel_for(keyword: &str) -> Option<(PanelKind, Option<&'static str>)> {
     Some(p)
 }
 
-/// First words that lead a clear question/request. When a query starts with one
-/// of these (or ends in `?`), the user is asking, not launching — route straight
-/// to the full agent. Bare/ambiguous text keeps the fork card so a stray
-/// keystroke or app-name typo never silently spins up an AI turn. (Moved here
-/// from the frontend `QUESTION_WORDS`.)
-const QUESTION_WORDS: &[&str] = &[
-    "what",
-    "whats",
-    "why",
-    "how",
-    "who",
-    "when",
-    "where",
-    "which",
-    "is",
-    "are",
-    "can",
-    "could",
-    "should",
-    "would",
-    "do",
-    "does",
-    "did",
-    "will",
-    "explain",
-    "tell",
-    "write",
-    "give",
-    "summarize",
-    "translate",
-    "define",
-    "compare",
-];
-
-/// Does `text` read as a clear natural-language question/request (high-confidence
-/// AI), vs. ambiguous short text that might be a mistyped command? Clear when it
-/// ends in `?`, OR it's multi-word AND its first word is a question/request word.
-/// A bare single word is always ambiguous (far likelier a fuzzy app/command match
-/// than a one-word question).
-pub fn is_clear_question(text: &str) -> bool {
-    let t = text.trim();
-    if t.is_empty() {
-        return false;
-    }
-    if t.ends_with('?') {
-        return true;
-    }
-    let Some((first, _rest)) = t.split_once(char::is_whitespace) else {
-        return false; // single token — ambiguous, not a question
-    };
-    let first = first.to_lowercase();
-    QUESTION_WORDS.contains(&first.as_str())
-}
-
 /// Classify a raw input string into a [`RouteDecision`], the pure string-grading
 /// core. Order mirrors the old frontend decider's precedence for the string
 /// cases (preset keyword → panel keyword → deterministic command → typo → NL),
@@ -156,18 +104,15 @@ pub fn classify_string(
         // Nothing to classify — caller guards this, but be safe.
         return RouteDecision::Nl {
             prompt: String::new(),
-            confident: false,
         };
     }
     let lower = trimmed.to_lowercase();
 
-    // Explicit `ask <q>` → the full agent (or AI-disabled), skipping the fork.
+    // Explicit `ask <q>` → the full agent (or AI-disabled).
     if lower == "ask" || lower.starts_with("ask ") {
         let q = trimmed[3..].trim();
         if !q.is_empty() {
-            return nl_or_disabled(
-                q, /* confident */ true, /* explicit */ true, has_ai,
-            );
+            return nl_or_disabled(q, /* explicit */ true, has_ai);
         }
         // bare "ask" falls through to normal handling
     }
@@ -251,19 +196,17 @@ pub fn classify_string(
                 return RouteDecision::Correct { corrected };
             }
 
-            // Genuine natural language → AI (confidence-graded), or web if AI off.
-            let confident = is_clear_question(trimmed);
-            nl_or_disabled(&input, confident, /* explicit */ false, has_ai)
+            // Genuine natural language → the full agent, or web if AI is off.
+            nl_or_disabled(&input, /* explicit */ false, has_ai)
         }
     }
 }
 
-/// NL → agent/quick-ai when AI is on; otherwise the web-search fallback.
-fn nl_or_disabled(prompt: &str, confident: bool, explicit: bool, has_ai: bool) -> RouteDecision {
+/// NL → the full agent when AI is on; otherwise the web-search fallback.
+fn nl_or_disabled(prompt: &str, explicit: bool, has_ai: bool) -> RouteDecision {
     if has_ai {
         RouteDecision::Nl {
             prompt: prompt.to_string(),
-            confident,
         }
     } else {
         RouteDecision::AiDisabled {
@@ -353,24 +296,12 @@ mod tests {
     }
 
     #[test]
-    fn is_clear_question_grammar() {
-        assert!(is_clear_question("what is rust?"));
-        assert!(is_clear_question("why is the sky blue"));
-        assert!(is_clear_question("explain closures"));
-        assert!(is_clear_question("anything ending in a question?"));
-        assert!(!is_clear_question("rust"));
-        assert!(!is_clear_question("docker logs"));
-        assert!(!is_clear_question("pasta recipe"));
-    }
-
-    #[test]
     fn explicit_ask_goes_to_agent() {
         let r = test_registry();
         assert_eq!(
             classify_string("ask what is rust?", &r, no_presets, true),
             RouteDecision::Nl {
                 prompt: "what is rust?".into(),
-                confident: true
             }
         );
     }
@@ -412,23 +343,17 @@ mod tests {
     }
 
     #[test]
-    fn clear_question_goes_to_agent_ambiguous_to_fork() {
+    fn all_natural_language_goes_to_the_agent() {
         let r = test_registry();
-        assert_eq!(
-            classify_string("what is rust?", &r, no_presets, true),
-            RouteDecision::Nl {
-                prompt: "what is rust?".into(),
-                confident: true
-            }
-        );
-        // A bare ambiguous word: not a command, not a question → fork card.
-        assert_eq!(
-            classify_string("pastarecipe", &r, no_presets, true),
-            RouteDecision::Nl {
-                prompt: "pastarecipe".into(),
-                confident: false
-            }
-        );
+        // A clear question and a bare ambiguous phrase now route identically —
+        // straight to the full agent (the quick-answer fork card was removed).
+        for q in ["what is rust?", "pastarecipe"] {
+            assert_eq!(
+                classify_string(q, &r, no_presets, true),
+                RouteDecision::Nl { prompt: q.into() },
+                "{q:?} should route to the agent",
+            );
+        }
     }
 
     #[test]

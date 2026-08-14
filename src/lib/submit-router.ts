@@ -159,14 +159,9 @@ export type SubmitAction =
 	/** Run a deterministic command through the executor. */
 	| { kind: "command"; command: string; runInline?: boolean }
 	/**
-	 * An unknown query — show the fork card: a short streamed answer with
-	 * [Search web] / [Full chat] buttons. This is the default for ambiguous
-	 * natural language; the user then chooses whether to escalate or bail out.
-	 */
-	| { kind: "quick-ai"; prompt: string }
-	/**
-	 * Hand the query straight to the full tool-calling agent, skipping the fork
-	 * card. A clear question (backend `nl.confident`) or an explicit `ask <q>`.
+	 * Hand the query straight to the full tool-calling agent. Every natural-
+	 * language query routes here — a clear question or an ambiguous phrase alike
+	 * (the quick-answer fork card was removed).
 	 */
 	| { kind: "agent"; prompt: string }
 	/**
@@ -200,9 +195,7 @@ function fromDecision(decision: RouteDecision): SubmitAction {
 		case "command":
 			return { kind: "command", command: decision.command };
 		case "nl":
-			return decision.confident
-				? { kind: "agent", prompt: decision.prompt }
-				: { kind: "quick-ai", prompt: decision.prompt };
+			return { kind: "agent", prompt: decision.prompt };
 		case "preset":
 			return {
 				kind: "preset",
@@ -278,15 +271,7 @@ export function decideSubmit(ctx: SubmitContext): SubmitAction {
 
 	// 5. Classify the raw input via the backend decision (single source of truth).
 	if (ctx.inputDecision) {
-		const action = fromDecision(ctx.inputDecision);
-		// With files staged, an ambiguous question is no longer ambiguous — the
-		// user attached material to ask ABOUT. Skip the fork card and answer it
-		// properly. (Attachments are UI state the classifier can't see, so this
-		// promotion belongs on this side of the boundary, not in the backend.)
-		if (ctx.hasAttachments && action.kind === "quick-ai") {
-			return { kind: "agent", prompt: action.prompt };
-		}
-		return action;
+		return fromDecision(ctx.inputDecision);
 	}
 	// No decision yet (race) — the caller awaits `classifyInput` and re-dispatches.
 	return { kind: "noop" };
@@ -408,7 +393,7 @@ function decideSelectedCompletion(ctx: SubmitContext, selected: RouterCompletion
 			return { kind: "command", command: `${prefix} ${selected.label}` };
 		}
 		// Multi-word non-command with a completion selected → classify the raw
-		// input (agent/quick-ai per the backend), never a raw command replay.
+		// input (the agent per the backend), never a raw command replay.
 		if (ctx.inputDecision) return fromDecision(ctx.inputDecision);
 		return { kind: "noop" };
 	}

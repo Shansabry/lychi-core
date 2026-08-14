@@ -36,10 +36,12 @@ function comp(over: Partial<RouterCompletion> = {}): RouterCompletion {
 }
 
 const CMD = (command: string): RouteDecision => ({ kind: "command", command });
-const NL = (prompt: string, confident: boolean): RouteDecision => ({
+// `_confident` is accepted-and-ignored: the backend `Nl` decision no longer
+// carries a confidence flag (every NL query goes to the agent), but call sites
+// still pass the old second arg. Kept optional so they need no churn.
+const NL = (prompt: string, _confident?: boolean): RouteDecision => ({
 	kind: "nl",
 	prompt,
-	confident,
 });
 
 describe("decideSubmit — guards", () => {
@@ -63,9 +65,9 @@ describe("decideSubmit — staged attachments (FE-only UI state)", () => {
 		expect(decideSubmit(ctx({ hasAttachments: false })).kind).toBe("noop");
 	});
 
-	it("attachments promote an ambiguous question past the fork card", () => {
-		const base = { trimmed: "what is this", inputDecision: NL("what is this", false) };
-		expect(decideSubmit(ctx(base)).kind).toBe("quick-ai");
+	it("a natural-language query routes to the agent, with or without attachments", () => {
+		const base = { trimmed: "what is this", inputDecision: NL("what is this") };
+		expect(decideSubmit(ctx(base)).kind).toBe("agent");
 		expect(decideSubmit(ctx({ ...base, hasAttachments: true })).kind).toBe("agent");
 	});
 
@@ -115,16 +117,13 @@ describe("decideSubmit — actuating the backend decision", () => {
 		});
 	});
 
-	it("a confident NL decision goes straight to the full agent", () => {
+	it("every NL decision — question or ambiguous — goes to the full agent", () => {
 		expect(
-			decideSubmit(ctx({ trimmed: "what is rust?", inputDecision: NL("what is rust?", true) })),
+			decideSubmit(ctx({ trimmed: "what is rust?", inputDecision: NL("what is rust?") })),
 		).toEqual({ kind: "agent", prompt: "what is rust?" });
-	});
-
-	it("an ambiguous NL decision shows the fork card (quick-ai)", () => {
 		expect(
-			decideSubmit(ctx({ trimmed: "pasta recipe", inputDecision: NL("pasta recipe", false) })),
-		).toEqual({ kind: "quick-ai", prompt: "pasta recipe" });
+			decideSubmit(ctx({ trimmed: "pasta recipe", inputDecision: NL("pasta recipe") })),
+		).toEqual({ kind: "agent", prompt: "pasta recipe" });
 	});
 
 	it("a preset decision renders through", () => {
@@ -398,14 +397,14 @@ describe("decideSubmit — a selected row's run is classified by the backend (du
 		expect(decideSubmit(c)).toEqual({ kind: "agent", prompt: "what is rust?" });
 	});
 
-	it("an ambiguous NL query (no runnable row selected) shows the fork card", () => {
+	it("an ambiguous NL query (no runnable row selected) goes to the agent", () => {
 		// Inline fallback rows were removed backend-side, so a bare NL query has no
-		// competing row — the input decision drives Enter.
+		// competing row — the input decision drives Enter, straight to the agent.
 		const c = ctx({
 			trimmed: "pasta recipe",
-			inputDecision: NL("pasta recipe", false),
+			inputDecision: NL("pasta recipe"),
 		});
-		expect(decideSubmit(c)).toEqual({ kind: "quick-ai", prompt: "pasta recipe" });
+		expect(decideSubmit(c)).toEqual({ kind: "agent", prompt: "pasta recipe" });
 	});
 });
 

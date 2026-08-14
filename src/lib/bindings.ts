@@ -2248,17 +2248,7 @@ approve_action: string;
 /**
  * Reject a paused tool call. Escape.
  */
-reject_action: string; 
-/**
- * Quick-AI fork card: bail out to a plain web search. Ctrl+Enter —
- * deliberately the SAME binding as `web_search`, since it is the same
- * intent ("search the web for this") on a different surface.
- */
-fork_web: string; 
-/**
- * Quick-AI fork card: escalate the short answer into full chat. Enter.
- */
-fork_chat: string }
+reject_action: string }
 /**
  * One offered local model, for the settings picker. Carries the warning-gate
  * info (size/RAM) so the UI can inform the user BEFORE download.
@@ -2572,10 +2562,12 @@ export type RouteDecision =
  */
 { kind: "command"; command: string } | 
 /**
- * Natural language → AI. `confident` mirrors the old `isClearQuestion`:
- * true → straight to the full agent; false → the quick-ai fork card.
+ * Natural language → the full tool-calling agent. Every NL query (a clear
+ * question or an ambiguous phrase alike) goes straight to the agent, which
+ * answers and can act. (There was once a `confident` flag that sent vague
+ * input to a quick-answer "fork card" first; that path was removed.)
  */
-{ kind: "nl"; prompt: string; confident: boolean } | 
+{ kind: "nl"; prompt: string } | 
 /**
  * An AI preset invocation. When `input` is empty the FE first tries the
  * PRIMARY selection (highlighted text) as `{input}`, and prompts inline

@@ -913,50 +913,16 @@ async function clearAllConversations() {
 	conversations = [];
 }
 
-/**
- * Fork-card button: continue the quick answer in the full agent — WITHOUT
- * re-asking. `chat.escalate()` snapshots the on-screen answer into the transcript
- * and switches to full-chat mode; if nothing streamed yet it returns the prompt
- * to run a fresh full-agent turn instead. Either way we then focus the reply box.
- */
-function escalateToChat() {
-	const rerun = chat.escalate();
-	if (rerun) {
-		lastResult = null; // AI answer takes over the result area
-		chat.start(rerun, /* fresh */ true);
-		return;
-	}
-	// The reply box is now shown; explicit action → shift focus to it.
-	aiAnswerRef?.focusReply();
-}
-
-/** Fork-card button: bail out to a plain web search for the query. */
-async function quickWebSearch() {
-	const prompt = chat.quickPrompt;
-	chat.reset();
-	if (prompt) await runCommand(`web ${prompt}`);
-}
-
 async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 	if (isExecuting || !backendReady) return;
 	beginSubmit();
-
-	// Fork card shortcuts (quick-AI answer is on screen and idle):
-	//   Enter        → escalate to full chat
-	//   ⌘/Ctrl+Enter → bail out to a web search
-	// The input box is empty during the card, so these would otherwise no-op.
-	if (chat.quick && !chat.streaming && !inputValue.trim()) {
-		if (opts?.ctrlKey) await quickWebSearch();
-		else await escalateToChat();
-		return;
-	}
 
 	// A settled AI answer that produced a path + an empty input → Enter opens the
 	// folder (the "Open folder" action's primary binding). Same detector the chip
 	// uses, so key and button always agree. A modifier or typed text falls through
 	// to normal routing. When focus is in the follow-up reply box instead, its own
 	// keydown handles this and stops propagation before we get here.
-	if (ui.aiVisible && !chat.streaming && !chat.quick && !inputValue.trim() && !opts?.ctrlKey) {
+	if (ui.aiVisible && !chat.streaming && !inputValue.trim() && !opts?.ctrlKey) {
 		const path = answerRevealPath(chat.text);
 		if (path) {
 			await revealAnswerPath(path);
@@ -1137,19 +1103,6 @@ async function actuate(action: SubmitAction): Promise<void> {
 			}
 			await runCommand(action.command, { runInline: action.runInline });
 			return;
-
-		case "quick-ai": {
-			// Ambiguous natural language → the fork card. Typo correction is handled
-			// upstream by the backend classifier (a near-miss returns a `correct`
-			// decision), uniformly for single- AND multi-word input — so there's no
-			// special-case correction check here anymore.
-			inputValue = "";
-			completions.items = [];
-			completions.index = -1;
-			lastResult = null; // AI answer takes over the result area
-			await chat.startQuick(action.prompt);
-			return;
-		}
 
 		case "agent":
 			inputValue = "";
@@ -2177,9 +2130,6 @@ async function handleDismiss() {
 				onreveal={revealAnswerPath}
 				resumed={chat.resumed}
 				onstartfresh={startFreshFromResume}
-				quick={chat.quick}
-				onwebsearch={quickWebSearch}
-				onfullchat={escalateToChat}
 			/>
 		{:else if !ui.anyPanelOpen}
 			<CompletionsList

@@ -73,15 +73,6 @@ export const AGENT_SYSTEM =
 	"Tool choice: ALWAYS prefer a purpose-built tool over the generic `run` shell command. If a dedicated tool covers the request, use it — do NOT guess a shell command. Examples: system/hardware info (CPU, memory, disk, temperature, GPU, battery, IP, OS) → the `sysinfo` tool, never `run <something>`; math/units/currency → `calc`; opening or launching an app → `open`; web/searches → `web`; media control → `media`; screenshots → `screenshot`; packages → `packages`. Reach for `run` only for a genuine shell task that no dedicated tool handles.\n\n" +
 	"If a tool returns 'command not found' or an error, do NOT retry the same guess — reconsider which dedicated tool fits, or ask the user. Never run the same failing command twice.";
 
-/**
- * The quick-AI fork-card system prompt. The agent CAN act (it has the tool
- * catalog): if the query is an action Lychi can perform (weather, open an app,
- * media control, system info…), DO it via a tool rather than describing how.
- * Otherwise answer directly and concisely.
- */
-export const QUICK_AI_SYSTEM =
-	"You are Lychi, a smart assistant inside a Linux launcher. You can ACT on the user's system by calling tools. If the request is something a tool can do (check the weather, open/launch an app, control media, read system info, search, etc.), call the tool and give the result — never tell the user to run a command themselves when you have a tool for it. Otherwise, answer the question directly and concisely in 2-3 sentences with minimal markdown.";
-
 /** System prompt for AI presets (text transforms) — do the task, nothing else. */
 export const PRESET_SYSTEM =
 	"You are Lychi's AI command runner. Perform the task in the user's message directly and return only the result — no preamble, no explanation, no tool use. Use minimal markdown.";
@@ -91,10 +82,6 @@ class ChatSession {
 	text = $state("");
 	streaming = $state(false);
 	error = $state<string | null>(null);
-
-	// Fork-card mode (a short answer with Search-web / Full-chat buttons).
-	quick = $state(false);
-	quickPrompt = $state("");
 
 	// Transcript + live turn. Replaced wholesale → $state.raw.
 	turns = $state.raw<AiTurn[]>([]);
@@ -143,7 +130,6 @@ class ChatSession {
 		prompt: string;
 		withTools: boolean;
 		images: string[];
-		quick: boolean;
 		display?: string;
 		attachment?: UserAttachment | null;
 		files?: TurnFile[];
@@ -215,8 +201,6 @@ class ChatSession {
 		this.lastAttachment = null;
 		this.lastFiles = [];
 		this.reply = "";
-		this.quick = false;
-		this.quickPrompt = "";
 		this.truncated = false;
 		this.tokensIn = 0;
 		this.tokensOut = 0;
@@ -259,13 +243,11 @@ class ChatSession {
 		// The bubble shows what the user typed; the model gets the `@`-expanded
 		// prompt. Same split the presets already use for a folded selection.
 		const gen = this.#beginRun(sent.prompt, text, null, sent.files);
-		this.quick = false; // full agent chat, not the fork card
 		this.#lastRun = {
 			system: AGENT_SYSTEM,
 			prompt: sent.prompt,
 			withTools: true,
 			images: sent.images,
-			quick: false,
 			display: text,
 			files: sent.files,
 		};
@@ -296,8 +278,6 @@ class ChatSession {
 		if (!last || this.streaming) return;
 		this.turns = [];
 		const gen = this.#beginRun(last.prompt, last.display, last.attachment, last.files);
-		this.quick = last.quick;
-		if (last.quick) this.quickPrompt = last.prompt;
 		try {
 			await agentChatStart(
 				last.system,
@@ -334,13 +314,11 @@ class ChatSession {
 		if (!text) return;
 		this.turns = [];
 		const gen = this.#beginRun(text, display?.instruction, display?.attachment);
-		this.quick = false;
 		this.#lastRun = {
 			system: PRESET_SYSTEM,
 			prompt: text,
 			withTools: false,
 			images: [],
-			quick: false,
 			display: display?.instruction,
 			attachment: display?.attachment,
 		};
@@ -367,73 +345,6 @@ class ChatSession {
 		} catch (e) {
 			this.#fail(gen, e);
 		}
-	};
-
-	/** The fork card: stream a short answer with Search-web / Full-chat buttons. */
-	startQuick = async (prompt: string): Promise<void> => {
-		const text = prompt.trim();
-		if (!text) return;
-		this.turns = [];
-		// Attachments apply to the fork card too — a screenshot with a one-line
-		// question is exactly the quick-answer shape.
-		const sent = this.#takeAttachments(text);
-		this.quickPrompt = sent.prompt;
-		const gen = this.#beginRun(sent.prompt, text, null, sent.files);
-		this.quick = true; // the fork card
-		this.#lastRun = {
-			system: QUICK_AI_SYSTEM,
-			prompt: sent.prompt,
-			withTools: true,
-			images: sent.images,
-			quick: true,
-			display: text,
-			files: sent.files,
-		};
-		try {
-			await agentChatStart(
-				QUICK_AI_SYSTEM,
-				sent.prompt,
-				/* fresh */ true,
-				/* withTools */ true,
-				gen,
-				sent.images,
-			);
-		} catch (e) {
-			this.#fail(gen, e);
-		}
-	};
-
-	/**
-	 * Escalate the fork-card answer into full chat WITHOUT re-asking. Returns the
-	 * prompt to re-run when nothing streamed yet (caller decides), else null.
-	 */
-	escalate = (): string | null => {
-		if (!this.text) {
-			// Nothing streamed yet — signal the caller to run a fresh full-agent turn.
-			const prompt = this.quickPrompt;
-			this.quick = false;
-			return prompt || null;
-		}
-		// Snapshot the quick answer as a completed turn, then switch to full chat.
-		// Clear the live-turn fields so the snapshot doesn't ALSO render as the bubble.
-		this.turns = [
-			...this.turns,
-			{
-				user: this.lastUser,
-				text: this.text,
-				toolSteps: this.toolSteps,
-				attachment: this.lastAttachment ?? undefined,
-				files: this.lastFiles,
-			},
-		];
-		this.lastUser = "";
-		this.lastAttachment = null;
-		this.lastFiles = [];
-		this.text = "";
-		this.toolSteps = [];
-		this.quick = false;
-		this.streaming = false;
-		return null;
 	};
 
 	/** Resolve a pending destructive-tool approval and resume the agent. */
@@ -478,7 +389,6 @@ class ChatSession {
 		this.approval = null;
 		this.streaming = false;
 		ui.showAi();
-		this.quick = false;
 		this.gen++; // fresh generation for any follow-up
 	};
 
