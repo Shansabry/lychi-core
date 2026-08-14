@@ -15,6 +15,7 @@ pub mod executor;
 pub mod file_search;
 pub mod file_search_score;
 pub mod files;
+pub mod filestore;
 pub mod fonts;
 pub mod fs_atomic;
 pub mod history;
