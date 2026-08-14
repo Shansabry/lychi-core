@@ -136,12 +136,12 @@ fn pin_rows(db: &Arc<Database>) -> Vec<CompletionItem> {
 /// The `run` is `open <Name>`, so Enter launches it — the same string
 /// `AppLauncher::completions` emits, so selection behaves identically whether
 /// the row came from here or from typing.
-fn recent_apps(db: &Arc<Database>) -> Vec<CompletionItem> {
+fn recent_apps(_db: &Arc<Database>) -> Vec<CompletionItem> {
     let index = crate::desktop_apps::app_index();
 
     // get_scores already applies the circadian affinity multiplier AND rides
     // the generation-keyed entry cache.
-    let mut scored: Vec<(&crate::desktop_apps::DesktopEntry, f64)> = frecency::get_scores(db)
+    let mut scored: Vec<(&crate::desktop_apps::DesktopEntry, f64)> = frecency::get_scores()
         .into_iter()
         // Cheap pre-filter: everything namespaced (`history:`, `win:`, `ws:`)
         // or absolute is definitely not an app name. Correctness still rests
@@ -248,6 +248,7 @@ mod tests {
     fn pins_come_first_in_pin_order_even_without_context() {
         let _idx = with_apps(&[]);
         let db = crate::db::open_test_database();
+        frecency::set_store_for_test(db.clone());
         let store = PinsStore::new();
         store.add(&db, "cargo test", "cargo test").unwrap();
         store.add(&db, "open Notes", "Notes").unwrap();
@@ -264,7 +265,8 @@ mod tests {
     fn a_pinned_app_dedupes_the_recent_app_row() {
         let _idx = with_apps(&[("Spotify", "/usr/bin/spotify")]);
         let db = crate::db::open_test_database();
-        frecency::record(&db, "spotify").unwrap();
+        frecency::set_store_for_test(db.clone());
+        frecency::record("spotify").unwrap();
         PinsStore::new()
             .add(&db, "open Spotify", "Spotify")
             .unwrap();
@@ -285,7 +287,8 @@ mod tests {
     fn only_pin_rows_carry_the_pinned_flag() {
         let _idx = with_apps(&[("Spotify", "/usr/bin/spotify")]);
         let db = crate::db::open_test_database();
-        frecency::record(&db, "spotify").unwrap();
+        frecency::set_store_for_test(db.clone());
+        frecency::record("spotify").unwrap();
         PinsStore::new()
             .add(&db, "cargo test", "cargo test")
             .unwrap();
@@ -306,7 +309,8 @@ mod tests {
     fn pins_survive_zero_state_recents_off() {
         let _idx = with_apps(&[("Spotify", "/usr/bin/spotify")]);
         let db = crate::db::open_test_database();
-        frecency::record(&db, "spotify").unwrap();
+        frecency::set_store_for_test(db.clone());
+        frecency::record("spotify").unwrap();
         PinsStore::new()
             .add(&db, "cargo test", "cargo test")
             .unwrap();
@@ -327,7 +331,8 @@ mod tests {
     fn a_full_pin_board_leaves_no_room_for_recents() {
         let _idx = with_apps(&[("Spotify", "/usr/bin/spotify")]);
         let db = crate::db::open_test_database();
-        frecency::record(&db, "spotify").unwrap();
+        frecency::set_store_for_test(db.clone());
+        frecency::record("spotify").unwrap();
         let store = PinsStore::new();
         for i in 0..crate::pins::store::MAX_PINS {
             store
@@ -348,10 +353,11 @@ mod tests {
     fn command_rows_never_reach_the_empty_prompt() {
         let _idx = with_apps(&[]);
         let db = crate::db::open_test_database();
+        frecency::set_store_for_test(db.clone());
         // A well-established workspace habit (passes any use-count gate)...
-        frecency::record_workspace(&db, "/home/u/proj", "cargo test").unwrap();
-        frecency::record_workspace(&db, "/home/u/proj", "cargo test").unwrap();
-        frecency::record_workspace(&db, "/home/u/proj", "cargo test").unwrap();
+        frecency::record_workspace("/home/u/proj", "cargo test").unwrap();
+        frecency::record_workspace("/home/u/proj", "cargo test").unwrap();
+        frecency::record_workspace("/home/u/proj", "cargo test").unwrap();
         // ...and a fresh clipboard capture.
         crate::clipboard::store::ClipboardStore::new()
             .push(&db, "https://example.com/x")
@@ -375,10 +381,11 @@ mod tests {
     fn no_data_yields_the_hint() {
         let _idx = with_apps(&[("Spotify", "/usr/bin/spotify")]);
         let db = crate::db::open_test_database();
+        frecency::set_store_for_test(db.clone());
         // The frecency entry cache is process-global and generation-keyed; a
         // test that never writes would read the PREVIOUS test's entries. One
         // namespaced write (never a row) points the cache at this db.
-        frecency::record(&db, "history:cache-warm").unwrap();
+        frecency::record("history:cache-warm").unwrap();
         let items = compose(&db, &cfg());
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].icon_path.as_deref(), Some("__info__"));
@@ -390,8 +397,9 @@ mod tests {
     fn speculative_context_never_reaches_the_empty_prompt() {
         let _idx = with_apps(&[]);
         let db = crate::db::open_test_database();
-        frecency::record(&db, "history:open firefox").unwrap();
-        frecency::record(&db, "history:web rust docs").unwrap();
+        frecency::set_store_for_test(db.clone());
+        frecency::record("history:open firefox").unwrap();
+        frecency::record("history:web rust docs").unwrap();
 
         let items = compose(&db, &cfg());
         assert!(
@@ -412,8 +420,9 @@ mod tests {
     fn a_launched_app_returns_as_an_app_row() {
         let _idx = with_apps(&[("Spotify", "/usr/bin/spotify")]);
         let db = crate::db::open_test_database();
+        frecency::set_store_for_test(db.clone());
         // Exactly what `app_launcher` records on launch.
-        frecency::record(&db, "spotify").unwrap();
+        frecency::record("spotify").unwrap();
 
         let items = compose(&db, &cfg());
 
@@ -435,8 +444,9 @@ mod tests {
     fn the_history_twin_of_an_app_never_appears() {
         let _idx = with_apps(&[("Spotify", "/usr/bin/spotify")]);
         let db = crate::db::open_test_database();
-        frecency::record(&db, "spotify").unwrap();
-        frecency::record(&db, "history:open spotify").unwrap();
+        frecency::set_store_for_test(db.clone());
+        frecency::record("spotify").unwrap();
+        frecency::record("history:open spotify").unwrap();
 
         let items = compose(&db, &cfg());
         let opens: Vec<&CompletionItem> = items
@@ -463,6 +473,7 @@ mod tests {
     fn non_app_frecency_keys_never_become_rows() {
         let _idx = with_apps(&[("Spotify", "/usr/bin/spotify")]);
         let db = crate::db::open_test_database();
+        frecency::set_store_for_test(db.clone());
         for key in [
             "history:web rust docs",
             "win:firefox",
@@ -470,7 +481,7 @@ mod tests {
             "/home/u/notes.md",
             "sug:something",
         ] {
-            frecency::record(&db, key).unwrap();
+            frecency::record(key).unwrap();
         }
 
         let items = compose(&db, &cfg());
@@ -493,8 +504,9 @@ mod tests {
     fn an_uninstalled_app_is_dropped() {
         let _idx = with_apps(&[("Spotify", "/usr/bin/spotify")]);
         let db = crate::db::open_test_database();
-        frecency::record(&db, "spotify").unwrap();
-        frecency::record(&db, "an-app-that-was-removed").unwrap();
+        frecency::set_store_for_test(db.clone());
+        frecency::record("spotify").unwrap();
+        frecency::record("an-app-that-was-removed").unwrap();
 
         let items = compose(&db, &cfg());
         assert!(
@@ -514,8 +526,9 @@ mod tests {
         let _idx = with_apps(&refs);
 
         let db = crate::db::open_test_database();
+        frecency::set_store_for_test(db.clone());
         for (name, _) in &apps {
-            frecency::record(&db, &name.to_lowercase()).unwrap();
+            frecency::record(&name.to_lowercase()).unwrap();
         }
 
         let items = compose(&db, &cfg());
@@ -539,8 +552,9 @@ mod tests {
         let _idx = with_apps(&refs);
 
         let db = crate::db::open_test_database();
+        frecency::set_store_for_test(db.clone());
         for (name, _) in &apps {
-            frecency::record(&db, &name.to_lowercase()).unwrap();
+            frecency::record(&name.to_lowercase()).unwrap();
         }
         PinsStore::new().add(&db, "open App9", "App9").unwrap();
 
@@ -566,9 +580,10 @@ mod tests {
     fn a_plain_non_app_key_produces_no_row() {
         let _idx = with_apps(&[("Spotify", "/usr/bin/spotify")]);
         let db = crate::db::open_test_database();
+        frecency::set_store_for_test(db.clone());
         // No colon, no leading slash — sails past the pre-filter, and is still
         // not an installed app.
-        frecency::record(&db, "definitely-not-an-app").unwrap();
+        frecency::record("definitely-not-an-app").unwrap();
 
         let items = compose(&db, &cfg());
         assert!(

@@ -39,7 +39,7 @@ impl ClearHandler {
     }
 
     fn clear_suggestions(&self) -> Result<usize, LychiError> {
-        frecency::clear(&self.db)
+        frecency::clear()
     }
 
     fn ok(message: impl Into<String>) -> ActionResult {
@@ -152,8 +152,9 @@ mod tests {
     #[tokio::test]
     async fn clear_suggestions_wipes_frecency() {
         let db = open_test_database();
-        frecency::record(&db, "history:foo").unwrap();
-        assert!(!frecency::get_scores(&db).is_empty());
+        frecency::set_store_for_test(db.clone());
+        frecency::record("history:foo").unwrap();
+        assert!(!frecency::get_scores().is_empty());
         let h = ClearHandler::new(db.clone());
         let result = h
             .execute(
@@ -163,7 +164,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.success);
-        assert!(frecency::get_scores(&db).is_empty());
+        assert!(frecency::get_scores().is_empty());
     }
 
     #[tokio::test]

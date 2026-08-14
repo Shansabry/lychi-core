@@ -1,8 +1,5 @@
 use async_trait::async_trait;
-use std::sync::Arc;
 use std::time::Instant;
-
-use redb::Database;
 
 use crate::action_registry::handlers::icons::resolve_icon_cached;
 use crate::action_registry::{
@@ -12,13 +9,12 @@ use crate::db::frecency;
 use crate::desktop_apps::{AUTO_LAUNCH_THRESHOLD, app_index};
 use crate::error::LychiError;
 
-pub struct AppLauncher {
-    db: Arc<Database>,
-}
+#[derive(Default)]
+pub struct AppLauncher;
 
 impl AppLauncher {
-    pub fn new(db: Arc<Database>) -> Self {
-        Self { db }
+    pub fn new() -> Self {
+        Self
     }
 
     /// Pre-warm the AppIndex and icon theme metadata. Fast (a few ms) — this is
@@ -105,7 +101,7 @@ impl ActionHandler for AppLauncher {
 
         // Record frecency access (fire-and-forget)
         let key = entry.name.to_lowercase();
-        let _ = frecency::record(&self.db, &key);
+        let _ = frecency::record(&key);
 
         // Smart open: focus if already running, launch if not.
         // Try StartupWMClass first (most precise), then exec basename, then display name.
@@ -147,7 +143,7 @@ impl ActionHandler for AppLauncher {
         let candidates = index.candidates(query, 12);
 
         // Load frecency scores (single read transaction)
-        let frecency_scores = frecency::get_scores(&self.db);
+        let frecency_scores = frecency::get_scores();
 
         let mut items: Vec<CompletionItem> = candidates
             .into_iter()

@@ -195,7 +195,7 @@ pub fn fuzzy_path_completions(
     live: &std::sync::Arc<live::LiveSearch>,
     scope: &str,
     query: &str,
-    db: &std::sync::Arc<redb::Database>,
+    _db: &std::sync::Arc<redb::Database>,
     limit: usize,
 ) -> Vec<CompletionItem> {
     // One-shot: start a session, take what has matched, done. No redraw callback
@@ -207,7 +207,7 @@ pub fn fuzzy_path_completions(
         return Vec::new();
     };
 
-    let frecency_scores = crate::db::frecency::get_scores(db);
+    let frecency_scores = crate::db::frecency::get_scores();
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

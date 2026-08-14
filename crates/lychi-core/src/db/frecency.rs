@@ -1,12 +1,92 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use redb::{Database, ReadableDatabase, ReadableTable};
+use redb::{Database, Durability, ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
 
 use crate::error::LychiError;
 
 use super::FRECENCY;
+
+/// The frecency database, registered once at startup.
+///
+/// Frecency lives in its OWN redb file (`frecency.redb`), not the user-data
+/// `lychi.redb`. It is derived, device-local, machine-learned ranking data — the
+/// one hot-path/keyed/multi-process store where redb (its in-memory cache below,
+/// its B-tree prefix scans, its multi-process locking) is the right engine, so it
+/// stays in redb rather than moving to a flat file. A separate file keeps
+/// `lychi.redb` to user-authored content and isolates frecency's growth and any
+/// corruption from the user's notes/todos/snippets.
+///
+/// Every public function reads this global handle rather than taking a `db`
+/// argument — the record/get call sites (60+, on the hot path and deep in
+/// handlers) do not thread a database around. Unset in tests until `init_store`
+/// (or `set_store_for_test`) runs; an unset store makes writes a no-op and reads
+/// empty, which degrades ranking to neutral rather than panicking.
+static STORE: OnceLock<Arc<Database>> = OnceLock::new();
+
+/// Register the frecency database. Called once at app startup.
+pub fn init_store(db: Arc<Database>) {
+    let _ = STORE.set(db);
+}
+
+/// The registered frecency database, if any.
+///
+/// In production this is a single `OnceLock` load (one atomic read, no lock) on
+/// the per-keystroke path. Under `cfg(test)` it first consults a per-thread
+/// override so each `#[test]` gets its own isolated database without fighting the
+/// set-once `STORE` (tests run in parallel in one process, and many assert exact
+/// table contents). The override branch is compiled out of release builds.
+#[cfg(not(test))]
+fn store() -> Option<Arc<Database>> {
+    // Cloning the Arc is a single atomic increment — negligible on the hot path,
+    // and it unifies the return type with the test override below.
+    STORE.get().cloned()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_STORE: std::cell::RefCell<Option<Arc<Database>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn store() -> Option<Arc<Database>> {
+    let overridden = TEST_STORE.with(|s| s.borrow().clone());
+    overridden.or_else(|| STORE.get().cloned())
+}
+
+/// Point this thread's frecency store at `db` (test-only). Each test calls this
+/// with its own `open_test_database()` so it is fully isolated. `pub(crate)` so
+/// tests in other modules (executor, suggestions, zero_state) that exercise
+/// frecency can register their own store the same way.
+#[cfg(test)]
+pub(crate) fn set_store_for_test(db: Arc<Database>) {
+    // The frecency table must exist in a bare test database.
+    {
+        let txn = db.begin_write().unwrap();
+        txn.open_table(FRECENCY).unwrap();
+        txn.commit().unwrap();
+    }
+    TEST_STORE.with(|s| *s.borrow_mut() = Some(db));
+    // A fresh store must not serve another test's cached entries.
+    invalidate();
+}
+
+/// Open a write transaction with per-write fsync DISABLED (`Durability::None`).
+///
+/// Frecency is not critical data: losing the last few ranking updates on a crash
+/// just means a suggestion ranks slightly stale and self-corrects on next use. So
+/// we skip the fsync every `commit()` would otherwise do — the write reaches the
+/// OS page cache and is flushed on the OS's own schedule. This is the one real
+/// perf lever for a per-keystroke keyed store, and it keeps the crash guarantee a
+/// file+periodic-flush design would give, without leaving redb.
+fn begin_write(db: &Arc<Database>) -> Result<redb::WriteTransaction, LychiError> {
+    let mut txn = db.begin_write()?;
+    // Best-effort: if the redb version returns a Result here, a failure just means
+    // this commit stays durable (fsync'd) — correct, only slightly slower.
+    let _ = txn.set_durability(Durability::None);
+    Ok(txn)
+}
 
 /// Frecency entry: tracks access frequency and recency for a single item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,9 +176,12 @@ impl FrecencyEntry {
 }
 
 /// Record an access for a given key.
-pub fn record(db: &Arc<Database>, key: &str) -> Result<(), LychiError> {
+pub fn record(key: &str) -> Result<(), LychiError> {
+    let Some(db) = store() else {
+        return Ok(());
+    };
     let now_ms = super::now_millis();
-    let txn = db.begin_write()?;
+    let txn = begin_write(&db)?;
     {
         let mut table = txn.open_table(FRECENCY)?;
 
@@ -122,34 +205,26 @@ pub fn record(db: &Arc<Database>, key: &str) -> Result<(), LychiError> {
 ///
 /// Key format: `ws:<project_root>:<command>` — scoped frecency that tracks
 /// which commands are frequently used in which project directory.
-pub fn record_workspace(
-    db: &Arc<Database>,
-    project_root: &str,
-    command: &str,
-) -> Result<(), LychiError> {
+pub fn record_workspace(project_root: &str, command: &str) -> Result<(), LychiError> {
     let normalized = project_root.trim_end_matches('/');
     let key = format!("ws:{normalized}:{command}");
-    record(db, &key)
+    record(&key)
 }
 
 /// Record that a command ran in a specific repo within a multi-repo container.
 /// Learns the user's active repo per container (`repo:<container>:<repo_path>`),
 /// so the most-used repo becomes the silent default.
-pub fn record_repo_choice(
-    db: &Arc<Database>,
-    container: &str,
-    repo_path: &str,
-) -> Result<(), LychiError> {
+pub fn record_repo_choice(container: &str, repo_path: &str) -> Result<(), LychiError> {
     let container = container.trim_end_matches('/');
     let key = format!("repo:{container}:{repo_path}");
-    record(db, &key)
+    record(&key)
 }
 
 /// Frecency scores of repos chosen within a container: `repo_path -> score`.
-pub fn get_repo_choice_scores(db: &Arc<Database>, container: &str) -> HashMap<String, f64> {
+pub fn get_repo_choice_scores(container: &str) -> HashMap<String, f64> {
     let container = container.trim_end_matches('/');
     let prefix = format!("repo:{container}:");
-    get_scores(db)
+    get_scores()
         .into_iter()
         .filter_map(|(key, score)| key.strip_prefix(&prefix).map(|r| (r.to_string(), score)))
         .collect()
@@ -158,10 +233,10 @@ pub fn get_repo_choice_scores(db: &Arc<Database>, container: &str) -> HashMap<St
 /// Get workspace-scoped frecency scores for a specific project.
 ///
 /// Returns a map of `command -> score` for commands previously run in this project.
-pub fn get_workspace_scores(db: &Arc<Database>, project_root: &str) -> HashMap<String, f64> {
+pub fn get_workspace_scores(project_root: &str) -> HashMap<String, f64> {
     let normalized = project_root.trim_end_matches('/');
     let prefix = format!("ws:{normalized}:");
-    let all_scores = get_scores(db);
+    let all_scores = get_scores();
     all_scores
         .into_iter()
         .filter_map(|(key, score)| {
@@ -176,22 +251,18 @@ pub fn get_workspace_scores(db: &Arc<Database>, project_root: &str) -> HashMap<S
 /// Key format: `sug:<context_key>:<command>` — Alfred-style "latching": the
 /// suggestion engine learns which suggestions the user actually accepts in
 /// which context (project root, focused app, or global).
-pub fn record_suggestion(
-    db: &Arc<Database>,
-    context_key: &str,
-    command: &str,
-) -> Result<(), LychiError> {
+pub fn record_suggestion(context_key: &str, command: &str) -> Result<(), LychiError> {
     let key = format!("sug:{context_key}:{command}");
-    record(db, &key)
+    record(&key)
 }
 
 /// Get learned suggestion-acceptance scores for a context.
 ///
 /// Returns a map of `command -> score (0.0 to 1.0)` for suggestions the user
 /// previously accepted in this context.
-pub fn get_suggestion_scores(db: &Arc<Database>, context_key: &str) -> HashMap<String, f64> {
+pub fn get_suggestion_scores(context_key: &str) -> HashMap<String, f64> {
     let prefix = format!("sug:{context_key}:");
-    get_scores(db)
+    get_scores()
         .into_iter()
         .filter_map(|(key, score)| {
             key.strip_prefix(&prefix)
@@ -204,14 +275,14 @@ pub fn get_suggestion_scores(db: &Arc<Database>, context_key: &str) -> HashMap<S
 /// `"web"`). Keyed globally (`fallback:<action>`), so Lychi learns which escape
 /// hatch this user prefers and orders the two rows accordingly — if you keep
 /// picking "Search web" over "Ask AI", web starts appearing first.
-pub fn record_fallback_choice(db: &Arc<Database>, action: &str) -> Result<(), LychiError> {
-    record(db, &format!("fallback:{action}"))
+pub fn record_fallback_choice(action: &str) -> Result<(), LychiError> {
+    record(&format!("fallback:{action}"))
 }
 
 /// Learned frecency score for a fallback action (`"ask"`/`"web"`), 0.0 if never
 /// chosen. Used to order the "Ask AI" / "Search web" rows by preference.
-pub fn get_fallback_score(db: &Arc<Database>, action: &str) -> f64 {
-    get_scores(db)
+pub fn get_fallback_score(action: &str) -> f64 {
+    get_scores()
         .get(&format!("fallback:{action}"))
         .copied()
         .unwrap_or(0.0)
@@ -267,7 +338,7 @@ pub fn invalidate() {
 /// Takes a closure rather than returning the Vec so the cached entries are
 /// borrowed under the lock instead of cloned — at 5000 entries the clone was
 /// most of what remained after caching.
-fn with_entries<R>(db: &Arc<Database>, f: impl FnOnce(&[(String, FrecencyEntry)]) -> R) -> R {
+fn with_entries<R>(f: impl FnOnce(&[(String, FrecencyEntry)]) -> R) -> R {
     let generation = GENERATION.load(std::sync::atomic::Ordering::Acquire);
     {
         let cache = ENTRY_CACHE.lock();
@@ -280,7 +351,8 @@ fn with_entries<R>(db: &Arc<Database>, f: impl FnOnce(&[(String, FrecencyEntry)]
     }
 
     let mut entries = Vec::new();
-    if let Ok(txn) = db.begin_read()
+    if let Some(db) = store()
+        && let Ok(txn) = db.begin_read()
         && let Ok(table) = txn.open_table(FRECENCY)
         && let Ok(iter) = table.iter()
     {
@@ -325,11 +397,10 @@ fn entries_fallback() -> Vec<(String, FrecencyEntry)> {
 /// Generic over the row type because the FRECENCY table multiplexes structs by
 /// namespace (`imp:` rows are `ImpressionEntry`, the rest `FrecencyEntry`) —
 /// which is also why these reads cannot ride the typed `ENTRY_CACHE`.
-fn for_prefix<T: serde::de::DeserializeOwned>(
-    db: &Arc<Database>,
-    prefix: &str,
-    mut f: impl FnMut(&str, T),
-) {
+fn for_prefix<T: serde::de::DeserializeOwned>(prefix: &str, mut f: impl FnMut(&str, T)) {
+    let Some(db) = store() else {
+        return;
+    };
     let Ok(txn) = db.begin_read() else {
         return;
     };
@@ -351,9 +422,9 @@ fn for_prefix<T: serde::de::DeserializeOwned>(
     }
 }
 
-pub fn get_scores(db: &Arc<Database>) -> HashMap<String, f64> {
+pub fn get_scores() -> HashMap<String, f64> {
     let now_ms = super::now_millis();
-    with_entries(db, |entries| {
+    with_entries(|entries| {
         let mut scores = HashMap::with_capacity(entries.len());
         for (key, entry) in entries {
             let score = entry.score(now_ms);
@@ -370,11 +441,11 @@ pub fn get_scores(db: &Arc<Database>) -> HashMap<String, f64> {
 /// The zero-state quality gate needs "how many times", which the score alone
 /// cannot answer (a single use minutes ago outscores five uses last week).
 /// Rides the same [`with_entries`] cache as [`get_scores`]; no extra scan.
-pub fn get_workspace_stats(db: &Arc<Database>, project_root: &str) -> HashMap<String, (f64, u32)> {
+pub fn get_workspace_stats(project_root: &str) -> HashMap<String, (f64, u32)> {
     let now_ms = super::now_millis();
     let normalized = project_root.trim_end_matches('/');
     let prefix = format!("ws:{normalized}:");
-    with_entries(db, |entries| {
+    with_entries(|entries| {
         let mut stats = HashMap::new();
         for (key, entry) in entries {
             if let Some(cmd) = key.strip_prefix(&prefix) {
@@ -396,12 +467,12 @@ pub fn get_workspace_stats(db: &Arc<Database>, project_root: &str) -> HashMap<St
 /// (1.0 neutral, up to 1.15) so the cold-path ranker can give workspace-memory
 /// suggestions the same "knows your routine" tiebreak the recents get. Commands
 /// with too little history (or absent) map to 1.0 by the caller's default.
-pub fn get_workspace_affinity(db: &Arc<Database>, project_root: &str) -> HashMap<String, f64> {
+pub fn get_workspace_affinity(project_root: &str) -> HashMap<String, f64> {
     let now_ms = super::now_millis();
     let normalized = project_root.trim_end_matches('/');
     let prefix = format!("ws:{normalized}:");
     let mut affinity = HashMap::new();
-    for_prefix::<FrecencyEntry>(db, &prefix, |cmd, entry| {
+    for_prefix::<FrecencyEntry>(&prefix, |cmd, entry| {
         affinity.insert(cmd.to_string(), entry.time_affinity(now_ms));
     });
     affinity
@@ -445,16 +516,15 @@ fn decay_counts(entry: &ImpressionEntry, now_ms: u64) -> (u32, u32) {
 
 /// Record one impression each for a batch of shown commands, in a single write
 /// transaction. Called once per panel-settle (debounced), never per keystroke.
-pub fn record_impressions(
-    db: &Arc<Database>,
-    context_key: &str,
-    commands: &[String],
-) -> Result<(), LychiError> {
+pub fn record_impressions(context_key: &str, commands: &[String]) -> Result<(), LychiError> {
     if commands.is_empty() {
         return Ok(());
     }
+    let Some(db) = store() else {
+        return Ok(());
+    };
     let now_ms = super::now_millis();
-    let txn = db.begin_write()?;
+    let txn = begin_write(&db)?;
     {
         let mut table = txn.open_table(FRECENCY)?;
         for command in commands {
@@ -474,14 +544,13 @@ pub fn record_impressions(
 
 /// Record one acceptance for a `(context, command)`. Called alongside
 /// `record_suggestion` when the user runs a shown suggestion.
-pub fn record_acceptance(
-    db: &Arc<Database>,
-    context_key: &str,
-    command: &str,
-) -> Result<(), LychiError> {
+pub fn record_acceptance(context_key: &str, command: &str) -> Result<(), LychiError> {
+    let Some(db) = store() else {
+        return Ok(());
+    };
     let now_ms = super::now_millis();
     let key = format!("imp:{context_key}:{command}");
-    let txn = db.begin_write()?;
+    let txn = begin_write(&db)?;
     {
         let mut table = txn.open_table(FRECENCY)?;
         let mut entry: ImpressionEntry = table
@@ -497,11 +566,11 @@ pub fn record_acceptance(
 }
 
 /// Get decayed `(accepts, impressions)` per command for a context.
-pub fn get_impression_stats(db: &Arc<Database>, context_key: &str) -> HashMap<String, (u32, u32)> {
+pub fn get_impression_stats(context_key: &str) -> HashMap<String, (u32, u32)> {
     let now_ms = super::now_millis();
     let prefix = format!("imp:{context_key}:");
     let mut out = HashMap::new();
-    for_prefix::<ImpressionEntry>(db, &prefix, |command, entry| {
+    for_prefix::<ImpressionEntry>(&prefix, |command, entry| {
         let (accepts, impressions) = decay_counts(&entry, now_ms);
         out.insert(command.to_string(), (accepts, impressions));
     });
@@ -533,13 +602,16 @@ const MAX_LEARNING_ROWS: usize = 50_000;
 ///
 /// Other namespaces decay asymptotically (an ancient row still weighs 0.1 in
 /// `score`), so they are never "dead", only cappable.
-pub fn prune_expired(db: &Arc<Database>) -> Result<usize, LychiError> {
-    prune_expired_impl(db, MAX_LEARNING_ROWS)
+pub fn prune_expired() -> Result<usize, LychiError> {
+    let Some(db) = store() else {
+        return Ok(0);
+    };
+    prune_expired_impl(&db, MAX_LEARNING_ROWS)
 }
 
 fn prune_expired_impl(db: &Arc<Database>, max_rows: usize) -> Result<usize, LychiError> {
     let now_ms = super::now_millis();
-    let txn = db.begin_write()?;
+    let txn = begin_write(db)?;
     let removed;
     {
         let mut table = txn.open_table(FRECENCY)?;
@@ -604,8 +676,11 @@ fn prune_expired_impl(db: &Arc<Database>, max_rows: usize) -> Result<usize, Lych
 /// Clear all learned ranking data (frecency for history, workspace, and
 /// suggestion-acceptance keys). Resets app/command ordering to neutral.
 /// Returns the number of entries removed.
-pub fn clear(db: &Arc<Database>) -> Result<usize, LychiError> {
-    let txn = db.begin_write()?;
+pub fn clear() -> Result<usize, LychiError> {
+    let Some(db) = store() else {
+        return Ok(0);
+    };
+    let txn = begin_write(&db)?;
     let removed;
     {
         let mut table = txn.open_table(FRECENCY)?;
@@ -677,7 +752,7 @@ fn latch_prefix(query: &str) -> String {
 /// key: the query itself is the context. That also means it still learns when
 /// there is no project or focused app — the case where per-context learning
 /// records nothing at all.
-pub fn record_latch(db: &Arc<Database>, query: &str, command: &str) -> Result<(), LychiError> {
+pub fn record_latch(query: &str, command: &str) -> Result<(), LychiError> {
     let prefix = latch_prefix(query);
     if prefix.is_empty() || command.trim().is_empty() {
         return Ok(());
@@ -688,7 +763,7 @@ pub fn record_latch(db: &Arc<Database>, query: &str, command: &str) -> Result<()
     if prefix == command.trim().to_lowercase() {
         return Ok(());
     }
-    record(db, &format!("latch:{prefix}\u{1}{command}"))
+    record(&format!("latch:{prefix}\u{1}{command}"))
 }
 
 /// Commands this user has chosen for this query, as `command -> strength`
@@ -697,7 +772,7 @@ pub fn record_latch(db: &Arc<Database>, query: &str, command: &str) -> Result<()
 /// Uses `\u{1}` as the field separator rather than `:` because commands
 /// routinely contain colons (`https://…`, `run docker: …`), and splitting on a
 /// character that appears in the data silently truncates keys.
-pub fn get_latches(db: &Arc<Database>, query: &str) -> HashMap<String, f64> {
+pub fn get_latches(query: &str) -> HashMap<String, f64> {
     let prefix = latch_prefix(query);
     let mut out = HashMap::new();
     if prefix.is_empty() {
@@ -707,7 +782,7 @@ pub fn get_latches(db: &Arc<Database>, query: &str) -> HashMap<String, f64> {
     let want = format!("latch:{prefix}\u{1}");
     // This runs on EVERY keystroke (Executor::completions) — it must stay a
     // range scan, never a table walk. See `for_prefix`.
-    for_prefix::<FrecencyEntry>(db, &want, |command, entry| {
+    for_prefix::<FrecencyEntry>(&want, |command, entry| {
         let strength = latch_strength(&entry, now_ms);
         if strength > 0.0 {
             out.insert(command.to_string(), strength);
@@ -765,6 +840,7 @@ mod prune_tests {
     #[test]
     fn prune_deletes_exactly_the_rows_reads_ignore() {
         let db = open_test_database();
+        set_store_for_test(db.clone());
 
         // Dead: latch past the 28-day horizon; imp decayed to (0,0).
         insert_raw(
@@ -785,26 +861,27 @@ mod prune_tests {
             },
         );
         // Living: a fresh latch, a fresh impression, an ordinary frecency row.
-        record_latch(&db, "new query", "chosen cmd").unwrap();
-        record_impressions(&db, "ctx", &["fresh-cmd".to_string()]).unwrap();
-        record(&db, "firefox").unwrap();
+        record_latch("new query", "chosen cmd").unwrap();
+        record_impressions("ctx", &["fresh-cmd".to_string()]).unwrap();
+        record("firefox").unwrap();
 
-        let removed = prune_expired(&db).unwrap();
+        let removed = prune_expired().unwrap();
         assert_eq!(removed, 2, "exactly the two inert rows go");
 
-        assert!(!get_latches(&db, "old query").contains_key("cmd"));
-        assert!(get_latches(&db, "new query").contains_key("chosen cmd"));
-        assert!(get_impression_stats(&db, "ctx").contains_key("fresh-cmd"));
-        assert!(get_scores(&db).contains_key("firefox"));
+        assert!(!get_latches("old query").contains_key("cmd"));
+        assert!(get_latches("new query").contains_key("chosen cmd"));
+        assert!(get_impression_stats("ctx").contains_key("fresh-cmd"));
+        assert!(get_scores().contains_key("firefox"));
 
         // Idempotent: nothing left to prune.
-        assert_eq!(prune_expired(&db).unwrap(), 0);
+        assert_eq!(prune_expired().unwrap(), 0);
     }
 
     /// The backstop cap evicts oldest-last-used first and only over the limit.
     #[test]
     fn cap_evicts_oldest_rows_first() {
         let db = open_test_database();
+        set_store_for_test(db.clone());
         for i in 0..6 {
             insert_raw(
                 &db,
@@ -817,7 +894,7 @@ mod prune_tests {
             );
         }
         assert_eq!(prune_expired_impl(&db, 4).unwrap(), 2);
-        let scores = get_scores(&db);
+        let scores = get_scores();
         assert!(!scores.contains_key("cmd-0") && !scores.contains_key("cmd-1"));
         assert!(scores.contains_key("cmd-2") && scores.contains_key("cmd-5"));
     }
@@ -835,12 +912,13 @@ mod latch_tests {
     #[test]
     fn latches_for_neighbouring_prefixes_stay_separate() {
         let db = open_test_database();
-        record_latch(&db, "aaa", "for-aaa").unwrap();
-        record_latch(&db, "aab", "for-aab").unwrap();
-        record(&db, "history:aaa something").unwrap(); // other namespace
-        record(&db, "zzz").unwrap(); // sorts after every latch
+        set_store_for_test(db.clone());
+        record_latch("aaa", "for-aaa").unwrap();
+        record_latch("aab", "for-aab").unwrap();
+        record("history:aaa something").unwrap(); // other namespace
+        record("zzz").unwrap(); // sorts after every latch
 
-        let latches = get_latches(&db, "aaa");
+        let latches = get_latches("aaa");
         assert_eq!(latches.len(), 1, "got: {latches:?}");
         assert!(latches.contains_key("for-aaa"));
     }
@@ -850,9 +928,10 @@ mod latch_tests {
     #[test]
     fn a_latch_binds_a_query_to_the_chosen_command() {
         let db = open_test_database();
-        record_latch(&db, "dnf search firefox", "pkg search firefox").unwrap();
+        set_store_for_test(db.clone());
+        record_latch("dnf search firefox", "pkg search firefox").unwrap();
 
-        let latches = get_latches(&db, "dnf search firefox");
+        let latches = get_latches("dnf search firefox");
         assert!(latches.contains_key("pkg search firefox"));
         assert!(latches["pkg search firefox"] > 0.0);
         // …and says nothing about the app that used to win.
@@ -864,8 +943,9 @@ mod latch_tests {
     #[test]
     fn a_latch_does_not_leak_to_an_unrelated_query() {
         let db = open_test_database();
-        record_latch(&db, "dnf search firefox", "pkg search firefox").unwrap();
-        assert!(get_latches(&db, "open my notes").is_empty());
+        set_store_for_test(db.clone());
+        record_latch("dnf search firefox", "pkg search firefox").unwrap();
+        assert!(get_latches("open my notes").is_empty());
     }
 
     /// Queries differing only AFTER the prefix cap share a latch — the same
@@ -877,12 +957,13 @@ mod latch_tests {
     #[test]
     fn queries_sharing_a_prefix_share_the_latch() {
         let db = open_test_database();
+        set_store_for_test(db.clone());
         // The shared head must be at least LATCH_PREFIX_LEN so the two inputs
         // are identical THROUGH the cap, not merely up to it.
         let base = "dnf search firefox extended release "; // > 24 chars
         assert!(base.len() > LATCH_PREFIX_LEN, "fixture must exceed the cap");
-        record_latch(&db, &format!("{base}stable"), "pkg search firefox").unwrap();
-        let latches = get_latches(&db, &format!("{base}nightly"));
+        record_latch(&format!("{base}stable"), "pkg search firefox").unwrap();
+        let latches = get_latches(&format!("{base}nightly"));
         assert!(
             latches.contains_key("pkg search firefox"),
             "queries identical through the cap must share a latch, got: {latches:?}"
@@ -893,26 +974,29 @@ mod latch_tests {
     #[test]
     fn queries_diverging_inside_the_cap_do_not_share_a_latch() {
         let db = open_test_database();
-        record_latch(&db, "dnf search firefox", "pkg search firefox").unwrap();
-        assert!(get_latches(&db, "dnf search chromium").is_empty());
+        set_store_for_test(db.clone());
+        record_latch("dnf search firefox", "pkg search firefox").unwrap();
+        assert!(get_latches("dnf search chromium").is_empty());
     }
 
     #[test]
     fn case_and_whitespace_do_not_split_a_latch() {
         let db = open_test_database();
-        record_latch(&db, "  DNF Search Firefox ", "pkg search firefox").unwrap();
-        assert!(get_latches(&db, "dnf search firefox").contains_key("pkg search firefox"));
+        set_store_for_test(db.clone());
+        record_latch("  DNF Search Firefox ", "pkg search firefox").unwrap();
+        assert!(get_latches("dnf search firefox").contains_key("pkg search firefox"));
     }
 
     /// Repetition strengthens, as Alfred's "2 or 3 times" behaviour requires.
     #[test]
     fn repeated_choices_strengthen_the_latch() {
         let db = open_test_database();
-        record_latch(&db, "q", "cmd").unwrap();
-        let once = get_latches(&db, "q")["cmd"];
-        record_latch(&db, "q", "cmd").unwrap();
-        record_latch(&db, "q", "cmd").unwrap();
-        assert!(get_latches(&db, "q")["cmd"] > once);
+        set_store_for_test(db.clone());
+        record_latch("q", "cmd").unwrap();
+        let once = get_latches("q")["cmd"];
+        record_latch("q", "cmd").unwrap();
+        record_latch("q", "cmd").unwrap();
+        assert!(get_latches("q")["cmd"] > once);
     }
 
     /// A latch to the literal input teaches nothing and would otherwise fill the
@@ -920,17 +1004,19 @@ mod latch_tests {
     #[test]
     fn a_query_latched_to_itself_is_not_stored() {
         let db = open_test_database();
-        record_latch(&db, "firefox", "firefox").unwrap();
-        assert!(get_latches(&db, "firefox").is_empty());
+        set_store_for_test(db.clone());
+        record_latch("firefox", "firefox").unwrap();
+        assert!(get_latches("firefox").is_empty());
     }
 
     #[test]
     fn empty_input_is_ignored() {
         let db = open_test_database();
-        record_latch(&db, "   ", "cmd").unwrap();
-        record_latch(&db, "q", "  ").unwrap();
-        assert!(get_latches(&db, "   ").is_empty());
-        assert!(get_latches(&db, "q").is_empty());
+        set_store_for_test(db.clone());
+        record_latch("   ", "cmd").unwrap();
+        record_latch("q", "  ").unwrap();
+        assert!(get_latches("   ").is_empty());
+        assert!(get_latches("q").is_empty());
     }
 
     /// Commands contain colons routinely (`https://…`). Separating fields on
@@ -938,8 +1024,9 @@ mod latch_tests {
     #[test]
     fn a_command_containing_colons_round_trips() {
         let db = open_test_database();
-        record_latch(&db, "docs", "open https://lychi.app/docs").unwrap();
-        assert!(get_latches(&db, "docs").contains_key("open https://lychi.app/docs"));
+        set_store_for_test(db.clone());
+        record_latch("docs", "open https://lychi.app/docs").unwrap();
+        assert!(get_latches("docs").contains_key("open https://lychi.app/docs"));
     }
 
     /// Truncating a multi-byte character mid-sequence panics. Search queries
@@ -948,9 +1035,10 @@ mod latch_tests {
     #[test]
     fn a_long_multibyte_query_does_not_panic() {
         let db = open_test_database();
+        set_store_for_test(db.clone());
         let q = "\u{e9}".repeat(40);
-        record_latch(&db, &q, "cmd").unwrap();
-        assert!(get_latches(&db, &q).contains_key("cmd"));
+        record_latch(&q, "cmd").unwrap();
+        assert!(get_latches(&q).contains_key("cmd"));
     }
 
     // ── Decay ───────────────────────────────────────────────────────────
@@ -1006,16 +1094,17 @@ mod tests {
     #[test]
     fn a_write_invalidates_the_cache() {
         let db = open_test_database();
-        record(&db, "alpha").unwrap();
-        let before = get_scores(&db);
+        set_store_for_test(db.clone());
+        record("alpha").unwrap();
+        let before = get_scores();
         assert!(before.contains_key("alpha"));
         assert!(!before.contains_key("beta"), "beta not recorded yet");
 
         // Populate the cache, then write.
-        let _ = get_scores(&db);
-        record(&db, "beta").unwrap();
+        let _ = get_scores();
+        record("beta").unwrap();
 
-        let after = get_scores(&db);
+        let after = get_scores();
         assert!(
             after.contains_key("beta"),
             "a write did not invalidate the cache: {after:?}"
@@ -1028,12 +1117,13 @@ mod tests {
     #[test]
     fn workspace_stats_carry_counts() {
         let db = open_test_database();
-        record_workspace(&db, "/proj", "cargo test").unwrap();
-        record_workspace(&db, "/proj", "cargo test").unwrap();
-        record_workspace(&db, "/proj", "kill 1234").unwrap();
-        record_workspace(&db, "/other", "make").unwrap();
+        set_store_for_test(db.clone());
+        record_workspace("/proj", "cargo test").unwrap();
+        record_workspace("/proj", "cargo test").unwrap();
+        record_workspace("/proj", "kill 1234").unwrap();
+        record_workspace("/other", "make").unwrap();
 
-        let stats = get_workspace_stats(&db, "/proj/");
+        let stats = get_workspace_stats("/proj/");
         assert_eq!(stats["cargo test"].1, 2);
         assert_eq!(stats["kill 1234"].1, 1);
         assert!(!stats.contains_key("make"), "other workspaces stay out");
@@ -1045,12 +1135,13 @@ mod tests {
     #[test]
     fn recording_again_still_raises_the_score() {
         let db = open_test_database();
-        record(&db, "once").unwrap();
-        record(&db, "twice").unwrap();
-        let _ = get_scores(&db); // warm the cache
-        record(&db, "twice").unwrap();
+        set_store_for_test(db.clone());
+        record("once").unwrap();
+        record("twice").unwrap();
+        let _ = get_scores(); // warm the cache
+        record("twice").unwrap();
 
-        let scores = get_scores(&db);
+        let scores = get_scores();
         assert!(
             scores["twice"] > scores["once"],
             "twice={} once={}",
@@ -1068,14 +1159,15 @@ mod tests {
     #[ignore]
     fn measure_get_scores_as_the_table_grows() {
         let db = open_test_database();
+        set_store_for_test(db.clone());
         for n in [100usize, 500, 1000, 2000, 5000] {
             while table_len(&db) < n {
                 let k = format!("key {}", table_len(&db));
-                record(&db, &k).unwrap();
+                record(&k).unwrap();
             }
             let t = std::time::Instant::now();
             for _ in 0..20 {
-                let _ = get_scores(&db);
+                let _ = get_scores();
             }
             println!(
                 "  {:>5} entries: get_scores = {:>6}us  (x20 = one 20-keystroke query)",
@@ -1097,17 +1189,18 @@ mod tests {
     #[test]
     fn impressions_batch_and_accept_roundtrip() {
         let db = open_test_database();
+        set_store_for_test(db.clone());
         let cmds = vec!["git commit".to_string(), "docker ps".to_string()];
         // One panel-settle records an impression for each shown command.
-        record_impressions(&db, "proj:/x", &cmds).unwrap();
-        record_impressions(&db, "proj:/x", &cmds).unwrap();
-        record_acceptance(&db, "proj:/x", "git commit").unwrap();
+        record_impressions("proj:/x", &cmds).unwrap();
+        record_impressions("proj:/x", &cmds).unwrap();
+        record_acceptance("proj:/x", "git commit").unwrap();
 
-        let stats = get_impression_stats(&db, "proj:/x");
+        let stats = get_impression_stats("proj:/x");
         assert_eq!(stats.get("git commit"), Some(&(1, 2))); // 1 accept, 2 impressions
         assert_eq!(stats.get("docker ps"), Some(&(0, 2)));
         // Other contexts are isolated.
-        assert!(get_impression_stats(&db, "proj:/y").is_empty());
+        assert!(get_impression_stats("proj:/y").is_empty());
     }
 
     #[test]
@@ -1161,6 +1254,7 @@ mod tests {
     fn workspace_affinity_reflects_usage_hours() {
         use super::FRECENCY;
         let db = open_test_database();
+        set_store_for_test(db.clone());
         let now = super::super::now_millis();
 
         // Seed two workspace commands directly: one used across prior days at
@@ -1190,7 +1284,7 @@ mod tests {
                 .collect(),
         );
 
-        let aff = get_workspace_affinity(&db, "/home/u/proj");
+        let aff = get_workspace_affinity("/home/u/proj");
         assert!(
             aff.get("cargo test").copied().unwrap() > 1.1,
             "same-hour command carries affinity boost"
@@ -1254,14 +1348,15 @@ mod tests {
     #[test]
     fn test_workspace_record_and_get() {
         let db = crate::db::open_test_database();
+        set_store_for_test(db.clone());
         let root = "/home/user/projects/lychi";
 
-        record_workspace(&db, root, "cargo build").unwrap();
-        record_workspace(&db, root, "cargo build").unwrap();
-        record_workspace(&db, root, "cargo test").unwrap();
-        record_workspace(&db, "/other/project", "npm run dev").unwrap();
+        record_workspace(root, "cargo build").unwrap();
+        record_workspace(root, "cargo build").unwrap();
+        record_workspace(root, "cargo test").unwrap();
+        record_workspace("/other/project", "npm run dev").unwrap();
 
-        let scores = get_workspace_scores(&db, root);
+        let scores = get_workspace_scores(root);
         assert!(scores.contains_key("cargo build"));
         assert!(scores.contains_key("cargo test"));
         assert!(!scores.contains_key("npm run dev")); // different project
@@ -1271,28 +1366,30 @@ mod tests {
     #[test]
     fn test_workspace_trailing_slash() {
         let db = crate::db::open_test_database();
-        record_workspace(&db, "/home/user/project/", "make").unwrap();
-        let scores = get_workspace_scores(&db, "/home/user/project");
+        set_store_for_test(db.clone());
+        record_workspace("/home/user/project/", "make").unwrap();
+        let scores = get_workspace_scores("/home/user/project");
         assert!(scores.contains_key("make"));
     }
 
     #[test]
     fn test_suggestion_record_and_get() {
         let db = crate::db::open_test_database();
+        set_store_for_test(db.clone());
 
-        record_suggestion(&db, "proj:/home/u/lychi", "run pnpm dev").unwrap();
-        record_suggestion(&db, "proj:/home/u/lychi", "run pnpm dev").unwrap();
-        record_suggestion(&db, "proj:/home/u/lychi", "git commit").unwrap();
-        record_suggestion(&db, "app:firefox", "web rust").unwrap();
+        record_suggestion("proj:/home/u/lychi", "run pnpm dev").unwrap();
+        record_suggestion("proj:/home/u/lychi", "run pnpm dev").unwrap();
+        record_suggestion("proj:/home/u/lychi", "git commit").unwrap();
+        record_suggestion("app:firefox", "web rust").unwrap();
 
-        let scores = get_suggestion_scores(&db, "proj:/home/u/lychi");
+        let scores = get_suggestion_scores("proj:/home/u/lychi");
         assert!(scores.contains_key("run pnpm dev"));
         assert!(scores.contains_key("git commit"));
         assert!(!scores.contains_key("web rust")); // different context
         assert!(scores["run pnpm dev"] > scores["git commit"]);
 
         // Other context is isolated
-        let firefox = get_suggestion_scores(&db, "app:firefox");
+        let firefox = get_suggestion_scores("app:firefox");
         assert_eq!(firefox.len(), 1);
         assert!(firefox.contains_key("web rust"));
     }
@@ -1300,16 +1397,17 @@ mod tests {
     #[test]
     fn test_fallback_choice_learns_preference() {
         let db = crate::db::open_test_database();
+        set_store_for_test(db.clone());
         // No history → both zero, so the caller's default (Ask AI first) holds.
-        assert_eq!(get_fallback_score(&db, "ask"), 0.0);
-        assert_eq!(get_fallback_score(&db, "web"), 0.0);
+        assert_eq!(get_fallback_score("ask"), 0.0);
+        assert_eq!(get_fallback_score("web"), 0.0);
 
         // User keeps choosing web → web outscores ask.
-        record_fallback_choice(&db, "web").unwrap();
-        record_fallback_choice(&db, "web").unwrap();
-        record_fallback_choice(&db, "ask").unwrap();
+        record_fallback_choice("web").unwrap();
+        record_fallback_choice("web").unwrap();
+        record_fallback_choice("ask").unwrap();
         assert!(
-            get_fallback_score(&db, "web") > get_fallback_score(&db, "ask"),
+            get_fallback_score("web") > get_fallback_score("ask"),
             "web chosen more → should score higher"
         );
     }
@@ -1317,11 +1415,12 @@ mod tests {
     #[test]
     fn test_record_and_get() {
         let db = crate::db::open_test_database();
-        record(&db, "firefox").unwrap();
-        record(&db, "firefox").unwrap();
-        record(&db, "terminal").unwrap();
+        set_store_for_test(db.clone());
+        record("firefox").unwrap();
+        record("firefox").unwrap();
+        record("terminal").unwrap();
 
-        let scores = get_scores(&db);
+        let scores = get_scores();
         assert!(scores.contains_key("firefox"));
         assert!(scores.contains_key("terminal"));
         assert!(scores["firefox"] > scores["terminal"]);

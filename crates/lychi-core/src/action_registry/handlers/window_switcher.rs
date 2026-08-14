@@ -1,10 +1,8 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher};
-use redb::Database;
 
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
@@ -16,13 +14,12 @@ use super::app_control::{self, RunningWindow};
 use super::icons;
 use crate::text::truncate_display;
 
-pub struct WindowSwitcherHandler {
-    db: Arc<Database>,
-}
+#[derive(Default)]
+pub struct WindowSwitcherHandler;
 
 impl WindowSwitcherHandler {
-    pub fn new(db: Arc<Database>) -> Self {
-        Self { db }
+    pub fn new() -> Self {
+        Self
     }
 }
 
@@ -224,7 +221,7 @@ impl ActionHandler for WindowSwitcherHandler {
             }
         } else {
             // Record frecency for focus (keyed by class — titles are volatile)
-            let _ = frecency::record(&self.db, &format!("win:{}", window.wm_class));
+            let _ = frecency::record(&format!("win:{}", window.wm_class));
 
             match app_control::do_focus(window) {
                 Ok(()) => Ok(ActionResult::ok(
@@ -254,7 +251,7 @@ impl ActionHandler for WindowSwitcherHandler {
         };
 
         // Load frecency scores for "win:" prefix keys
-        let frecency_scores: HashMap<String, f64> = frecency::get_scores(&self.db)
+        let frecency_scores: HashMap<String, f64> = frecency::get_scores()
             .into_iter()
             .filter_map(|(key, score)| key.strip_prefix("win:").map(|k| (k.to_string(), score)))
             .collect();

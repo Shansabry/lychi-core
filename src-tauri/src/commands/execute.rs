@@ -36,7 +36,7 @@ pub async fn execute_command(
     // "command not found") never get suggested back to the user.
     let trimmed = input.trim();
     if !trimmed.is_empty() {
-        let _ = frecency::record(&state.db, &format!("history:{trimmed}"));
+        let _ = frecency::record(&format!("history:{trimmed}"));
     }
 
     // Record workspace-scoped frecency (command memory per project)
@@ -49,7 +49,7 @@ pub async fn execute_command(
                 .map(|p| p.root.as_str())
                 .or(ctx.cwd.as_deref());
             if let Some(root) = project_root {
-                let _ = frecency::record_workspace(&state.db, root, trimmed);
+                let _ = frecency::record_workspace(root, trimmed);
             }
         }
         // Suggestion learning loop: executing a command we just suggested
@@ -58,8 +58,8 @@ pub async fn execute_command(
         // self-tunes toward what the user actually picks.
         if let Some(context_key) = executor_r.suggestion_acceptance(trimmed) {
             tracing::debug!("[suggest] acceptance: '{trimmed}' in {context_key}");
-            let _ = frecency::record_suggestion(&state.db, &context_key, trimmed);
-            let _ = frecency::record_acceptance(&state.db, &context_key, trimmed);
+            let _ = frecency::record_suggestion(&context_key, trimmed);
+            let _ = frecency::record_acceptance(&context_key, trimmed);
         }
         drop(executor_r);
 
@@ -70,7 +70,7 @@ pub async fn execute_command(
         // learning records nothing at all.
         if let Some(q) = query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
             tracing::debug!("[latch] '{q}' → '{trimmed}'");
-            let _ = frecency::record_latch(&state.db, q, trimmed);
+            let _ = frecency::record_latch(q, trimmed);
         }
 
         // Learn the user's fallback preference: running an `ask …`/`web …` on a
@@ -81,7 +81,7 @@ pub async fn execute_command(
             .into_iter()
             .find(|a| lower.starts_with(&format!("{a} ")))
         {
-            let _ = frecency::record_fallback_choice(&state.db, action);
+            let _ = frecency::record_fallback_choice(action);
         }
     }
 

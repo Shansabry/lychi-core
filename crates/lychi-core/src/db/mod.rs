@@ -22,6 +22,11 @@ pub const SETTINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("setting
 
 /// Frecency: key = normalized identifier (app name lowercase, file path),
 /// value = postcard-serialized FrecencyEntry.
+///
+/// Lives in its OWN database (`frecency.redb`, opened by `frecency::open`), NOT
+/// this user-data `lychi.redb` — see the `frecency` module. The table definition
+/// stays here because it is the shared row codec's home, but it is created and
+/// opened only against the frecency database.
 pub const FRECENCY: TableDefinition<&str, &[u8]> = TableDefinition::new("frecency");
 
 /// Aliases: key = alias name (lowercase), value = postcard-serialized AliasEntry.
@@ -71,12 +76,11 @@ pub const SCHEMA_VERSION: u8 = 1;
 
 /// Every enveloped table — the migration and any future whole-table rewrite
 /// iterate this list, so a new table added here is versioned from birth.
-pub(crate) const ENVELOPED_TABLES: [&str; 10] = [
+pub(crate) const ENVELOPED_TABLES: [&str; 9] = [
     "notes",
     "todos",
     "clipboard",
     "settings",
-    "frecency",
     "aliases",
     "reminders",
     "snippets",
@@ -238,7 +242,6 @@ pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
     txn.open_table(TODOS)?;
     txn.open_table(CLIPBOARD)?;
     txn.open_table(SETTINGS)?;
-    txn.open_table(FRECENCY)?;
     txn.open_table(ALIASES)?;
     txn.open_table(REMINDERS)?;
     txn.open_table(SNIPPETS)?;
@@ -485,7 +488,6 @@ pub struct TableStats {
     pub todos: u64,
     pub clipboard: u64,
     pub settings: u64,
-    pub frecency: u64,
     pub aliases: u64,
     pub reminders: u64,
     pub snippets: u64,
@@ -499,7 +501,6 @@ pub fn table_stats(db: &Arc<Database>) -> Result<TableStats, LychiError> {
         todos: txn.open_table(TODOS)?.len()?,
         clipboard: txn.open_table(CLIPBOARD)?.len()?,
         settings: txn.open_table(SETTINGS)?.len()?,
-        frecency: txn.open_table(FRECENCY)?.len()?,
         aliases: txn.open_table(ALIASES)?.len()?,
         reminders: txn.open_table(REMINDERS)?.len()?,
         snippets: txn.open_table(SNIPPETS)?.len()?,
@@ -588,48 +589,52 @@ mod envelope_tests {
         let (dir, path) = temp_db_path("migrate");
         std::fs::create_dir_all(&dir).unwrap();
 
-        // What v0.1.0 wrote: raw postcard, no tag, no META table.
-        let raw = postcard::to_allocvec(&frecency::FrecencyEntry {
-            count: 3,
-            recent_timestamps: vec![now_millis()],
+        // What v0.1.0 wrote: raw postcard, no tag, no META table. Uses NOTES (a
+        // table that stays in lychi.redb) as the migration sample — the envelope
+        // behaviour is table-agnostic.
+        let raw = postcard::to_allocvec(&schema::NoteEntry {
+            text: "hello".into(),
+            created_at: now_millis(),
+            updated_at: now_millis(),
+            deleted_at: None,
+            sync_status: schema::SYNC_LOCAL,
         })
         .unwrap();
         {
             let db = Database::create(&path).unwrap();
             let txn = db.begin_write().unwrap();
             {
-                let mut t = txn.open_table(FRECENCY).unwrap();
-                t.insert("firefox", raw.as_slice()).unwrap();
+                let mut t = txn.open_table(NOTES).unwrap();
+                t.insert("note-1", raw.as_slice()).unwrap();
             }
             txn.commit().unwrap();
         }
 
-        let db = open_database(&path).unwrap();
-        // One write first: the frecency entry cache is process-global and
-        // generation-keyed, and in a full test run another test's database may
-        // occupy the matching generation. Any write invalidates it for THIS db.
-        frecency::record(&db, "cache-poke").unwrap();
-        assert!(
-            frecency::get_scores(&db).contains_key("firefox"),
-            "a migrated row must decode through the normal read path"
-        );
-        let stored_len = {
+        let read_len = |db: &Database| -> usize {
             let txn = db.begin_read().unwrap();
-            let t = txn.open_table(FRECENCY).unwrap();
-            t.get("firefox").unwrap().unwrap().value().len()
+            let t = txn.open_table(NOTES).unwrap();
+            t.get("note-1").unwrap().unwrap().value().len()
         };
+        let decodes = |db: &Database| -> bool {
+            let txn = db.begin_read().unwrap();
+            let t = txn.open_table(NOTES).unwrap();
+            let v = t.get("note-1").unwrap().unwrap();
+            decode_row::<schema::NoteEntry>("notes", "note-1", v.value()).is_some()
+        };
+
+        let db = open_database(&path).unwrap();
+        assert!(
+            decodes(&db),
+            "a migrated row must decode through the envelope"
+        );
+        let stored_len = read_len(&db);
         assert_eq!(stored_len, raw.len() + 1, "exactly one tag byte prepended");
         drop(db);
 
         // Reopen: the stamp must prevent a second wrap.
         let db = open_database(&path).unwrap();
-        let stored_len2 = {
-            let txn = db.begin_read().unwrap();
-            let t = txn.open_table(FRECENCY).unwrap();
-            t.get("firefox").unwrap().unwrap().value().len()
-        };
-        assert_eq!(stored_len2, stored_len, "migration must be idempotent");
-        assert!(frecency::get_scores(&db).contains_key("firefox"));
+        assert_eq!(read_len(&db), stored_len, "migration must be idempotent");
+        assert!(decodes(&db));
         drop(db);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -643,23 +648,42 @@ mod envelope_tests {
     #[test]
     fn a_newer_generation_row_is_skipped_beside_readable_ones() {
         let db = open_test_database();
-        frecency::record(&db, "current-row").unwrap();
+        // A current-generation row and a future-tagged one, side by side in a
+        // table that stays in lychi.redb (NOTES). The list decode must keep the
+        // one it understands and skip the newer-tagged one.
+        let current = encode_row(&schema::NoteEntry {
+            text: "current".into(),
+            created_at: now_millis(),
+            updated_at: now_millis(),
+            deleted_at: None,
+            sync_status: schema::SYNC_LOCAL,
+        })
+        .unwrap();
         {
             let txn = db.begin_write().unwrap();
             {
-                let mut t = txn.open_table(FRECENCY).unwrap();
+                let mut t = txn.open_table(NOTES).unwrap();
+                t.insert("current-row", current.as_slice()).unwrap();
                 t.insert("future-row", [SCHEMA_VERSION + 1, 0xDE, 0xAD].as_slice())
                     .unwrap();
             }
             txn.commit().unwrap();
         }
-        let scores = frecency::get_scores(&db);
-        assert!(
-            scores.contains_key("current-row"),
-            "known rows keep working"
+        let txn = db.begin_read().unwrap();
+        let t = txn.open_table(NOTES).unwrap();
+        let current_ok = decode_row::<schema::NoteEntry>(
+            "notes",
+            "current-row",
+            t.get("current-row").unwrap().unwrap().value(),
         );
+        let future_ok = decode_row::<schema::NoteEntry>(
+            "notes",
+            "future-row",
+            t.get("future-row").unwrap().unwrap().value(),
+        );
+        assert!(current_ok.is_some(), "known rows keep working");
         assert!(
-            !scores.contains_key("future-row"),
+            future_ok.is_none(),
             "a newer-tagged row must be skipped, never garbage-decoded"
         );
     }

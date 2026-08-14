@@ -1,8 +1,5 @@
 use async_trait::async_trait;
 use std::path::PathBuf;
-use std::sync::Arc;
-
-use redb::Database;
 
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, ExecContext, OutputType,
@@ -10,13 +7,12 @@ use crate::action_registry::{
 use crate::db::frecency;
 use crate::error::LychiError;
 
-pub struct FileOpen {
-    db: Arc<Database>,
-}
+#[derive(Default)]
+pub struct FileOpen;
 
 impl FileOpen {
-    pub fn new(db: Arc<Database>) -> Self {
-        Self { db }
+    pub fn new() -> Self {
+        Self
     }
 
     /// Expand ~ to home directory.
@@ -68,7 +64,7 @@ impl ActionHandler for FileOpen {
         }
 
         // Record frecency access
-        let _ = frecency::record(&self.db, &expanded.display().to_string());
+        let _ = frecency::record(&expanded.display().to_string());
 
         // Convert to file:// URI for GDK-based opening on the frontend
         let file_uri = format!("file://{}", expanded.display());

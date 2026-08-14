@@ -161,16 +161,16 @@ pub fn resolve_run_targets(command: &str, ctx: &RunContext) -> Option<ResolvedTa
 
 /// Record that `command` ran in `repo` under `container`, so this workspace's
 /// repos rank by usage next time. `None` container (single-target) is a no-op.
-pub fn record_choice(db: &Arc<Database>, container: Option<&str>, repo: &str) {
+pub fn record_choice(_db: &Arc<Database>, container: Option<&str>, repo: &str) {
     if let Some(container) = container {
-        let _ = crate::db::frecency::record_repo_choice(db, container, repo);
+        let _ = crate::db::frecency::record_repo_choice(container, repo);
     }
 }
 
 /// Rank repo paths by frecency (usage in this container) → mtime → name.
-fn rank_candidates(candidates: &mut [String], container: Option<&str>, db: &Arc<Database>) {
+fn rank_candidates(candidates: &mut [String], container: Option<&str>, _db: &Arc<Database>) {
     let scores = container
-        .map(|c| crate::db::frecency::get_repo_choice_scores(db, c))
+        .map(crate::db::frecency::get_repo_choice_scores)
         .unwrap_or_default();
     candidates.sort_by(|a, b| {
         let sa = scores.get(a).copied().unwrap_or(0.0);

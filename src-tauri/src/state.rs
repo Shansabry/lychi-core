@@ -303,6 +303,16 @@ impl AppState {
             db_size as f64 / 1024.0
         );
 
+        // Open and register the frecency database — its OWN redb file, separate
+        // from the user-data DB above. If it can't open, frecency degrades to
+        // neutral ranking (an unset store is a no-op) rather than blocking start.
+        match lychi_core::db::open_database(&paths::frecency_db_file()) {
+            Ok(frec_db) => lychi_core::db::frecency::init_store(frec_db),
+            Err(e) => tracing::error!(
+                "Cannot open frecency database: {e} — ranking will not persist this session"
+            ),
+        }
+
         // Register the learned-model-capability store before any provider is
         // built, so the factory can wire failure-learning into BYO clients.
         lychi_core::providers::capability::init_store(lychi_core::paths::model_caps_file());
@@ -366,17 +376,15 @@ impl AppState {
                 + stats.todos
                 + stats.clipboard
                 + stats.settings
-                + stats.frecency
                 + stats.aliases
                 + stats.reminders
                 + stats.snippets;
             tracing::info!(
-                "DB tables: {} notes, {} todos, {} clipboard, {} settings, {} frecency, {} aliases, {} reminders, {} snippets ({} total rows, {:.1} KB on disk)",
+                "DB tables: {} notes, {} todos, {} clipboard, {} settings, {} aliases, {} reminders, {} snippets ({} total rows, {:.1} KB on disk)",
                 stats.notes,
                 stats.todos,
                 stats.clipboard,
                 stats.settings,
-                stats.frecency,
                 stats.aliases,
                 stats.reminders,
                 stats.snippets,
@@ -538,7 +546,7 @@ impl AppState {
     ) -> ActionRegistry {
         let mut registry = ActionRegistry::new();
         registry.register(Box::new(AppControlHandler::new()));
-        registry.register(Box::new(AppLauncher::new(db.clone())));
+        registry.register(Box::new(AppLauncher::new()));
         registry.register(Box::new(BookmarkHandler::new()));
         registry.register(Box::new(EmojiHandler::new()));
         registry.register(Box::new(WebSearch::with_search_url(
@@ -564,7 +572,7 @@ impl AppState {
         registry.register(Box::new(PackagesHandler::new()));
         registry.register(Box::new(ClipboardHandler::new(db.clone())));
         registry.register(Box::new(ClearHandler::new(db.clone())));
-        registry.register(Box::new(FileOpen::new(db.clone())));
+        registry.register(Box::new(FileOpen::new()));
         registry.register(Box::new(UrlOpen::new()));
         #[cfg(feature = "mpris")]
         {
@@ -590,7 +598,7 @@ impl AppState {
         registry.register(Box::new(GenerateHandler::new()));
         registry.register(Box::new(SshHandler::new()));
         registry.register(Box::new(ColorHandler::new()));
-        registry.register(Box::new(WindowSwitcherHandler::new(db.clone())));
+        registry.register(Box::new(WindowSwitcherHandler::new()));
         registry.register(Box::new(WeatherHandler::new(
             config.weather.unit.clone(),
             config.weather.default_location.clone(),

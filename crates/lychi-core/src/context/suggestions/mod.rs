@@ -266,12 +266,11 @@ fn candidate_matches(needle: &str, c: &Candidate, provider_id: &str) -> bool {
 /// vs typed-only (context actions shown after a matching keyword).
 fn collect(
     env: &EnvironmentContext,
-    db: Option<&Arc<Database>>,
+    _db: Option<&Arc<Database>>,
     tier: ProviderTier,
 ) -> Vec<(&'static str, Candidate)> {
     let ctx = SuggestCtx {
         env,
-        db,
         in_dev_window: env
             .active_window
             .as_ref()
@@ -327,24 +326,19 @@ fn fuzzy_subsequence(needle: &str, haystack: &str) -> bool {
 fn rank(
     candidates: Vec<(&'static str, Candidate)>,
     env: &EnvironmentContext,
-    db: Option<&Arc<Database>>,
+    _db: Option<&Arc<Database>>,
 ) -> Vec<Candidate> {
     let ctx_key = context_key(env);
-    let learned = db
-        .map(|db| frecency::get_suggestion_scores(db, &ctx_key))
-        .unwrap_or_default();
-    // Impression stats drive CTR demotion (self-tuning). (accepts, impressions)
-    // per command; empty without a db → cold-start neutral for every candidate.
-    let impressions = db
-        .map(|db| frecency::get_impression_stats(db, &ctx_key))
-        .unwrap_or_default();
+    let learned = frecency::get_suggestion_scores(&ctx_key);
+    // Impression stats drive CTR demotion (self-tuning): (accepts, impressions)
+    // per command. Empty (cold-start neutral) until the frecency store learns.
+    let impressions = frecency::get_impression_stats(&ctx_key);
     // Per-command circadian affinity for this workspace's remembered commands,
     // so cold-path workspace-memory suggestions get the same "knows your
     // routine" tiebreak the frecency recents already receive. Commands with no
     // workspace history (clipboard, typed-context) fall through to 1.0 neutral.
-    let ws_affinity = db
-        .zip(workspace_root(env))
-        .map(|(db, root)| frecency::get_workspace_affinity(db, &root))
+    let ws_affinity = workspace_root(env)
+        .map(|root| frecency::get_workspace_affinity(&root))
         .unwrap_or_default();
 
     // Score via the pure ranker: prior + learned boost, modulated by acceptance
@@ -568,8 +562,9 @@ mod tests {
         // MemoryProvider is not universal: outside a terminal/IDE the empty
         // prompt must not surface workspace commands.
         let db = crate::db::open_test_database();
-        frecency::record_workspace(&db, "/home/u/proj", "cargo test").unwrap();
-        frecency::record_workspace(&db, "/home/u/proj", "cargo test").unwrap();
+        frecency::set_store_for_test(db.clone());
+        frecency::record_workspace("/home/u/proj", "cargo test").unwrap();
+        frecency::record_workspace("/home/u/proj", "cargo test").unwrap();
 
         let mut env = dev_env();
         env.cwd = Some("/home/u/proj".into());

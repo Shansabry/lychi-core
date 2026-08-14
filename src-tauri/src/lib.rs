@@ -479,14 +479,12 @@ pub fn run() {
             // impression rows were expired read-side only — scanned and decoded
             // forever, readable by nothing. Deleting them keeps read cost
             // linear in current habits, not in lifetime usage.
-            {
-                let frec_db = app.state::<AppState>().db.clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    if let Err(e) = lychi_core::db::frecency::prune_expired(&frec_db) {
-                        tracing::warn!("[frecency] learning-row prune failed: {e}");
-                    }
-                });
-            }
+            tauri::async_runtime::spawn_blocking(|| {
+                // Frecency reads its own registered database internally.
+                if let Err(e) = lychi_core::db::frecency::prune_expired() {
+                    tracing::warn!("[frecency] learning-row prune failed: {e}");
+                }
+            });
             tauri::async_runtime::spawn_blocking(|| {
                 lychi_core::context::network::warmup();
             });

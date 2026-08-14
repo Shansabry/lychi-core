@@ -194,7 +194,7 @@ pub async fn start_file_search(
 fn emit_ranked_results(
     live: &Arc<lychi_core::file_search::live::LiveSearch>,
     generation: lychi_core::file_search::session::Generation,
-    db: &Arc<redb::Database>,
+    _db: &Arc<redb::Database>,
     app: &AppHandle,
     search_id: u64,
 ) {
@@ -220,7 +220,7 @@ fn emit_ranked_results(
         "[file-search] emitting"
     );
 
-    let frecency_scores = lychi_core::db::frecency::get_scores(db);
+    let frecency_scores = lychi_core::db::frecency::get_scores();
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -309,7 +309,7 @@ fn walk_and_emit(
     scope: &str,
     search_id: u64,
     active_id: &Arc<std::sync::atomic::AtomicU64>,
-    db: &Arc<redb::Database>,
+    _db: &Arc<redb::Database>,
     app: &AppHandle,
 ) {
     const BATCH_SIZE: usize = 10;
@@ -322,7 +322,7 @@ fn walk_and_emit(
     // a familiar file outranks a fuzzy-equal stranger — the Raycast/Alfred
     // standard. Fetched once per search (all keys); file paths are absolute so
     // they don't collide with the prefixed keys (history:/ws:/sug:).
-    let frecency_scores = lychi_core::db::frecency::get_scores(db);
+    let frecency_scores = lychi_core::db::frecency::get_scores();
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

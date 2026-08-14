@@ -33,6 +33,15 @@ pub fn db_file() -> PathBuf {
     data_dir().join("lychi.redb")
 }
 
+/// The frecency database. Derived, device-local ranking data lives in its OWN
+/// redb file, separate from the user-data `lychi.redb`: it keeps the main DB to
+/// user-authored content and isolates frecency's growth/corruption. redb (not a
+/// flat file) because frecency is the hot-path, keyed, multi-process store its
+/// engine is built for — see `db::frecency`.
+pub fn frecency_db_file() -> PathBuf {
+    data_dir().join("frecency.redb")
+}
+
 pub fn clipboard_images_dir() -> PathBuf {
     data_dir().join("clipboard-images")
 }

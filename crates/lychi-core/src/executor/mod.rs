@@ -337,7 +337,7 @@ impl Executor {
         ) {
             return; // same panel still settling — already counted
         }
-        let _ = crate::db::frecency::record_impressions(&self.db, &context_key, &commands);
+        let _ = crate::db::frecency::record_impressions(&context_key, &commands);
     }
 
     /// Build the run-target `RunContext` from the current environment context.
@@ -1091,7 +1091,7 @@ impl Executor {
 
         // Learned query→command bindings for this exact query. Empty for a new
         // user or an unseen query, in which case ranking is unchanged.
-        let latches = crate::db::frecency::get_latches(&self.db, trimmed);
+        let latches = crate::db::frecency::get_latches(trimmed);
         // Stamp the ranker's verdict onto the item before the `Suggestion`
         // wrapper (and with it `Source` and `Tier`) is dropped. This is the only
         // point where all three inputs to `can_be_default` exist together, so
@@ -3283,6 +3283,7 @@ mod tests {
     #[tokio::test]
     async fn a_recorded_latch_reorders_the_next_completion_list() {
         let ex = make_executor(registry_open_matches());
+        crate::db::frecency::set_store_for_test(ex.db.clone());
         let cfg = crate::config::schema::SuggestionsConfig::default();
 
         // Baseline: whatever the ranker decides on its own.
@@ -3295,16 +3296,16 @@ mod tests {
             .find(|c| c.kind == Some(crate::action_registry::CompletionKind::SearchWeb))
             .map(|c| c.label.clone())
             .expect("fixture needs a fallback row to choose");
-        crate::db::frecency::record_latch(&ex.db, "zqx", &chosen).unwrap();
-        crate::db::frecency::record_latch(&ex.db, "zqx", &chosen).unwrap();
+        crate::db::frecency::record_latch("zqx", &chosen).unwrap();
+        crate::db::frecency::record_latch("zqx", &chosen).unwrap();
 
         // The latch is readable for this query and only this query.
-        let latches = crate::db::frecency::get_latches(&ex.db, "zqx");
+        let latches = crate::db::frecency::get_latches("zqx");
         assert!(
             latches.contains_key(&chosen.to_lowercase()) || latches.contains_key(&chosen),
             "the executor's db must see the latch it just recorded, got: {latches:?}"
         );
-        assert!(crate::db::frecency::get_latches(&ex.db, "other").is_empty());
+        assert!(crate::db::frecency::get_latches("other").is_empty());
 
         // Sanity: the list is still produced (the latch must not break ranking).
         let after = ex.completions("zqx", &cfg).await;
@@ -3327,7 +3328,7 @@ mod tests {
             .find(|c| c.kind.is_some_and(|k| k.is_fallback()))
             .expect("expected a fallback row");
 
-        crate::db::frecency::record_latch(&ex.db, "zqx", &fallback.label).unwrap();
+        crate::db::frecency::record_latch("zqx", &fallback.label).unwrap();
 
         // Re-wrap as the ranker would and confirm the row is still ineligible.
         let s = Suggestion::new(fallback.clone(), Source::Fallback, Tier::Prefix);

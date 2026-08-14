@@ -59,7 +59,6 @@ impl Candidate {
 /// Everything a provider may look at.
 pub struct SuggestCtx<'a> {
     pub env: &'a EnvironmentContext,
-    pub db: Option<&'a Arc<Database>>,
     /// Focused window is a terminal or IDE.
     pub in_dev_window: bool,
 }
@@ -238,11 +237,10 @@ impl SuggestionProvider for ClipboardProvider {
 /// the row is reached from typed matching or the empty prompt.
 pub(super) fn clipboard_candidate(
     env: &EnvironmentContext,
-    db: Option<&Arc<Database>>,
+    _db: Option<&Arc<Database>>,
 ) -> Option<Candidate> {
     let ctx = SuggestCtx {
         env,
-        db,
         in_dev_window: env
             .active_window
             .as_ref()
@@ -317,9 +315,6 @@ impl SuggestionProvider for MemoryProvider {
     }
 
     fn suggest(&self, ctx: &SuggestCtx) -> Vec<Candidate> {
-        let Some(db) = ctx.db else {
-            return Vec::new();
-        };
         let root = ctx
             .env
             .project
@@ -335,12 +330,11 @@ impl SuggestionProvider for MemoryProvider {
         // a one-off `kill 1234` haunting the empty prompt for a week was the
         // reported garbage. Counts, not scores — a single use minutes ago
         // outscores five uses last week.
-        let scores: std::collections::HashMap<String, f64> =
-            frecency::get_workspace_stats(db, root)
-                .into_iter()
-                .filter(|(_, (_, count))| *count >= MIN_WORKSPACE_USES)
-                .map(|(cmd, (score, _))| (cmd, score))
-                .collect();
+        let scores: std::collections::HashMap<String, f64> = frecency::get_workspace_stats(root)
+            .into_iter()
+            .filter(|(_, (_, count))| *count >= MIN_WORKSPACE_USES)
+            .map(|(cmd, (score, _))| (cmd, score))
+            .collect();
         if scores.is_empty() {
             return Vec::new();
         }

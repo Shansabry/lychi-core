@@ -131,7 +131,7 @@ impl HistoryStore {
     ///
     /// Still takes the database because frecency scores live in redb; when
     /// frecency also moves to a file this argument goes away.
-    pub fn fuzzy_search(&self, db: &Arc<Database>, query: &str) -> Vec<CompletionItem> {
+    pub fn fuzzy_search(&self, _db: &Arc<Database>, query: &str) -> Vec<CompletionItem> {
         let query = query.trim();
         if query.is_empty() {
             return Vec::new();
@@ -174,7 +174,7 @@ impl HistoryStore {
         scored.sort_unstable_by_key(|b| std::cmp::Reverse(b.1));
 
         // Blend with frecency
-        let frecency_scores = frecency::get_scores(db);
+        let frecency_scores = frecency::get_scores();
         let mut items: Vec<CompletionItem> = scored
             .drain(..)
             .take(10)
