@@ -1,120 +1,71 @@
-# File search: "Searching…" sticks on the first query (cold start)
+# File search: "Searching…" sticks on the first / cold query
 
-**Status:** Known bug, deferred. Diagnosed, not yet fixed.
-**Severity:** UX rough edge — first-run only, self-resolves when the user types another character.
-**Not a regression from the storage refactor** (see "Provenance").
+**Status:** FIXED (backend terminal-emit guarantee). See "The fix" below.
+**Severity was:** UX bug — first-query-after-idle and freshly-drilled-subfolder
+stuck on "Searching…" until the next keystroke.
 
 ## Symptom
 
-The first `/`-file-search query after launch (or after the search subsystem has
-gone idle) shows **"Searching…"** and never populates, even though results exist.
-Typing one more character makes results appear instantly. Reproducible by
-launching cold and immediately typing e.g. `/Don` — the list stays on
-"Searching…" until the next keystroke, which returns the folder results.
+The first `/`-file-search after launch/idle, or drilling into a never-indexed
+subfolder, shows **"Searching…"** and never populates even though results exist.
+Typing one more character makes results appear. Intermittent.
 
-## Root cause: loading-vs-empty state conflation
+## Root cause (corrected — the earlier version of this doc was wrong)
 
-This is a textbook async-search bug (Algolia documents the exact shape: an init
-phase that emits an empty result set with an `idle` status, which the UI misreads
-as "done, found nothing"). Lychi's chain:
+The earlier diagnosis claimed the streaming FE path was half-wired and the live
+`/`-search ran a one-shot with no `done` signal. **That was wrong** — it was
+written from a static read that never opened `+page.svelte`. A source trace
+confirmed the STREAMING path IS the live path and is fully wired on both ends
+(`searchMode` set true at `+page.svelte:443`, `fileSearchId` bumped `:445`,
+`startFileSearch` invoked `:472`; `applyFileSearchBatch` correctly handles
+`search_id` staleness + the `done` flag). The one-shot `fuzzy_path_completions`
+is only used by `@`-browse.
 
-1. The file-search backend is **asynchronous** — `fuzzy_path_completions` starts a
-   `LiveSearch` session and returns "**whatever has matched so far**" (see
-   `crates/lychi-core/src/file_search/mod.rs`, the one-shot comment: *"reads
-   whatever is ready. Correct rather than complete."*).
-2. On the **first query against a cold index/matcher**, the session hasn't matched
-   anything yet → it returns an **empty** set.
-3. The UI treats "empty so far" as a **terminal** state and latches "Searching…"
-   (there is no `done` signal on the one-shot path to say the search actually
-   finished), so it never transitions to results.
-4. It's stuck because the query fired once (debounced) and nothing re-fires until
-   the next keystroke — which hits a now-**warm** index and returns results.
+The real bug is a **dropped terminal-emit on a COLD corpus**, backend-side:
 
-**Why first-run-only:** the matcher/corpus is aggressively released when idle
-(recent perf commits: `e5febfa release the search matcher when searching goes
-idle`, `61793a2 evict path corpora for scopes nobody is searching`,
-`ad759d9 break the Arc cycle`). So the first search after launch/idle is cold; all
-subsequent ones are warm.
+1. On a cold scope, `start_file_search`'s initial `emit_ranked_results`
+   (`filesystem.rs`) matches against the tiny/partial corpus walked so far and
+   emits `done:false` (or an empty `done:true` if `injected_count` is already
+   satisfied by an empty snapshot).
+2. When the walk finishes it re-injects the full corpus; the matcher must
+   re-match and emit the final `done:true`.
+3. That final emit rides the matcher's re-seed subscription
+   (`live.rs::reseed_on_corpus_change`), which legitimately EARLY-RETURNS when the
+   matcher has no active query at publish time / was rebuilt / isn't stale
+   (`live.rs:224,226,229`). On the first cold query the publish→notify can land in
+   that window → the final emit is dropped → stuck spinner until the next
+   keystroke bumps `fileSearchId` and re-runs against the now-warm corpus.
+4. Drilling into a subfolder hits the identical bug — a drilled folder is always a
+   cold scope.
 
-## Provenance (NOT the storage refactor)
+**Note on `nucleo::Status.running`:** NOT usable as the done-signal here.
+`session.rs::results_for` documents (with measurements) that `running` reflects
+injection progress, not query completion — a 162k one-burst injection keeps it
+`true` almost permanently, reporting `false`-complete on 22/23 finished searches.
+`complete = snap.item_count() >= injected_count` is the honest matching-done
+signal and is correct; the bug was never the `complete` derivation, only that a
+re-matched cold corpus's terminal batch wasn't guaranteed to be emitted.
 
-- `src/routes/+page.svelte` and `src/lib/stores/completions.svelte.ts` were **not
-  modified** in the storage-refactor session.
-- The frecency move made `frecency::get_scores()` return empty on a fresh db (a
-  separate, now-fixed bug — see the `init_store` table-creation fix), but that only
-  affects **ranking**, called AFTER the results check — it cannot cause an empty
-  *result set* or a stuck spinner.
-- The cold-start predates this session, rooted in the idle-eviction perf work.
+## The fix
 
-## The current frontend is mid-migration (the real blocker to a clean fix)
+`start_file_search` (`src-tauri/src/commands/filesystem.rs`) attaches a
+DEDICATED, event-based one-shot to the corpus that emits one authoritative batch
+for the active `search_id` when the walk completes — independent of the matcher's
+query state, so it cannot be dropped like the re-seed notification. Race-critical
+ordering: **subscribe first, THEN check `is_complete()`** (a walk finishing
+between a check-first and the subscribe would fire its notify before the
+subscriber existed). A `fired` atomic makes it exactly-once; a duplicate/stale
+batch is harmless (FE ignores a stale `search_id`; a repeat `done:true` just
+re-latches `searchDone`). This is the industry pattern (fzf EOF / Telescope
+`on_exit` / VS Code promise-settle): bind "done" to something that cannot be
+missed — here, a guaranteed terminal emit on corpus completion.
 
-A **streaming** result path exists but appears **half-wired**:
+## Deferred polish (not done — separate from the bug)
 
-- `lychi://file-search-results` IS listened (`src/lib/events/bridge.svelte.ts`)
-  → routes to `completions.applyFileSearchBatch` (`src/lib/events/router.ts`).
-- `applyFileSearchBatch` already handles `search_id` staleness and a `done` flag
-  (sets `searchDone = true`) — the correct machinery.
-- BUT: `startFileSearch` (`src/lib/ipc.ts`) is **never called** in live code;
-  `completions.searchMode` is **only ever set to `false`** (never `true`);
-  `completions.fileSearchId` is **never incremented**. So the streaming entry path
-  (enter search mode → bump id → invoke startFileSearch → receive batches) is not
-  driven.
-- The live `/`-search therefore runs through a **different/older path** (the
-  one-shot `fuzzy_path_completions`, or another trigger not yet located by static
-  reading). That one-shot path is the one with no `done` signal → the stuck
-  spinner.
-
-Pinning the exact live trigger needs the app running with browser devtools (real
-stack + call trace) or a full read of the large `+page.svelte` + store, not more
-grep.
-
-## Recommended fix (researched, industry-standard)
-
-Primary — **make the streaming `done`/`search_id` contract the single source of
-truth** (what Telescope, VS Code Quick Open, and Algolia effectively do):
-
-1. Route `/`-search through the streaming path (invoke `startFileSearch`, bump
-   `fileSearchId` per query, enter `searchMode`).
-2. Bind UI state to the stream, not to any one-shot return, for the current
-   `search_id`:
-   - **"Searching…" while `!done`.**
-   - **Populate on any non-empty batch.**
-   - **"No results" ONLY when a batch with `done: true` arrives empty** — never on
-     an interim empty batch.
-3. **Ignore batches whose `search_id` isn't the latest** (stale-session guard —
-   already present in `applyFileSearchBatch`).
-4. **Delay the "Searching…" indicator ~150–200ms** so fast warm queries never flash
-   it (Algolia's `stalledSearchDelay` default is 200ms).
-
-Complementary — **warm the file-search index/matcher at startup** (background pass)
-so the first real query is rarely cold. This shrinks the race window but does NOT
-close it (the user can type before warmup finishes), so it is a latency
-optimization on top of the done-signal fix, not a standalone fix.
-
-Avoid:
-- **Client re-poll on empty** — the Alfred pattern for a *one-shot* backend;
-  redundant polling on top of an existing streaming channel.
-- **"Searching…" timing out to "No results"** as the primary fix — a blind timeout
-  can declare "No results" while a slow-but-valid search is still running (turns a
-  stuck spinner into a wrong answer). At most keep a long watchdog as a failure
-  fallback.
-
-## Key files
-
-- Backend one-shot: `crates/lychi-core/src/file_search/mod.rs`
-  (`fuzzy_path_completions`), `src-tauri/src/commands/filesystem.rs`
-  (`start_file_search`, `fuzzy_path_completions`, the `file-search-results` emit).
-- Frontend state: `src/lib/stores/completions.svelte.ts`
-  (`applyFileSearchBatch`, `searchMode`, `searchDone`, `fileSearchId`).
-- Event wiring: `src/lib/events/bridge.svelte.ts`, `src/lib/events/router.ts`.
-- "Searching…" render: `src/lib/components/CompletionsList.svelte` (note: this
-  component appears to have no live importer — verify it is the actual on-screen
-  component before editing; the live search list may render elsewhere).
-
-## First step when picking this up
-
-Run the app with devtools and trace what fires when you type `/x`: which IPC
-command is invoked, whether `file-search-results` events arrive, and where
-"Searching…" is bound. That resolves the "which path is live" question the static
-read could not, and tells you whether to (a) finish wiring the streaming path or
-(b) add a `done` signal to the one-shot path.
+- **Stalled-spinner delay (~200ms, Algolia `stalledSearchDelay`).** Don't render
+  "Searching…" for the first ~150–200ms so warm queries never flash a spinner.
+  Frontend-only: a `searchStalled` state gating `+page.svelte:2143,2152` +
+  `CompletionsList.svelte:173`. Nice-to-have; the stuck-spinner bug is fixed
+  without it.
+- **Prewarm drilled/non-home scopes** on drill so the terminal-emit path rarely
+  has to wait. Latency optimization on top of the correctness fix.

@@ -175,6 +175,58 @@ pub async fn start_file_search(
         let generation = live.begin(&scope, &query, redraw);
         let _ = generation_cell.set(generation);
         emit_ranked_results(&live, generation, &db, &app, search_id);
+
+        // Guaranteed terminal emit for a COLD scope.
+        //
+        // On a cold corpus the initial emit above sends `done:false` (matching
+        // finished, but only against the tiny/partial snapshot walked so far).
+        // When the walk finishes it re-injects the full corpus and the matcher
+        // re-matches — but the emit that would carry the final `done:true` rides
+        // the matcher's own re-seed subscription, which legitimately drops the
+        // notification when the matcher has no active query at publish time, was
+        // rebuilt, etc. On the first (or a freshly-drilled) cold query that drop
+        // leaves the UI stuck on "Searching…" until the next keystroke warms it.
+        //
+        // So attach a DEDICATED, event-based one-shot (no poll — it rides the same
+        // `notify_subscribers` the corpus already fires) that emits one
+        // authoritative batch for THIS `search_id` when the walk completes,
+        // independent of the matcher's query state so it cannot be dropped. The
+        // `fired` guard makes it exactly-once; a duplicate/stale batch is harmless
+        // (the frontend ignores a stale `search_id`, and a repeat `done:true`
+        // merely re-latches `searchDone`).
+        //
+        // Ordering is the race-critical part: SUBSCRIBE FIRST, then check
+        // `is_complete()`. If we checked first, a walk finishing between the check
+        // (false) and the subscribe would fire its notify before our subscriber
+        // existed — dropped, stuck spinner. Subscribing first means that publish
+        // reaches us; the post-subscribe `is_complete()` covers the walk that
+        // finished BEFORE we subscribed (whose notify we'd have missed). The
+        // `fired` swap dedups when both paths race.
+        let corpus = live.corpus(&scope);
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let emit_terminal = {
+            let live = live.clone();
+            let db = db.clone();
+            let app = app.clone();
+            let cell = generation_cell.clone();
+            let fired = fired.clone();
+            move || {
+                if fired.swap(true, Ordering::SeqCst) {
+                    return; // the terminal batch already went out
+                }
+                if let Some(&generation) = cell.get() {
+                    emit_ranked_results(&live, generation, &db, &app, search_id);
+                }
+            }
+        };
+        corpus.subscribe(Arc::new({
+            let emit_terminal = emit_terminal.clone();
+            move || emit_terminal()
+        }));
+        // Covers a walk that completed before we subscribed (its notify is gone).
+        if corpus.is_complete() {
+            emit_terminal();
+        }
     });
 
     Ok(())
