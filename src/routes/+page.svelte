@@ -1354,6 +1354,19 @@ async function attachSelectedFile() {
 
 /** Drill into a folder result — browse its contents inside Lychi (Tab / →). */
 function drillIntoFolder(item: CompletionItem) {
+	// `@`-browse: keep the `@` prefix and put the folder's FULL path after it, so
+	// re-running `@`-completion lists THAT folder (a path-like partial routes to
+	// listPathCompletions). The label is already the full `~/…/` path, so drilling
+	// a nested folder resolves correctly — the old code dropped the `@` and rebuilt
+	// a `/`-search path, which resolved a nested folder like `BG` as `~/BG` and
+	// showed "Empty folder".
+	if (completions.atMode) {
+		const label = item.label.endsWith("/") ? item.label : `${item.label}/`;
+		inputValue = `@${label}`;
+		handleInput(inputValue);
+		return;
+	}
+	// `/`-search: convert the label to a scope-relative `/path/`.
 	let path = item.label;
 	if (path.startsWith("~/")) {
 		path = path.slice(2); // ~/Downloads/ → Downloads/
@@ -2021,20 +2034,29 @@ async function handleDismiss() {
 			ontabcomplete={() => {
 				if (completions.items.length > 0 && completions.index >= 0) {
 					const item = completions.items[completions.index];
-					if (completions.searchMode && item.icon_path === "__folder__") {
+					// Standard file-picker keys (VS Code + Raycast + shell): Tab and
+					// → DRILL into a folder (in both `/`-search and `@`-browse); Tab
+					// on a file accepts it. Enter is pure accept (handled elsewhere) —
+					// it never drills, so a folder can still be selected as-is.
+					if (item.icon_path === "__folder__") {
 						drillIntoFolder(item);
 					} else if (completions.searchMode) {
-						// File in search mode — open it
+						// File in search mode — open it.
 						openFileByLabel(item.label);
 					} else {
-						// Browse mode — existing behavior
+						// File in `@`-browse — insert the reference.
 						handleCompletionSelect(item.label);
 					}
 				}
 			}}
 			ondrillinto={() => {
-				// Arrow-right → drill into the selected folder (search mode only).
-				if (completions.searchMode && completions.items.length > 0 && completions.index >= 0) {
+				// Arrow-right → drill into the selected folder, in BOTH search and
+				// `@`-browse modes (Alfred convention).
+				if (
+					(completions.searchMode || completions.atMode) &&
+					completions.items.length > 0 &&
+					completions.index >= 0
+				) {
 					const item = completions.items[completions.index];
 					if (item?.icon_path === "__folder__") drillIntoFolder(item);
 				}

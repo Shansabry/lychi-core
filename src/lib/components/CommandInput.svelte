@@ -351,11 +351,11 @@ function handleKeydown(e: KeyboardEvent) {
 		acceptGhost();
 	} else if (
 		e.key === "ArrowRight" &&
-		searchMode &&
+		(searchMode || atMode) &&
 		inputEl &&
 		inputEl.selectionStart === value.length
 	) {
-		// Search mode, cursor at end, no ghost → drill into the selected folder.
+		// Search or @-browse, cursor at end, no ghost → drill into the selected folder.
 		e.preventDefault();
 		ondrillinto();
 	} else if (matchesAction(e, "copy_path") && searchMode) {
