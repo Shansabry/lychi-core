@@ -47,6 +47,25 @@ use serde::de::DeserializeOwned;
 
 use crate::error::LychiError;
 
+/// Narrow a store file to owner-only (`0600`). These files hold clipboard text,
+/// command history and AI transcripts — the same sensitivity as the databases,
+/// which are already 0600. Best-effort and non-fatal: a filesystem that can't
+/// represent the mode (FAT `$HOME`, some network mounts) is not a reason to fail
+/// a write. No-op on non-Unix.
+fn restrict_owner_only(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(md) = fs::metadata(path)
+            && md.permissions().mode() & 0o777 != 0o600
+        {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 /// An append-only JSON Lines log at a fixed path.
 ///
 /// Cheap to construct (holds only the path); each operation opens the file for
@@ -92,12 +111,22 @@ impl JsonlLog {
             fs::create_dir_all(parent)?;
         }
 
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        // Owner-only from birth: these logs hold clipboard text, command history
+        // and AI transcripts — the same sensitivity as the databases, which are
+        // 0600. Without this the default umask makes them world-readable (0644).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&self.path)?;
         f.write_all(&buf)?;
         f.sync_data()?;
+        // An EXISTING file created before this (or by an older build) keeps its
+        // old mode on open, so tighten it explicitly too.
+        restrict_owner_only(&self.path);
 
         // On first creation, fsync the parent dir so the new file's directory
         // entry survives a crash (the append's own bytes are already fsync'd).
@@ -174,6 +203,7 @@ impl JsonlLog {
             buf.push(b'\n');
         }
         crate::fs_atomic::write_atomic(&self.path, &buf)?;
+        restrict_owner_only(&self.path);
         Ok(())
     }
 
@@ -275,6 +305,7 @@ pub fn snapshot<T: Serialize>(path: &Path, value: &T) -> Result<(), LychiError> 
     let bytes = serde_json::to_vec(value)
         .map_err(|e| LychiError::Config(format!("snapshot encode: {e}")))?;
     crate::fs_atomic::write_atomic(path, &bytes)?;
+    restrict_owner_only(path);
     Ok(())
 }
 
@@ -507,6 +538,29 @@ mod tests {
         snapshot(&path, &v).unwrap();
         let got: Option<Vec<Rec>> = load_snapshot(&path).unwrap();
         assert_eq!(got, Some(v));
+        fs::remove_file(&path).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        // Append log: 0600 from birth.
+        let log = JsonlLog::new(temp("perm_log"));
+        log.append(&rec(1, "secret clip")).unwrap();
+        let m = fs::metadata(log.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(m, 0o600, "jsonl log must be owner-only, got {m:o}");
+        // Rewrite keeps it 0600.
+        log.rewrite(&[rec(1, "a")]).unwrap();
+        let m = fs::metadata(log.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(m, 0o600, "rewritten log must stay owner-only, got {m:o}");
+        log.clear().unwrap();
+
+        // Snapshot: 0600 too.
+        let path = temp("perm_snap");
+        snapshot(&path, &vec![rec(1, "a")]).unwrap();
+        let m = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(m, 0o600, "snapshot must be owner-only, got {m:o}");
         fs::remove_file(&path).ok();
     }
 

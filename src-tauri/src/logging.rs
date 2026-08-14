@@ -78,7 +78,26 @@ pub fn init() -> WorkerGuard {
     let fused = ByteFuseWriter::new(file_writer, LOG_DAILY_BYTE_BUDGET);
 
     // Each layer gets its own env filter (they can't share one instance).
-    let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    //
+    // Base level is `info` (or `RUST_LOG` when set), but two third-party targets
+    // are force-quietened on top of that, because they flood the file log with
+    // thousands of lines a day of noise Lychi cannot act on:
+    //
+    //   - `ignore` (the file-search directory walker) logs EVERY hidden file it
+    //     skips at DEBUG — measured at ~14k lines/day, ~60% of the whole log, and
+    //     the main driver behind multi-MB daily logs. Pinned to `warn` so a
+    //     `RUST_LOG=debug` dev run doesn't drown in "ignoring …: Hidden".
+    //   - `zbus::proxy` logs a WARN on every summon when an XDG-portal request
+    //     object has already gone away ("Failed to populate properties cache via
+    //     GetAll … UnknownMethod"). Harmless (a lost portal request, not our
+    //     bug) and survives the `info` base, so it is pinned to `error`.
+    //
+    // Appended as explicit directives so they hold even when the user sets
+    // `RUST_LOG` — a broad `debug` should still not re-enable this crate noise.
+    let filter = || {
+        let base = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+        EnvFilter::new(format!("{base},ignore=warn,zbus::proxy=error"))
+    };
 
     // File: structured JSON (parseable, aggregatable, pipeline-ready).
     let file_layer = tracing_subscriber::fmt::layer()
