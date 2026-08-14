@@ -1694,6 +1694,12 @@ keyword: string;
  */
 description: string; 
 /**
+ * Agent-facing argument/usage help from the handler ([`ActionHandler::usage`]).
+ * Empty when the handler declares none. Consumed by the capability manifest,
+ * not the Guide.
+ */
+usage: string; 
+/**
  * The family this command belongs to (for Guide grouping).
  */
 category: CommandCategory; 

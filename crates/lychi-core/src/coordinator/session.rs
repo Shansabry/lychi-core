@@ -97,6 +97,16 @@ impl Session {
         }
     }
 
+    /// The current system prompt (messages[0]), or `""` if there is no leading
+    /// system message. Lets a caller augment the prompt (e.g. append a generated
+    /// capability manifest) without re-threading the original string.
+    pub fn system_prompt(&self) -> String {
+        match self.messages.first() {
+            Some(m) if m.role == crate::providers::Role::System => m.content_text(),
+            _ => String::new(),
+        }
+    }
+
     /// Append the assistant turn for a completed model response: its prose plus
     /// any tool calls it requested (preserved so the turn round-trips to the
     /// provider on the next request).

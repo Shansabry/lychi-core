@@ -73,6 +73,9 @@ impl ActionHandler for SysInfoHandler {
     fn description(&self) -> &str {
         "System info — ip, cpu, mem, disk, temp, gpu, battery, net, audio, display, os"
     }
+    fn usage(&self) -> &str {
+        "Subcommands: ip, cpu, mem, disk, temp, gpu, battery, net, audio, display, os. Empty args shows a full overview"
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::System
     }

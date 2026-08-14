@@ -320,6 +320,9 @@ impl ActionHandler for ServicesHandler {
     fn description(&self) -> &str {
         "Control systemd services: list, status, start/stop/restart"
     }
+    fn usage(&self) -> &str {
+        "'<name>' or '<name> status' to check it; '<name> start|stop|restart|reload|enable|disable' to control it"
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::System
     }

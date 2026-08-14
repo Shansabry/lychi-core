@@ -349,6 +349,9 @@ impl ActionHandler for TimerHandler {
     fn description(&self) -> &str {
         "Timer — countdown timers with desktop notification. Usage: timer 25m, timer start workout 5m, timer stop, timer status"
     }
+    fn usage(&self) -> &str {
+        "'start [name] <duration>' (e.g. 'start 25m', 'start workout 5m'), 'stopwatch [name]' to start a count-up stopwatch, 'stop [name]', 'pause [name]', 'resume [name]', 'status', 'clear'. Shorthand: a bare duration like '25m' starts a timer"
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
     }

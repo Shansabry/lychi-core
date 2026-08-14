@@ -67,6 +67,9 @@ impl ActionHandler for ConvertImageHandler {
     fn description(&self) -> &str {
         "Convert an image: convert <path> to <png | jpg | webp | gif | bmp | tiff>"
     }
+    fn usage(&self) -> &str {
+        "convert <path> to <png|jpg|webp|gif|bmp|tiff>"
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Files
     }

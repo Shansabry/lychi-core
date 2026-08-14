@@ -250,6 +250,9 @@ impl ActionHandler for DevUtilsHandler {
     fn description(&self) -> &str {
         "Developer utilities: base64, hash, urlencode/decode, epoch, json, text-case"
     }
+    fn usage(&self) -> &str {
+        "Prepend the verb to the text. Verbs: 'base64 <text>' / 'base64 -d <b64>', 'hash [md5|sha256] <text>', 'urlencode <text>' / 'urldecode <text>', 'epoch [<unix-seconds>]', 'json <text>' (pretty-print) / 'json -m <text>' (minify), 'upper/lower/title <text>', 'slug <text>', 'reverse <text>', 'count <text>'. Use for encode/decode, format json, slugify, etc."
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Developer
     }

@@ -122,10 +122,7 @@ pub fn derive_title(messages: &[ChatMessage]) -> String {
     // First non-empty line, with light markdown stripping so a heading/bullet
     // answer ("## Summary", "- point") yields a clean title, not its syntax.
     let raw = source.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-    let line = raw
-        .trim()
-        .trim_start_matches(|c: char| c == '#' || c == '-' || c == '*' || c == '>')
-        .trim();
+    let line = raw.trim().trim_start_matches(['#', '-', '*', '>']).trim();
     const MAX: usize = 60;
     if line.chars().count() > MAX {
         let truncated: String = line.chars().take(MAX).collect();

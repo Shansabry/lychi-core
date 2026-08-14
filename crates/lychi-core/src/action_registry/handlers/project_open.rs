@@ -392,6 +392,9 @@ impl ActionHandler for ProjectOpen {
     fn description(&self) -> &str {
         "Open a project folder in the code editor"
     }
+    fn usage(&self) -> &str {
+        "the project name (e.g. 'lychi'). Opens it in the code editor"
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Files
     }

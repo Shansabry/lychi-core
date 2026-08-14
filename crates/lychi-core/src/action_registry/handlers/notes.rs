@@ -97,6 +97,9 @@ impl ActionHandler for NotesHandler {
     fn description(&self) -> &str {
         "Notes — add, list, or delete notes. Usage: note <text> to add, note read to list, note delete <id> to remove"
     }
+    fn usage(&self) -> &str {
+        "text to add a note, 'read' to view all, 'delete <id>' to remove. Max 5 notes"
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
     }
@@ -239,6 +242,9 @@ impl ActionHandler for TodoHandler {
 
     fn description(&self) -> &str {
         "Todo list — add, list, check off, or delete items. Usage: todo add <text>, todo list, todo done <id>, todo delete <id>"
+    }
+    fn usage(&self) -> &str {
+        "'add <text>', 'list', 'done <id>', 'delete <id>', 'summary'"
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities

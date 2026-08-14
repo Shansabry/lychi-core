@@ -484,11 +484,18 @@ impl AgentEventDto {
 /// `with_tools = false` → the "quick-AI" fork card: no tool catalog, so the model
 /// just answers (a short prose reply, no acting). The full agent chat passes
 /// `true` and gets every handler as a callable tool.
+/// Build the agent loop and the capability-manifest text for its system prompt.
+///
+/// The returned `String` is the generated manifest (tools + AI commands) to fold
+/// into the session's system message; empty when tools are off (a preset/quick-AI
+/// run acts on nothing, so it needs no catalog). Generated from the FULL registry
+/// catalog + presets even though the callable tool SCHEMAS are filtered per query
+/// — the model should KNOW every capability exists; only the schemas cost tokens.
 async fn build_coordinator(
     state: &AppState,
     with_tools: bool,
     query: &str,
-) -> Result<(Coordinator<ExecutorAdapter>, ()), LychiError> {
+) -> Result<(Coordinator<ExecutorAdapter>, String), LychiError> {
     let provider = state
         .ai_provider
         .read()
@@ -502,11 +509,20 @@ async fn build_coordinator(
     // what the query plausibly needs (core tools are always kept), trimming the
     // per-turn token cost without starving the agent — an empty `query` (e.g. a
     // resume) yields the full catalog.
+    // The manifest describes every tool + AI command in prose (cheap awareness),
+    // built from the FULL catalog before per-query schema filtering. Empty when
+    // tools are off. Presets read from the same DB the store uses.
+    let mut manifest = String::new();
+
     let tools: Vec<ToolDef> = if with_tools {
+        let catalog = state.executor.read().await.registry.command_catalog();
+        let presets = lychi_core::ai_presets::store::AiPresetsStore::new()
+            .get_presets(&state.db)
+            .unwrap_or_default();
+        manifest = lychi_core::coordinator::build_manifest(&catalog, &presets);
+
         let full: Vec<ToolDef> = {
-            let exec = state.executor.read().await;
-            exec.registry
-                .command_catalog()
+            catalog
                 .into_iter()
                 .map(|c| {
                     // The `run` tool captures output inline by default so the
@@ -543,7 +559,7 @@ async fn build_coordinator(
         executor: state.executor.clone(),
         privacy,
     });
-    Ok((Coordinator::new(provider, adapter, tools), ()))
+    Ok((Coordinator::new(provider, adapter, tools), manifest))
 }
 
 /// Drive a coordinator run/resume: forward every `AgentEvent` as
@@ -805,7 +821,7 @@ pub async fn agent_chat_start(
     let mut session = session;
     session.set_last_user_display(display);
 
-    let (coord, ()) = match build_coordinator(&state, with_tools, &query).await {
+    let (coord, manifest) = match build_coordinator(&state, with_tools, &query).await {
         Ok(c) => c,
         Err(e) => {
             // Failed before the loop ever ran (e.g. AI disabled
@@ -817,6 +833,14 @@ pub async fn agent_chat_start(
             return Err(e);
         }
     };
+    // Fold the capability manifest into the system prompt so the model knows its
+    // tools + AI commands. `splice_manifest` is idempotent (it replaces any prior
+    // manifest), so a follow-up turn on a continued session doesn't stack copies;
+    // an empty manifest (tools off) leaves the prompt as-is.
+    {
+        let base = session.system_prompt();
+        session.set_system(lychi_core::coordinator::splice_manifest(&base, &manifest));
+    }
     let (stream, handle) = coord.run(session, cancel);
     drive(
         app,
@@ -853,8 +877,9 @@ pub async fn agent_approve(
 
     // Approval resumes the full agent (a tool was pending), so tools stay on.
     // Empty query → full catalog: mid-task we must not drop a tool the ongoing
-    // plan may still call.
-    let (coord, ()) = match build_coordinator(&state, true, "").await {
+    // plan may still call. The manifest is ignored on resume — the continued
+    // session already carries it in its system prompt from the initial turn.
+    let (coord, _manifest) = match build_coordinator(&state, true, "").await {
         Ok(c) => c,
         Err(e) => {
             // Restore the taken session: the approval is still pending and the

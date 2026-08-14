@@ -37,6 +37,9 @@ impl ActionHandler for AliasHandler {
     fn description(&self) -> &str {
         "Aliases — save command shortcuts. Usage: alias add <name> <command>, alias list, alias delete <name>"
     }
+    fn usage(&self) -> &str {
+        "'set <name> <command>', 'remove <name>', 'list'"
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
     }

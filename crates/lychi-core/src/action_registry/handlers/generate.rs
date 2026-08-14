@@ -168,6 +168,9 @@ impl ActionHandler for GenerateHandler {
     fn description(&self) -> &str {
         "Generate passwords, UUIDs, tokens, and random numbers"
     }
+    fn usage(&self) -> &str {
+        "'password [length]', 'uuid', 'token [length]', 'random [min] <max>' (random integer, default 0-100). Use for 'generate a password', 'give me a uuid', 'random number between 1 and 100'"
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
     }

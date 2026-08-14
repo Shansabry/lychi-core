@@ -352,6 +352,9 @@ impl ActionHandler for MediaHandler {
     fn description(&self) -> &str {
         "Media controls — play, pause, next, prev. Prefix with provider (spotify, yt) to target a specific player."
     }
+    fn usage(&self) -> &str {
+        "play, pause, next, prev, toggle, 'pause all'. Prefix with a provider to target a specific player (e.g. 'spotify pause', 'yt next')"
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Media
     }

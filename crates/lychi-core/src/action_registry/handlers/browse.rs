@@ -43,6 +43,9 @@ impl ActionHandler for BrowseHandler {
     fn description(&self) -> &str {
         "Browse files in a directory interactively"
     }
+    fn usage(&self) -> &str {
+        "ONLY use to open/browse a whole folder without filtering (e.g. 'browse downloads'). If the user mentions specific filenames or search terms, use 'run' with ls/find instead"
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Files
     }

@@ -716,6 +716,9 @@ impl ActionHandler for SystemCommand {
     fn description(&self) -> &str {
         "System controls (power, audio, brightness, wifi, bluetooth)"
     }
+    fn usage(&self) -> &str {
+        "shutdown, reboot, suspend, hibernate, lock, logout, mute, unmute, volume <up|down|0-100>, brightness <up|down|0-100>, wifi <on|off>, bluetooth <on|off>, connect bluetooth <device>, disconnect bluetooth <device>, shutdown in <duration> (e.g. 'shutdown in 30m'), cancel shutdown"
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::System
     }

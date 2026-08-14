@@ -73,6 +73,9 @@ impl ActionHandler for ResizeImageHandler {
     fn description(&self) -> &str {
         "Resize an image: resize <path> to <800x600 | 800 | x600 | 50%>"
     }
+    fn usage(&self) -> &str {
+        "resize <path> to <800x600|800|x600|50%>"
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Files
     }

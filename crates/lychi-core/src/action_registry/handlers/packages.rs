@@ -581,6 +581,9 @@ impl ActionHandler for PackagesHandler {
     fn description(&self) -> &str {
         "Search, install, remove & upgrade system packages (dnf/apt/pacman/zypper/flatpak)"
     }
+    fn usage(&self) -> &str {
+        "'search <query>' or 'install <package>'. Uses the OS package manager (dnf/apt/pacman/flatpak). NOT for web searches"
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::System
     }

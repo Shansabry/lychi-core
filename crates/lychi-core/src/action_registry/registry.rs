@@ -9,6 +9,7 @@ fn command_info(
     id: &str,
     keyword: &str,
     description: &str,
+    usage: &str,
     category: CommandCategory,
     mutates: bool,
 ) -> CommandInfo {
@@ -16,6 +17,7 @@ fn command_info(
         id: id.to_string(),
         keyword: keyword.to_string(),
         description: description.to_string(),
+        usage: usage.to_string(),
         category,
         category_title: category.title().to_string(),
         category_order: category.order(),
@@ -166,6 +168,7 @@ impl ActionRegistry {
                     h.id(),
                     keyword,
                     h.description(),
+                    h.usage(),
                     h.category(),
                     h.mutates_state(),
                 ))
@@ -198,6 +201,7 @@ impl ActionRegistry {
                 "",
                 sigil,
                 desc,
+                "",
                 CommandCategory::General,
                 false,
             ));
@@ -212,6 +216,7 @@ impl ActionRegistry {
                     handler_id,
                     prefix,
                     h.description(),
+                    "",
                     h.category(),
                     h.mutates_state(),
                 ))

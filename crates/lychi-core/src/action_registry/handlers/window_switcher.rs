@@ -149,6 +149,9 @@ impl ActionHandler for WindowSwitcherHandler {
     fn description(&self) -> &str {
         "Switch between open windows (focus or close)"
     }
+    fn usage(&self) -> &str {
+        "the app/window name (e.g. 'win firefox'). Use to switch TO something already open rather than launch it"
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::System
     }

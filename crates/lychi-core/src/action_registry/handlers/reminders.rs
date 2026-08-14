@@ -112,6 +112,9 @@ impl ActionHandler for RemindersHandler {
     fn description(&self) -> &str {
         "Reminders — timed desktop notifications. Usage: reminder add <text> in/at <time>, reminder list, reminder delete <id>"
     }
+    fn usage(&self) -> &str {
+        "'add <text> in/at <time>' (e.g. 'add buy milk in 30m', 'add standup at 9am', 'add meeting tomorrow 2pm'), 'list', 'delete <id>', 'clear'. Without 'add', infers from natural language"
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
     }

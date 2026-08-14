@@ -89,6 +89,9 @@ impl ActionHandler for ExtractHandler {
     fn description(&self) -> &str {
         "Extract an archive: extract <archive.zip|.tar.gz> [to <dir>]"
     }
+    fn usage(&self) -> &str {
+        "extract <archive.zip|.tar.gz> [to <dir>]"
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Files
     }

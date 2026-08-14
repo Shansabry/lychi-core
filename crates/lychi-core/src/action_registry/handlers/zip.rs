@@ -66,6 +66,9 @@ impl ActionHandler for ZipHandler {
     fn description(&self) -> &str {
         "Zip files/folders: zip <path...> [to <out.zip>]"
     }
+    fn usage(&self) -> &str {
+        "zip <path...> [to <out.zip>]"
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Files
     }

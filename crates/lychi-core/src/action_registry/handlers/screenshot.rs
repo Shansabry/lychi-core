@@ -612,6 +612,9 @@ impl ActionHandler for ScreenshotHandler {
     fn description(&self) -> &str {
         "Capture a screenshot (full screen, region, or window)"
     }
+    fn usage(&self) -> &str {
+        "empty or 'full' for the whole screen, 'area' (aliases: region, select) to select a region, 'window' for the active window"
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::System
     }

@@ -609,6 +609,10 @@ pub struct CommandInfo {
     pub keyword: String,
     /// One-line human description from the handler.
     pub description: String,
+    /// Agent-facing argument/usage help from the handler ([`ActionHandler::usage`]).
+    /// Empty when the handler declares none. Consumed by the capability manifest,
+    /// not the Guide.
+    pub usage: String,
     /// The family this command belongs to (for Guide grouping).
     pub category: CommandCategory,
     /// The category's human-readable section title (so the frontend needn't map).
@@ -905,6 +909,19 @@ pub trait ActionHandler: Send + Sync {
 
     /// Human-readable description for help/discovery.
     fn description(&self) -> &str;
+
+    /// Agent-facing usage help: the argument syntax, sub-verbs, and "when to use
+    /// vs when NOT to" guidance the tool-calling model needs to invoke this
+    /// correctly (e.g. `system` → "shutdown, reboot, volume <0-100>, brightness
+    /// <up|down|0-100>…"). Folded into the agent's capability manifest.
+    ///
+    /// Distinct from `description()` (a one-line label for the Guide/completions);
+    /// `usage()` is the detailed args text that used to live, unused by the model,
+    /// in a hand-maintained table. Empty by default — a handler with no arguments
+    /// or self-evident use needs none.
+    fn usage(&self) -> &str {
+        ""
+    }
 
     /// The family this handler belongs to, for grouping in the Guide. Override to
     /// place a handler in a category; the default `General` keeps unclassified

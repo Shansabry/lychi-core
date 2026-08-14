@@ -444,6 +444,9 @@ impl ActionHandler for TimeHandler {
     fn description(&self) -> &str {
         "World clock & timezone conversion"
     }
+    fn usage(&self) -> &str {
+        "a timezone name or city (e.g. 'tokyo', 'EST', 'london'). Empty for local time"
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
     }
