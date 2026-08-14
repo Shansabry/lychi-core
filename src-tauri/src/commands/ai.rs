@@ -124,9 +124,8 @@ pub async fn get_model_vision(state: State<'_, AppState>) -> Result<String, Lych
     let (provider, model) = (config.ai.provider.clone(), config.ai.model.clone());
     drop(config);
 
-    let db = state.db.clone();
     let vision = tauri::async_runtime::spawn_blocking(move || {
-        lychi_core::providers::capability::get_vision(&db, &provider, &model)
+        lychi_core::providers::capability::get_vision(&provider, &model)
     })
     .await
     .map_err(|e| LychiError::ExecutionFailed(format!("vision lookup task panicked: {e}")))?;

@@ -305,7 +305,7 @@ impl AppState {
 
         // Register the learned-model-capability store before any provider is
         // built, so the factory can wire failure-learning into BYO clients.
-        lychi_core::providers::capability::init_store(db.clone());
+        lychi_core::providers::capability::init_store(lychi_core::paths::model_caps_file());
 
         // FIRST write-adjacent step at startup: if this is the first run of a
         // new version, snapshot the old version's data before any seeding,

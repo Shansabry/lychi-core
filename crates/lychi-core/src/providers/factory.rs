@@ -144,9 +144,7 @@ fn build_byo(
     );
     // Learn from failures when a capability store is registered (it is, in the
     // app; not in tests). Wired here so no caller has to remember to.
-    if let Some(db) = super::capability::store() {
-        client = client.with_capability_store(db.clone());
-    }
+    client = client.with_capability_learning(super::capability::store().is_some());
     Ok(Arc::new(client))
 }
 

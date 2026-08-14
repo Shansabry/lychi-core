@@ -43,6 +43,12 @@ pub fn timers_file() -> PathBuf {
     data_dir().join("timers.json")
 }
 
+/// Learned per-model capabilities (vision support, capability-meter estimate).
+/// Derived machine-learned data, not user content — a JSONL file, not the DB.
+pub fn model_caps_file() -> PathBuf {
+    data_dir().join("model-caps.jsonl")
+}
+
 /// Where backup archives live. Inside the data dir so a user copying that one
 /// directory takes their backups with them, but excluded from the archive
 /// itself so backups never nest.

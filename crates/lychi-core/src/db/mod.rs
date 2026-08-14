@@ -45,12 +45,6 @@ pub const AI_PRESETS: TableDefinition<&str, &[u8]> = TableDefinition::new("ai_pr
 /// (Phase 4). Capped + pruned so the DB doesn't grow unbounded.
 pub const AI_CONVERSATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("ai_conversations");
 
-/// Learned model capabilities: key = `<provider>/<model>`, value =
-/// postcard-serialized `ModelCapability`. Populated from provider metadata when
-/// the endpoint reports it, and from observed failures otherwise — so Lychi
-/// stops re-sending requests a model has already rejected.
-pub const MODEL_CAPS: TableDefinition<&str, &[u8]> = TableDefinition::new("model_caps");
-
 /// User-pinned zero-state rows: key = normalized run string (lowercased,
 /// whitespace-collapsed), value = postcard-serialized PinEntry. The user's
 /// hand-chosen commands, always shown first on the empty prompt.
@@ -85,7 +79,7 @@ pub const SCHEMA_VERSION: u8 = 1;
 
 /// Every enveloped table — the migration and any future whole-table rewrite
 /// iterate this list, so a new table added here is versioned from birth.
-pub(crate) const ENVELOPED_TABLES: [&str; 13] = [
+pub(crate) const ENVELOPED_TABLES: [&str; 12] = [
     "history",
     "notes",
     "todos",
@@ -97,7 +91,6 @@ pub(crate) const ENVELOPED_TABLES: [&str; 13] = [
     "snippets",
     "ai_presets",
     "ai_conversations",
-    "model_caps",
     "pins",
 ];
 
@@ -262,7 +255,6 @@ pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
     txn.open_table(SNIPPETS)?;
     txn.open_table(AI_PRESETS)?;
     txn.open_table(AI_CONVERSATIONS)?;
-    txn.open_table(MODEL_CAPS)?;
     txn.open_table(PINS)?;
     txn.open_table(META)?;
     txn.commit()?;

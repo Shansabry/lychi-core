@@ -42,11 +42,12 @@ pub struct BYOClient {
     api_key: String,
     max_tokens: u32,
     http: Client,
-    /// Optional store for LEARNED model capabilities. When present, a rejection
-    /// that proves this model can't read images is recorded so the next attach
-    /// is warned before a request is wasted (see `providers::capability`).
-    /// `None` keeps the client usable in tests and anywhere without a DB.
-    caps_db: Option<std::sync::Arc<redb::Database>>,
+    /// Whether to LEARN model capabilities from failures. When true, a rejection
+    /// that proves this model can't read images is recorded (against the global
+    /// `providers::capability` store) so the next attach is warned before a
+    /// request is wasted. False keeps the client silent in tests / without a
+    /// registered store.
+    learn_caps: bool,
 }
 
 impl BYOClient {
@@ -82,13 +83,14 @@ impl BYOClient {
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),
-            caps_db: None,
+            learn_caps: false,
         }
     }
 
-    /// Attach the capability store so failures teach us about this model.
-    pub fn with_capability_store(mut self, db: std::sync::Arc<redb::Database>) -> Self {
-        self.caps_db = Some(db);
+    /// Enable failure-learning so a vision rejection teaches us about this model.
+    /// The verdict is recorded against the global capability store.
+    pub fn with_capability_learning(mut self, enabled: bool) -> Self {
+        self.learn_caps = enabled;
         self
     }
 
@@ -103,16 +105,16 @@ impl BYOClient {
             ),
             WireFormat::OpenAi => (Dialect::OpenAi, AuthStyle::Bearer(self.api_key.clone())),
         };
-        // When a store is attached, a failure that proves this model can't read
-        // images is recorded against `<provider>/<model>` — so the NEXT attach
-        // is warned up-front instead of spending another rejected request.
-        let observer = self.caps_db.clone().map(|db| {
+        // When learning is enabled, a failure that proves this model can't read
+        // images is recorded against `<provider>/<model>` (in the global
+        // capability store) — so the NEXT attach is warned up-front instead of
+        // spending another rejected request.
+        let observer = self.learn_caps.then(|| {
             let provider = self.provider_id.clone();
             let model = self.model.clone();
             let obs: super::wire::ErrorObserver = std::sync::Arc::new(move |err| {
                 if err.kind == super::errors::AiErrorKind::VisionUnsupported {
                     let _ = super::capability::record(
-                        &db,
                         &provider,
                         &model,
                         super::capability::Vision::Unsupported,
