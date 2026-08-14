@@ -208,6 +208,22 @@ async getModelVision() : Promise<Result<string, string>> {
 }
 },
 /**
+ * The capability-meter estimate for the currently-configured model.
+ * 
+ * Returns the stored estimate (computed on the last model/mode change). If none
+ * is stored yet — e.g. a config restored from backup, or a model chosen before
+ * this feature existed — it is computed on the fly from the config so the meter
+ * always shows something. `None` only when there is no model to score.
+ */
+async getModelPotential() : Promise<Result<Estimate | null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_model_potential") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Actively test the configured AI provider by sending one real request through
  * it. Unlike `check_ai_health` (which pings `/models` and passes even when the
  * *model name* is wrong), this exercises the full path — endpoint, auth, AND
@@ -1979,6 +1995,18 @@ gather_ms: number;
  */
 terminal_matches_workspace?: boolean }
 /**
+ * The stored estimate plus the display signals it was based on.
+ */
+export type Estimate = { tier: Tier; 
+/**
+ * e.g. "3B", "" when unknown. Display only.
+ */
+params_label: string; 
+/**
+ * e.g. "Q4", "" when unknown. Display only.
+ */
+quant_label: string }
+/**
  * One attached file, fully classified and ready to render as a chip.
  */
 export type FileAttachment = { 
@@ -2685,6 +2713,26 @@ export type ShellProfile =
  */
 "auto-accept"
 export type SnippetItem = { id: string; name: string; body: string; created_at: number; updated_at: number }
+/**
+ * A coarse capability estimate for the "AI potential meter". Filled in by the
+ * meter on a model/mode change; `None` on a record until then. Ordered weak →
+ * strong. The scoring that produces it lives in `providers::potential`; the
+ * type lives here because this is where it is stored.
+ */
+export type Tier = 
+/**
+ * Small local models (roughly < 7B). Expect simpler reasoning and misses on
+ * complex commands — the tier that surfaces the "experimental" caveat.
+ */
+"basic" | 
+/**
+ * Mid-size models (~7–30B) or a typical BYO setup. Handles most tasks.
+ */
+"capable" | 
+/**
+ * Frontier hosted models, or large local models (~30B+). No caveat.
+ */
+"full"
 /**
  * Serializable timer status sent to the frontend.
  */

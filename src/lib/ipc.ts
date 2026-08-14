@@ -25,6 +25,7 @@ import type {
 	CreditBalance,
 	DirEntry,
 	EnvironmentContext,
+	Estimate,
 	FileAttachment,
 	FilePreviewData,
 	FirebaseUser,
@@ -356,6 +357,14 @@ export type ModelVision = "supported" | "unsupported" | "unknown";
 export async function getModelVision(): Promise<ModelVision> {
 	if (!isTauri()) return "unknown";
 	return unwrap(await commands.getModelVision()) as ModelVision;
+}
+
+export type { Estimate };
+
+/** The capability-meter estimate for the current model, or null if none applies. */
+export async function getModelPotential(): Promise<Estimate | null> {
+	if (!isTauri()) return null;
+	return unwrap(await commands.getModelPotential());
 }
 
 /**

@@ -40,6 +40,10 @@ pub async fn save_ai_config(
         ai_snapshot = config.ai.clone();
     }
 
+    // Recompute the capability-meter estimate for the new model/mode and store
+    // it (keyed by provider/model). On-change only, never per render.
+    lychi_core::providers::potential::compute_and_store(&ai_snapshot);
+
     // If the user switched to (or picked a model for) local AI, warm it up now so
     // the first query isn't slow. No-op for other modes.
     AppState::warmup_local_ai(&app, &ai_snapshot);
@@ -136,6 +140,42 @@ pub async fn get_model_vision(state: State<'_, AppState>) -> Result<String, Lych
         lychi_core::providers::capability::Vision::Unknown => "unknown",
     }
     .to_string())
+}
+
+/// The capability-meter estimate for the currently-configured model.
+///
+/// Returns the stored estimate (computed on the last model/mode change). If none
+/// is stored yet — e.g. a config restored from backup, or a model chosen before
+/// this feature existed — it is computed on the fly from the config so the meter
+/// always shows something. `None` only when there is no model to score.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_model_potential(
+    state: State<'_, AppState>,
+) -> Result<Option<lychi_core::providers::capability::Estimate>, LychiError> {
+    use lychi_core::providers::potential;
+    let ai = state.config.read().await.ai.clone();
+
+    let est = tauri::async_runtime::spawn_blocking(move || {
+        let model = potential::active_model(&ai);
+        if model.trim().is_empty() && ai.mode != "cloud" {
+            return None;
+        }
+        // Prefer the stored estimate; fall back to computing it live.
+        lychi_core::providers::capability::get_estimate(&ai.provider, model).or_else(|| {
+            Some(potential::estimate(
+                &ai.mode,
+                &ai.provider,
+                model,
+                None,
+                None,
+            ))
+        })
+    })
+    .await
+    .map_err(|e| LychiError::ExecutionFailed(format!("potential lookup task panicked: {e}")))?;
+
+    Ok(est)
 }
 
 #[tauri::command]

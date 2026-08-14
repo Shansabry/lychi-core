@@ -75,6 +75,7 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::ai::get_ai_status,
         commands::ai::check_ai_health,
         commands::ai::get_model_vision,
+        commands::ai::get_model_potential,
         commands::ai::test_ai_connection,
         commands::ai::list_ollama_models,
         commands::ai::get_local_models,

@@ -15,6 +15,7 @@ import ByoFields from "./modes/ByoFields.svelte";
 import CloudPanel from "./modes/CloudPanel.svelte";
 import LocalModels from "./modes/LocalModels.svelte";
 import OllamaFields from "./modes/OllamaFields.svelte";
+import PotentialMeter from "./PotentialMeter.svelte";
 
 let {
 	aiConfig = $bindable(),
@@ -288,6 +289,13 @@ export function dismissConfirm(): boolean {
 			{testResult}
 			ontest={runConnectionTest}
 		/>
+	{/if}
+
+	<!-- Capability meter (all modes). Shows the estimated tier and, when the tier
+	     is Basic, the "experimental / expect simpler reasoning" caveat. Refreshes
+	     whenever the active model/mode changes. -->
+	{#if aiConfig.mode !== "disabled"}
+		<PotentialMeter refreshKey={`${aiConfig.mode}:${summaryModel}`} />
 	{/if}
 
 	<!-- Agent safety: how much the AI must ask before running a shell command.

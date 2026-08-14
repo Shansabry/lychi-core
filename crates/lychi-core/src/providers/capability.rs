@@ -47,13 +47,55 @@ pub enum Vision {
 
 /// A coarse capability estimate for the "AI potential meter". Filled in by the
 /// meter on a model/mode change; `None` on a record until then. Ordered weak →
-/// strong. Kept minimal here so the meter (which computes it) owns the scoring.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+/// strong. The scoring that produces it lives in `providers::potential`; the
+/// type lives here because this is where it is stored.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, specta::Type,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
+    /// Small local models (roughly < 7B). Expect simpler reasoning and misses on
+    /// complex commands — the tier that surfaces the "experimental" caveat.
     Basic,
+    /// Mid-size models (~7–30B) or a typical BYO setup. Handles most tasks.
     Capable,
+    /// Frontier hosted models, or large local models (~30B+). No caveat.
     Full,
+}
+
+impl Tier {
+    /// One notch weaker, saturating at `Basic` — penalises heavy quantization
+    /// without underflowing.
+    pub fn demote(self) -> Self {
+        match self {
+            Tier::Full => Tier::Capable,
+            Tier::Capable => Tier::Basic,
+            Tier::Basic => Tier::Basic,
+        }
+    }
+
+    /// The label shown in the meter.
+    pub fn label(self) -> &'static str {
+        match self {
+            Tier::Basic => "Basic",
+            Tier::Capable => "Capable",
+            Tier::Full => "Full",
+        }
+    }
+
+    /// Fraction of the meter to fill (1/3, 2/3, 3/3).
+    pub fn fill(self) -> f32 {
+        match self {
+            Tier::Basic => 1.0 / 3.0,
+            Tier::Capable => 2.0 / 3.0,
+            Tier::Full => 1.0,
+        }
+    }
+
+    /// Whether this tier warrants the "expect simpler reasoning" caveat banner.
+    pub fn is_low(self) -> bool {
+        self == Tier::Basic
+    }
 }
 
 /// The stored estimate plus the display signals it was based on.

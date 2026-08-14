@@ -12,6 +12,8 @@ pub mod local_download;
 /// download command + settings UI work without the `local-ai` engine feature).
 pub mod local_models;
 pub mod ollama;
+/// Heuristic capability tier ("AI potential meter") for the selected model.
+pub mod potential;
 /// Shared wire-format encoding + SSE streaming machinery for the `chat` primitive.
 mod wire;
 

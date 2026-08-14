@@ -4,7 +4,6 @@ import { onMount } from "svelte";
 import type { AiConfig, LocalModelInfo } from "$lib/ipc";
 import { deleteLocalModel, downloadLocalModel, getLocalModels } from "$lib/ipc";
 import AdvancedFields from "../AdvancedFields.svelte";
-import ExperimentalNote from "../ExperimentalNote.svelte";
 
 let {
 	aiConfig = $bindable(),
@@ -129,13 +128,6 @@ onMount(() => {
 	};
 });
 </script>
-
-<ExperimentalNote>
-	Local models run entirely on your machine, so they're smaller and less capable
-	than cloud models — expect simpler reasoning and the occasional miss on complex
-	commands. Best for private, offline use; connect a cloud or API-key model for
-	the full Lychi experience.
-</ExperimentalNote>
 
 <div class="section-label">Models</div>
 <div class="cards">
