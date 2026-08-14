@@ -362,8 +362,7 @@ impl AppState {
 
         // Log DB table stats
         if let Ok(stats) = lychi_core::db::table_stats(&db) {
-            let total = stats.history
-                + stats.notes
+            let total = stats.notes
                 + stats.todos
                 + stats.clipboard
                 + stats.settings
@@ -372,8 +371,7 @@ impl AppState {
                 + stats.reminders
                 + stats.snippets;
             tracing::info!(
-                "DB tables: {} history, {} notes, {} todos, {} clipboard, {} settings, {} frecency, {} aliases, {} reminders, {} snippets ({} total rows, {:.1} KB on disk)",
-                stats.history,
+                "DB tables: {} notes, {} todos, {} clipboard, {} settings, {} frecency, {} aliases, {} reminders, {} snippets ({} total rows, {:.1} KB on disk)",
                 stats.notes,
                 stats.todos,
                 stats.clipboard,

@@ -62,7 +62,7 @@ fn get(db: &Arc<Database>, table: TableDefinition<&str, &[u8]>, k: &str) -> Opti
 fn round_trip_restores_every_row() {
     let sb = Sandbox::new("roundtrip");
     let db = test_db(&sb);
-    put(&db, crate::db::HISTORY, "h1", b"one");
+    put(&db, crate::db::TODOS, "h1", b"one");
     put(&db, crate::db::NOTES, "n1", b"a note");
     put(&db, crate::db::CLIPBOARD, "c1", b"a clip");
 
@@ -73,19 +73,19 @@ fn round_trip_restores_every_row() {
     {
         let txn = db.begin_write().unwrap();
         {
-            let mut t = txn.open_table(crate::db::HISTORY).unwrap();
+            let mut t = txn.open_table(crate::db::TODOS).unwrap();
             t.retain(|_, _| false).unwrap();
             let mut t = txn.open_table(crate::db::NOTES).unwrap();
             t.retain(|_, _| false).unwrap();
         }
         txn.commit().unwrap();
     }
-    assert!(get(&db, crate::db::HISTORY, "h1").is_none());
+    assert!(get(&db, crate::db::TODOS, "h1").is_none());
 
     let report = restore(&db, Path::new(&info.path), "0.1.0").unwrap();
     assert!(report.rows_restored >= 3);
     assert_eq!(
-        get(&db, crate::db::HISTORY, "h1").as_deref(),
+        get(&db, crate::db::TODOS, "h1").as_deref(),
         Some(&b"one"[..])
     );
     assert_eq!(
@@ -103,15 +103,15 @@ fn round_trip_restores_every_row() {
 fn restore_snapshots_the_state_it_replaces() {
     let sb = Sandbox::new("safety");
     let db = test_db(&sb);
-    put(&db, crate::db::HISTORY, "old", b"original");
+    put(&db, crate::db::TODOS, "old", b"original");
     let first = create(&db, BackupKind::Manual, "first", "0.1.0").unwrap();
 
     // Move on to a different state, then go back to the first backup.
-    put(&db, crate::db::HISTORY, "new", b"later");
+    put(&db, crate::db::TODOS, "new", b"later");
     let report = restore(&db, Path::new(&first.path), "0.1.0").unwrap();
 
     // The "later" row is gone from live data...
-    assert!(get(&db, crate::db::HISTORY, "new").is_none());
+    assert!(get(&db, crate::db::TODOS, "new").is_none());
     // ...but recoverable from the safety backup the restore took.
     let safety = list()
         .into_iter()
@@ -119,7 +119,7 @@ fn restore_snapshots_the_state_it_replaces() {
         .expect("safety backup should be listed");
     restore(&db, Path::new(&safety.path), "0.1.0").unwrap();
     assert_eq!(
-        get(&db, crate::db::HISTORY, "new").as_deref(),
+        get(&db, crate::db::TODOS, "new").as_deref(),
         Some(&b"later"[..])
     );
 }
@@ -129,18 +129,18 @@ fn restore_snapshots_the_state_it_replaces() {
 fn restore_replaces_rather_than_merges() {
     let sb = Sandbox::new("replace");
     let db = test_db(&sb);
-    put(&db, crate::db::HISTORY, "kept", b"in backup");
+    put(&db, crate::db::TODOS, "kept", b"in backup");
     let info = create(&db, BackupKind::Manual, "t", "0.1.0").unwrap();
 
-    put(&db, crate::db::HISTORY, "extra", b"added after");
+    put(&db, crate::db::TODOS, "extra", b"added after");
     restore(&db, Path::new(&info.path), "0.1.0").unwrap();
 
     assert_eq!(
-        get(&db, crate::db::HISTORY, "kept").as_deref(),
+        get(&db, crate::db::TODOS, "kept").as_deref(),
         Some(&b"in backup"[..])
     );
     assert!(
-        get(&db, crate::db::HISTORY, "extra").is_none(),
+        get(&db, crate::db::TODOS, "extra").is_none(),
         "a row not in the backup must not survive a replace-restore"
     );
 }
@@ -150,7 +150,7 @@ fn restore_replaces_rather_than_merges() {
 fn a_truncated_archive_is_refused_and_changes_nothing() {
     let sb = Sandbox::new("truncated");
     let db = test_db(&sb);
-    put(&db, crate::db::HISTORY, "live", b"precious");
+    put(&db, crate::db::TODOS, "live", b"precious");
     let info = create(&db, BackupKind::Manual, "t", "0.1.0").unwrap();
 
     // Chop the archive in half.
@@ -163,7 +163,7 @@ fn a_truncated_archive_is_refused_and_changes_nothing() {
 
     // Live data intact, and no safety backup was taken — we failed before it.
     assert_eq!(
-        get(&db, crate::db::HISTORY, "live").as_deref(),
+        get(&db, crate::db::TODOS, "live").as_deref(),
         Some(&b"precious"[..])
     );
     assert_eq!(
@@ -178,7 +178,7 @@ fn a_truncated_archive_is_refused_and_changes_nothing() {
 fn a_newer_backup_is_refused() {
     let sb = Sandbox::new("newer");
     let db = test_db(&sb);
-    put(&db, crate::db::HISTORY, "x", b"y");
+    put(&db, crate::db::TODOS, "x", b"y");
     let info = create(&db, BackupKind::Manual, "t", "9.9.9").unwrap();
 
     let err = restore(&db, Path::new(&info.path), "0.1.0");
@@ -346,7 +346,7 @@ fn path_traversal_in_an_archive_is_refused() {
 fn pruning_keeps_manual_backups() {
     let sb = Sandbox::new("prune");
     let db = test_db(&sb);
-    put(&db, crate::db::HISTORY, "k", b"v");
+    put(&db, crate::db::TODOS, "k", b"v");
 
     let manual = create(&db, BackupKind::Manual, "keep me", "0.1.0").unwrap();
     for i in 0..(AUTO_RETAIN + 4) {
@@ -384,7 +384,7 @@ fn delete_refuses_paths_outside_the_backups_dir() {
 fn list_is_newest_first() {
     let sb = Sandbox::new("order");
     let db = test_db(&sb);
-    put(&db, crate::db::HISTORY, "k", b"v");
+    put(&db, crate::db::TODOS, "k", b"v");
     for i in 0..3 {
         create(&db, BackupKind::Manual, &format!("b{i}"), "0.1.0").unwrap();
     }
@@ -477,7 +477,7 @@ fn an_upgrade_snapshots_the_old_version_first() {
     let sb = Sandbox::new("upgrade");
     let db = test_db(&sb);
     backup_if_upgraded(&db, "0.1.0");
-    put(&db, crate::db::HISTORY, "pre", b"data from 0.1.0");
+    put(&db, crate::db::TODOS, "pre", b"data from 0.1.0");
 
     let taken = backup_if_upgraded(&db, "0.2.0").expect("an upgrade must take a backup");
     let m = taken.manifest.as_ref().unwrap();
@@ -496,14 +496,14 @@ fn an_upgrade_snapshots_the_old_version_first() {
     {
         let txn = db.begin_write().unwrap();
         {
-            let mut t = txn.open_table(crate::db::HISTORY).unwrap();
+            let mut t = txn.open_table(crate::db::TODOS).unwrap();
             t.retain(|_, _| false).unwrap();
         }
         txn.commit().unwrap();
     }
     restore(&db, Path::new(&taken.path), "0.2.0").unwrap();
     assert_eq!(
-        get(&db, crate::db::HISTORY, "pre").as_deref(),
+        get(&db, crate::db::TODOS, "pre").as_deref(),
         Some(&b"data from 0.1.0"[..])
     );
 }
@@ -513,7 +513,7 @@ fn an_upgrade_snapshots_the_old_version_first() {
 fn the_hourly_backup_replaces_the_previous_one() {
     let sb = Sandbox::new("hourly");
     let db = test_db(&sb);
-    put(&db, crate::db::HISTORY, "k", b"v");
+    put(&db, crate::db::TODOS, "k", b"v");
 
     let first = hourly_backup(&db, "0.1.0").expect("first run must back up");
     // Force the interval to have elapsed.
@@ -542,7 +542,7 @@ fn the_hourly_backup_replaces_the_previous_one() {
 fn a_second_summon_within_the_hour_does_nothing() {
     let sb = Sandbox::new("interval");
     let db = test_db(&sb);
-    put(&db, crate::db::HISTORY, "k", b"v");
+    put(&db, crate::db::TODOS, "k", b"v");
 
     assert!(hourly_backup(&db, "0.1.0").is_some());
     assert!(
@@ -557,7 +557,7 @@ fn a_second_summon_within_the_hour_does_nothing() {
 fn the_rolling_refresh_spares_upgrade_and_manual_backups() {
     let sb = Sandbox::new("spare");
     let db = test_db(&sb);
-    put(&db, crate::db::HISTORY, "k", b"v");
+    put(&db, crate::db::TODOS, "k", b"v");
 
     let manual = create(&db, BackupKind::Manual, "keep me", "0.1.0").unwrap();
     let upgrade = create(
@@ -593,7 +593,7 @@ fn the_rolling_refresh_spares_upgrade_and_manual_backups() {
 fn a_backwards_clock_does_not_cause_a_backup_storm() {
     let sb = Sandbox::new("clock");
     let db = test_db(&sb);
-    put(&db, crate::db::HISTORY, "k", b"v");
+    put(&db, crate::db::TODOS, "k", b"v");
 
     hourly_backup(&db, "0.1.0").unwrap();
     // "Last backup" in the future — what a backwards clock jump looks like.

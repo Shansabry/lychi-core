@@ -1,23 +1,42 @@
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
-use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata};
+use redb::Database;
+use serde::{Deserialize, Serialize};
 
 use crate::action_registry::CompletionItem;
-use crate::db::{
-    self, frecency,
-    schema::{HistoryEntry, SYNC_LOCAL},
-};
+use crate::db::frecency;
 use crate::error::LychiError;
+use crate::filestore::JsonlLog;
 
 /// Cached nucleo matcher for history fuzzy search.
 static MATCHER: Mutex<Option<Matcher>> = Mutex::new(None);
 
+/// One command in the history log. Just the command text — command history is a
+/// device-local usage record, not portable content, so it needs no sync/tombstone
+/// bookkeeping (the redb version's `deleted_at`/`sync_status` are gone: `clear`
+/// unlinks the file, so there is nothing to soft-delete).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoryRecord {
+    command: String,
+}
+
+/// Command history, an append-only JSONL log (newest last) at
+/// [`crate::paths::history_file`].
+///
+/// Device-local usage data, not user-authored content, so it lives in a file,
+/// not the database. Ordering is file order; `push` dedups (removes a prior
+/// occurrence so a repeat moves to the end) and caps to `max_entries` by
+/// rewriting the log — cheap at the 500-entry ceiling. `clear` unlinks the file,
+/// which actually reclaims the disk (the old soft-delete left every command the
+/// user had ever typed sitting in the database, merely hidden — a privacy bug).
 #[derive(Clone)]
 pub struct HistoryStore {
     max_entries: usize,
     deduplicate: bool,
+    path: PathBuf,
 }
 
 impl HistoryStore {
@@ -25,110 +44,100 @@ impl HistoryStore {
         Self {
             max_entries,
             deduplicate,
+            path: crate::paths::history_file(),
         }
     }
 
-    pub fn push(&self, db: &Arc<Database>, entry: &str) -> Result<(), LychiError> {
+    /// Store backed by an explicit file — for tests, so they never touch the real
+    /// history file or race each other.
+    #[cfg(test)]
+    fn with_path(max_entries: usize, deduplicate: bool, path: PathBuf) -> Self {
+        Self {
+            max_entries,
+            deduplicate,
+            path,
+        }
+    }
+
+    fn log(&self) -> JsonlLog {
+        JsonlLog::new(self.path.clone())
+    }
+
+    /// Append a command. Dedups (drops any prior identical command so the repeat
+    /// moves to the end) and caps to `max_entries`, rewriting the log when either
+    /// removes something. A blank command is ignored.
+    pub fn push(&self, entry: &str) -> Result<(), LychiError> {
         let entry = entry.trim();
         if entry.is_empty() {
             return Ok(());
         }
+        let log = self.log();
+        let mut records: Vec<HistoryRecord> = log.load()?;
+        let new_record = HistoryRecord {
+            command: entry.to_string(),
+        };
 
-        let txn = db.begin_write()?;
-        {
-            let mut table = txn.open_table(db::HISTORY)?;
+        // Dedup: remove any earlier occurrence so the repeat becomes the newest.
+        let removed_a_duplicate = if self.deduplicate {
+            let before = records.len();
+            records.retain(|r| r.command != entry);
+            records.len() != before
+        } else {
+            false
+        };
+        records.push(new_record.clone());
 
-            if self.deduplicate {
-                // REMOVE the previous occurrence rather than tombstoning it.
-                // A tombstone stays in the table forever and is deserialized by
-                // every later scan, so dedup was making the thing it scans grow.
-                let mut to_delete = Vec::new();
-                for result in table.iter()? {
-                    let (key, val) = result?;
-                    // One unreadable row must not hide the rest of the list.
-                    let Some(existing) =
-                        db::decode_row::<HistoryEntry>("history", key.value(), val.value())
-                    else {
-                        continue;
-                    };
-                    if existing.command == entry {
-                        to_delete.push(key.value().to_string());
-                    }
-                }
-                for key in &to_delete {
-                    table.remove(key.as_str())?;
-                }
-            }
+        // Cap: keep the newest `max_entries` (a `max_entries` of 0 means unbounded,
+        // matching the redb store, which only trimmed when `len > max_entries`).
+        let trimmed = if self.max_entries > 0 && records.len() > self.max_entries {
+            let excess = records.len() - self.max_entries;
+            records.drain(0..excess);
+            true
+        } else {
+            false
+        };
 
-            // Insert new entry with UUID v7 key (time-ordered)
-            let id = db::new_id();
-            let data = HistoryEntry {
-                command: entry.to_string(),
-                deleted_at: None,
-                sync_status: SYNC_LOCAL,
-            };
-            let bytes = crate::db::encode_row(&data)?;
-            table.insert(id.as_str(), bytes.as_slice())?;
-
-            // Enforce max entries by soft-deleting oldest
-            self.enforce_max(&mut table)?;
+        // Fast path — a single append — is valid ONLY when the on-disk log already
+        // equals `records` minus the new tail: i.e. nothing was removed (no dedup
+        // hit, no trim). Otherwise the file and the in-memory list have diverged
+        // and the whole log must be rewritten. (A wrong fast-path append here left
+        // trimmed/duplicate rows on disk — the `max_entries_enforced` failure.)
+        if !removed_a_duplicate && !trimmed {
+            log.append(&new_record)?;
+        } else {
+            log.rewrite(&records)?;
         }
-        txn.commit()?;
         Ok(())
     }
 
-    pub fn entries(&self, db: &Arc<Database>) -> Result<Vec<String>, LychiError> {
-        let txn = db.begin_read()?;
-        let table = txn.open_table(db::HISTORY)?;
-        let mut entries = Vec::new();
-        for result in table.iter()? {
-            let (_, val) = result?;
-            // One unreadable row must not hide the rest of the list.
-            let Some(entry) = db::decode_row::<HistoryEntry>("history", "?", val.value()) else {
-                continue;
-            };
-            // Still checked although nothing writes tombstones any more: an
-            // existing database carries whatever the old soft-delete wrote until
-            // `purge_tombstones` runs at startup, and a deleted command must not
-            // reappear in the list in the meantime.
-            if entry.deleted_at.is_none() {
-                entries.push(entry.command);
-            }
-        }
-        Ok(entries)
+    /// All commands, oldest → newest (file order).
+    pub fn entries(&self) -> Result<Vec<String>, LychiError> {
+        Ok(self
+            .log()
+            .load::<HistoryRecord>()?
+            .into_iter()
+            .map(|r| r.command)
+            .collect())
     }
 
-    /// Delete every history entry.
-    ///
-    /// Actually deletes. This used to tombstone, which meant "clear history"
-    /// left every command the user had ever typed sitting in the database,
-    /// merely hidden from the list — the opposite of what the action promises,
-    /// and a privacy failure rather than a performance one (C6).
-    pub fn clear(&self, db: &Arc<Database>) -> Result<(), LychiError> {
-        let txn = db.begin_write()?;
-        {
-            let mut table = txn.open_table(db::HISTORY)?;
-            let keys: Vec<String> = table
-                .iter()?
-                .map(|r| r.map(|(k, _)| k.value().to_string()))
-                .collect::<Result<_, _>>()?;
-            for key in keys {
-                table.remove(key.as_str())?;
-            }
-        }
-        txn.commit()?;
-        Ok(())
+    /// Delete every history entry by unlinking the file — the data is actually
+    /// gone, not merely hidden.
+    pub fn clear(&self) -> Result<(), LychiError> {
+        self.log().clear()
     }
 
     /// Fuzzy-search history entries against `query`, blended with frecency scores.
     /// Returns up to 5 `CompletionItem`s sorted by blended score (descending).
+    ///
+    /// Still takes the database because frecency scores live in redb; when
+    /// frecency also moves to a file this argument goes away.
     pub fn fuzzy_search(&self, db: &Arc<Database>, query: &str) -> Vec<CompletionItem> {
         let query = query.trim();
         if query.is_empty() {
             return Vec::new();
         }
 
-        let entries = match self.entries(db) {
+        let entries = match self.entries() {
             Ok(e) => e,
             Err(_) => return Vec::new(),
         };
@@ -202,249 +211,121 @@ impl HistoryStore {
         let mut guard = MATCHER.lock().unwrap();
         guard.get_or_insert_with(|| Matcher::new(Config::DEFAULT));
     }
-
-    /// Delete tombstones left by earlier versions.
-    ///
-    /// Until 2026-08-05 this store soft-deleted: rows were marked `deleted_at`
-    /// and kept forever, and every push deserialized all of them. Measured on a
-    /// fresh database, push cost grew linearly — 6.5ms at 500 commands, 35ms at
-    /// 3000, extrapolating to 116ms at 10k — while the live set stayed at 500.
-    ///
-    /// New writes no longer create tombstones, but an existing database still
-    /// carries whatever the old code wrote, so it would keep paying. Runs once
-    /// at startup; on a database with none it is a single scan and no writes.
-    pub fn purge_tombstones(&self, db: &Arc<Database>) -> Result<usize, LychiError> {
-        let txn = db.begin_write()?;
-        let removed = {
-            let mut table = txn.open_table(db::HISTORY)?;
-            let doomed: Vec<String> = table
-                .iter()?
-                .filter_map(|r| {
-                    let (key, val) = r.ok()?;
-                    let entry: HistoryEntry = crate::db::decode_value(val.value()).ok()?;
-                    entry.deleted_at.map(|_| key.value().to_string())
-                })
-                .collect();
-            for key in &doomed {
-                table.remove(key.as_str())?;
-            }
-            doomed.len()
-        };
-        txn.commit()?;
-        if removed > 0 {
-            tracing::info!("[history] purged {removed} tombstones from earlier versions");
-        }
-        Ok(removed)
-    }
-
-    /// Trim the table to `max_entries`, deleting the oldest.
-    ///
-    /// Keys are UUID v7, which sort in creation order, so `table.len()` and the
-    /// iteration order are enough — no deserialization is needed to decide what
-    /// goes. That matters: this used to deserialize every row on every push.
-    fn enforce_max(&self, table: &mut redb::Table<&str, &[u8]>) -> Result<(), LychiError> {
-        let len = table.len()? as usize;
-        if len <= self.max_entries {
-            return Ok(());
-        }
-        let excess = len - self.max_entries;
-        // Oldest first, by key order. Collected before removing because the
-        // iterator borrows the table.
-        let doomed: Vec<String> = table
-            .iter()?
-            .take(excess)
-            .map(|r| r.map(|(k, _)| k.value().to_string()))
-            .collect::<Result<_, _>>()?;
-        for key in doomed {
-            table.remove(key.as_str())?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::open_test_database;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Measures how `push` scales as tombstones accumulate. Ignored: it is a
-    /// measurement, not an assertion.
-    ///
-    ///     cargo test -p lychi-core --lib history -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn measure_push_cost_as_tombstones_accumulate() {
-        let db = open_test_database();
-        let store = HistoryStore::new(500, true);
-        let t0 = std::time::Instant::now();
-        for i in 0..3000 {
-            store.push(&db, &format!("cmd {i}")).unwrap();
-            if (i + 1) % 500 == 0 {
-                let t = std::time::Instant::now();
-                store.push(&db, "probe command").unwrap();
-                let live = store.entries(&db).unwrap().len();
-                println!(
-                    "  after {:>5} pushes: one push = {:>7}us   live entries = {}",
-                    i + 1,
-                    t.elapsed().as_micros(),
-                    live
-                );
-            }
-        }
-        println!("  total for 3000 pushes: {:?}", t0.elapsed());
-    }
-
-    /// The bug: history soft-deleted, so the table only ever grew and every
-    /// push deserialized all of it. Measured before the fix, push cost rose
-    /// linearly (6.5ms at 500 commands, 35ms at 3000) while the live set stayed
-    /// at 500. This asserts the table itself stays bounded, which is what makes
-    /// the cost flat.
-    #[test]
-    fn the_table_stays_bounded_not_just_the_live_set() {
-        let db = open_test_database();
-        let store = HistoryStore::new(10, true);
-        for i in 0..200 {
-            store.push(&db, &format!("cmd {i}")).unwrap();
-        }
-        let txn = db.begin_read().unwrap();
-        let rows = txn.open_table(db::HISTORY).unwrap().len().unwrap() as usize;
-        assert!(
-            rows <= 10,
-            "table holds {rows} rows for a 10-entry limit — tombstones are back"
-        );
-        assert_eq!(store.entries(&db).unwrap().len(), 10);
-    }
-
-    /// Dedup must REMOVE the previous occurrence, not tombstone it. Tombstoning
-    /// meant repeating a command grew the table it scans.
-    #[test]
-    fn dedup_does_not_grow_the_table() {
-        let db = open_test_database();
-        let store = HistoryStore::new(500, true);
-        for _ in 0..50 {
-            store.push(&db, "same command").unwrap();
-        }
-        let txn = db.begin_read().unwrap();
-        let rows = txn.open_table(db::HISTORY).unwrap().len().unwrap() as usize;
-        assert_eq!(rows, 1, "50 pushes of one command left {rows} rows");
-    }
-
-    /// **Privacy, not performance.** `clear` used to tombstone, so "clear
-    /// history" left every command the user had typed in the database, merely
-    /// hidden from the list. Clearing must actually delete (C6).
-    #[test]
-    fn clear_actually_deletes_the_data() {
-        let db = open_test_database();
-        let store = HistoryStore::new(500, true);
-        store.push(&db, "something private").unwrap();
-        store.clear(&db).unwrap();
-
-        assert!(store.entries(&db).unwrap().is_empty());
-        let txn = db.begin_read().unwrap();
-        let rows = txn.open_table(db::HISTORY).unwrap().len().unwrap() as usize;
-        assert_eq!(
-            rows, 0,
-            "cleared history left {rows} rows on disk — the data is still there"
-        );
-    }
-
-    /// An existing database carries tombstones the old code wrote; the purge
-    /// removes them without touching live rows.
-    #[test]
-    fn purge_removes_legacy_tombstones_only() {
-        let db = open_test_database();
-        let store = HistoryStore::new(500, true);
-        store.push(&db, "keep me").unwrap();
-
-        // Hand-write a tombstone the way the old code did.
-        {
-            let txn = db.begin_write().unwrap();
-            {
-                let mut t = txn.open_table(db::HISTORY).unwrap();
-                let e = HistoryEntry {
-                    command: "old deleted".into(),
-                    deleted_at: Some(1),
-                    sync_status: SYNC_LOCAL,
-                };
-                let bytes = crate::db::encode_row(&e).unwrap();
-                t.insert(db::new_id().as_str(), bytes.as_slice()).unwrap();
-            }
-            txn.commit().unwrap();
-        }
-
-        assert_eq!(store.purge_tombstones(&db).unwrap(), 1);
-        assert_eq!(store.entries(&db).unwrap(), vec!["keep me"]);
-        assert_eq!(
-            store.purge_tombstones(&db).unwrap(),
-            0,
-            "must be idempotent"
-        );
+    fn store(max_entries: usize, deduplicate: bool) -> HistoryStore {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "lychi_history_test_{}_{}.jsonl",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        HistoryStore::with_path(max_entries, deduplicate, path)
     }
 
     #[test]
     fn push_and_retrieve() {
-        let db = open_test_database();
-        let store = HistoryStore::new(500, true);
-        store.push(&db, "web rust").unwrap();
-        store.push(&db, "open firefox").unwrap();
-        let entries = store.entries(&db).unwrap();
-        assert_eq!(entries, vec!["web rust", "open firefox"]);
+        let store = store(500, true);
+        store.push("web rust").unwrap();
+        store.push("open firefox").unwrap();
+        assert_eq!(store.entries().unwrap(), vec!["web rust", "open firefox"]);
+        store.clear().unwrap();
+    }
+
+    #[test]
+    fn deduplication_moves_repeat_to_the_end() {
+        let store = store(500, true);
+        store.push("web rust").unwrap();
+        store.push("open firefox").unwrap();
+        store.push("web rust").unwrap();
+        assert_eq!(store.entries().unwrap(), vec!["open firefox", "web rust"]);
+        store.clear().unwrap();
+    }
+
+    #[test]
+    fn dedup_keeps_the_file_bounded() {
+        // 50 pushes of one command must leave exactly one record, not grow the
+        // file (the redb version's tombstones made the repeated-command case grow
+        // the very thing every read scans).
+        let store = store(500, true);
+        for _ in 0..50 {
+            store.push("same command").unwrap();
+        }
+        assert_eq!(store.entries().unwrap(), vec!["same command"]);
+        assert_eq!(store.log().approx_len().unwrap(), 1);
+        store.clear().unwrap();
+    }
+
+    #[test]
+    fn max_entries_enforced() {
+        let store = store(3, false);
+        store.push("a").unwrap();
+        store.push("b").unwrap();
+        store.push("c").unwrap();
+        store.push("d").unwrap();
+        assert_eq!(store.entries().unwrap(), vec!["b", "c", "d"]);
+        store.clear().unwrap();
+    }
+
+    #[test]
+    fn the_file_stays_bounded_not_just_the_live_set() {
+        // Push far more than the cap; the on-disk record count must stay at the
+        // cap, so read cost stays flat.
+        let store = store(10, true);
+        for i in 0..200 {
+            store.push(&format!("cmd {i}")).unwrap();
+        }
+        assert_eq!(store.entries().unwrap().len(), 10);
+        assert!(
+            store.log().approx_len().unwrap() <= 10,
+            "file holds {} records for a 10-entry limit",
+            store.log().approx_len().unwrap()
+        );
+        store.clear().unwrap();
+    }
+
+    #[test]
+    fn clear_actually_deletes_the_data() {
+        // Privacy: clear must remove the file, not hide entries. After clear, the
+        // backing file is gone (nothing left on disk to recover).
+        let store = store(500, true);
+        store.push("something private").unwrap();
+        assert!(store.path.exists());
+        store.clear().unwrap();
+        assert!(store.entries().unwrap().is_empty());
+        assert!(
+            !store.path.exists(),
+            "cleared history left the file on disk"
+        );
+    }
+
+    #[test]
+    fn blank_commands_are_ignored() {
+        let store = store(500, true);
+        store.push("   ").unwrap();
+        store.push("").unwrap();
+        assert!(store.entries().unwrap().is_empty());
+        store.clear().unwrap();
     }
 
     #[test]
     fn fuzzy_search_sets_run_to_full_command() {
         let db = open_test_database();
-        let store = HistoryStore::new(500, true);
-        store.push(&db, "run htop").unwrap();
+        let store = store(500, true);
+        store.push("run htop").unwrap();
         let items = store.fuzzy_search(&db, "run htop");
         assert!(!items.is_empty());
         // The label is the past command, and `run` carries it verbatim so the
         // frontend dispatches it as-is (never re-prefixed into "run run htop").
         assert_eq!(items[0].label, "run htop");
         assert_eq!(items[0].run.as_deref(), Some("run htop"));
-    }
-
-    #[test]
-    fn deduplication() {
-        let db = open_test_database();
-        let store = HistoryStore::new(500, true);
-        store.push(&db, "web rust").unwrap();
-        store.push(&db, "open firefox").unwrap();
-        store.push(&db, "web rust").unwrap();
-        let entries = store.entries(&db).unwrap();
-        assert_eq!(entries, vec!["open firefox", "web rust"]);
-    }
-
-    #[test]
-    fn max_entries_enforced() {
-        let db = open_test_database();
-        let store = HistoryStore::new(3, false);
-        store.push(&db, "a").unwrap();
-        store.push(&db, "b").unwrap();
-        store.push(&db, "c").unwrap();
-        store.push(&db, "d").unwrap();
-        let entries = store.entries(&db).unwrap();
-        assert_eq!(entries, vec!["b", "c", "d"]);
-    }
-
-    #[test]
-    fn clear_history() {
-        let db = open_test_database();
-        let store = HistoryStore::new(500, true);
-        store.push(&db, "web rust").unwrap();
-        store.push(&db, "open firefox").unwrap();
-        store.clear(&db).unwrap();
-        let entries = store.entries(&db).unwrap();
-        assert!(entries.is_empty());
-    }
-
-    #[test]
-    fn empty_entry_ignored() {
-        let db = open_test_database();
-        let store = HistoryStore::new(500, true);
-        store.push(&db, "").unwrap();
-        store.push(&db, "   ").unwrap();
-        let entries = store.entries(&db).unwrap();
-        assert!(entries.is_empty());
+        store.clear().unwrap();
     }
 }

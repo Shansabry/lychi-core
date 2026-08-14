@@ -31,7 +31,7 @@ impl ClearHandler {
 
     fn clear_history(&self) -> Result<(), LychiError> {
         // Constructor args (limit/dedup) don't affect clearing.
-        HistoryStore::new(0, false).clear(&self.db)
+        HistoryStore::new(0, false).clear()
     }
 
     fn clear_clipboard(&self) -> Result<(), LychiError> {

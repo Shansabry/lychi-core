@@ -56,6 +56,12 @@ pub fn ai_history_dir() -> PathBuf {
     data_dir().join("ai_history")
 }
 
+/// Command history — a JSONL log of past commands (device-local usage record,
+/// not portable user content). Newest-last, deduped, capped.
+pub fn history_file() -> PathBuf {
+    data_dir().join("history.jsonl")
+}
+
 /// Where backup archives live. Inside the data dir so a user copying that one
 /// directory takes their backups with them, but excluded from the archive
 /// itself so backups never nest.

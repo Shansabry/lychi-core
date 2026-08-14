@@ -11,15 +11,6 @@ pub type SyncStatus = u8;
 pub const SYNC_LOCAL: SyncStatus = 0;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct HistoryEntry {
-    pub command: String,
-    #[serde(default)]
-    pub deleted_at: Option<u64>,
-    #[serde(default)]
-    pub sync_status: SyncStatus,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NoteEntry {
     pub text: String,
     pub created_at: u64,

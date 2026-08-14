@@ -323,7 +323,7 @@ async fn finalize_exec(
     // the launch worked even if the program later exits non-zero.) Confirmation
     // prompts returned early above, so they're recorded on the confirmed re-run.
     if dto.success {
-        let _ = state.history.push(&state.db, input);
+        let _ = state.history.push(input);
     }
 
     Ok(dto)

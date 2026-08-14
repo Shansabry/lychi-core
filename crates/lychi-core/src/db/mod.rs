@@ -8,9 +8,6 @@ use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, Tab
 
 use crate::error::LychiError;
 
-/// History: key = UUID v7 string (time-ordered), value = postcard-serialized HistoryEntry.
-pub const HISTORY: TableDefinition<&str, &[u8]> = TableDefinition::new("history");
-
 /// Notes: key = UUID v7 string, value = postcard-serialized NoteEntry.
 pub const NOTES: TableDefinition<&str, &[u8]> = TableDefinition::new("notes");
 
@@ -74,8 +71,7 @@ pub const SCHEMA_VERSION: u8 = 1;
 
 /// Every enveloped table — the migration and any future whole-table rewrite
 /// iterate this list, so a new table added here is versioned from birth.
-pub(crate) const ENVELOPED_TABLES: [&str; 11] = [
-    "history",
+pub(crate) const ENVELOPED_TABLES: [&str; 10] = [
     "notes",
     "todos",
     "clipboard",
@@ -238,7 +234,6 @@ pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
 
     // Ensure all tables exist by opening them in a write transaction.
     let txn = db.begin_write()?;
-    txn.open_table(HISTORY)?;
     txn.open_table(NOTES)?;
     txn.open_table(TODOS)?;
     txn.open_table(CLIPBOARD)?;
@@ -486,7 +481,6 @@ fn sweep_stale_test_databases() {
 
 /// Row counts for each table (includes soft-deleted rows).
 pub struct TableStats {
-    pub history: u64,
     pub notes: u64,
     pub todos: u64,
     pub clipboard: u64,
@@ -501,7 +495,6 @@ pub struct TableStats {
 pub fn table_stats(db: &Arc<Database>) -> Result<TableStats, LychiError> {
     let txn = db.begin_read()?;
     Ok(TableStats {
-        history: txn.open_table(HISTORY)?.len()?,
         notes: txn.open_table(NOTES)?.len()?,
         todos: txn.open_table(TODOS)?.len()?,
         clipboard: txn.open_table(CLIPBOARD)?.len()?,
@@ -812,7 +805,7 @@ mod stale_artifact_tests {
         {
             let txn = first.begin_write().unwrap();
             {
-                let mut t = txn.open_table(HISTORY).unwrap();
+                let mut t = txn.open_table(NOTES).unwrap();
                 t.insert("row-1", b"user data".as_slice()).unwrap();
             }
             txn.commit().unwrap();
@@ -831,7 +824,7 @@ mod stale_artifact_tests {
 
         // And the first instance still sees its row.
         let txn = first.begin_read().unwrap();
-        let t = txn.open_table(HISTORY).unwrap();
+        let t = txn.open_table(NOTES).unwrap();
         assert!(t.get("row-1").unwrap().is_some(), "user data survived");
 
         drop(t);
