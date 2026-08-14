@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use redb::{ReadableDatabase, ReadableTable};
 use serde::Serialize;
 
 use crate::action_registry::{
@@ -127,10 +126,26 @@ impl Timer {
     }
 }
 
-/// Persist the entire timer map to redb (called after every mutation). Timers
-/// are few and small, so a full rewrite each time is simplest and cheap.
-pub fn persist_timers(state: &TimerState, db: &Arc<redb::Database>) {
-    let snapshot: Vec<(String, crate::db::schema::TimerEntry)> = {
+/// One persisted timer: its id plus its wall-clock state. The on-disk record for
+/// the timers file (JSON). `TimerEntry` already round-trips the reconstruction
+/// math; this just pairs it with the id that was the redb key.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedTimer {
+    id: String,
+    entry: crate::db::schema::TimerEntry,
+}
+
+/// Persist the entire timer map to the timers file (called after every
+/// mutation). Timers are few and small, so a full atomic rewrite each time is
+/// simplest and cheap — the file-store `snapshot` gives crash-safe all-or-nothing
+/// writes. Device-local state, so it lives in a file, not the user-data DB.
+pub fn persist_timers(state: &TimerState) {
+    persist_timers_to(state, &crate::paths::timers_file());
+}
+
+/// Persist to an explicit path — the testable core of [`persist_timers`].
+fn persist_timers_to(state: &TimerState, path: &std::path::Path) {
+    let snapshot: Vec<PersistedTimer> = {
         let Ok(timers) = state.lock() else {
             return;
         };
@@ -138,31 +153,14 @@ pub fn persist_timers(state: &TimerState, db: &Arc<redb::Database>) {
             .iter()
             // Don't persist already-completed timers (they're about to be removed).
             .filter(|(_, t)| !t.completed)
-            .map(|(id, t)| (id.clone(), t.to_entry()))
+            .map(|(id, t)| PersistedTimer {
+                id: id.clone(),
+                entry: t.to_entry(),
+            })
             .collect()
     };
 
-    let write = || -> Result<(), LychiError> {
-        let txn = db.begin_write()?;
-        {
-            let mut table = txn.open_table(crate::db::TIMERS)?;
-            // Clear then rewrite: collect existing keys, remove, insert current.
-            let existing: Vec<String> = table
-                .iter()?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_string()))
-                .collect();
-            for k in existing {
-                table.remove(k.as_str())?;
-            }
-            for (id, entry) in &snapshot {
-                let bytes = crate::db::encode_row(entry)?;
-                table.insert(id.as_str(), bytes.as_slice())?;
-            }
-        }
-        txn.commit()?;
-        Ok(())
-    };
-    if let Err(e) = write() {
+    if let Err(e) = crate::filestore::snapshot(path, &snapshot) {
         tracing::warn!("[timer] failed to persist timers: {e}");
     }
 }
@@ -171,32 +169,27 @@ pub fn persist_timers(state: &TimerState, db: &Arc<redb::Database>) {
 /// already completed while the app was closed are dropped (a fire-on-boot could
 /// be added later, but silently dropping a long-expired timer is the safer
 /// default than a surprise notification for something the user forgot).
-pub fn load_timers(db: &Arc<redb::Database>) -> HashMap<String, Timer> {
+pub fn load_timers() -> HashMap<String, Timer> {
+    load_timers_from(&crate::paths::timers_file())
+}
+
+/// Load from an explicit path — the testable core of [`load_timers`].
+fn load_timers_from(path: &std::path::Path) -> HashMap<String, Timer> {
+    let persisted: Vec<PersistedTimer> = crate::filestore::load_snapshot(path)
+        .unwrap_or_else(|e| {
+            tracing::warn!("[timer] failed to load timers file: {e}");
+            None
+        })
+        .unwrap_or_default();
+
     let mut map = HashMap::new();
-    let mut read = || -> Result<(), LychiError> {
-        let txn = db.begin_read()?;
-        let table = txn.open_table(crate::db::TIMERS)?;
-        for result in table.iter()? {
-            let (key, val) = result?;
-            // One unreadable row must not drop every running timer.
-            let Some(entry) = crate::db::decode_row::<crate::db::schema::TimerEntry>(
-                "timers",
-                key.value(),
-                val.value(),
-            ) else {
-                continue;
-            };
-            let timer = Timer::from_entry(&entry);
-            // Skip countdowns that already elapsed while the app was closed.
-            if timer.is_done() {
-                continue;
-            }
-            map.insert(key.value().to_string(), timer);
+    for p in persisted {
+        let timer = Timer::from_entry(&p.entry);
+        // Skip countdowns that already elapsed while the app was closed.
+        if timer.is_done() {
+            continue;
         }
-        Ok(())
-    };
-    if let Err(e) = read() {
-        tracing::warn!("[timer] failed to load timers: {e}");
+        map.insert(p.id, timer);
     }
     map
 }
@@ -297,17 +290,34 @@ fn err_result(start: Instant, error: String) -> ActionResult {
 
 pub struct TimerHandler {
     state: TimerState,
-    db: Arc<redb::Database>,
+    /// Where to persist. `None` = the real [`crate::paths::timers_file`]; tests
+    /// set a temp path so they never touch the user's data dir or race each other.
+    persist_path: Option<std::path::PathBuf>,
 }
 
 impl TimerHandler {
-    pub fn new(state: TimerState, db: Arc<redb::Database>) -> Self {
-        Self { state, db }
+    pub fn new(state: TimerState) -> Self {
+        Self {
+            state,
+            persist_path: None,
+        }
+    }
+
+    /// Test constructor: persist to an explicit path instead of the real file.
+    #[cfg(test)]
+    fn with_persist_path(state: TimerState, path: std::path::PathBuf) -> Self {
+        Self {
+            state,
+            persist_path: Some(path),
+        }
     }
 
     /// Persist the current timer map after a mutation. Best-effort.
     fn persist(&self) {
-        persist_timers(&self.state, &self.db);
+        match &self.persist_path {
+            Some(path) => persist_timers_to(&self.state, path),
+            None => persist_timers(&self.state),
+        }
     }
 }
 
@@ -850,7 +860,7 @@ fn timer_monitor_loop(
                         "[timer] system slept ~{}s — advanced {shifted} running timer(s)",
                         slept_ms / 1000
                     );
-                    persist_timers(state, db);
+                    persist_timers(state);
                 }
             }
         }
@@ -889,7 +899,7 @@ fn timer_monitor_loop(
             // A fired timer was removed → update the persisted set so it doesn't
             // resurrect on the next restart.
             if removed_any {
-                persist_timers(state, db);
+                persist_timers(state);
             }
         }
 
@@ -904,6 +914,19 @@ fn timer_monitor_loop(
 mod tests {
     use super::*;
     use crate::action_registry::Output;
+
+    /// A handler that persists to a unique temp file, so timer subcommand tests
+    /// never write the real `timers.json` or race each other on a shared path.
+    fn test_handler(state: TimerState) -> TimerHandler {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "lychi_timerhandler_test_{}_{}.json",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        TimerHandler::with_persist_path(state, path)
+    }
 
     /// Extract the text body from a result's output, for assertions.
     fn body(r: &ActionResult) -> Option<&str> {
@@ -1033,8 +1056,17 @@ mod tests {
     }
 
     #[test]
-    fn load_persist_via_db_roundtrips() {
-        let db = crate::db::open_test_database();
+    fn load_persist_via_file_roundtrips() {
+        // Unique temp path so parallel tests don't collide and nothing touches
+        // the real timers file.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "lychi_timers_test_{}_{}.json",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+
         let state = new_timer_state();
         state.lock().unwrap().insert(
             "id1".to_string(),
@@ -1047,12 +1079,13 @@ mod tests {
                 completed: false,
             },
         );
-        persist_timers(&state, &db);
+        persist_timers_to(&state, &path);
 
-        let loaded = load_timers(&db);
+        let loaded = load_timers_from(&path);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded.get("id1").unwrap().name, "washer");
         assert_eq!(loaded.get("id1").unwrap().duration_secs, 1800);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1108,7 +1141,7 @@ mod tests {
     #[tokio::test]
     async fn test_timer_start_and_status() {
         let state = new_timer_state();
-        let handler = TimerHandler::new(state.clone(), crate::db::open_test_database());
+        let handler = test_handler(state.clone());
 
         let result = handler
             .execute(
@@ -1137,7 +1170,7 @@ mod tests {
     #[tokio::test]
     async fn test_timer_pause_resume() {
         let state = new_timer_state();
-        let handler = TimerHandler::new(state.clone(), crate::db::open_test_database());
+        let handler = test_handler(state.clone());
 
         handler
             .execute(
@@ -1173,7 +1206,7 @@ mod tests {
     #[tokio::test]
     async fn test_timer_stop() {
         let state = new_timer_state();
-        let handler = TimerHandler::new(state.clone(), crate::db::open_test_database());
+        let handler = test_handler(state.clone());
 
         handler
             .execute(
@@ -1201,7 +1234,7 @@ mod tests {
     #[tokio::test]
     async fn test_timer_shorthand() {
         let state = new_timer_state();
-        let handler = TimerHandler::new(state.clone(), crate::db::open_test_database());
+        let handler = test_handler(state.clone());
 
         // "timer 25m" → starts a timer and opens panel
         let result = handler
@@ -1216,7 +1249,7 @@ mod tests {
     #[tokio::test]
     async fn test_timer_clear() {
         let state = new_timer_state();
-        let handler = TimerHandler::new(state.clone(), crate::db::open_test_database());
+        let handler = test_handler(state.clone());
 
         handler
             .execute(
@@ -1247,7 +1280,7 @@ mod tests {
     #[tokio::test]
     async fn test_stopwatch_start() {
         let state = new_timer_state();
-        let handler = TimerHandler::new(state.clone(), crate::db::open_test_database());
+        let handler = test_handler(state.clone());
 
         let result = handler
             .execute(&crate::action_registry::ExecContext::default(), "stopwatch")
@@ -1267,7 +1300,7 @@ mod tests {
     #[tokio::test]
     async fn test_stopwatch_named() {
         let state = new_timer_state();
-        let handler = TimerHandler::new(state.clone(), crate::db::open_test_database());
+        let handler = test_handler(state.clone());
 
         let result = handler
             .execute(
@@ -1287,7 +1320,7 @@ mod tests {
     #[tokio::test]
     async fn test_stopwatch_stop() {
         let state = new_timer_state();
-        let handler = TimerHandler::new(state.clone(), crate::db::open_test_database());
+        let handler = test_handler(state.clone());
 
         handler
             .execute(
@@ -1311,7 +1344,7 @@ mod tests {
     #[tokio::test]
     async fn test_stopwatch_sw_alias() {
         let state = new_timer_state();
-        let handler = TimerHandler::new(state.clone(), crate::db::open_test_database());
+        let handler = test_handler(state.clone());
 
         let result = handler
             .execute(&crate::action_registry::ExecContext::default(), "sw")

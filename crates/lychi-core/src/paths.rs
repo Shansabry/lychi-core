@@ -37,6 +37,12 @@ pub fn clipboard_images_dir() -> PathBuf {
     data_dir().join("clipboard-images")
 }
 
+/// Running-timer state. Device-local (bound to this session's wall clock), so it
+/// lives in a file rather than the user-data database — see `filestore`.
+pub fn timers_file() -> PathBuf {
+    data_dir().join("timers.json")
+}
+
 /// Where backup archives live. Inside the data dir so a user copying that one
 /// directory takes their backups with them, but excluded from the archive
 /// itself so backups never nest.

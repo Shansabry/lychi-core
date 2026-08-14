@@ -36,10 +36,6 @@ pub const REMINDERS: TableDefinition<&str, &[u8]> = TableDefinition::new("remind
 /// Snippets: key = UUID v7 string, value = postcard-serialized SnippetEntry.
 pub const SNIPPETS: TableDefinition<&str, &[u8]> = TableDefinition::new("snippets");
 
-/// Timers: key = timer id, value = postcard-serialized TimerEntry. Persisted so
-/// running countdowns/stopwatches survive an app restart (rehydrated on boot).
-pub const TIMERS: TableDefinition<&str, &[u8]> = TableDefinition::new("timers");
-
 /// AI presets: key = UUID v7 string, value = postcard-serialized AiPresetEntry.
 /// User-defined saved prompt templates invoked by keyword (Phase 3 AI Commands).
 pub const AI_PRESETS: TableDefinition<&str, &[u8]> = TableDefinition::new("ai_presets");
@@ -89,7 +85,7 @@ pub const SCHEMA_VERSION: u8 = 1;
 
 /// Every enveloped table — the migration and any future whole-table rewrite
 /// iterate this list, so a new table added here is versioned from birth.
-pub(crate) const ENVELOPED_TABLES: [&str; 14] = [
+pub(crate) const ENVELOPED_TABLES: [&str; 13] = [
     "history",
     "notes",
     "todos",
@@ -99,7 +95,6 @@ pub(crate) const ENVELOPED_TABLES: [&str; 14] = [
     "aliases",
     "reminders",
     "snippets",
-    "timers",
     "ai_presets",
     "ai_conversations",
     "model_caps",
@@ -265,7 +260,6 @@ pub fn open_database(path: &Path) -> Result<Arc<Database>, LychiError> {
     txn.open_table(ALIASES)?;
     txn.open_table(REMINDERS)?;
     txn.open_table(SNIPPETS)?;
-    txn.open_table(TIMERS)?;
     txn.open_table(AI_PRESETS)?;
     txn.open_table(AI_CONVERSATIONS)?;
     txn.open_table(MODEL_CAPS)?;
