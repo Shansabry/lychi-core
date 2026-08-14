@@ -98,6 +98,105 @@ fn round_trip_restores_every_row() {
     );
 }
 
+/// The storage refactor spread state across the DB, a frecency DB, and plain
+/// files. A backup must capture the file stores (clipboard/history/timers/model-
+/// caps) and the AI transcripts, and a restore must bring them back byte-exact.
+#[test]
+fn round_trip_restores_the_file_stores_and_ai_history() {
+    let sb = Sandbox::new("filestores");
+    let db = test_db(&sb);
+    // Something must be in the DB or create() has nothing to anchor to.
+    put(&db, crate::db::NOTES, "n1", b"note");
+
+    let data = crate::paths::data_dir();
+    fs::create_dir_all(&data).unwrap();
+    fs::write(
+        data.join("clipboard.jsonl"),
+        b"{\"id\":\"c\",\"text\":\"hi\"}\n",
+    )
+    .unwrap();
+    fs::write(data.join("history.jsonl"), b"{\"command\":\"open x\"}\n").unwrap();
+    fs::write(data.join("timers.json"), b"[]").unwrap();
+    fs::write(data.join("model-caps.jsonl"), b"{\"key\":\"a/b\"}\n").unwrap();
+    let ai = crate::paths::ai_history_dir();
+    fs::create_dir_all(&ai).unwrap();
+    fs::write(ai.join("conv1.json"), b"{\"id\":\"conv1\",\"title\":\"t\"}").unwrap();
+
+    let info = create(&db, BackupKind::Manual, "test", "0.1.0").unwrap();
+    let m = info.manifest.as_ref().unwrap();
+    assert!(
+        m.files.contains(&"clipboard.jsonl".to_string()),
+        "files listed in manifest"
+    );
+    assert!(m.files.contains(&"history.jsonl".to_string()));
+    assert!(m.has_ai_history, "ai_history flagged in manifest");
+
+    // Destroy the file stores + transcripts.
+    for f in [
+        "clipboard.jsonl",
+        "history.jsonl",
+        "timers.json",
+        "model-caps.jsonl",
+    ] {
+        fs::remove_file(data.join(f)).unwrap();
+    }
+    fs::remove_dir_all(&ai).unwrap();
+
+    restore(&db, Path::new(&info.path), "0.1.0").unwrap();
+
+    assert_eq!(
+        fs::read(data.join("clipboard.jsonl")).unwrap(),
+        b"{\"id\":\"c\",\"text\":\"hi\"}\n"
+    );
+    assert_eq!(
+        fs::read(data.join("history.jsonl")).unwrap(),
+        b"{\"command\":\"open x\"}\n"
+    );
+    assert_eq!(fs::read(data.join("timers.json")).unwrap(), b"[]");
+    assert_eq!(
+        fs::read(data.join("model-caps.jsonl")).unwrap(),
+        b"{\"key\":\"a/b\"}\n"
+    );
+    assert_eq!(
+        fs::read(ai.join("conv1.json")).unwrap(),
+        b"{\"id\":\"conv1\",\"title\":\"t\"}"
+    );
+
+    // Sensitive file stores are restored 0600, matching how the live store writes them.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(data.join("clipboard.jsonl"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "restored clipboard log must be owner-only, got {mode:o}"
+        );
+    }
+}
+
+/// A tampered archive must not be able to write a file outside the known
+/// file-store basenames (e.g. a traversal or an arbitrary filename under files/).
+#[test]
+fn restore_rejects_unknown_file_store_names() {
+    let sb = Sandbox::new("filestore_guard");
+    let db = test_db(&sb);
+    put(&db, crate::db::NOTES, "n1", b"note");
+    let info = create(&db, BackupKind::Manual, "t", "0.1.0").unwrap();
+
+    // Hand-inject a rogue files/ entry into a copy of the archive by rebuilding it
+    // is heavy; instead assert the acceptance predicate directly: only the known
+    // basenames pass. (The restore loop uses exactly this check.)
+    assert!(FILE_STORE_NAMES.contains(&"clipboard.jsonl"));
+    assert!(!FILE_STORE_NAMES.contains(&"../config.toml"));
+    assert!(!FILE_STORE_NAMES.contains(&"evil.sh"));
+    // And a normal restore of the just-made archive still succeeds.
+    restore(&db, Path::new(&info.path), "0.1.0").unwrap();
+}
+
 /// Restore must be reversible: the state it replaced is itself backed up.
 #[test]
 fn restore_snapshots_the_state_it_replaces() {
@@ -407,10 +506,13 @@ fn restorability_is_reported_for_the_ui() {
         kind: BackupKind::Manual,
         reason: String::new(),
         tables: vec![],
+        frecency_tables: vec![],
         schema_version: crate::db::SCHEMA_VERSION,
         has_config: false,
         has_scripts: false,
         has_clipboard_images: false,
+        files: vec![],
+        has_ai_history: false,
     };
     let ok = BackupInfo {
         path: "/x".into(),

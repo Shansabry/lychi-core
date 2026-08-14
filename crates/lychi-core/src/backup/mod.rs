@@ -35,15 +35,35 @@ use crate::error::LychiError;
 
 /// Archive layout version. Bumped only when the *shape* of the archive changes
 /// (new top-level entries, different manifest fields) — not on every release.
-pub const ARCHIVE_VERSION: u32 = 1;
+pub const ARCHIVE_VERSION: u32 = 2;
 
 /// Name of the manifest inside the archive.
 const MANIFEST_NAME: &str = "manifest.json";
-/// Directory inside the archive holding the exported database tables.
+/// Directory inside the archive holding the exported `lychi.redb` tables.
 const DB_DIR: &str = "db";
-/// Directory inside the archive holding clipboard image PNGs (their DB rows
-/// carry the on-disk paths, so the files must ride along or restore dangles).
+/// Directory inside the archive holding the exported `frecency.redb` tables.
+/// Frecency lives in its own database (see `db::frecency`); its rows are dumped
+/// the same way as the main DB's so a restore is version-safe.
+const FRECENCY_DB_DIR: &str = "frecency-db";
+/// Directory inside the archive holding the raw file-store files (clipboard,
+/// command history, timers, model capabilities). These moved out of redb into
+/// plain files (see `filestore`); they are copied verbatim.
+const FILES_DIR: &str = "files";
+/// Directory inside the archive holding the per-conversation AI chat transcripts
+/// (`ai_history/<id>.json`).
+const AI_HISTORY_DIR: &str = "ai_history";
+/// Directory inside the archive holding clipboard image PNGs (the clipboard log
+/// rows carry the on-disk paths, so the files must ride along or restore dangles).
 const CLIP_IMAGES_DIR: &str = "clipboard-images";
+
+/// The device-local file stores copied whole into the archive, by their basename
+/// under [`FILES_DIR`]. Each is resolved to its real path via `paths` on restore.
+const FILE_STORE_NAMES: &[&str] = &[
+    "clipboard.jsonl",
+    "history.jsonl",
+    "timers.json",
+    "model-caps.jsonl",
+];
 
 /// How many automatic backups to keep. Manual ones are never auto-pruned —
 /// a user who clicked "Back up now" before doing something risky should not
@@ -84,9 +104,13 @@ pub struct Manifest {
     /// Free-text note ("before restore", "before upgrade to 0.2.0").
     #[serde(default)]
     pub reason: String,
-    /// Table name → row count, so the UI can say what is in a backup without
-    /// unpacking it, and restore can verify it got everything.
+    /// `lychi.redb` table name → row count, so the UI can say what is in a backup
+    /// without unpacking it, and restore can verify it got everything.
     pub tables: Vec<(String, u64)>,
+    /// `frecency.redb` table name → row count (archive v2+). Empty for v1
+    /// archives, which predate the frecency database split.
+    #[serde(default)]
+    pub frecency_tables: Vec<(String, u64)>,
     /// Schema generation of the archived row VALUES. `0` (the serde
     /// default) marks archives from before the row envelope existed — their
     /// values are raw postcard, and restore must wrap them after applying, or
@@ -99,12 +123,19 @@ pub struct Manifest {
     pub has_config: bool,
     #[serde(default)]
     pub has_scripts: bool,
-    /// Clipboard image PNGs. The DB rows only hold the image PATHS, so without
-    /// the files themselves a restore leaves dangling references — and the
+    /// Clipboard image PNGs. The clipboard log rows only hold the image PATHS, so
+    /// without the files themselves a restore leaves dangling references — and the
     /// startup orphan-GC then deletes the PNGs the restored (older) rows don't
     /// mention. Archiving the dir keeps a restore round-trip lossless.
     #[serde(default)]
     pub has_clipboard_images: bool,
+    /// File-store basenames present in the archive (archive v2+): the device-local
+    /// JSONL/json stores that moved out of redb. Copied verbatim on restore.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// AI chat transcripts present (archive v2+): the `ai_history/` directory.
+    #[serde(default)]
+    pub has_ai_history: bool,
 }
 
 impl Manifest {
@@ -212,9 +243,30 @@ pub fn create(
         .map(|d| (d.name.clone(), d.rows.len() as u64))
         .collect();
 
+    // Frecency lives in its own database now. Dump it through the SAME open
+    // handle the app registered (never a second open — see `frecency::store_handle`).
+    let frecency_dumps: Vec<TableDump> = match crate::db::frecency::store_handle() {
+        Some(fdb) => dump_tables(&fdb)?,
+        None => Vec::new(),
+    };
+    let frecency_tables: Vec<(String, u64)> = frecency_dumps
+        .iter()
+        .map(|d| (d.name.clone(), d.rows.len() as u64))
+        .collect();
+
+    // The device-local file stores that moved out of redb.
+    let file_stores: Vec<(String, Vec<u8>)> = FILE_STORE_NAMES
+        .iter()
+        .filter_map(|name| {
+            let path = crate::paths::data_dir().join(name);
+            fs::read(&path).ok().map(|b| (name.to_string(), b))
+        })
+        .collect();
+
     let config_path = crate::paths::config_file();
     let scripts_path = crate::paths::scripts_dir();
     let clip_images_path = crate::paths::clipboard_images_dir();
+    let ai_history_path = crate::paths::ai_history_dir();
     let manifest = Manifest {
         archive_version: ARCHIVE_VERSION,
         app_version: app_version.to_string(),
@@ -222,10 +274,13 @@ pub fn create(
         kind,
         reason: reason.to_string(),
         tables,
+        frecency_tables,
         schema_version: crate::db::SCHEMA_VERSION,
         has_config: config_path.is_file(),
         has_scripts: scripts_path.is_dir(),
         has_clipboard_images: dir_has_files(&clip_images_path),
+        files: file_stores.iter().map(|(n, _)| n.clone()).collect(),
+        has_ai_history: dir_has_files(&ai_history_path),
     };
 
     {
@@ -243,6 +298,21 @@ pub fn create(
             append_bytes(&mut tar, &format!("{DB_DIR}/{}.bin", dump.name), &bytes)?;
         }
 
+        for dump in &frecency_dumps {
+            let bytes = postcard::to_allocvec(dump).map_err(|e| {
+                LychiError::ExecutionFailed(format!("frecency table encode failed: {e}"))
+            })?;
+            append_bytes(
+                &mut tar,
+                &format!("{FRECENCY_DB_DIR}/{}.bin", dump.name),
+                &bytes,
+            )?;
+        }
+
+        for (name, bytes) in &file_stores {
+            append_bytes(&mut tar, &format!("{FILES_DIR}/{name}"), bytes)?;
+        }
+
         if manifest.has_config
             && let Ok(bytes) = fs::read(&config_path)
         {
@@ -253,6 +323,9 @@ pub fn create(
         }
         if manifest.has_clipboard_images {
             append_dir(&mut tar, &clip_images_path, CLIP_IMAGES_DIR)?;
+        }
+        if manifest.has_ai_history {
+            append_dir(&mut tar, &ai_history_path, AI_HISTORY_DIR)?;
         }
 
         // Finish the gzip stream and fsync before the rename, so the rename
@@ -408,9 +481,12 @@ pub fn restore(
     //    manifest. A truncated or tampered archive must fail here, before any
     //    live data has been touched.
     let mut dumps: Vec<TableDump> = Vec::new();
+    let mut frecency_dumps: Vec<TableDump> = Vec::new();
     let mut config: Option<Vec<u8>> = None;
     let mut scripts: Vec<(PathBuf, Vec<u8>)> = Vec::new();
     let mut clip_images: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    let mut file_stores: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut ai_history: Vec<(PathBuf, Vec<u8>)> = Vec::new();
 
     for entry in open_archive(archive)?.entries()? {
         let mut entry = entry?;
@@ -429,6 +505,11 @@ pub fn restore(
                 LychiError::ExecutionFailed(format!("backup table {name} is corrupt: {e}"))
             })?;
             dumps.push(dump);
+        } else if name.starts_with(&format!("{FRECENCY_DB_DIR}/")) && name.ends_with(".bin") {
+            let dump: TableDump = postcard::from_bytes(&buf).map_err(|e| {
+                LychiError::ExecutionFailed(format!("backup frecency table {name} is corrupt: {e}"))
+            })?;
+            frecency_dumps.push(dump);
         } else if name == "config/config.toml" {
             config = Some(buf);
         } else if let Some(rest) = name.strip_prefix("config/scripts/")
@@ -439,6 +520,16 @@ pub fn restore(
             && let Some(rel) = safe_relative(rest, &name)
         {
             clip_images.push((rel, buf));
+        } else if let Some(rest) = name.strip_prefix(&format!("{FILES_DIR}/")) {
+            // Only accept known file-store basenames (no path separators), so a
+            // tampered archive can't write arbitrary files into the data dir.
+            if !rest.is_empty() && !rest.contains('/') && FILE_STORE_NAMES.contains(&rest) {
+                file_stores.push((rest.to_string(), buf));
+            }
+        } else if let Some(rest) = name.strip_prefix(&format!("{AI_HISTORY_DIR}/"))
+            && let Some(rel) = safe_relative(rest, &name)
+        {
+            ai_history.push((rel, buf));
         }
     }
 
@@ -482,6 +573,32 @@ pub fn restore(
         txn.commit()?;
     }
 
+    // 4b. Restore the frecency database (its own file). Same replace-in-one-txn
+    //     contract, through the app's open handle. Skipped for a v1 archive (no
+    //     frecency dumps) or if the store isn't registered — frecency is derived
+    //     ranking data, so its absence self-heals rather than being a failure.
+    if !frecency_dumps.is_empty()
+        && let Some(fdb) = crate::db::frecency::store_handle()
+    {
+        let txn = fdb.begin_write()?;
+        for dump in &frecency_dumps {
+            let def: TableDefinition<'_, &str, &[u8]> = TableDefinition::new(dump.name.as_str());
+            let mut table = txn.open_table(def)?;
+            table.retain(|_, _| false)?;
+            for (k, v) in &dump.rows {
+                table.insert(k.as_str(), v.as_slice())?;
+                rows_restored += 1;
+            }
+        }
+        if manifest.schema_version < crate::db::SCHEMA_VERSION {
+            let names: Vec<&str> = frecency_dumps.iter().map(|d| d.name.as_str()).collect();
+            let _ = crate::db::envelope_raw_rows(&txn, &names)?;
+        }
+        txn.commit()?;
+        // The in-memory frecency cache must not keep serving pre-restore scores.
+        crate::db::frecency::invalidate();
+    }
+
     // 5. Files last — they are the least dangerous to get wrong, and doing
     //    them after the DB commit keeps the risky step first while the safety
     //    backup is freshest.
@@ -513,9 +630,9 @@ pub fn restore(
         }
     }
 
-    // Restore clipboard image PNGs so the restored rows' path references resolve
-    // (and the startup orphan-GC doesn't then delete them). Written into the SAME
-    // dir the DB rows point at, so no path rewriting is needed.
+    // Restore clipboard image PNGs so the restored clipboard-log rows' path
+    // references resolve (and the startup orphan-GC doesn't then delete them).
+    // Written into the SAME dir the log rows point at, so no path rewriting.
     if !clip_images.is_empty() {
         let base = crate::paths::clipboard_images_dir();
         fs::create_dir_all(&base)?;
@@ -528,10 +645,31 @@ pub fn restore(
         }
     }
 
-    // Restore rewrote the FRECENCY table directly (not via frecency::commit_write),
-    // so the in-process read cache still holds the PRE-restore scores. Force it to
-    // re-read, or the launcher keeps ranking by data the user just restored away.
-    crate::db::frecency::invalidate();
+    // Restore the device-local file stores (clipboard.jsonl, history.jsonl,
+    // timers.json, model-caps.jsonl) to their real paths, atomically. Only the
+    // known basenames were accepted above, so each maps to a fixed data-dir path.
+    for (name, bytes) in &file_stores {
+        let dest = crate::paths::data_dir().join(name);
+        if let Some(parent) = dest.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = write_atomic(&dest, bytes);
+        #[cfg(unix)]
+        restrict_file(&dest); // these hold clipboard text / command history → 0600
+    }
+
+    // Restore AI chat transcripts (one file per conversation) into ai_history/.
+    if !ai_history.is_empty() {
+        let base = crate::paths::ai_history_dir();
+        fs::create_dir_all(&base)?;
+        for (rel, bytes) in &ai_history {
+            let dest = base.join(rel);
+            if let Some(parent) = dest.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = write_atomic(&dest, bytes);
+        }
+    }
 
     Ok(RestoreReport {
         tables_restored: dumps.len() as u64,

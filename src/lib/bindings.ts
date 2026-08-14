@@ -2230,10 +2230,15 @@ created_at: number; kind: BackupKind;
  */
 reason?: string; 
 /**
- * Table name → row count, so the UI can say what is in a backup without
- * unpacking it, and restore can verify it got everything.
+ * `lychi.redb` table name → row count, so the UI can say what is in a backup
+ * without unpacking it, and restore can verify it got everything.
  */
 tables: ([string, number])[]; 
+/**
+ * `frecency.redb` table name → row count (archive v2+). Empty for v1
+ * archives, which predate the frecency database split.
+ */
+frecency_tables?: ([string, number])[]; 
 /**
  * Schema generation of the archived row VALUES. `0` (the serde
  * default) marks archives from before the row envelope existed — their
@@ -2247,12 +2252,21 @@ schema_version?: number;
  */
 has_config?: boolean; has_scripts?: boolean; 
 /**
- * Clipboard image PNGs. The DB rows only hold the image PATHS, so without
- * the files themselves a restore leaves dangling references — and the
+ * Clipboard image PNGs. The clipboard log rows only hold the image PATHS, so
+ * without the files themselves a restore leaves dangling references — and the
  * startup orphan-GC then deletes the PNGs the restored (older) rows don't
  * mention. Archiving the dir keeps a restore round-trip lossless.
  */
-has_clipboard_images?: boolean }
+has_clipboard_images?: boolean; 
+/**
+ * File-store basenames present in the archive (archive v2+): the device-local
+ * JSONL/json stores that moved out of redb. Copied verbatim on restore.
+ */
+files?: string[]; 
+/**
+ * AI chat transcripts present (archive v2+): the `ai_history/` directory.
+ */
+has_ai_history?: boolean }
 /**
  * The presentational split of a user turn: the instruction line shown in the
  * bubble plus the payload folded into a collapsed chip. Computed ONCE by the

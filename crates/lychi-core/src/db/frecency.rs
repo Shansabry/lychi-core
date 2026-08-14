@@ -47,6 +47,14 @@ pub fn init_store(db: Arc<Database>) {
     let _ = STORE.set(db);
 }
 
+/// The registered frecency database handle, for callers that need the raw
+/// `Arc<Database>` (backup dumps and restores its tables through the SAME open
+/// handle rather than opening `frecency.redb` a second time, which would fight
+/// redb's single-writer lock). `None` before startup registration / in tests.
+pub fn store_handle() -> Option<Arc<Database>> {
+    STORE.get().cloned()
+}
+
 /// The registered frecency database, if any.
 ///
 /// In production this is a single `OnceLock` load (one atomic read, no lock) on
