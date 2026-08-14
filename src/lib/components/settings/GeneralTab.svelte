@@ -12,6 +12,7 @@ import {
 	setAutostartEnabled,
 	setHotkey,
 } from "$lib/ipc";
+import { invalidateSettings } from "$lib/preloadCache";
 import Select from "../Select.svelte";
 
 let {
@@ -93,6 +94,7 @@ async function handleHideOnBlurToggle() {
 	generalConfig.hide_on_blur = !generalConfig.hide_on_blur;
 	try {
 		await saveGeneralConfig(generalConfig);
+		invalidateSettings();
 	} catch (err) {
 		console.error("[settings] Failed to save general config:", err);
 		onsaveerror(`Failed to save: ${err}`);
@@ -103,6 +105,7 @@ async function handleMonitorModeChange(val: string) {
 	generalConfig.monitor_mode = val;
 	try {
 		await saveGeneralConfig(generalConfig);
+		invalidateSettings();
 	} catch (err) {
 		console.error("[settings] Failed to save monitor mode:", err);
 		onsaveerror(`Failed to save: ${err}`);

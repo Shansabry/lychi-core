@@ -295,7 +295,7 @@ function handleKeydown(e: KeyboardEvent) {
 		padding: 12px 8px;
 		border-right: 1px solid var(--border);
 		flex-shrink: 0;
-		width: 120px;
+		width: 150px;
 	}
 
 	.tab-btn {

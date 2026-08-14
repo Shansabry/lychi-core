@@ -2,6 +2,7 @@
 import { Monitor, Moon, RotateCcw, Sun } from "lucide-svelte";
 import type { FontFamily, GeneralConfig } from "$lib/ipc";
 import { getInstalledFonts, saveGeneralConfig, setCardBlur } from "$lib/ipc";
+import { invalidateSettings } from "$lib/preloadCache";
 import {
 	ACCENTS,
 	MAX_CORNER_RADIUS,
@@ -47,6 +48,10 @@ async function applyAndSaveTheme() {
 	window.dispatchEvent(new CustomEvent<Theme>("lychi-theme-change", { detail: theme }));
 	try {
 		await saveGeneralConfig(generalConfig);
+		// Freshen the preload cache, or the next summon re-reads the STALE cached
+		// config and the sliders (opacity/corners) snap back to the old value —
+		// the "I lowered opacity, re-summoned, and the slider desynced" bug.
+		invalidateSettings();
 	} catch (err) {
 		console.error("[settings] Failed to save appearance:", err);
 		onsaveerror(`Failed to save: ${err}`);
