@@ -1,6 +1,7 @@
 <script lang="ts">
 import {
 	Archive,
+	Blocks,
 	BookOpen,
 	CircleCheck,
 	FolderOpen,
@@ -26,6 +27,7 @@ import AiTab from "./settings/ai/AiTab.svelte";
 import DataTab from "./settings/DataTab.svelte";
 import GeneralTab from "./settings/GeneralTab.svelte";
 import GuideTab from "./settings/GuideTab.svelte";
+import PluginsTab from "./settings/PluginsTab.svelte";
 import ProjectsTab from "./settings/ProjectsTab.svelte";
 import SetupTab from "./settings/SetupTab.svelte";
 import ShortcutsTab from "./settings/ShortcutsTab.svelte";
@@ -34,6 +36,7 @@ type Tab =
 	| "general"
 	| "appearance"
 	| "ai"
+	| "plugins"
 	| "projects"
 	| "shortcuts"
 	| "data"
@@ -172,6 +175,14 @@ function handleKeydown(e: KeyboardEvent) {
 		</button>
 		<button
 			class="tab-btn"
+			class:active={activeTab === "plugins"}
+			onclick={() => (activeTab = "plugins")}
+		>
+			<Blocks size={14} strokeWidth={1.5} />
+			<span>Plugins</span>
+		</button>
+		<button
+			class="tab-btn"
 			class:active={activeTab === "projects"}
 			onclick={() => (activeTab = "projects")}
 		>
@@ -245,6 +256,8 @@ function handleKeydown(e: KeyboardEvent) {
 				onsaveerror={(msg) => (saveError = msg)}
 				{onpresetchange}
 			/>
+		{:else if activeTab === "plugins"}
+			<PluginsTab />
 		{:else if activeTab === "projects"}
 			<ProjectsTab
 				bind:projectDirs
