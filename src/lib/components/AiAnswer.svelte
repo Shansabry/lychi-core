@@ -68,6 +68,8 @@ let {
 	/** Accumulated token spend for the conversation. */
 	tokensIn = 0,
 	tokensOut = 0,
+	/** Of tokensIn, how many were prompt-cache hits (caching made visible). */
+	tokensCached = 0,
 }: {
 	turns?: Turn[];
 	lastUser?: string;
@@ -89,6 +91,7 @@ let {
 	truncated?: boolean;
 	tokensIn?: number;
 	tokensOut?: number;
+	tokensCached?: number;
 } = $props();
 
 const md = renderMarkdown;
@@ -573,8 +576,13 @@ function onWindowKeydown(e: KeyboardEvent) {
 	{/if}
 
 	{#if tokensOut > 0}
-		<div class="token-spend" title="Token spend this conversation">
-			{tokensIn.toLocaleString()} in · {tokensOut.toLocaleString()} out · {(tokensIn + tokensOut).toLocaleString()} tokens
+		<div
+			class="token-spend"
+			title={tokensCached > 0
+				? `${tokensIn.toLocaleString()} in (${Math.round((tokensCached / tokensIn) * 100)}% cached) · ${tokensOut.toLocaleString()} out`
+				: `${tokensIn.toLocaleString()} in · ${tokensOut.toLocaleString()} out`}
+		>
+			{(tokensIn + tokensOut).toLocaleString()} tokens
 		</div>
 	{/if}
 </div>

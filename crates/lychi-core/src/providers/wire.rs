@@ -258,13 +258,13 @@ fn build_body(
 ) -> Value {
     match dialect {
         Dialect::Anthropic => {
-            let system = anthropic_system(messages);
             let mut b = json!({
                 "model": model, "max_tokens": max_tokens, "stream": true,
                 "messages": anthropic_messages(messages),
             });
-            if !system.is_empty() {
-                b["system"] = json!(system);
+            let system = anthropic_system_blocks(messages);
+            if !system.is_null() {
+                b["system"] = system;
             }
             if !tools.is_empty() {
                 b["tools"] = json!(anthropic_tools(tools));
@@ -364,6 +364,24 @@ pub(crate) fn anthropic_system(messages: &[ChatMessage]) -> String {
         .map(|m| m.content_text())
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// Build Anthropic's `system` field as a cache-aware text block.
+///
+/// The system prompt is now fully STABLE across turns (the per-turn relevance hint
+/// rides a trailing message, not the system prompt — see the coordinator loop), so
+/// the whole block gets `cache_control: ephemeral` and Anthropic caches it (reads
+/// bill at 0.1×). Returns `Value::Null` for an empty prompt so the caller omits it.
+fn anthropic_system_blocks(messages: &[ChatMessage]) -> Value {
+    let full = anthropic_system(messages);
+    if full.is_empty() {
+        return Value::Null;
+    }
+    Value::Array(vec![json!({
+        "type": "text",
+        "text": full,
+        "cache_control": { "type": "ephemeral" },
+    })])
 }
 
 /// Encode a user message's content parts as Anthropic content blocks: `text`
@@ -474,10 +492,21 @@ fn tool_input_schema(t: &ToolDef) -> Value {
 /// llama.cpp grammar, so a valid verb is guaranteed on both paths. Not set on the
 /// free-text tools: strict requires `additionalProperties:false`/all-required,
 /// and there is nothing to constrain on an open string anyway.
+///
+/// PROMPT CACHING: the last tool carries `cache_control: {type: ephemeral}`, which
+/// tells Anthropic to cache the entire tools-array prefix. Cache reads bill at 0.1×
+/// input price, so after the first turn the (large, stable) catalog is ~10× cheaper
+/// and does not re-consume the latency of re-processing. This is why the catalog
+/// MUST be byte-stable turn-to-turn (any tool change invalidates the whole cache) —
+/// the agent now sends the full catalog every turn instead of a per-turn-varying
+/// filtered subset, and the "relevant now" hint that steers selection lives in the
+/// message stream, never in the tools array. Caching is GA (no beta header).
 pub(crate) fn anthropic_tools(tools: &[ToolDef]) -> Vec<Value> {
+    let last = tools.len().saturating_sub(1);
     tools
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(i, t)| {
             let mut tool = json!({
                 "name": t.name,
                 "description": t.description,
@@ -485,6 +514,12 @@ pub(crate) fn anthropic_tools(tools: &[ToolDef]) -> Vec<Value> {
             });
             if t.input_schema.is_some() {
                 tool["strict"] = json!(true);
+            }
+            // Mark the cache breakpoint on the final tool so the whole array is
+            // cached as one prefix. Harmless on providers that ignore it; on
+            // Anthropic it is the single highest-value cost lever for the agent.
+            if i == last {
+                tool["cache_control"] = json!({ "type": "ephemeral" });
             }
             tool
         })
@@ -549,8 +584,20 @@ where
             match data["type"].as_str() {
                 Some("message_start") => {
                     // input_tokens is reported here; output_tokens accrues in message_delta.
-                    if let Some(n) = data["message"]["usage"]["input_tokens"].as_u64() {
+                    let u = &data["message"]["usage"];
+                    if let Some(n) = u["input_tokens"].as_u64() {
                         usage.input_tokens = n as u32;
+                    }
+                    // Prompt-cache read (the two-tier caching, made observable).
+                    // Anthropic bills `input_tokens` as the UNCACHED remainder and
+                    // reports cache reads separately, so the true prompt size is the
+                    // sum; fold the cache read into input_tokens and record it.
+                    if let Some(n) = u["cache_read_input_tokens"].as_u64() {
+                        usage.cached_input_tokens = n as u32;
+                        usage.input_tokens += n as u32;
+                    }
+                    if let Some(n) = u["cache_creation_input_tokens"].as_u64() {
+                        usage.input_tokens += n as u32;
                     }
                 }
                 Some("message_delta") => {
@@ -650,6 +697,12 @@ where
                 }
                 if let Some(n) = u["completion_tokens"].as_u64() {
                     usage.output_tokens = n as u32;
+                }
+                // Groq / OpenAI-dialect prompt-cache hits: how much of the input
+                // was served from cache. Makes the stable-prefix optimization
+                // visible (0 when the provider omits it).
+                if let Some(n) = u["prompt_tokens_details"]["cached_tokens"].as_u64() {
+                    usage.cached_input_tokens = n as u32;
                 }
             }
             let delta = &data["choices"][0]["delta"];
@@ -1373,12 +1426,19 @@ mod tests {
             input_schema: None,
         }];
 
-        // Anthropic: system out-of-band, tools present, stream:true.
+        // Anthropic: system out-of-band as cache-aware text blocks, tools present.
         let a = build_body(Dialect::Anthropic, "claude", 100, &msgs, &tools);
         assert_eq!(a["model"], "claude");
         assert_eq!(a["stream"], true);
-        assert_eq!(a["system"], "sys");
+        // system is now a block array; the single (stable) block carries the
+        // prompt-cache breakpoint.
+        assert_eq!(a["system"][0]["type"], "text");
+        assert_eq!(a["system"][0]["text"], "sys");
+        assert_eq!(a["system"][0]["cache_control"]["type"], "ephemeral");
+        // tools present, and the LAST tool carries the cache breakpoint too.
         assert!(a["tools"].is_array());
+        let last = a["tools"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["cache_control"]["type"], "ephemeral");
         // system message is NOT in the messages array (out-of-band).
         assert_eq!(a["messages"].as_array().unwrap().len(), 1);
 
@@ -1391,5 +1451,24 @@ mod tests {
         // No tools → no `tools` key.
         let no_tools = build_body(Dialect::OpenAi, "gpt", 100, &msgs, &[]);
         assert!(no_tools["tools"].is_null());
+    }
+
+    #[test]
+    fn system_is_one_cached_block() {
+        // The system prompt is fully stable (the volatile hint rides a trailing
+        // message, not the system prompt), so it is a single cached block.
+        let msgs = vec![
+            ChatMessage::system("stable persona"),
+            ChatMessage::user("hi"),
+        ];
+        let a = build_body(Dialect::Anthropic, "claude", 100, &msgs, &[]);
+        let blocks = a["system"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["text"], "stable persona");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+
+        // OpenAI: plain system message.
+        let o = build_body(Dialect::OpenAi, "gpt", 100, &msgs, &[]);
+        assert_eq!(o["messages"][0]["content"], "stable persona");
     }
 }

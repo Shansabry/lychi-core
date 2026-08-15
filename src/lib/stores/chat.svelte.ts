@@ -67,11 +67,17 @@ export type AiTurn = {
 
 // --- System prompts (moved here with the chat logic that uses them) ---
 
-/** The system prompt for the agent — a launcher assistant that can act via tools. */
+/**
+ * The system prompt for the agent — a TOOL CONTRACT, not a persona. A launcher is
+ * an instrument you invoke dozens of times a day, so it defines behaviour (terse,
+ * act-then-report) rather than a chatbot character.
+ *
+ * ALL tool knowledge (names, args, when-to-use, tool-choice conduct) lives in the
+ * generated capability manifest the backend appends to this prompt, built from the
+ * live registry — one source of truth, no drift.
+ */
 export const AGENT_SYSTEM =
-	"You are Lychi, a helpful assistant inside a Linux launcher. Answer concisely in markdown. You can call tools to act on the user's system when helpful; otherwise just answer.\n\n" +
-	"Tool choice: ALWAYS prefer a purpose-built tool over the generic `run` shell command. If a dedicated tool covers the request, use it — do NOT guess a shell command. Examples: system/hardware info (CPU, memory, disk, temperature, GPU, battery, IP, OS) → the `sysinfo` tool, never `run <something>`; math/units/currency → `calc`; opening or launching an app → `open`; web/searches → `web`; media control → `media`; screenshots → `screenshot`; packages → `packages`. Reach for `run` only for a genuine shell task that no dedicated tool handles.\n\n" +
-	"If a tool returns 'command not found' or an error, do NOT retry the same guess — reconsider which dedicated tool fits, or ask the user. Never run the same failing command twice.";
+	"You are the AI inside Lychi, a Linux launcher. Be terse and direct — no preamble or sign-off. Answer in minimal markdown. Act via tools when useful; otherwise answer the question directly.";
 
 /** System prompt for AI presets (text transforms) — do the task, nothing else. */
 export const PRESET_SYSTEM =
@@ -104,6 +110,7 @@ class ChatSession {
 	truncated = $state(false);
 	tokensIn = $state(0);
 	tokensOut = $state(0);
+	tokensCached = $state(0);
 
 	/**
 	 * The conversation was PRESERVED across a re-summon because a run was still
@@ -204,6 +211,7 @@ class ChatSession {
 		this.truncated = false;
 		this.tokensIn = 0;
 		this.tokensOut = 0;
+		this.tokensCached = 0;
 		this.resumed = false;
 		// The tray is per-conversation: a fresh start (or a re-summon) shouldn't
 		// leave files staged from a session the user has moved on from.
@@ -464,6 +472,7 @@ class ChatSession {
 			case "usage":
 				this.tokensIn += ev.input_tokens ?? 0;
 				this.tokensOut += ev.output_tokens ?? 0;
+				this.tokensCached += ev.cached_input_tokens ?? 0;
 				break;
 			case "stopped":
 				this.streaming = false;

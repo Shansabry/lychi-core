@@ -331,6 +331,13 @@ pub enum StreamEvent {
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// How many of `input_tokens` were served from the provider's prompt cache
+    /// (billed at a large discount). This is how the two-tier tool strategy's
+    /// caching is made OBSERVABLE: a high ratio here means the stable catalog +
+    /// system prefix is hitting cache. Anthropic reports it as
+    /// `cache_read_input_tokens`; OpenAI-dialect providers (Groq, …) as
+    /// `prompt_tokens_details.cached_tokens`. 0 when the provider doesn't report it.
+    pub cached_input_tokens: u32,
 }
 
 /// The stream a provider returns: a boxed, `Send + 'static` stream of events (or

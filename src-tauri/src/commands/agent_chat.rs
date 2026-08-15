@@ -375,6 +375,10 @@ pub struct AgentEventDto {
     pub input_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u32>,
+    /// How many input tokens were prompt-cache hits (kind = usage). Lets the UI
+    /// show the caching working; 0/None when the provider doesn't report it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u32>,
     /// A rich tool artifact for inline render (kind = tool_completed):
     /// artifact_kind = "svg" | "weather" | …, artifact_content = the raw payload.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -397,6 +401,7 @@ impl AgentEventDto {
             truncated: false,
             input_tokens: None,
             output_tokens: None,
+            cached_input_tokens: None,
             artifact_kind: None,
             artifact_content: None,
         };
@@ -461,10 +466,12 @@ impl AgentEventDto {
             AgentEvent::Usage {
                 input_tokens,
                 output_tokens,
+                cached_input_tokens,
             } => {
                 d.kind = "usage".into();
                 d.input_tokens = Some(input_tokens);
                 d.output_tokens = Some(output_tokens);
+                d.cached_input_tokens = Some(cached_input_tokens);
             }
             AgentEvent::Stopped { reason } => {
                 d.kind = "stopped".into();
@@ -522,35 +529,25 @@ async fn build_coordinator(
         let presets = lychi_core::ai_presets::store::AiPresetsStore::new()
             .get_presets(&state.db)
             .unwrap_or_default();
-        manifest = lychi_core::coordinator::build_manifest(&catalog, &presets);
+        // No prose manifest: it would list ALL tools in the system prompt, undoing
+        // the per-query tool filtering that keeps input tokens low. The callable
+        // tool SCHEMAS (name + description + args) are the single source of tool
+        // knowledge, and the coordinator sends only the query-relevant subset. The
+        // presets list is still surfaced (it is small and not a tool schema).
+        let _ = &catalog;
+        manifest = lychi_core::coordinator::build_presets_note(&presets);
 
         let full: Vec<ToolDef> = {
+            // Tool descriptions come straight from the registry — no per-tool prose
+            // injected here. The `run` tool's `--terminal` guidance lives in its
+            // handler `usage()`, which the capability manifest carries (one source).
             catalog
                 .into_iter()
-                .map(|c| {
-                    // The `run` tool captures output inline by default so the
-                    // model can read what it ran. Teach the model how to ask for
-                    // a real terminal on the few commands that need one — the
-                    // adapter honours the sentinel (see `agent_run_inputs`).
-                    let description = if c.id == "run" {
-                        format!(
-                            "{}. Output is captured and returned to you. For an \
-                             interactive or long-running foreground command that \
-                             needs a real terminal window (ssh, an editor like vim, \
-                             a REPL such as python or node, top/htop), prefix the \
-                             command with `{TERMINAL_PREFIX} ` to open it in an \
-                             external terminal instead.",
-                            c.description
-                        )
-                    } else {
-                        c.description
-                    };
-                    ToolDef {
-                        name: c.id,
-                        description,
-                        mutates: c.mutates,
-                        input_schema: c.input_schema,
-                    }
+                .map(|c| ToolDef {
+                    name: c.id,
+                    description: c.description,
+                    mutates: c.mutates,
+                    input_schema: c.input_schema,
                 })
                 .collect()
         };

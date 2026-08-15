@@ -20,15 +20,15 @@
 //!   `needs_confirmation` (the Rules Engine decides which tools do).
 
 mod loop_;
-mod manifest;
+pub mod manifest;
+mod relevance;
 mod session;
 mod tool_executor;
-mod tool_filter;
 
 pub use loop_::{
     AgentEvent, AgentEventStream, Coordinator, MaxSteps, Outcome, OutcomeHandle, StopCondition,
 };
-pub use manifest::{build_manifest, splice_manifest, with_manifest};
+pub use manifest::{build_manifest, build_presets_note, splice_manifest, with_manifest};
+pub use relevance::select_tools;
 pub use session::{ApprovalDecision, ApprovalRequest, PendingApproval, Session};
 pub use tool_executor::{ResumeToken, ToolArtifact, ToolExecutor, ToolOutcome, ToolOutputChannel};
-pub use tool_filter::{select_tools, select_tools_for_context};

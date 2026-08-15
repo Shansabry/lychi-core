@@ -13,10 +13,13 @@
 //! so the agent knows those exist too. It is generated from the live registry and
 //! presets store, so it never drifts from what is actually registered.
 //!
-//! Cheap on purpose: the prose lists ALL capabilities (awareness is what fixes
-//! wrong calls), while the expensive callable tool SCHEMAS stay filtered per
-//! query by [`super::select_tools`]. Prose is a few hundred tokens; schemas are
-//! the real cost.
+//! The prose lists ALL capabilities (awareness is what fixes wrong calls), and the
+//! callable tool SCHEMAS now also carry the full, stable catalog every turn — so
+//! the provider can prompt-cache both (see [`crate::providers::wire`]). Selection
+//! is steered, not filtered: a per-turn relevance hint ([`super::relevance_hint`])
+//! rides a TRAILING message after the history, never the system prompt. The
+//! manifest is part of the CACHED prefix, so it must stay byte-stable across turns —
+//! never fold per-turn state into it; that belongs in the trailing hint.
 
 use crate::action_registry::CommandInfo;
 use crate::ai_presets::AiPresetItem;
@@ -35,10 +38,13 @@ pub fn build_manifest(tools: &[CommandInfo], presets: &[AiPresetItem]) -> String
     }
 
     let mut out = String::new();
+    out.push_str(MANIFEST_MARKER);
     out.push_str(
-        "## Your tools\n\
+        "\n### Your tools\n\
          Call a tool by its name with `args`. Pick the most specific tool for the \
          request; reach for `run` only for a genuine shell task no other tool covers. \
+         If a tool errors or returns 'command not found', do NOT retry the same call — \
+         pick a better-suited tool or ask the user; never repeat a failing call. \
          Each line is `name — what it does. args: how to call it`.\n",
     );
 
@@ -59,29 +65,53 @@ pub fn build_manifest(tools: &[CommandInfo], presets: &[AiPresetItem]) -> String
         out.push('\n');
     }
 
-    if !presets.is_empty() {
-        out.push_str(
-            "\n## AI commands\n\
-             These are saved prompt templates the user can run by keyword on their text \
-             or selection. You do not call them as tools, but know they exist so you can \
-             point the user to one when it fits (e.g. \"try `summarize <text>`\").\n",
-        );
-        for p in presets {
-            out.push_str("- `");
-            out.push_str(&p.keyword);
-            out.push_str("` — ");
-            out.push_str(&p.name);
-            out.push('\n');
-        }
-    }
-
+    out.push_str(&presets_section(presets));
     out
 }
 
-/// The heading the manifest always opens with. Used to splice the manifest onto a
-/// system prompt idempotently — everything from this marker on is a prior
-/// manifest to be replaced, so re-augmenting the same session never stacks copies.
-pub const MANIFEST_MARKER: &str = "## Your tools";
+/// The AI-commands (presets) note ALONE — no tool list — as a spliceable block.
+///
+/// When tool knowledge is carried by the callable schemas (the token-lean default),
+/// the agent still needs to know its saved AI presets exist so it can point the
+/// user to one. This is small (one line per preset) and, unlike the tool list, does
+/// not grow with the catalog — safe to always include. Returns "" when there are no
+/// presets. Opens with [`MANIFEST_MARKER`] so [`splice_manifest`] stays idempotent
+/// whichever block is spliced.
+pub fn build_presets_note(presets: &[AiPresetItem]) -> String {
+    let section = presets_section(presets);
+    if section.is_empty() {
+        return String::new();
+    }
+    format!("{MANIFEST_MARKER}\n{section}")
+}
+
+/// The presets list body (no marker) — shared by [`build_manifest`] and
+/// [`build_presets_note`]. Empty when there are no presets.
+fn presets_section(presets: &[AiPresetItem]) -> String {
+    if presets.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n### AI commands\n\
+         These are saved prompt templates the user can run by keyword on their text \
+         or selection. You do not call them as tools, but know they exist so you can \
+         point the user to one when it fits (e.g. \"try `summarize <text>`\").\n",
+    );
+    for p in presets {
+        out.push_str("- `");
+        out.push_str(&p.keyword);
+        out.push_str("` — ");
+        out.push_str(&p.name);
+        out.push('\n');
+    }
+    out
+}
+
+/// The heading every generated capability block opens with — a stable splice
+/// anchor. [`splice_manifest`] replaces everything from this marker down, so
+/// re-augmenting the same session never stacks copies, whichever block is spliced
+/// (full tool manifest or the presets-only note).
+pub const MANIFEST_MARKER: &str = "## Capabilities";
 
 /// Fold `manifest` onto `base`, replacing any manifest already appended.
 ///

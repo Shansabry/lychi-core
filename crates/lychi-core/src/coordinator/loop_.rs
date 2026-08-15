@@ -67,6 +67,9 @@ pub enum AgentEvent {
     Usage {
         input_tokens: u32,
         output_tokens: u32,
+        /// How many input tokens were prompt-cache hits (the two-tier caching,
+        /// made visible). 0 when the provider doesn't report it.
+        cached_input_tokens: u32,
     },
     /// The loop stopped on the step cap.
     Stopped { reason: String },
@@ -286,14 +289,13 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
             }
             self.emit(AgentEvent::TurnStarted { step });
 
-            // Re-select the tool shortlist from the CURRENT conversation before
-            // each turn, rather than freezing the opening query's set: a later
-            // step reaches a tool its own context now implies. `self.tools` is
-            // the FULL catalog; only the model-facing subset is trimmed. The
-            // executor still runs any tool by name, so a call for a shortlisted-
-            // out tool is not lost.
-            let step_tools =
-                crate::coordinator::select_tools_for_context(&session.messages, self.tools.clone());
+            // Send only the tools this query plausibly needs, re-selected from the
+            // CURRENT conversation each turn (a later step reaches tools its own
+            // context now implies). This cuts input tokens ~80% on a focused query
+            // and improves selection accuracy; it is fail-safe (core always present,
+            // full catalog on vague/broad queries) and the executor still runs any
+            // tool by name, so a filtered-out tool is never lost. See `relevance`.
+            let step_tools = crate::coordinator::select_tools(&session.messages, &self.tools);
 
             // Stream one model turn, forwarding prose + collecting tool calls.
             let turn = match self.consume_turn(&session.messages, &step_tools).await {
@@ -453,9 +455,24 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                     // means the answer was cut off at the token cap.
                     truncated = matches!(stop_reason, crate::providers::StopReason::MaxTokens);
                     if let Some(u) = usage {
+                        // Visible confirmation the prompt cache is (or isn't)
+                        // hitting — the whole point of the stable-catalog design.
+                        let pct = if u.input_tokens > 0 {
+                            (u.cached_input_tokens as f32 / u.input_tokens as f32 * 100.0) as u32
+                        } else {
+                            0
+                        };
+                        tracing::info!(
+                            input_tokens = u.input_tokens,
+                            output_tokens = u.output_tokens,
+                            cached_input_tokens = u.cached_input_tokens,
+                            cache_hit_pct = pct,
+                            "[agent] turn token usage"
+                        );
                         self.emit(AgentEvent::Usage {
                             input_tokens: u.input_tokens,
                             output_tokens: u.output_tokens,
+                            cached_input_tokens: u.cached_input_tokens,
                         });
                     }
                     break;

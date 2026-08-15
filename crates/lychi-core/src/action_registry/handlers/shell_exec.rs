@@ -1133,6 +1133,15 @@ impl ActionHandler for ShellExec {
     fn description(&self) -> &str {
         "Execute a shell command"
     }
+    /// Folded into the agent capability manifest so the model learns how to reach a
+    /// real terminal without any prompt text being hand-injected downstream. The
+    /// `--terminal` sentinel is parsed by the agent adapter (see `agent_run_inputs`).
+    fn usage(&self) -> &str {
+        "`run <command>`. Output is captured and returned to you. For an interactive \
+         or long-running foreground command that needs a real terminal window (ssh, \
+         an editor like vim, a REPL such as python or node, top/htop), prefix the \
+         command with `--terminal ` to open it in an external terminal instead"
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Developer
     }
