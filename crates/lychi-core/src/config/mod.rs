@@ -307,6 +307,7 @@ mod tests {
             [
                 "ai",
                 "commands",
+                "file_search",
                 "general",
                 "history",
                 "keybindings",

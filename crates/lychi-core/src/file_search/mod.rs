@@ -5,6 +5,7 @@
 
 /// The persistent per-scope fuzzy file index (nucleo engine + fs watcher).
 pub mod corpus;
+pub mod index_config;
 pub mod live;
 pub mod rank;
 pub mod session;

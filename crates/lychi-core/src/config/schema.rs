@@ -16,6 +16,8 @@ pub struct Config {
     pub privacy: PrivacyConfig,
     pub keybindings: KeybindingsConfig,
     pub suggestions: SuggestionsConfig,
+    #[serde(default)]
+    pub file_search: FileSearchConfig,
 }
 
 /// The current config schema version. Bump this by one whenever a field is
@@ -60,6 +62,36 @@ impl Default for SuggestionsConfig {
             context_actions_typed: true,
         }
     }
+}
+
+/// File-search indexing policy. Every field is ADDITIVE over sensible built-in
+/// defaults (the `file_search` module owns the base allowlist of useful dot-dirs
+/// and the base denylist of machine-generated junk) — so out of the box this
+/// needs no config, and a power user only lists what they want to ADD.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, specta::Type)]
+pub struct FileSearchConfig {
+    /// Dot-directories to ALSO index, beyond the built-in useful set (`.config`,
+    /// `.ssh`, `.local/bin`, …). Names or scope-relative paths, e.g.
+    /// `extra_dot_dirs = [".dotfiles", ".password-store"]`. Everything else
+    /// hidden stays excluded — the launcher indexes what you can see, not the
+    /// machine-generated dot-trees (`.cache`, `.local/share`, browser caches).
+    #[serde(default)]
+    pub extra_dot_dirs: Vec<String>,
+    /// Directory names to ALSO prune whole-subtree, beyond the built-in junk set
+    /// (`.cache`, `node_modules`, `target`, …). E.g. `extra_excludes = ["Backups"]`.
+    #[serde(default)]
+    pub extra_excludes: Vec<String>,
+    /// Hard ceiling on how many paths the index holds. The walk stops here rather
+    /// than growing unbounded — the backstop that keeps a pathological home dir
+    /// from exhausting memory. 0 = use the built-in default.
+    #[serde(default)]
+    pub max_indexed_paths: usize,
+    /// A directory with more immediate children than this is treated as
+    /// machine-generated bulk and pruned whole-subtree during the walk (a
+    /// name-agnostic net for junk trees the denylist doesn't know about). 0 = use
+    /// the built-in default.
+    #[serde(default)]
+    pub max_dir_children: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]

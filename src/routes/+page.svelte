@@ -1361,8 +1361,16 @@ function drillIntoFolder(item: CompletionItem) {
 	// a `/`-search path, which resolved a nested folder like `BG` as `~/BG` and
 	// showed "Empty folder".
 	if (completions.atMode) {
+		// Replace ONLY the `@…` token in place, preserving any text the user typed
+		// before it (e.g. "translate this @~/Pictures/BG/" must keep "translate
+		// this "). The token runs from `atStart` to the next whitespace (or end).
 		const label = item.label.endsWith("/") ? item.label : `${item.label}/`;
-		inputValue = `@${label}`;
+		const start = completions.atStart >= 0 ? completions.atStart : inputValue.indexOf("@");
+		const before = start > 0 ? inputValue.slice(0, start) : "";
+		const afterToken = inputValue.slice(start + 1); // text after the `@`
+		const wsIdx = afterToken.search(/\s/);
+		const after = wsIdx === -1 ? "" : afterToken.slice(wsIdx); // trailing text (incl. its space)
+		inputValue = `${before}@${label}${after}`;
 		handleInput(inputValue);
 		return;
 	}
@@ -2140,6 +2148,7 @@ async function handleDismiss() {
 				truncated={chat.truncated}
 				tokensIn={chat.tokensIn}
 				tokensOut={chat.tokensOut}
+				tokensCached={chat.tokensCached}
 				streaming={chat.streaming}
 				error={chat.error}
 				toolSteps={chat.toolSteps}

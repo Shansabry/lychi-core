@@ -317,6 +317,21 @@ impl AppState {
         // built, so the factory can wire failure-learning into BYO clients.
         lychi_core::providers::capability::init_store(lychi_core::paths::model_caps_file());
 
+        // Register the file-search index policy from config before any corpus
+        // walk runs, so the walk's allowlist/prune/caps use the user's
+        // `[file_search]` additions (falls back to smart built-ins if unset).
+        {
+            let fs = &config.file_search;
+            lychi_core::file_search::index_config::init_config(
+                lychi_core::file_search::index_config::IndexConfig::from_parts(
+                    &fs.extra_dot_dirs,
+                    &fs.extra_excludes,
+                    fs.max_indexed_paths,
+                    fs.max_dir_children,
+                ),
+            );
+        }
+
         // FIRST write-adjacent step at startup: if this is the first run of a
         // new version, snapshot the old version's data before any seeding,
         // migration or new-code path has touched it. Ordering is the whole

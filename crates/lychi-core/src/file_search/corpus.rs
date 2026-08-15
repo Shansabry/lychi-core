@@ -182,6 +182,11 @@ struct ArenaBuilder {
 }
 
 impl ArenaBuilder {
+    /// How many paths pushed so far — for the walk's total-path cap.
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     fn new(scope: &str) -> Self {
         Self {
             // Sized from measured shape (~80 bytes of rel_path per entry on a
@@ -302,39 +307,257 @@ pub fn stat_now(full_path: &str) -> (Option<u64>, Option<u64>) {
 /// enumeration. They must not drift: watching a superset wastes kernel watches,
 /// watching a subset silently leaves parts of the corpus stale.
 fn index_walker(scope: &str) -> WalkBuilder {
+    let scope_root = PathBuf::from(scope);
     let mut b = WalkBuilder::new(scope);
-    b.hidden(true)
+    // Hidden filtering is OFF so USEFUL dotfiles can be indexed — but `filter_entry`
+    // below is the bounded gate that keeps this from exploding into `.cache`/
+    // `.local/share`: every hidden path must be on the allowlist, and every junk /
+    // high-fan-out directory is pruned WHOLE-SUBTREE (filter_entry does not descend
+    // into a rejected dir, so its millions of entries are never read).
+    b.hidden(false)
         .git_ignore(true)
         .git_global(false)
         .git_exclude(false)
-        // Honor `.gitignore`/`.ignore` even outside a git repo, so each
-        // project's own rules apply (adaptive noise filtering).
+        // Honor `.gitignore`/`.ignore` even outside a git repo, so each project's
+        // own rules apply (adaptive noise filtering for build outputs).
         .require_git(false)
         .follow_links(false)
-        .max_depth(Some(MAX_SEARCH_DEPTH));
+        .max_depth(Some(MAX_SEARCH_DEPTH))
+        .filter_entry(move |entry| index_entry_allowed(&scope_root, entry));
+    // Honor the cross-tool "don't index this subtree" marker files (GNOME Tracker's
+    // `.trackerignore`/`.nomedia`, plus the app-agnostic `.ignore`): a directory
+    // that drops one opts its whole subtree out. Reuses the crate's ignore
+    // machinery rather than re-implementing marker scanning in filter_entry.
+    b.add_custom_ignore_filename(".trackerignore");
+    b.add_custom_ignore_filename(".nomedia");
     b
+}
+
+/// The single per-entry gate for the index walk (see [`index_walker`]). Returning
+/// `false` for a directory PRUNES its whole subtree — the walk never descends —
+/// which is what bounds the walk. Reads [`index_config`] so the walk and the
+/// watcher's [`is_indexable`] share one policy source and can't drift.
+///
+/// Rules, in order:
+/// 1. Prune a junk directory (`.cache`, `node_modules`, …) whole-subtree.
+/// 2. Prune a machine-generated-bulk directory identified by STRUCTURE, not name —
+///    an Electron/Chromium profile, a browser web-storage store, or a blob/log
+///    cache — so the launcher stays convergent as new apps appear (see
+///    [`dir_is_prunable_bulk`]).
+/// 3. Reject a hidden path unless it's an allowlisted useful dotfile.
+/// 4. Otherwise allow.
+fn index_entry_allowed(scope_root: &Path, entry: &ignore::DirEntry) -> bool {
+    let cfg = crate::file_search::index_config::current();
+    let path = entry.path();
+    let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+
+    let name = entry.file_name().to_str().unwrap_or("");
+
+    // 1. Junk directory → prune subtree.
+    if is_dir && cfg.is_excluded_dir(name) {
+        return false;
+    }
+
+    // 2. Structural / content bulk → prune subtree. One readdir of the immediate
+    //    children (only for directories) drives ALL the name-agnostic signals.
+    if is_dir && dir_is_prunable_bulk(path, cfg.max_dir_children) {
+        return false;
+    }
+
+    // 3. Hidden path (a dot-prefixed component anywhere) is allowed only if it's on
+    //    the useful-dotfile allowlist. A home-root dotFILE (e.g. `~/.bashrc`) is
+    //    always allowed; a hidden path deeper down must be under an allowlisted
+    //    dot-dir. `rel` is relative to the scope root so the allowlist matches by
+    //    component regardless of where the scope is mounted.
+    if let Ok(rel) = path.strip_prefix(scope_root) {
+        let is_hidden = rel.components().any(|c| {
+            matches!(c, std::path::Component::Normal(s)
+                if s.to_str().is_some_and(|s| s.starts_with('.')))
+        });
+        if is_hidden {
+            // A single-component dotfile at the scope root (e.g. `.bashrc`,
+            // `.gitconfig`) is a genuine user file — always keep it.
+            let is_root_dotfile = rel.components().count() == 1 && !is_dir;
+            return is_root_dotfile || cfg.dotpath_allowed(rel);
+        }
+    }
+
+    // 4. Ordinary visible path.
+    true
+}
+
+/// Chromium/Electron web-storage container dir names. Every Electron app and every
+/// Chromium browser lays out its per-profile state under these EXACT names, so
+/// matching the layout — not the app — prunes all of them and any future one.
+const CHROMIUM_CACHE_SIBLINGS: &[&str] = &[
+    "Cache",
+    "Code Cache",
+    "GPUCache",
+    "DawnCache",
+    "DawnGraphiteCache",
+    "DawnWebGPUCache",
+    "blob_storage",
+    "Service Worker",
+    "CacheStorage",
+];
+
+/// Files that only ever appear at the root of a Chromium/Electron *user-data*
+/// directory. Their presence (with a cache sibling) is the profile fingerprint.
+const CHROMIUM_PROFILE_MARKERS: &[&str] = &["Local State", "Preferences"];
+
+/// Decide whether a directory is machine-generated bulk we should prune WHOLE, by
+/// examining its immediate children ONCE. Name-agnostic: it never enumerates app
+/// names, so it converges as new Electron apps and browsers appear. Signals:
+///
+/// - **Chromium/Electron profile root** — has a `Local State`/`Preferences` file
+///   AND a `Cache`/`Code Cache`/`GPUCache`/… sibling. This is the Chromium
+///   `user_data_dir` layout; every Electron app inherits it.
+/// - **`CACHEDIR.TAG`** — the cross-tool self-declared-cache standard (a child file
+///   whose first bytes are the well-known signature). Free correctness; honored
+///   even though few apps under `~/.config` write it today.
+/// - **leveldb store** — a `CURRENT` file next to a `MANIFEST-*` (Local Storage /
+///   IndexedDB / Session Storage).
+/// - **extensionless-dominant** — ≥16 children and >85% of files have no extension:
+///   a blob cache of hash-named files. The floor keeps a small hand-written config
+///   dir from ever matching.
+/// - **log-dominant** — ≥16 children and >85% are `.log`: log spew (e.g. gcloud).
+/// - **fan-out** — more immediate children than `max_dir_children`: the original
+///   name-agnostic net for anything the above miss.
+///
+/// Errors (permission, race) mean "not bulk" — a transient failure never wrongly
+/// prunes a real directory.
+fn dir_is_prunable_bulk(dir: &Path, max_dir_children: usize) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false; // unreadable → don't prune on a guess
+    };
+
+    let mut total = 0usize;
+    let mut files = 0usize;
+    let mut extensionless = 0usize;
+    let mut log_files = 0usize;
+    let mut has_current = false;
+    let mut has_manifest = false;
+    let mut has_profile_marker = false;
+    let mut has_cache_sibling = false;
+    let mut cachedir_tag: Option<PathBuf> = None;
+
+    for entry in rd.flatten() {
+        total += 1;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+
+        if is_dir {
+            if CHROMIUM_CACHE_SIBLINGS.iter().any(|s| *s == name) {
+                has_cache_sibling = true;
+            }
+        } else {
+            files += 1;
+            match Path::new(&*name).extension().and_then(|e| e.to_str()) {
+                None => extensionless += 1,
+                Some("log") => log_files += 1,
+                _ => {}
+            }
+            if CHROMIUM_PROFILE_MARKERS.iter().any(|m| *m == name) {
+                has_profile_marker = true;
+            }
+            match &*name {
+                "CURRENT" => has_current = true,
+                "CACHEDIR.TAG" => cachedir_tag = Some(entry.path()),
+                n if n.starts_with("MANIFEST-") => has_manifest = true,
+                _ => {}
+            }
+        }
+    }
+
+    // Electron/Chromium profile root — the highest-value, near-zero-false-positive
+    // signal. Catches every browser and Electron app by layout alone.
+    if has_profile_marker && has_cache_sibling {
+        return true;
+    }
+    // Self-declared cache (validated signature, not just the filename).
+    if cachedir_tag.is_some_and(|p| is_cachedir_tag(&p)) {
+        return true;
+    }
+    // LevelDB / IndexedDB store.
+    if has_current && has_manifest {
+        return true;
+    }
+    // Blob-cache / log-spew: dominated by extensionless or `.log` files. The floor
+    // avoids catching a small legitimate config directory.
+    if files >= 16 {
+        let pct = |n: usize| n * 100 >= files * 85;
+        if pct(extensionless) || pct(log_files) {
+            return true;
+        }
+    }
+    // Fan-out backstop for anything the structural signals miss.
+    total > max_dir_children
+}
+
+/// The `CACHEDIR.TAG` standard (bford.info/cachedir): a file whose first 43 bytes
+/// are exactly `Signature: 8a477f597d28d172789f06886806bc55`. Validate the content,
+/// not just the name, so a coincidental filename can't prune a real directory.
+fn is_cachedir_tag(path: &Path) -> bool {
+    use std::io::Read;
+    const SIG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; SIG.len()];
+    f.read_exact(&mut buf).is_ok() && buf == *SIG
 }
 
 /// Would this path appear in the corpus?
 ///
-/// The watcher's event filter. It must agree with [`index_walker`]'s
-/// `hidden(true)`: a non-recursive watch on a directory still reports its
-/// hidden children, so without this an event for a dotfile we never index
-/// triggers a full rebuild. Checking every component (not just the file name)
-/// catches `~/.cache/foo/bar.txt`, where only an ancestor is hidden.
+/// The watcher's event filter, deciding whether a filesystem event should trigger
+/// a rebuild. It MUST agree with [`index_walker`]'s policy or the corpus goes
+/// stale (an indexed file whose writes don't rebuild) or thrashes (a pruned file
+/// whose writes do). Both read the same [`index_config`], so they can't drift.
 ///
-/// Deliberately NOT re-running the ignore rules here: that would mean building
-/// a `WalkBuilder` per event, and a `.gitignore`d file inside an indexed tree
-/// is a rare enough false positive to be worth the simplicity. Hidden paths
-/// are the ones that fire constantly.
-fn is_indexable(path: &Path) -> bool {
+/// A path is indexable when it is either not hidden and not under a pruned junk
+/// directory, OR it is an allowlisted useful dotfile. `scope` anchors the
+/// relative path used for the dotfile allowlist. Deliberately does NOT re-run the
+/// `.gitignore` rules (that would mean a `WalkBuilder` per event) — a gitignored
+/// file inside an indexed tree is a rare, tolerable false positive.
+///
+/// This is only a coarse REBUILD TRIGGER, not the index-membership decider: it
+/// checks the path alone, never touching disk. The walk's structural bulk prune
+/// ([`dir_is_prunable_bulk`] — Electron profiles, leveldb stores, blob caches)
+/// lives ONLY in [`index_entry_allowed`], because it needs a `read_dir` per
+/// directory and running that per filesystem event is the cost this predicate
+/// exists to avoid. The walk is authoritative for what ends up in the corpus; the
+/// worst case here is one wasted rebuild for a change inside a dir the walk will
+/// then correctly prune.
+fn is_indexable(scope: &Path, path: &Path) -> bool {
     use std::path::Component;
-    !path.components().any(|c| {
-        // Only Normal components can be hidden. `.` and `..` are path syntax,
-        // and matching them on a leading dot would reject every relative path.
+    let cfg = crate::file_search::index_config::current();
+
+    // A junk directory component anywhere → not indexed (matches the walk prune).
+    if path.components().any(|c| {
+        matches!(c, Component::Normal(s)
+            if s.to_str().is_some_and(|s| cfg.is_excluded_dir(s)))
+    }) {
+        return false;
+    }
+
+    // Hidden path → indexed only if it's an allowlisted useful dotfile.
+    let Ok(rel) = path.strip_prefix(scope) else {
+        // Outside the scope — fall back to the plain hidden check.
+        return !path.components().any(|c| {
+            matches!(c, Component::Normal(s)
+                if s.to_str().is_some_and(|s| s.starts_with('.')))
+        });
+    };
+    let is_hidden = rel.components().any(|c| {
         matches!(c, Component::Normal(s)
             if s.to_str().is_some_and(|s| s.starts_with('.')))
-    })
+    });
+    if is_hidden {
+        let is_root_dotfile = rel.components().count() == 1;
+        return is_root_dotfile || cfg.dotpath_allowed(rel);
+    }
+    true
 }
 
 /// Does this event mean the set of files on disk changed?
@@ -648,6 +871,11 @@ impl PathCorpus {
             .name("lychi-corpus-walk".into())
             .spawn(move || {
                 let builder = Mutex::new(ArenaBuilder::new(&me.scope));
+                // The hard ceiling on how many paths the arena may hold — the
+                // backstop that keeps a pathological home dir from exhausting
+                // memory even if the pruning missed a giant tree (the failure this
+                // guards is a walk that grew the arena to gigabytes).
+                let max_paths = crate::file_search::index_config::current().max_indexed_paths;
                 index_walker(&me.scope).build_parallel().run(|| {
                     let builder = &builder;
                     let me = me.clone();
@@ -679,7 +907,16 @@ impl PathCorpus {
                         // Batched per walk thread would be faster, but the
                         // parallel walk hands each thread its own closure
                         // and this lock is held for a push, not a walk.
-                        builder.lock().unwrap().push(rel, is_dir);
+                        let len = {
+                            let mut b = builder.lock().unwrap();
+                            b.push(rel, is_dir);
+                            b.len()
+                        };
+                        // Total-path ceiling reached: stop every walk thread. The
+                        // already-collected paths still publish below.
+                        if len >= max_paths {
+                            return WalkState::Quit;
+                        }
                         WalkState::Continue
                     })
                 });
@@ -948,7 +1185,12 @@ impl CorpusStore {
                             // check drops reads (including the ones our own
                             // rebuild walk causes — see `is_change`); the path
                             // check drops writes to files we'd never index.
-                            if is_change(&ev.kind) && ev.paths.iter().any(|p| is_indexable(p)) {
+                            if is_change(&ev.kind)
+                                && ev
+                                    .paths
+                                    .iter()
+                                    .any(|p| is_indexable(Path::new(&scope_owned), p))
+                            {
                                 pending = true;
                                 last_event = Instant::now();
                             }
@@ -1028,37 +1270,108 @@ mod tests {
         }
     }
 
-    /// Lychi's own database lives under ~/.local/share/lychi, and every write to
-    /// it used to rebuild the whole corpus.
+    /// Junk dot-trees never rebuild; useful dotfiles now DO (they're indexed).
     #[test]
-    fn hidden_paths_do_not_trigger_rebuilds() {
+    fn junk_dotpaths_do_not_rebuild_but_useful_ones_do() {
+        let scope = Path::new("/home/u");
+        // Junk — pruned, must not rebuild:
         for p in [
-            "/home/u/.local/share/lychi/lychi.redb",
-            "/home/u/.claude.json",
+            "/home/u/.local/share/lychi/lychi.redb", // .local junk (not bin/applications)
             "/home/u/.cache/plasmashell/qqpc_opengl",
-            "/home/u/.config/lychi/config.toml",
+            "/home/u/.mozilla/firefox/prefs.js",
+            "/home/u/project/node_modules/react/index.js",
         ] {
-            assert!(!is_indexable(Path::new(p)), "{p} must not rebuild");
+            assert!(!is_indexable(scope, Path::new(p)), "{p} must not rebuild");
+        }
+        // Useful dotfiles — now indexed, so writes must rebuild:
+        for p in [
+            "/home/u/.claude.json",              // root dotfile
+            "/home/u/.config/lychi/config.toml", // allowlisted dot-dir
+            "/home/u/.ssh/config",               // allowlisted dot-dir
+            "/home/u/.local/bin/my-script",      // allowlisted .local subdir
+        ] {
+            assert!(is_indexable(scope, Path::new(p)), "{p} must rebuild");
         }
     }
 
     #[test]
     fn visible_paths_still_trigger_rebuilds() {
+        let scope = Path::new("/home/u");
         for p in [
             "/home/u/work/report.md",
             "/home/u/Documents/notes/todo.txt",
             "/home/u/src/project/main.rs",
         ] {
-            assert!(is_indexable(Path::new(p)), "{p} must rebuild");
+            assert!(is_indexable(scope, Path::new(p)), "{p} must rebuild");
         }
     }
 
-    /// `..` is `Component::ParentDir`, whose `as_os_str()` is `".."` — matching
-    /// a leading dot on it would reject every relative path.
+    /// The real walk against a temp tree: it KEEPS visible files + allowlisted
+    /// dotfiles, and PRUNES junk dot-trees and high-fan-out dirs WHOLE-SUBTREE
+    /// (never descends). Guards the exact regression that once OOM'd the walk.
     #[test]
-    fn dot_components_are_not_hidden() {
-        assert!(is_indexable(Path::new("../sibling/file.txt")));
-        assert!(is_indexable(Path::new("./file.txt")));
+    fn index_walk_keeps_useful_prunes_junk_and_bulk() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        // Small per-dir cap so the test's fan-out dir is pruned deterministically.
+        crate::file_search::index_config::set_config_for_test(
+            crate::file_search::index_config::IndexConfig::from_parts(&[], &[], 0, 50),
+        );
+        let root = std::env::temp_dir().join(format!(
+            "lychi-walk-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mk = |rel: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"x").unwrap();
+        };
+        mk("Downloads/report.pdf"); // visible
+        mk(".config/nvim/init.lua"); // allowlisted dotfile
+        mk(".bashrc"); // root dotfile
+        mk(".cache/thumbs/a.png"); // junk dot-tree → pruned
+        mk(".mozilla/profile/prefs.js"); // junk dot-tree → pruned
+        mk("proj/node_modules/react/index.js"); // junk → pruned
+        for i in 0..80 {
+            mk(&format!("bulk/f{i}")); // >50 children → pruned whole-subtree
+        }
+
+        let found: std::collections::HashSet<String> = index_walker(root.to_str().unwrap())
+            .build()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                e.path()
+                    .strip_prefix(&root)
+                    .ok()
+                    .map(|p| p.to_string_lossy().to_string())
+            })
+            .collect();
+
+        assert!(
+            found.iter().any(|p| p.contains("Downloads")),
+            "visible kept: {found:?}"
+        );
+        assert!(
+            found.iter().any(|p| p.contains(".config")),
+            "useful dotfile kept: {found:?}"
+        );
+        assert!(
+            found.iter().any(|p| p == ".bashrc"),
+            "root dotfile kept: {found:?}"
+        );
+        assert!(!found.iter().any(|p| p.contains(".cache")), "junk pruned");
+        assert!(!found.iter().any(|p| p.contains(".mozilla")), "junk pruned");
+        assert!(
+            !found.iter().any(|p| p.contains("node_modules")),
+            "junk pruned"
+        );
+        assert!(
+            !found.iter().any(|p| p.contains("bulk/f")),
+            "high fan-out pruned"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A corpus on a path that cannot be walked, so `spawn_walk` finishes
@@ -1321,5 +1634,86 @@ mod tests {
         let counts = subtree_sizes(&dirs);
         assert_eq!(counts.get(Path::new("/a")).copied(), Some(3));
         assert_eq!(counts.get(Path::new("/a/b")).copied(), Some(1));
+    }
+
+    /// The structural bulk prune must catch Electron/browser state by LAYOUT (never
+    /// by app name) while leaving hand-written config intact. This is the core
+    /// convergence guarantee: a newly-installed app is classified by its structure,
+    /// so no denylist edit is ever needed.
+    #[test]
+    fn structural_prune_catches_app_state_keeps_config() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N1: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "lychi-struct-{}-{}",
+            std::process::id(),
+            N1.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mk_file = |p: &str, body: &str| {
+            let full = dir.join(p);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, body).unwrap();
+        };
+        let mk_dir = |p: &str| std::fs::create_dir_all(dir.join(p)).unwrap();
+
+        // An Electron/Chromium app profile: `Local State` file + a `Cache` sibling.
+        mk_file("SomeNewApp/Local State", "{}");
+        mk_dir("SomeNewApp/Cache");
+        mk_file("SomeNewApp/settings.json", "{}");
+        // A LevelDB store: CURRENT + MANIFEST-*.
+        mk_file("store/CURRENT", "MANIFEST-000001\n");
+        mk_file("store/MANIFEST-000001", "");
+        // A blob cache: many extensionless hash-named files.
+        for i in 0..20 {
+            mk_file(&format!("blobs/{i:08x}deadbeef"), "x");
+        }
+        // A log-spew dir.
+        for i in 0..20 {
+            mk_file(&format!("logspew/run{i}.log"), "x");
+        }
+        // A CACHEDIR.TAG-marked dir (validated signature).
+        mk_file(
+            "tagged/CACHEDIR.TAG",
+            "Signature: 8a477f597d28d172789f06886806bc55\n# more",
+        );
+        mk_file("tagged/whatever", "x");
+        // Genuine hand-written config — must survive.
+        mk_file("nvim/init.lua", "vim.opt.number = true");
+        mk_file("git/config", "[user]\n");
+
+        let big = |name: &str| dir_is_prunable_bulk(&dir.join(name), 1000);
+        assert!(
+            big("SomeNewApp"),
+            "Electron profile must be pruned by structure"
+        );
+        assert!(big("store"), "leveldb store must be pruned");
+        assert!(big("blobs"), "extensionless blob cache must be pruned");
+        assert!(big("logspew"), "log-dominant dir must be pruned");
+        assert!(big("tagged"), "CACHEDIR.TAG dir must be pruned");
+        assert!(!big("nvim"), "real config must NOT be pruned");
+        assert!(!big("git"), "real config must NOT be pruned");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A coincidental `CACHEDIR.TAG` filename with the WRONG contents must not
+    /// prune a real directory — we validate the signature bytes, not the name.
+    #[test]
+    fn cachedir_tag_requires_valid_signature() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N2: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "lychi-cachesig-{}-{}",
+            std::process::id(),
+            N2.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("CACHEDIR.TAG"), "not the real signature").unwrap();
+        std::fs::write(dir.join("real-config.toml"), "x").unwrap();
+        assert!(
+            !dir_is_prunable_bulk(&dir, 1000),
+            "a CACHEDIR.TAG with an invalid signature must not prune the dir"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
