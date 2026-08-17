@@ -357,10 +357,25 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
             // session.pending (surfaced to the user one at a time, in order);
             // and an infra error mid-batch synthesizes error results for
             // everything not yet answered rather than leaving danglers.
+            // Read-only siblings run CONCURRENTLY (join_all: results come back
+            // in call order); the single mutating call (filter_batch caps the
+            // batch at one) runs after them, alone. Ordering rationale: same-turn
+            // calls are independent by tool-calling convention, so reads observing
+            // pre-mutation state is correct; and if the mutating call suspends on
+            // approval, every read has already answered its tool_use id.
+            let (mutating, reads): (Vec<ToolCall>, Vec<ToolCall>) =
+                calls.into_iter().partition(|c| self.is_mutating(&c.name));
+
+            let read_results =
+                futures_util::future::join_all(reads.iter().map(|c| self.execute_tool_call(c)))
+                    .await;
+
             let mut first_request: Option<ApprovalRequest> = None;
-            let mut remaining = calls.into_iter();
-            while let Some(call) = remaining.next() {
-                match self.run_one_tool(&mut session, call).await {
+            let mut batch_error: Option<LychiError> = None;
+            for (call, result) in reads.into_iter().zip(read_results) {
+                // Fold EVERY completed result even after one errored — these
+                // tools already ran, and their tool_use ids must be answered.
+                match self.fold_outcome(&mut session, call, result) {
                     Ok(None) => {}
                     Ok(Some(request)) => {
                         if first_request.is_none() {
@@ -368,36 +383,58 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                         }
                     }
                     Err(error) => {
-                        // The failing call already got its error tool_result in
-                        // run_one_tool. Answer everything else so no tool_use
-                        // dangles: unrun siblings, and any approvals queued
-                        // earlier in this batch (an Error outcome never reaches
-                        // apply_decision, so their pending entries would
-                        // otherwise never produce a result).
-                        for c in remaining {
-                            session.push_tool_result(
-                                &c.id,
-                                "not run: an earlier tool call in this batch failed".into(),
-                                true,
-                            );
+                        if batch_error.is_none() {
+                            batch_error = Some(error);
                         }
-                        let queued: Vec<String> =
-                            session.pending.drain(..).map(|p| p.call.id).collect();
-                        for id in queued {
-                            session.push_tool_result(
-                                &id,
-                                "not run: the batch failed before approval could be requested"
-                                    .into(),
-                                true,
-                            );
-                        }
-                        self.emit(AgentEvent::Error(error.to_string()));
-                        return Outcome::Error {
-                            error,
-                            session: Some(session),
-                        };
                     }
                 }
+            }
+
+            if batch_error.is_none() {
+                for call in mutating {
+                    match self.run_one_tool(&mut session, call).await {
+                        Ok(None) => {}
+                        Ok(Some(request)) => {
+                            if first_request.is_none() {
+                                first_request = Some(request);
+                            }
+                        }
+                        Err(error) => {
+                            batch_error = Some(error);
+                            break;
+                        }
+                    }
+                }
+            } else {
+                // A read errored: the mutating call must not run on a failed
+                // premise. Answer its tool_use id so nothing dangles.
+                for c in mutating {
+                    session.push_tool_result(
+                        &c.id,
+                        "not run: an earlier tool call in this batch failed".into(),
+                        true,
+                    );
+                }
+            }
+
+            if let Some(error) = batch_error {
+                // The failing call already got its error tool_result in
+                // fold_outcome. Answer any approvals queued in this batch (an
+                // Error outcome never reaches apply_decision, so their pending
+                // entries would otherwise never produce a result).
+                let queued: Vec<String> = session.pending.drain(..).map(|p| p.call.id).collect();
+                for id in queued {
+                    session.push_tool_result(
+                        &id,
+                        "not run: the batch failed before approval could be requested".into(),
+                        true,
+                    );
+                }
+                self.emit(AgentEvent::Error(error.to_string()));
+                return Outcome::Error {
+                    error,
+                    session: Some(session),
+                };
             }
             if let Some(request) = first_request {
                 self.emit(AgentEvent::AwaitingApproval(request.clone()));
@@ -497,6 +534,17 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
         session: &mut Session,
         call: ToolCall,
     ) -> Result<Option<ApprovalRequest>, LychiError> {
+        let result = self.execute_tool_call(&call).await;
+        self.fold_outcome(session, call, result)
+    }
+
+    /// The execution half of a tool call: emit the start event, wire the live
+    /// output stream, run the executor, and return the raw outcome — WITHOUT
+    /// touching the session. Session-free on purpose: read-only siblings in one
+    /// batch run through this concurrently ([`join_all`] in the main loop), and
+    /// their outcomes are folded into the session afterwards, in call order, by
+    /// [`Self::fold_outcome`].
+    async fn execute_tool_call(&self, call: &ToolCall) -> Result<ToolOutcome, LychiError> {
         self.emit(AgentEvent::ToolCallStarted {
             call_id: call.id.clone(),
             name: call.name.clone(),
@@ -509,7 +557,8 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
         // the output as it happens. The task ends when the tool drops its sender
         // (the channel closes) — i.e. when the command finishes. Non-streaming
         // tools never push, so the task simply ends at once. The FINAL output
-        // still comes back in the `Ran` outcome below, unchanged.
+        // still comes back in the `Ran` outcome, unchanged. Concurrent calls
+        // interleave safely: every delta is tagged with its call id.
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
         let forward = {
             let ev_tx = self.ev_tx.clone();
@@ -537,7 +586,18 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
         // drain any last buffered chunks and end. Await it so all deltas are
         // emitted BEFORE the completion event (ordering the UI relies on).
         let _ = forward.await;
+        result
+    }
 
+    /// The bookkeeping half of a tool call: apply an outcome from
+    /// [`Self::execute_tool_call`] to the session (tool_result / pending
+    /// approval) and emit the completion event.
+    fn fold_outcome(
+        &self,
+        session: &mut Session,
+        call: ToolCall,
+        result: Result<ToolOutcome, LychiError>,
+    ) -> Result<Option<ApprovalRequest>, LychiError> {
         match result {
             Ok(ToolOutcome::Ran {
                 output,
