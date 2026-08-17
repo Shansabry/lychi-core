@@ -281,6 +281,8 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
 
         // ── The turn loop ────────────────────────────────────────────────────
         let mut step = 0usize;
+        // One free retry for a provider returning a fully-empty turn (see below).
+        let mut retried_empty_turn = false;
         loop {
             if self.cancel.is_cancelled() {
                 // Esc ends the TURN, not the conversation — the session (with
@@ -333,6 +335,27 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                 }
             };
             let (text, calls, truncated) = (turn.text, turn.tool_calls, turn.truncated);
+
+            // A COMPLETELY empty turn (no prose, no calls, not a token-cap cut)
+            // is a provider flake, not an answer — Groq has returned 0-token
+            // streams right after a tool result, and treating that as the final
+            // answer ended the conversation in silence with the user staring at
+            // a finished tool call. Retry once; then fail honestly.
+            if text.trim().is_empty() && calls.is_empty() && !truncated {
+                if !retried_empty_turn {
+                    retried_empty_turn = true;
+                    tracing::warn!("[agent] provider returned an empty turn — retrying once");
+                    continue;
+                }
+                let error = LychiError::Ai(
+                    "The AI returned an empty response twice — try again in a moment.".into(),
+                );
+                self.emit(AgentEvent::Error(error.to_string()));
+                return Outcome::Error {
+                    error,
+                    session: Some(session),
+                };
+            }
             session.push_assistant(text.clone(), calls.clone());
 
             // No tool calls → final answer, done.
@@ -1248,6 +1271,39 @@ mod tests {
         let exec = Arc::new(MockExecutor::new());
         let coord = Coordinator::new(provider, exec, Vec::new());
         assert!(coord.tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_empty_turn_is_retried_once_then_errors() {
+        // First turn: the provider streams NOTHING (the Groq 0-token flake).
+        // The loop must retry; a good second turn answers normally.
+        let provider = MockProvider::new(vec![answer(""), answer("recovered")]);
+        let exec = Arc::new(MockExecutor::new());
+        let (stream, handle) =
+            coordinator(provider, exec).run(Session::new("sys", "hi"), CancellationToken::new());
+        let events = drain(stream).await;
+        assert_eq!(final_text(&events), Some("recovered"));
+        match handle.wait().await {
+            Outcome::Done { session } => {
+                // The empty attempt must not linger in history.
+                assert_eq!(session.messages.len(), 3, "system, user, one assistant");
+            }
+            _ => panic!("expected Done"),
+        }
+
+        // Two empty turns in a row → an honest error, not silence.
+        let provider = MockProvider::new(vec![answer(""), answer("")]);
+        let exec = Arc::new(MockExecutor::new());
+        let (stream, handle) =
+            coordinator(provider, exec).run(Session::new("sys", "hi"), CancellationToken::new());
+        let events = drain(stream).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Error(msg) if msg.contains("empty"))),
+            "an error event must surface"
+        );
+        assert!(matches!(handle.wait().await, Outcome::Error { .. }));
     }
 
     #[tokio::test]

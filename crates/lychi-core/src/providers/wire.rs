@@ -697,6 +697,13 @@ where
                     }
                 }
                 Some("message_stop") => break,
+                // Anthropic streams failures as an `error` event; treating it
+                // as an unknown event ended the turn "successfully" empty.
+                Some("error") => {
+                    let msg = data["error"]["message"].as_str().unwrap_or("unspecified provider error");
+                    tracing::warn!(detail = %data["error"].to_string(), "[wire] provider streamed an error");
+                    Err(LychiError::Ai(format!("The AI provider reported an error: {msg}")))?;
+                }
                 _ => {}
             }
         }
@@ -732,6 +739,15 @@ where
             let evt = match sse.next_event(&cancel).await? { Some(e) => e, None => break };
             if evt.trim() == "[DONE]" { break; }
             let data: Value = match serde_json::from_str(&evt) { Ok(v) => v, Err(_) => continue };
+            // A provider can stream an ERROR chunk mid-stream (Groq does this
+            // for failures that occur after headers went out). Skipping it as
+            // an unrecognized chunk made the turn end "successfully" empty —
+            // the user saw a finished tool call and then silence.
+            if let Some(err) = data.get("error").filter(|e| !e.is_null()) {
+                let msg = err["message"].as_str().unwrap_or("unspecified provider error");
+                tracing::warn!(detail = %err.to_string(), "[wire] provider streamed an error");
+                Err(LychiError::Ai(format!("The AI provider reported an error: {msg}")))?;
+            }
             // Usage rides on ONE extra chunk at the end (requested via
             // `stream_options.include_usage`), whose `choices` array is empty.
             // Read it before touching `choices` so the empty-array case is a
