@@ -317,9 +317,29 @@ fn recent_context(messages: &[ChatMessage]) -> String {
         .rev()
         .filter(|m| matches!(m.role, Role::User | Role::Assistant))
         .take(CONTEXT_LOOKBACK_MESSAGES)
-        .map(|m| m.content_text())
+        .map(|m| strip_context_blocks(&m.content_text()))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Remove injected `<context>…</context>` blocks before ranking. The ambient
+/// block rides INSIDE the user message, and its own words ("Working
+/// directory", "Project type", "Local time", "Package manager") lexically
+/// rank `files`/`quick_tools`/`system_control` on EVERY turn — selection must
+/// judge the user's words, not our telemetry. (Found via the wire log: a
+/// trivia question shipped 7 tools instead of core's 3.)
+fn strip_context_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<context>") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("</context>") {
+            Some(end) => rest = &rest[start + end + "</context>".len()..],
+            None => return out, // unterminated block: drop the tail
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -557,6 +577,31 @@ mod tests {
                 "{query:?} over-included: {n:?}"
             );
         }
+    }
+
+    #[test]
+    fn precision_the_ambient_context_block_ranks_nothing() {
+        // The ambient block rides INSIDE the user message and its own words
+        // ("Working directory", "Project type", "Local time", "Package
+        // manager") name several groups — a trivia question with the block
+        // attached must still ship core only.
+        let cat = heavy(production_like_catalog());
+        let msgs = vec![ChatMessage::user(
+            "what is a dolphin?\n\n<context>\n- Local time: 2026-08-17 Sunday 16:45\n\
+             - Working directory: /mnt/DevSSD/Lychi\n- Git branch: main\n\
+             - Project type: Rust\n- Package manager: pnpm\n\
+             - Docker: 2 running container(s)\n</context>",
+        )];
+        let n = names(&select_tools(&msgs, &cat));
+        assert_eq!(
+            n,
+            vec![
+                "web_tools".to_string(),
+                "run".to_string(),
+                FIND_TOOL.to_string()
+            ],
+            "the ambient context block must not rank tools"
+        );
     }
 
     #[test]
