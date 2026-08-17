@@ -402,6 +402,12 @@ function onWindowKeydown(e: KeyboardEvent) {
 					<!-- Inline rich tool output (e.g. a QR code). Sanitized SVG. -->
 					<!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized -->
 					<div class="tool-artifact svg">{@html sanitizeSvg(step.artifactContent)}</div>
+				{:else if step.artifactKind === "image" && step.artifactContent?.startsWith("data:image/")}
+					<!-- A capture the agent took and analyzed (a screenshot) — show the
+					     user exactly what the model saw. Data URI only; never a path. -->
+					<div class="tool-artifact image">
+						<img src={step.artifactContent} alt="Screenshot the AI captured" />
+					</div>
 				{/if}
 			{/each}
 		</div>
@@ -918,6 +924,20 @@ function onWindowKeydown(e: KeyboardEvent) {
 		display: block;
 		width: 160px;
 		height: 160px;
+	}
+	.tool-artifact.image {
+		align-self: flex-start;
+		margin: 6px 0 4px;
+		max-width: 100%;
+	}
+	.tool-artifact.image img {
+		display: block;
+		max-width: 420px;
+		max-height: 260px;
+		width: auto;
+		height: auto;
+		border-radius: 8px;
+		border: 1px solid var(--border);
 	}
 	.tool-step {
 		display: flex;

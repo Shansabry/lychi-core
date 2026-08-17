@@ -371,6 +371,11 @@ pub struct ActionResult {
     /// Result-level risk tag for display (e.g. app-control kill). Distinct from
     /// the pre-execution `assess_risk` gate; the frontend shows it on the card.
     pub risk_level: Option<RiskLevel>,
+    /// TYPED path of a file this action produced (a screenshot's PNG, a
+    /// converted image). Consumers that want the file — the agent feeding a
+    /// capture to a vision model — read THIS, never re-parse the display text
+    /// (the reverse-parsing trap that broke display truncation once already).
+    pub saved_file: Option<String>,
 }
 
 impl ActionResult {
@@ -387,6 +392,12 @@ impl ActionResult {
     }
 
     /// Failed result with an error message.
+    /// Tag the typed path of a file this action produced (builder-style).
+    pub fn with_saved_file(mut self, path: impl Into<String>) -> Self {
+        self.saved_file = Some(path.into());
+        self
+    }
+
     pub fn err(error: impl Into<String>) -> Self {
         Self {
             success: false,

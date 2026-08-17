@@ -686,10 +686,25 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                 output,
                 is_error,
                 artifact,
+                image,
             }) => {
                 // Only the text `output` goes into the model's context; the rich
                 // `artifact` (if any) rides the event to the UI for inline render.
                 session.push_tool_result(&call.id, output.clone(), is_error);
+                // A captured image the model should SEE (a screenshot it just
+                // took): appended as an image message after the tool result —
+                // the OpenAI dialect's tool role is text-only, so the image
+                // cannot ride the result itself. Clearly labeled as the tool's
+                // own capture, not user input.
+                if let Some(img) = image
+                    && !is_error
+                {
+                    session.push_user_with_images(
+                        "[Screenshot captured by the tool call above — this is the \
+                         current screen for you to analyze.]",
+                        vec![img],
+                    );
+                }
                 if is_error {
                     self.emit(AgentEvent::ToolCallFailed {
                         call_id: call.id,
@@ -1142,6 +1157,21 @@ mod tests {
                 execute_calls: Mutex::new(0),
             }
         }
+        fn ran_with_image(mut self, name: &str, output: &str) -> Self {
+            self.outcomes.insert(
+                name.into(),
+                ToolOutcome::Ran {
+                    output: output.into(),
+                    is_error: false,
+                    artifact: None,
+                    image: Some(crate::providers::ImageSource {
+                        media_type: "image/png".into(),
+                        data: "aGVsbG8=".into(),
+                    }),
+                },
+            );
+            self
+        }
         fn ran(mut self, name: &str, output: &str, is_error: bool) -> Self {
             self.outcomes.insert(
                 name.into(),
@@ -1149,6 +1179,7 @@ mod tests {
                     output: output.into(),
                     is_error,
                     artifact: None,
+                    image: None,
                 },
             );
             self
@@ -1175,7 +1206,10 @@ mod tests {
             *self.execute_calls.lock().unwrap() += 1;
             match self.outcomes.get(name) {
                 Some(ToolOutcome::Ran {
-                    output, is_error, ..
+                    output,
+                    is_error,
+                    image,
+                    ..
                 }) => {
                     // Stream the output as two chunks when a channel is provided,
                     // so a test can assert live deltas arrive before completion.
@@ -1188,6 +1222,7 @@ mod tests {
                         output: output.clone(),
                         is_error: *is_error,
                         artifact: None,
+                        image: image.clone(),
                     })
                 }
                 Some(ToolOutcome::NeedsApproval { reason, resume }) => {
@@ -1371,6 +1406,37 @@ mod tests {
         let exec = Arc::new(MockExecutor::new());
         let coord = Coordinator::new(provider, exec, Vec::new());
         assert!(coord.tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_tool_capture_reaches_the_model_as_an_image() {
+        // Turn 1 calls the tool; the executor returns an image (a screenshot).
+        // The session must gain an image-bearing message AFTER the tool result,
+        // and turn 2's request must include it.
+        let provider = MockProvider::new(vec![
+            call_tool("c1", "weather", "full"),
+            answer("I can see the screen"),
+        ]);
+        let exec = Arc::new(MockExecutor::new().ran_with_image("weather", "Screenshot saved"));
+        let (stream, handle) =
+            coordinator(provider, exec).run(Session::new("sys", "look"), CancellationToken::new());
+        drain(stream).await;
+        match handle.wait().await {
+            Outcome::Done { session } => {
+                let img_idx = session
+                    .messages
+                    .iter()
+                    .position(|m| m.has_images())
+                    .expect("an image message was appended");
+                let result_idx = session
+                    .messages
+                    .iter()
+                    .position(|m| m.tool_call_id.is_some())
+                    .expect("tool result present");
+                assert!(img_idx > result_idx, "image follows the tool result");
+            }
+            _ => panic!("expected Done"),
+        }
     }
 
     #[test]

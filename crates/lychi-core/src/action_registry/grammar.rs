@@ -406,7 +406,8 @@ impl ToolGroup {
             ToolGroup::System => {
                 "Control this Linux desktop and system: launch/quit/focus apps, manage \
                  windows, volume/brightness/wifi/bluetooth/power, systemd services, \
-                 install or search packages, take screenshots, read system info."
+                 install or search packages, read system info, and take screenshots — \
+                 a capture is shown back to you, so you can analyze what is on screen."
             }
             ToolGroup::Media => {
                 "Control media playback (play/pause/next/previous, what's playing) via \

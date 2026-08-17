@@ -26,7 +26,7 @@ use lychi_core::error::LychiError;
 use lychi_core::executor::{Executor, RunInputs};
 use lychi_core::providers::{CancellationToken, ImageSource, ToolDef};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::RwLock;
 
 use crate::state::AppState;
@@ -44,9 +44,36 @@ struct ExecutorAdapter {
     /// command does (`finalize_exec`), or the panel shows stale data until
     /// the next summon.
     app: AppHandle,
+    /// Whether the ACTIVE model may be shown images (capability-learned; only
+    /// a known rejection turns this off). Gates feeding a screenshot back to
+    /// the model — a text-only model just gets the saved path in the text.
+    vision_ok: bool,
 }
 
 impl ExecutorAdapter {
+    /// Hide the launcher before a screenshot tool runs — the chat card sits in
+    /// the middle of the screen and would occlude exactly what the user asked
+    /// about ("analyze this chart"). Routed through the FE's `request-hide`
+    /// (the ONE sanctioned hide primitive: blank-then-hide paints a clean
+    /// frame first — a raw `.hide()` re-introduces the re-summon flash), with
+    /// the same settle budget as the hotkey path's watchdog. The agent-busy
+    /// guard held by `drive` keeps the focus loss from being read as a
+    /// dismissal.
+    async fn hide_for_capture(&self) {
+        let _ = self.app.emit("lychi://request-hide", ());
+        tokio::time::sleep(std::time::Duration::from_millis(220)).await;
+    }
+
+    /// Re-summon after the capture so the user watches the analysis arrive.
+    /// The chat conversation survives the hide/show (the resume machinery
+    /// preserves an active run across a re-summon).
+    async fn reshow_after_capture(&self) {
+        if let Some(w) = self.app.get_webview_window("main") {
+            let _ =
+                tauri::async_runtime::spawn_blocking(move || crate::window::show_window(&w)).await;
+        }
+    }
+
     /// Mirror `finalize_exec`'s panel notification for the agent path.
     fn notify_panel_mutation(&self, action_id: &str, success: bool) {
         if success && crate::commands::execute::PANEL_MUTATION_ACTIONS.contains(&action_id) {
@@ -143,6 +170,40 @@ fn result_text(res: &lychi_core::action_registry::ActionResult) -> String {
             } else {
                 "Failed.".to_string()
             }
+        }
+    }
+}
+
+/// Vision-encode a file a tool just saved (a screenshot), for the model AND
+/// the UI. Returns `(image for the model, artifact for the tool step)` — both
+/// `None` unless the result succeeded, tagged a file, and the current model is
+/// not KNOWN to reject images (Unknown attaches and lets capability learning
+/// record a rejection). Blocking image work runs off the async runtime.
+async fn encode_tool_capture(
+    res: &lychi_core::executor::ExecuteResult,
+    vision_ok: bool,
+) -> (Option<ImageSource>, Option<ToolArtifact>) {
+    let Some(path) = res.result.saved_file.clone().filter(|_| res.result.success) else {
+        return (None, None);
+    };
+    if !vision_ok {
+        return (None, None);
+    }
+    let encoded = tauri::async_runtime::spawn_blocking(move || {
+        lychi_core::files::image_ops::encode_image_for_vision(std::path::Path::new(&path))
+    })
+    .await;
+    match encoded {
+        Ok(Ok((media_type, data))) => {
+            let artifact = ToolArtifact {
+                kind: "image".into(),
+                content: format!("data:{media_type};base64,{data}"),
+            };
+            (Some(ImageSource { media_type, data }), Some(artifact))
+        }
+        other => {
+            tracing::warn!("[agent] could not vision-encode tool capture: {other:?}");
+            (None, None)
         }
     }
 }
@@ -280,6 +341,7 @@ impl ToolExecutor for ExecutorAdapter {
                         output: msg,
                         is_error: true,
                         artifact: None,
+                        image: None,
                     });
                 }
                 GroupDispatch::Resolved {
@@ -297,9 +359,17 @@ impl ToolExecutor for ExecutorAdapter {
                         routing: lychi_core::intent::RoutingMethod::Ai,
                     };
                     let run_inputs = RunInputs::default();
+                    let capturing = intent.action_id == "screenshot";
+                    if capturing {
+                        self.hide_for_capture().await;
+                    }
                     let res = exec
                         .run_resolved(intent.clone(), &self.privacy, &run_inputs)
-                        .await?;
+                        .await;
+                    if capturing {
+                        self.reshow_after_capture().await;
+                    }
+                    let res = res?;
                     self.notify_panel_mutation(&intent.action_id, res.result.success);
                     if let Some(reason) = res.envelope.needs_confirmation {
                         let pending = res.pending_intent.unwrap_or(intent);
@@ -320,11 +390,13 @@ impl ToolExecutor for ExecutorAdapter {
                             resume: token,
                         });
                     }
+                    let (image, capture_artifact) = encode_tool_capture(&res, self.vision_ok).await;
                     let (output, artifact) = result_summary_and_artifact(&res.result);
                     return Ok(ToolOutcome::Ran {
                         output,
                         is_error: !res.result.success,
-                        artifact,
+                        artifact: capture_artifact.or(artifact),
+                        image,
                     });
                 }
             }
@@ -351,7 +423,15 @@ impl ToolExecutor for ExecutorAdapter {
         // a slow shell command, and holding the guard across it queued every
         // launcher keystroke behind the next config save's blocking_write.
         let exec = self.executor.read().await.clone();
-        let res = exec.run(&input, false, &self.privacy, &run_inputs).await?;
+        let capturing = name == "screenshot";
+        if capturing {
+            self.hide_for_capture().await;
+        }
+        let res = exec.run(&input, false, &self.privacy, &run_inputs).await;
+        if capturing {
+            self.reshow_after_capture().await;
+        }
+        let res = res?;
 
         // Destructive → the Rules Engine flagged it; pause for approval. Carry the
         // exact assessed intent in the resume token so approval runs THAT action.
@@ -379,11 +459,13 @@ impl ToolExecutor for ExecutorAdapter {
 
         // Standalone tools are handler ids (the group path returned above).
         self.notify_panel_mutation(name, res.result.success);
+        let (image, capture_artifact) = encode_tool_capture(&res, self.vision_ok).await;
         let (output, artifact) = result_summary_and_artifact(&res.result);
         Ok(ToolOutcome::Ran {
             output,
             is_error: !res.result.success,
-            artifact,
+            artifact: capture_artifact.or(artifact),
+            image,
         })
     }
 
@@ -638,10 +720,21 @@ async fn build_coordinator(
         Vec::new()
     };
 
+    // Whether the active model may see images: only a capability-learned
+    // rejection disables it (Unknown tries and learns). Snapshot here, per
+    // coordinator build — a model switch rebuilds on the next turn anyway.
+    let vision_ok = {
+        let ai = state.config_snapshot(|c| c.ai.clone()).await;
+        !matches!(
+            lychi_core::providers::capability::get_vision(&ai.provider, &ai.model),
+            lychi_core::providers::capability::Vision::Unsupported
+        )
+    };
     let adapter = Arc::new(ExecutorAdapter {
         executor: state.executor.clone(),
         privacy,
         app: app.clone(),
+        vision_ok,
     });
     Ok((Coordinator::new(provider, adapter, tools), manifest))
 }

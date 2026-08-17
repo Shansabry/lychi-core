@@ -755,7 +755,8 @@ impl ActionHandler for ScreenshotHandler {
                             path_str
                         ),
                         OutputType::Text,
-                    ));
+                    )
+                    .with_saved_file(&path_str));
                 }
                 // A soft cancel (user aborted the region drag) is a deliberate
                 // action — report it, don't fall through to a second selector.
@@ -781,6 +782,7 @@ impl ActionHandler for ScreenshotHandler {
                         ),
                         OutputType::Text,
                     )
+                    .with_saved_file(&path_str)
                 } else {
                     ActionResult::err("Screenshot cancelled")
                 });
@@ -815,7 +817,8 @@ impl ActionHandler for ScreenshotHandler {
                             path_str
                         ),
                         OutputType::Text,
-                    ))
+                    )
+                    .with_saved_file(&path_str))
                 } else {
                     Ok(ActionResult::err("Screenshot cancelled"))
                 }

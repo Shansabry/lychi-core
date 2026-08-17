@@ -30,6 +30,11 @@ pub enum ToolOutcome {
         output: String,
         is_error: bool,
         artifact: Option<ToolArtifact>,
+        /// A captured image the MODEL should see (a screenshot the agent just
+        /// took, already vision-encoded). The loop appends it to the session as
+        /// an image message after the tool result — tool-result content is
+        /// text-only on the OpenAI dialect, so it can't ride the result itself.
+        image: Option<crate::providers::ImageSource>,
     },
     /// The tool is destructive and needs the user's OK before running. `reason`
     /// explains why (shown in the approval prompt). `resume` is an opaque token
