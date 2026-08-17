@@ -471,7 +471,7 @@ impl AppState {
         let resolver = IntentResolver::new(ai_router);
         let shell_policy =
             lychi_core::rules::shell::ShellPolicy::from_config(&config.commands.shell_policy);
-        let rules = RulesEngine::with_shell_policy(shell_policy);
+        let rules = RulesEngine::with_policies(shell_policy, &config.commands.approved_actions);
         let mut executor = Executor::new(registry, rules, resolver, history.clone(), db.clone());
         executor.set_quicklinks(quicklinks);
         executor.set_script_keywords(script_keywords);

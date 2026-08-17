@@ -863,10 +863,15 @@ export async function agentChatStart(
 	);
 }
 
-/** Approve (or reject) a pending destructive tool call, resuming the agent. */
-export async function agentApprove(approve: boolean, generation: number): Promise<void> {
+/** Resolve a pending destructive tool call and resume the agent.
+ * "approve" runs it once, "always" runs it and persists an always-allow
+ * grant, "reject" feeds the refusal back to the model. */
+export async function agentApprove(
+	decision: "approve" | "always" | "reject",
+	generation: number,
+): Promise<void> {
 	if (!isTauri()) return;
-	unwrap(await commands.agentApprove(approve, generation));
+	unwrap(await commands.agentApprove(decision, generation));
 }
 
 export async function testAiConnection(): Promise<AiTestResult> {

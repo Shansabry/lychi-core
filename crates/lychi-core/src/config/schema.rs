@@ -269,6 +269,14 @@ pub struct CommandsConfig {
     /// Defaults to the long-standing "ask before mutating" behaviour.
     #[serde(default)]
     pub shell_policy: ShellPolicyConfig,
+    /// Actions the user chose "Always allow" for on an agent approval prompt.
+    /// Entry = `"<handler-id>"` (whole handler) or `"<handler-id> <verb>"`
+    /// (one verb of a verbed grammar), e.g. `"service restart"`. Consulted by
+    /// the Rules Engine for MEDIUM-risk confirmations only — High risk and
+    /// privacy consents always still ask, and `run` uses `shell_policy.allow`
+    /// instead (a command needs a real pattern, not a verb).
+    #[serde(default)]
+    pub approved_actions: Vec<String>,
 }
 
 /// Sensible built-in search shortcuts. Users add their own in config.toml.
@@ -303,6 +311,7 @@ impl Default for CommandsConfig {
             // time, so they aren't duplicated across both fields.
             quicklinks: Vec::new(),
             shell_policy: ShellPolicyConfig::default(),
+            approved_actions: Vec::new(),
         }
     }
 }

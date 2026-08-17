@@ -36,12 +36,20 @@ pub enum ValidationDecision {
 #[derive(Clone)]
 pub struct RulesEngine {
     shell_rules: ShellRules,
+    /// "Always allow" grants from approval prompts: (handler id, args prefix).
+    /// An empty prefix approves the whole handler. Parsed from
+    /// `CommandsConfig.approved_actions` ("id" or "id verb") at construction;
+    /// consulted ONLY for Medium-risk confirmations — High risk and privacy
+    /// consents are never grantable this way, and `run` has its own
+    /// pattern-based allow list in the shell policy.
+    approved: Vec<(String, String)>,
 }
 
 impl RulesEngine {
     pub fn new() -> Self {
         Self {
             shell_rules: ShellRules::new(),
+            approved: Vec::new(),
         }
     }
 
@@ -51,7 +59,39 @@ impl RulesEngine {
     pub fn with_shell_policy(policy: shell::ShellPolicy) -> Self {
         Self {
             shell_rules: ShellRules::with_policy(policy),
+            approved: Vec::new(),
         }
+    }
+
+    /// The full production constructor: shell policy + the user's per-action
+    /// "Always allow" grants.
+    pub fn with_policies(policy: shell::ShellPolicy, approved_actions: &[String]) -> Self {
+        Self {
+            shell_rules: ShellRules::with_policy(policy),
+            approved: approved_actions
+                .iter()
+                .map(|e| match e.split_once(' ') {
+                    Some((action, prefix)) => (action.to_string(), prefix.trim().to_string()),
+                    None => (e.clone(), String::new()),
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether the user has an "Always allow" grant covering this invocation:
+    /// same handler, and the flat args start with the granted verb prefix at a
+    /// word boundary (empty prefix = the whole handler).
+    fn action_approved(&self, action_id: &str, args: &str) -> bool {
+        let args = args.trim();
+        self.approved.iter().any(|(action, prefix)| {
+            action == action_id
+                && (prefix.is_empty()
+                    || (args.starts_with(prefix.as_str())
+                        && args[prefix.len()..]
+                            .chars()
+                            .next()
+                            .is_none_or(char::is_whitespace)))
+        })
     }
 
     /// Validate whether an action should execute, require confirmation, or be denied.
@@ -115,6 +155,16 @@ impl RulesEngine {
         // decision, using the handler's custom message when one was supplied.
         match req.risk.level {
             RiskLevel::Low => ValidationDecision::Execute,
+            // A Medium confirmation the user granted "Always allow" for runs
+            // without asking. MEDIUM ONLY: High risk keeps confirming no matter
+            // what was granted (same safe-direction rule as the shell policy —
+            // user allowances relax the middle, never the top), and the consent
+            // check above already returned before this point, so a grant can
+            // never bypass privacy.
+            RiskLevel::Medium if self.action_approved(req.action_id, req.args) => {
+                tracing::info!(action = %req.action_id, "[rules] pre-approved (always-allow grant)");
+                ValidationDecision::Execute
+            }
             RiskLevel::Medium | RiskLevel::High => {
                 ValidationDecision::Confirm {
                     reason: req.risk.reason.clone().unwrap_or_else(|| {
@@ -181,6 +231,122 @@ mod tests {
             routed_by: "explicit",
             risk: &LOW,
         }
+    }
+
+    // ── Always-allow grants ──────────────────────────────────────────────────
+
+    const MEDIUM: RiskAssessment = RiskAssessment {
+        level: RiskLevel::Medium,
+        reason: None,
+        consent: None,
+    };
+    const HIGH: RiskAssessment = RiskAssessment {
+        level: RiskLevel::High,
+        reason: None,
+        consent: None,
+    };
+
+    fn engine_with_grants(grants: &[&str]) -> RulesEngine {
+        let grants: Vec<String> = grants.iter().map(|s| s.to_string()).collect();
+        RulesEngine::with_policies(shell::ShellPolicy::default(), &grants)
+    }
+
+    #[test]
+    fn a_verb_grant_executes_medium_without_asking() {
+        let engine = engine_with_grants(&["service restart"]);
+        let r = ValidationRequest {
+            action_id: "service",
+            args: "restart nginx",
+            routed_by: "ai",
+            risk: &MEDIUM,
+        };
+        assert_eq!(engine.validate(&r, &privacy()), ValidationDecision::Execute);
+
+        // A different verb of the same handler still confirms.
+        let r = ValidationRequest {
+            action_id: "service",
+            args: "stop nginx",
+            routed_by: "ai",
+            risk: &MEDIUM,
+        };
+        assert!(matches!(
+            engine.validate(&r, &privacy()),
+            ValidationDecision::Confirm { .. }
+        ));
+
+        // Prefix must respect word boundaries: "restart" ≠ "restartx".
+        let engine = engine_with_grants(&["service restart"]);
+        let r = ValidationRequest {
+            action_id: "service",
+            args: "restartx nginx",
+            routed_by: "ai",
+            risk: &MEDIUM,
+        };
+        assert!(matches!(
+            engine.validate(&r, &privacy()),
+            ValidationDecision::Confirm { .. }
+        ));
+    }
+
+    #[test]
+    fn a_whole_handler_grant_covers_every_invocation() {
+        let engine = engine_with_grants(&["fetch"]);
+        let r = ValidationRequest {
+            action_id: "fetch",
+            args: "https://example.org",
+            routed_by: "ai",
+            risk: &MEDIUM,
+        };
+        assert_eq!(engine.validate(&r, &privacy()), ValidationDecision::Execute);
+    }
+
+    #[test]
+    fn a_grant_never_relaxes_high_risk_or_consent() {
+        // High risk keeps confirming even with a grant covering the action.
+        let engine = engine_with_grants(&["service restart"]);
+        let r = ValidationRequest {
+            action_id: "service",
+            args: "restart nginx",
+            routed_by: "ai",
+            risk: &HIGH,
+        };
+        assert!(matches!(
+            engine.validate(&r, &privacy()),
+            ValidationDecision::Confirm { .. }
+        ));
+
+        // An ungranted consent keeps prompting — grants are not privacy.
+        let with_consent = RiskAssessment {
+            level: RiskLevel::Medium,
+            reason: None,
+            consent: Some(crate::action_registry::ConsentNeed {
+                kind: ConsentKind::WebAccess,
+                prompt: "allow web?".into(),
+            }),
+        };
+        let engine = engine_with_grants(&["search"]);
+        let r = ValidationRequest {
+            action_id: "search",
+            args: "anything",
+            routed_by: "ai",
+            risk: &with_consent,
+        };
+        assert!(matches!(
+            engine.validate(&r, &privacy()),
+            ValidationDecision::Confirm { .. }
+        ));
+    }
+
+    #[test]
+    fn shell_allow_pattern_derivation() {
+        assert_eq!(
+            shell::allow_pattern_for("git push origin main"),
+            r"^git\s+push\b"
+        );
+        assert_eq!(shell::allow_pattern_for("ls -la"), r"^ls\b");
+        assert_eq!(shell::allow_pattern_for("cat /etc/hosts"), r"^cat\b");
+        // Metacharacters in the program name are escaped, never interpreted.
+        assert_eq!(shell::allow_pattern_for("a.b run"), r"^a\.b\s+run\b");
     }
 
     #[test]

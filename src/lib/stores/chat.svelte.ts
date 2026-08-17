@@ -355,15 +355,18 @@ class ChatSession {
 		}
 	};
 
-	/** Resolve a pending destructive-tool approval and resume the agent. */
-	approve = async (ok: boolean): Promise<void> => {
+	/** Resolve a pending destructive-tool approval and resume the agent.
+	 * "approve" runs it once; "always" runs it AND remembers a grant so the
+	 * same action never asks again; "reject" feeds the refusal back to the
+	 * model so it takes a different path (the run continues either way). */
+	approve = async (decision: "approve" | "always" | "reject"): Promise<void> => {
 		if (!this.approval) return;
 		this.approval = null;
 		this.truncated = false;
 		this.streaming = true;
 		const gen = this.gen; // same run continues
 		try {
-			await agentApprove(ok, gen);
+			await agentApprove(decision, gen);
 		} catch (e) {
 			this.#fail(gen, e);
 		}

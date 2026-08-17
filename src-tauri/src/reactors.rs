@@ -67,7 +67,10 @@ impl EventHandler for CommandsReactor {
         // Rebuild the shell approval policy (profile + user allow/deny rules) so
         // a settings change takes effect without a restart.
         let policy = lychi_core::rules::shell::ShellPolicy::from_config(&commands.shell_policy);
-        executor.set_rules(lychi_core::rules::RulesEngine::with_shell_policy(policy));
+        executor.set_rules(lychi_core::rules::RulesEngine::with_policies(
+            policy,
+            &commands.approved_actions,
+        ));
         tracing::info!("[reactor] commands config applied (shell + {count} quicklinks + policy)");
     }
 }

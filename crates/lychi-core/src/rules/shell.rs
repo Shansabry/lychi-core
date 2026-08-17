@@ -212,6 +212,26 @@ pub fn authorize_with(cmd: &str, policy: &ShellPolicy) -> ShellDecision {
     }
 }
 
+/// Derive the `shell_policy.allow` regex for an "Always allow" grant on a
+/// command: the leading program (plus its subcommand when the second token
+/// looks like one, not a flag or path), anchored and boundary-terminated —
+/// `git push origin main` → `^git\s+push\b`, `ls -la` → `^ls\b`. Escaped, so
+/// the derived pattern can never be broader than those tokens.
+pub fn allow_pattern_for(cmd: &str) -> String {
+    let mut tokens = cmd.split_whitespace();
+    let first = tokens.next().unwrap_or("");
+    let second = tokens.next().filter(|t| {
+        !t.starts_with('-')
+            && !t.contains('/')
+            && t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    });
+    match second {
+        Some(sub) => format!("^{}\\s+{}\\b", regex::escape(first), regex::escape(sub)),
+        None => format!("^{}\\b", regex::escape(first)),
+    }
+}
+
 /// A compiled shell policy: the approval profile plus the user's allow/deny
 /// rules as ready-to-match regexes. Built once from [`ShellPolicyConfig`]; an
 /// invalid regex is logged and dropped rather than failing the whole gate.

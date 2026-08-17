@@ -304,11 +304,13 @@ async agentChatStart(params: AgentChatStart) : Promise<Result<null, string>> {
 }
 },
 /**
- * Resolve a pending approval and resume the agent loop.
+ * Resolve a pending approval and resume the agent loop. `decision` is
+ * "approve", "always" (approve + persist an always-allow grant), or "reject"
+ * (deny-and-continue: the refusal feeds back to the model as a tool result).
  */
-async agentApprove(approve: boolean, generation: number) : Promise<Result<null, string>> {
+async agentApprove(decision: string, generation: number) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("agent_approve", { approve, generation }) };
+    return { status: "ok", data: await TAURI_INVOKE("agent_approve", { decision, generation }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1810,7 +1812,16 @@ quicklinks?: Quicklink[];
  * Shell approval policy: the confirmation profile + user allow/deny rules.
  * Defaults to the long-standing "ask before mutating" behaviour.
  */
-shell_policy?: ShellPolicyConfig }
+shell_policy?: ShellPolicyConfig; 
+/**
+ * Actions the user chose "Always allow" for on an agent approval prompt.
+ * Entry = `"<handler-id>"` (whole handler) or `"<handler-id> <verb>"`
+ * (one verb of a verbed grammar), e.g. `"service restart"`. Consulted by
+ * the Rules Engine for MEDIUM-risk confirmations only — High risk and
+ * privacy consents always still ask, and `run` uses `shell_policy.allow`
+ * instead (a command needs a real pattern, not a verb).
+ */
+approved_actions?: string[] }
 export type CompletionItem = { label: string; icon_path: string | null; score: number; description?: string | null; 
 /**
  * Provenance — why this was suggested. Set by context suggestions,

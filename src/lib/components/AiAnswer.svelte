@@ -81,7 +81,7 @@ let {
 	toolSteps?: ToolStep[];
 	approval?: Approval | null;
 	reply?: string;
-	onapprove?: (approve: boolean) => void;
+	onapprove?: (decision: "approve" | "always" | "reject") => void;
 	onreply?: () => void;
 	onstop?: () => void;
 	onregenerate?: () => void;
@@ -341,11 +341,15 @@ function onWindowKeydown(e: KeyboardEvent) {
 		if (matchesAction(e, "approve_action") || letter === "y") {
 			e.preventDefault();
 			e.stopPropagation();
-			onapprove?.(true);
+			onapprove?.("approve");
+		} else if (letter === "a") {
+			e.preventDefault();
+			e.stopPropagation();
+			onapprove?.("always");
 		} else if (matchesAction(e, "reject_action") || letter === "n") {
 			e.preventDefault();
 			e.stopPropagation();
-			onapprove?.(false);
+			onapprove?.("reject");
 		}
 		return;
 	}
@@ -537,14 +541,21 @@ function onWindowKeydown(e: KeyboardEvent) {
 				<div class="approval-actions">
 					<button
 						class="approve"
-						onclick={() => onapprove?.(true)}
+						onclick={() => onapprove?.("approve")}
 						title={`Approve (${getComboString("approve_action")} or Y)`}
 					>
 						Approve <kbd>{getComboString("approve_action")}</kbd>
 					</button>
 					<button
+						class="approve always"
+						onclick={() => onapprove?.("always")}
+						title="Approve and never ask again for this action (A)"
+					>
+						Always allow <kbd>A</kbd>
+					</button>
+					<button
 						class="reject"
-						onclick={() => onapprove?.(false)}
+						onclick={() => onapprove?.("reject")}
 						title={`Reject (${getComboString("reject_action")} or N)`}
 					>
 						Reject <kbd>{getComboString("reject_action")}</kbd>
@@ -1119,6 +1130,12 @@ function onWindowKeydown(e: KeyboardEvent) {
 	.approval-actions .approve {
 		border-color: var(--accent);
 		color: var(--accent);
+	}
+	/* "Always allow" is the bigger commitment — same family as Approve but
+	   visually second fiddle, so the default action stays the obvious one. */
+	.approval-actions .approve.always {
+		border-color: var(--border);
+		color: var(--fg-muted);
 	}
 	.approval-actions .approve:hover {
 		background: var(--accent);

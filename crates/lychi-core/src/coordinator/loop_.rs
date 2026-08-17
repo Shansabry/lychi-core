@@ -750,7 +750,15 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                 }
             }
             ApprovalDecision::Reject { message } => {
-                let msg = message.unwrap_or_else(|| "User declined this action.".to_string());
+                let msg = message.unwrap_or_else(|| {
+                    // Deny-and-continue: the refusal is FEEDBACK, not a wall.
+                    // Naming the follow-ups stops the model from retrying the
+                    // same call or ending the run with an apology.
+                    "The user declined this action. Do not retry it — take a \
+                     different approach, or briefly say what you would have done \
+                     and ask how they'd like to proceed."
+                        .to_string()
+                });
                 session.push_tool_result(&call_id, msg.clone(), true);
                 self.emit(AgentEvent::ToolCallFailed {
                     call_id,

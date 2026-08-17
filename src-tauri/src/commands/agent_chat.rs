@@ -949,11 +949,83 @@ pub async fn agent_chat_start(
     Ok(())
 }
 
-/// Resolve a pending approval and resume the agent loop.
+/// Persist an "Always allow" grant for the pending approval, so future
+/// invocations of the same action run without asking. `run` commands become a
+/// prefix regex in `shell_policy.allow` (the shell's own decider); every other
+/// handler becomes an `approved_actions` entry — "handler verb" when the
+/// grammar is verbed, the bare handler id otherwise. Saved through the same
+/// lock-then-emit discipline as `save_commands_config`, so the CommandsReactor
+/// rebuilds the Rules Engine and the grant is live for the very next call.
+async fn persist_always_allow(
+    state: &AppState,
+    action_id: &str,
+    args: &str,
+) -> Result<(), LychiError> {
+    use lychi_core::events::{ConfigSection, DomainEvent};
+
+    let entry = if action_id == "run" {
+        let (_, cmd) =
+            lychi_core::action_registry::handlers::shell_exec::split_terminal_sentinel(args);
+        Some(lychi_core::rules::shell::allow_pattern_for(cmd))
+    } else {
+        None
+    };
+
+    // Verbed grammar → grant this verb only; free-form → the whole handler.
+    let action_entry = if action_id == "run" {
+        None
+    } else {
+        let executor = state.executor.read().await;
+        let verbed = executor
+            .registry
+            .get(action_id)
+            .and_then(|h| h.grammar())
+            .is_some_and(|g| !g.is_free_form());
+        let first = args.split_whitespace().next().unwrap_or("");
+        Some(if verbed && !first.is_empty() {
+            format!("{action_id} {first}")
+        } else {
+            action_id.to_string()
+        })
+    };
+
+    {
+        let mut config = state.config.write().await;
+        match (entry, action_entry) {
+            (Some(pattern), _) => {
+                if !config.commands.shell_policy.allow.contains(&pattern) {
+                    tracing::info!(%pattern, "[agent] always-allow shell grant");
+                    config.commands.shell_policy.allow.push(pattern);
+                }
+            }
+            (None, Some(entry)) => {
+                if !config.commands.approved_actions.contains(&entry) {
+                    tracing::info!(%entry, "[agent] always-allow action grant");
+                    config.commands.approved_actions.push(entry);
+                }
+            }
+            (None, None) => {}
+        }
+        config.save(&lychi_core::paths::config_file())?;
+    }
+    // Release the write lock BEFORE emitting — the reactors take these locks
+    // with blocking_* (same discipline as save_commands_config).
+    state
+        .event_bus
+        .emit_from_async(DomainEvent::ConfigChanged {
+            section: ConfigSection::Commands,
+        })
+        .await;
+    Ok(())
+}
+
+/// Resolve a pending approval and resume the agent loop. `decision` is
+/// "approve", "always" (approve + persist an always-allow grant), or "reject"
+/// (deny-and-continue: the refusal feeds back to the model as a tool result).
 #[tauri::command]
 #[specta::specta]
 pub async fn agent_approve(
-    approve: bool,
+    decision: String,
     generation: u64,
     app: AppHandle,
     state: State<'_, AppState>,
@@ -964,6 +1036,22 @@ pub async fn agent_approve(
         .await
         .take()
         .ok_or_else(|| LychiError::Ai("no pending agent approval".to_string()))?;
+
+    if decision == "always" {
+        // The resume token carries the EXACT assessed action — grant that,
+        // not a re-parse of the display strings.
+        if let Some(pending) = session.pending.first() {
+            let action_id = pending.resume.0["action_id"].as_str().unwrap_or_default();
+            let args = pending.resume.0["args"].as_str().unwrap_or_default();
+            if !action_id.is_empty()
+                && let Err(e) = persist_always_allow(&state, action_id, args).await
+            {
+                // The grant failing must not strand the approval — approve
+                // this run anyway and tell the log.
+                tracing::warn!("[agent] always-allow grant failed: {e}");
+            }
+        }
+    }
 
     state.ai_generation.store(generation, Ordering::Relaxed);
     let cancel = CancellationToken::new();
@@ -982,10 +1070,10 @@ pub async fn agent_approve(
             return Err(e);
         }
     };
-    let decision = if approve {
-        ApprovalDecision::Approve
-    } else {
+    let decision = if decision == "reject" {
         ApprovalDecision::Reject { message: None }
+    } else {
+        ApprovalDecision::Approve
     };
     let (stream, handle) = coord.resume(session, decision, cancel);
     drive(
