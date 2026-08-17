@@ -107,10 +107,10 @@ fn classify_kind(status: Option<u16>, lower: &str, had_images: bool) -> AiErrorK
         // spent — a true rate limit, retryable. When the request alone
         // OUTGROWS the budget, no amount of waiting helps and "try again"
         // is a lie. The provider states both numbers; believe them.
-        if let Some((limit, requested)) = tpm_numbers(lower) {
-            if requested > limit {
-                return AiErrorKind::BudgetExceeded;
-            }
+        if let Some((limit, requested)) = tpm_numbers(lower)
+            && requested > limit
+        {
+            return AiErrorKind::BudgetExceeded;
         }
         return AiErrorKind::RateLimit;
     }
