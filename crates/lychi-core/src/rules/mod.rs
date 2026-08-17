@@ -142,6 +142,7 @@ pub fn consent_granted(kind: ConsentKind, privacy: &PrivacyConfig) -> bool {
         ConsentKind::IpGeolocation => privacy.allow_ip_geolocation,
         ConsentKind::PublicIp => privacy.allow_public_ip,
         ConsentKind::LargeTransfer => false,
+        ConsentKind::WebAccess => privacy.allow_web_access,
     }
 }
 

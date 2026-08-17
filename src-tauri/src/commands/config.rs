@@ -238,7 +238,7 @@ pub async fn save_privacy_config(
 
 /// C6: Grant a specific privacy consent and persist it.
 /// Called by the frontend when the user confirms a privacy-gated action.
-/// `feature` is one of: "ip_geolocation", "public_ip"
+/// `feature` is one of: "ip_geolocation", "public_ip", "web_access"
 #[tauri::command]
 #[specta::specta]
 pub async fn grant_privacy_consent(
@@ -249,6 +249,7 @@ pub async fn grant_privacy_consent(
     match feature.as_str() {
         "ip_geolocation" => config.privacy.allow_ip_geolocation = true,
         "public_ip" => config.privacy.allow_public_ip = true,
+        "web_access" => config.privacy.allow_web_access = true,
         other => {
             return Err(LychiError::Config(format!(
                 "Unknown privacy feature: {other}"

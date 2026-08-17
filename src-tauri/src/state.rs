@@ -44,6 +44,7 @@ use lychi_core::action_registry::handlers::timer::{TimerHandler, TimerState};
 use lychi_core::action_registry::handlers::unicode::UnicodeHandler;
 use lychi_core::action_registry::handlers::url_open::UrlOpen;
 use lychi_core::action_registry::handlers::weather::WeatherHandler;
+use lychi_core::action_registry::handlers::web_access::{FetchPageHandler, SearchWebHandler};
 use lychi_core::action_registry::handlers::web_search::WebSearch;
 use lychi_core::action_registry::handlers::window_switcher::WindowSwitcherHandler;
 use lychi_core::action_registry::handlers::youtube::YouTube;
@@ -565,6 +566,16 @@ impl AppState {
         registry.register(Box::new(WebSearch::with_search_url(
             config.commands.default_search_engine.clone(),
         )));
+        // Agent web access: `search` reads results as data, `fetch` reads a
+        // page. The Brave key (if that backend is chosen) comes through the
+        // same keyring-lookup seam the AI factory uses, read lazily at call
+        // time — never during startup.
+        registry.register(Box::new(SearchWebHandler::new(
+            config.ai.web_search_provider.clone(),
+            config.ai.searxng_url.clone(),
+            std::sync::Arc::new(byo_key_lookup),
+        )));
+        registry.register(Box::new(FetchPageHandler::new()));
         registry.register(Box::new(YouTube::new()));
         registry.register(Box::new(ShellExec::with_shell(
             config.commands.shell.clone(),
@@ -1000,6 +1011,8 @@ mod tests {
             ("generate a strong password", "quick_tools"),
             ("check the weather in tokyo", "quick_tools"),
             ("pause the music playback", "media_control"),
+            ("search the web for tauri window decorations", "web_tools"),
+            ("fetch that page and summarize it", "web_tools"),
             // Chained intents: the request mixes model work (summarize) with
             // an action leg — the action leg's group must still be pulled.
             (

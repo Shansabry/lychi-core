@@ -712,6 +712,7 @@ export async function saveProjectsConfig(projects: ProjectsConfig): Promise<void
 export const PRIVACY_DEFAULTS: PrivacyConfig = {
 	allow_ip_geolocation: false,
 	allow_public_ip: false,
+	allow_web_access: false,
 	clipboard: { respect_sensitive_hint: true, excluded_apps: [] },
 };
 

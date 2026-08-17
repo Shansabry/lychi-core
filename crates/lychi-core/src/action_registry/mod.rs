@@ -60,6 +60,9 @@ pub enum ConsentKind {
     /// Bulk data transfer to a third party (e.g. speedtest). Has no
     /// remember-me flag: consented per run, every run.
     LargeTransfer,
+    /// The AI agent reaching the web on the user's behalf: sending a search
+    /// query to the configured search service, or fetching a page's content.
+    WebAccess,
 }
 
 impl ConsentKind {
@@ -75,6 +78,7 @@ impl ConsentKind {
             ConsentKind::IpGeolocation => Some("ip_geolocation"),
             ConsentKind::PublicIp => Some("public_ip"),
             ConsentKind::LargeTransfer => None,
+            ConsentKind::WebAccess => Some("web_access"),
         }
     }
 }

@@ -44,6 +44,7 @@ pub mod timer;
 pub mod unicode;
 pub mod url_open;
 pub mod weather;
+pub mod web_access;
 pub mod web_search;
 pub mod window_switcher;
 #[cfg(target_os = "linux")]

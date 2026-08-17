@@ -1,14 +1,18 @@
 <script lang="ts">
-import type { AiConfig, CommandsConfig } from "$lib/ipc";
+import type { AiConfig, CommandsConfig, PrivacyConfig } from "$lib/ipc";
 import {
 	checkAiHealth,
 	getMaskedApiKey,
+	getPrivacyConfig,
+	PRIVACY_DEFAULTS,
 	saveAiConfig,
 	saveCommandsConfig,
+	savePrivacyConfig,
 	testAiConnection,
 } from "$lib/ipc";
 import Select from "../../Select.svelte";
 import type ApiKeyField from "./ApiKeyField.svelte";
+import ApiKeyFieldInput from "./ApiKeyField.svelte";
 import ConnectionStatus from "./ConnectionStatus.svelte";
 import ConnectionSummary from "./ConnectionSummary.svelte";
 import ByoFields from "./modes/ByoFields.svelte";
@@ -26,6 +30,45 @@ let {
 	commandsConfig: CommandsConfig;
 	onsaveerror: (msg: string) => void;
 } = $props();
+
+// Web access consent lives in PrivacyConfig (the Rules Engine gate reads it);
+// it is EDITED here because web access is an agent capability. Loaded lazily —
+// the AI tab owns its own copy rather than threading a prop through the panel.
+let privacyConfig: PrivacyConfig = $state({ ...PRIVACY_DEFAULTS });
+$effect(() => {
+	getPrivacyConfig()
+		.then((p) => {
+			privacyConfig = p;
+		})
+		.catch(() => {});
+});
+
+async function toggleWebAccess() {
+	privacyConfig.allow_web_access = !privacyConfig.allow_web_access;
+	try {
+		await savePrivacyConfig(privacyConfig);
+	} catch (e) {
+		onsaveerror(String(e));
+	}
+}
+
+async function handleSearchProviderChange(val: string) {
+	aiConfig.web_search_provider = val;
+	try {
+		await saveAiConfig(aiConfig);
+	} catch (e) {
+		onsaveerror(String(e));
+	}
+}
+
+async function handleSearxngUrlChange(e: Event) {
+	aiConfig.searxng_url = (e.target as HTMLInputElement).value.trim();
+	try {
+		await saveAiConfig(aiConfig);
+	} catch (e2) {
+		onsaveerror(String(e2));
+	}
+}
 
 // The agent's shell approval profile lives in commandsConfig.shell_policy.
 // Defaults to "ask-on-write" (today's behaviour) when the config predates it.
@@ -321,9 +364,91 @@ export function dismissConfirm(): boolean {
 			whatever the profile.
 		</div>
 	</div>
+
+	<!-- Web access: the agent's `search` + `fetch` tools. Consent is the
+	     Rules-Engine gate (PrivacyConfig); the backend choice is AiConfig. -->
+	<div class="agent-safety">
+		<div class="section-label">Web access</div>
+		<div class="field">
+			<label for="allow-web-access">Allow AI web access</label>
+			<button
+				id="allow-web-access"
+				class="checkbox"
+				class:checked={privacyConfig.allow_web_access}
+				onclick={toggleWebAccess}
+				role="checkbox"
+				aria-checked={privacyConfig.allow_web_access}
+			>
+				{#if privacyConfig.allow_web_access}
+					<svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+						<path d="M2 6L5 9L10 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+					</svg>
+				{/if}
+			</button>
+		</div>
+		<div class="hint">
+			Lets the AI search the web and read pages to answer you. Off = the tools
+			ask for consent on first use.
+		</div>
+		<div class="field">
+			<label for="search-provider">Search provider</label>
+			<Select
+				id="search-provider"
+				value={aiConfig.web_search_provider || "duckduckgo"}
+				options={[
+					{ value: "duckduckgo", label: "DuckDuckGo (no key needed)" },
+					{ value: "brave", label: "Brave Search API (free key)" },
+					{ value: "searxng", label: "SearXNG (self-hosted)" },
+				]}
+				onchange={handleSearchProviderChange}
+			/>
+		</div>
+		{#if aiConfig.web_search_provider === "brave"}
+			<ApiKeyFieldInput provider="brave-search" />
+			<div class="hint">
+				Get a free key at brave.com/search/api (~2,000 queries/month).
+			</div>
+		{:else if aiConfig.web_search_provider === "searxng"}
+			<div class="field">
+				<label for="searxng-url">Instance URL</label>
+				<input
+					id="searxng-url"
+					type="text"
+					placeholder="https://searx.example.org"
+					value={aiConfig.searxng_url}
+					onchange={handleSearxngUrlChange}
+				/>
+			</div>
+		{/if}
+	</div>
 {/if}
 
 <style>
+	.checkbox {
+		width: 18px;
+		height: 18px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		background: var(--bg-secondary);
+		border: 1px solid var(--border);
+		border-radius: 3px;
+		color: var(--accent);
+		cursor: pointer;
+		padding: 0;
+		flex-shrink: 0;
+		transition: border-color 100ms ease;
+	}
+
+	.checkbox:hover {
+		border-color: var(--fg-muted);
+	}
+
+	#searxng-url {
+		flex: 1;
+		min-width: 0;
+	}
+
 	.field {
 		display: grid;
 		grid-template-columns: 120px 1fr;

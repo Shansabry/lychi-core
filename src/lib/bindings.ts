@@ -413,7 +413,7 @@ async savePrivacyConfig(privacy: PrivacyConfig) : Promise<Result<null, string>> 
 /**
  * C6: Grant a specific privacy consent and persist it.
  * Called by the frontend when the user confirms a privacy-gated action.
- * `feature` is one of: "ip_geolocation", "public_ip"
+ * `feature` is one of: "ip_geolocation", "public_ip", "web_access"
  */
 async grantPrivacyConsent(feature: string) : Promise<Result<null, string>> {
     try {
@@ -1440,7 +1440,20 @@ timeout_secs: number;
  * every path: the HTTP request body (`max_tokens`, both dialects) and the
  * local engine's decode-loop bound.
  */
-max_tokens: number }
+max_tokens: number; 
+/**
+ * Which backend the agent's `search` tool queries: "duckduckgo" (default,
+ * keyless), "brave" (official API; key stored in the keyring as
+ * `byo-brave-search` via the same command BYOK uses), or "searxng"
+ * (self-hosted; needs `searxng_url`). Part of AiConfig because web access
+ * is an AI-agent capability, configured in the AI tab.
+ */
+web_search_provider?: string; 
+/**
+ * Base URL of a SearXNG instance (e.g. "https://searx.example.org") for
+ * `web_search_provider = "searxng"`.
+ */
+searxng_url?: string }
 export type AiPresetItem = { id: string; 
 /**
  * The typed shortcut that invokes this preset (e.g. "translate").
@@ -2426,6 +2439,11 @@ allow_ip_geolocation: boolean;
  * Allow public IP lookup (sysinfo net via ifconfig.me)
  */
 allow_public_ip: boolean; 
+/**
+ * Allow the AI agent to reach the web: send search queries to the
+ * configured search service and fetch page content it cites.
+ */
+allow_web_access?: boolean; 
 /**
  * What the clipboard monitor refuses to record.
  */

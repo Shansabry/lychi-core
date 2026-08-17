@@ -546,6 +546,21 @@ pub struct AiConfig {
     /// every path: the HTTP request body (`max_tokens`, both dialects) and the
     /// local engine's decode-loop bound.
     pub max_tokens: u32,
+    /// Which backend the agent's `search` tool queries: "duckduckgo" (default,
+    /// keyless), "brave" (official API; key stored in the keyring as
+    /// `byo-brave-search` via the same command BYOK uses), or "searxng"
+    /// (self-hosted; needs `searxng_url`). Part of AiConfig because web access
+    /// is an AI-agent capability, configured in the AI tab.
+    #[serde(default = "default_web_search_provider")]
+    pub web_search_provider: String,
+    /// Base URL of a SearXNG instance (e.g. "https://searx.example.org") for
+    /// `web_search_provider = "searxng"`.
+    #[serde(default)]
+    pub searxng_url: String,
+}
+
+fn default_web_search_provider() -> String {
+    "duckduckgo".to_string()
 }
 
 /// Preset metadata for a known BYO provider: default endpoint + wire format.
@@ -730,6 +745,8 @@ impl Default for AiConfig {
             local_model: String::new(),
             timeout_secs: default_ai_timeout(),
             max_tokens: default_max_tokens(),
+            web_search_provider: default_web_search_provider(),
+            searxng_url: String::new(),
         }
     }
 }
@@ -759,6 +776,10 @@ pub struct PrivacyConfig {
     pub allow_ip_geolocation: bool,
     /// Allow public IP lookup (sysinfo net via ifconfig.me)
     pub allow_public_ip: bool,
+    /// Allow the AI agent to reach the web: send search queries to the
+    /// configured search service and fetch page content it cites.
+    #[serde(default)]
+    pub allow_web_access: bool,
     /// What the clipboard monitor refuses to record.
     pub clipboard: ClipboardPrivacyConfig,
 }
