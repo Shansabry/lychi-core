@@ -18,6 +18,11 @@ pub enum ProviderError {
     Disabled,
     /// BYO mode but no API key is stored for the selected provider.
     MissingApiKey(String),
+    /// BYO mode but no model has been chosen yet. Guarded here so a mid-setup
+    /// health check or test never sends a request with `model: ""` — Groq
+    /// answered that with a baffling 404 ("The model `` does not exist")
+    /// during first-run setup, before the user reached the model field.
+    ByoNoModel,
     /// BYO mode but the resolved base URL is empty (custom preset, no URL given).
     MissingBaseUrl,
     /// BYO mode but the base URL is unsafe (cleartext http to a non-loopback
@@ -41,6 +46,7 @@ impl std::fmt::Display for ProviderError {
         match self {
             Self::Disabled => write!(f, "AI is disabled"),
             Self::MissingApiKey(p) => write!(f, "No API key stored for '{p}'"),
+            Self::ByoNoModel => write!(f, "No model selected yet — pick one to finish setup"),
             Self::MissingBaseUrl => {
                 write!(f, "No endpoint URL set for the custom provider")
             }
@@ -118,6 +124,9 @@ fn build_byo(
     cfg: &AiConfig,
     key_lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<Arc<dyn AiProvider>, ProviderError> {
+    if cfg.model.trim().is_empty() {
+        return Err(ProviderError::ByoNoModel);
+    }
     let base_url = cfg.resolved_base_url();
     if base_url.is_empty() {
         return Err(ProviderError::MissingBaseUrl);
@@ -163,6 +172,25 @@ fn build_ollama(cfg: &AiConfig) -> Result<Arc<dyn AiProvider>, ProviderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byo_with_no_model_fails_the_build_with_a_plain_message() {
+        // Mid-setup (provider picked, model field still empty) a health check
+        // must get a setup hint, not send `model: ""` to the provider for a
+        // baffling 404.
+        let cfg = crate::config::AiConfig {
+            mode: "byo".into(),
+            provider: "groq".into(),
+            model: String::new(),
+            ..crate::config::AiConfig::default()
+        };
+        let err = match build_provider(&cfg, |_| Some("key".into())) {
+            Err(e) => e,
+            Ok(_) => panic!("empty model must not build"),
+        };
+        assert!(matches!(err, ProviderError::ByoNoModel), "{err}");
+        assert!(err.to_string().contains("No model selected"), "{err}");
+    }
 
     fn cfg(mode: &str) -> AiConfig {
         AiConfig {
