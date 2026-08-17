@@ -21,6 +21,11 @@ on:
   push:
     tags: ["v*"]
 
+# The release job must WRITE releases (create/attach assets); nothing here
+# needs more than that.
+permissions:
+  contents: write
+
 jobs:
   linux:
     runs-on: ubuntu-latest

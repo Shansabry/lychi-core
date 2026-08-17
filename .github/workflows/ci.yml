@@ -35,6 +35,12 @@ env:
 # serially in one job.
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Least-privilege token: every job here only reads the repo. Pinned explicitly
+# so the default (broader) token permissions never apply (CodeQL
+# actions/missing-workflow-permissions).
+permissions:
+  contents: read
+
 jobs:
   # ── Stage 1: fail fast on things that need no compilation ──────────────────
   quick:
