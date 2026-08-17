@@ -157,6 +157,16 @@ impl WireClient {
 
         // Build the wire body up-front (pure, no IO).
         let body = build_body(dialect, &model, self.max_tokens, messages, tools);
+        // Request-weight observability: reported input_tokens routinely exceeds
+        // what the visible payload suggests (provider chat templates re-render
+        // tool schemas verbosely), and diagnosing "why was this turn N tokens"
+        // needs the actual sizes, not estimates.
+        tracing::debug!(
+            body_bytes = body.to_string().len(),
+            tools = tools.len(),
+            messages = messages.len(),
+            "[wire] request built"
+        );
         // Whether this request carried images decides how a 400 is explained: a
         // shape complaint about `content` means "text-only model" only when we
         // actually sent image blocks. Captured here, before `messages` is dropped.
