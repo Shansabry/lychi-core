@@ -27,6 +27,71 @@ const REMINDER_SUBCOMMANDS: &[(&str, &str)] = &[
     ("delete", "Delete a reminder by ID"),
 ];
 
+/// The reminder verbs the tool schema constrains the model to — the same set
+/// `execute`'s match dispatches on (canonical spellings only; the parser's
+/// aliases like `ls`/`del`/`rm` stay accepted on the flat path).
+const REMINDER_ACTION_VERBS: &[&str] = &["add", "list", "delete", "clear"];
+
+/// The JSON Schema for `reminder`'s args: a required `action` (constrained to
+/// [`REMINDER_ACTION_VERBS`]) plus the operands `add`/`delete` need. `text` and
+/// `when` are separate properties so the model states the time phrase
+/// deliberately instead of hoping it lands inside free text.
+fn reminder_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "action": { "type": "string", "enum": REMINDER_ACTION_VERBS,
+                        "description": "What to do: \"add\" a timed reminder, \"list\" all reminders, \"delete\" one by id, or \"clear\" all already-fired ones." },
+            "text": { "type": "string",
+                      "description": "What to be reminded of, without the time (e.g. \"buy milk\", \"standup\"). Required for \"add\"; omit otherwise." },
+            "when": { "type": "string",
+                      "description": "When to fire, as a phrase starting with \"in\", \"at\", or \"tomorrow\": e.g. \"in 30m\", \"in 2 hours\", \"at 9am\", \"at 17:30\", \"tomorrow 2pm\". Required for \"add\"; omit otherwise." },
+            "id": { "type": "string",
+                    "description": "The reminder's id, as shown by \"list\". Required for \"delete\"; omit otherwise." }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+/// Normalize the tool's `args` to the flat string the parser already
+/// understands (`"add <text> <when>"`, `"list"`, `"delete <id>"`, `"clear"`).
+/// A constrained model sends the structured JSON; a human or legacy/flat caller
+/// sends the string directly. Keeps `execute` on `&str`.
+fn reminder_args_to_flat(args: &str) -> String {
+    let t = args.trim();
+    if !t.starts_with('{') {
+        return t.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(t) {
+        Ok(v) => {
+            let field = |k: &str| v.get(k).and_then(|a| a.as_str()).unwrap_or("").trim();
+            let action = field("action");
+            let operand = match action {
+                // `split_text_and_time` re-splits text from the time phrase, so
+                // rejoining them here loses nothing — and a missing `when` gets
+                // the parser's own "couldn't parse time" message.
+                "add" => [field("text"), field("when")]
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                "delete" => field("id").to_string(),
+                _ => String::new(),
+            };
+            if operand.is_empty() {
+                action.to_string()
+            } else {
+                format!("{action} {operand}")
+            }
+        }
+        // Not the JSON we expected — fall back to the raw string; the parser
+        // treats it like typed input.
+        Err(_) => t.to_string(),
+    }
+}
+
 fn ok_result(start: Instant, output: String) -> ActionResult {
     ActionResult::ok(output, OutputType::Status).with_duration(start.elapsed().as_millis() as u64)
 }
@@ -115,13 +180,20 @@ impl ActionHandler for RemindersHandler {
     fn usage(&self) -> &str {
         "'add <text> in/at <time>' (e.g. 'add buy milk in 30m', 'add standup at 9am', 'add meeting tomorrow 2pm'), 'list', 'delete <id>', 'clear'. Without 'add', infers from natural language"
     }
+    fn input_schema(&self) -> Option<serde_json::Value> {
+        Some(reminder_input_schema())
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let start = Instant::now();
-        let trimmed = args.trim();
+        // A constrained model sends `{"action":..,"text":..,"when":..}`; flatten
+        // it (and a plain-string caller passes through) to the form the parser
+        // reads.
+        let flat = reminder_args_to_flat(args);
+        let trimmed = flat.trim();
         let store = RemindersStore::new();
 
         // No args → open reminders panel
@@ -304,6 +376,64 @@ mod tests {
     fn split_text_and_time_tomorrow() {
         let (text, _due) = split_text_and_time("meeting tomorrow 9am").unwrap();
         assert_eq!(text, "meeting");
+    }
+
+    #[test]
+    fn reminder_args_flatten_from_structured_json() {
+        // A constrained model sends the typed object; text and time phrase are
+        // rejoined into the string `split_text_and_time` re-splits.
+        assert_eq!(
+            reminder_args_to_flat(r#"{"action":"add","text":"buy milk","when":"in 30m"}"#),
+            "add buy milk in 30m"
+        );
+        assert_eq!(reminder_args_to_flat(r#"{"action":"list"}"#), "list");
+        assert_eq!(reminder_args_to_flat(r#"{"action":"clear"}"#), "clear");
+        assert_eq!(
+            reminder_args_to_flat(r#"{"action":"delete","id":"abc123"}"#),
+            "delete abc123"
+        );
+        // Missing `when` still flattens — the parser's own "couldn't parse
+        // time" message answers, which names the fix.
+        assert_eq!(
+            reminder_args_to_flat(r#"{"action":"add","text":"standup"}"#),
+            "add standup"
+        );
+        // A plain-string caller (human, legacy) passes straight through.
+        assert_eq!(
+            reminder_args_to_flat("add buy milk in 30m"),
+            "add buy milk in 30m"
+        );
+        // Malformed JSON → raw fallback.
+        assert_eq!(reminder_args_to_flat("{not json"), "{not json");
+    }
+
+    #[test]
+    fn reminder_schema_enum_matches_the_real_verbs() {
+        // The schema's action enum must be exactly REMINDER_ACTION_VERBS, so
+        // the model is constrained to verbs the parser actually handles.
+        let schema = reminder_input_schema();
+        let en = schema["properties"]["action"]["enum"].as_array().unwrap();
+        assert_eq!(en.len(), REMINDER_ACTION_VERBS.len());
+        for v in REMINDER_ACTION_VERBS {
+            assert!(en.iter().any(|e| e == v), "enum missing {v}");
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_structured_add_parses_time() {
+        // End to end through execute: the JSON form must land in the same
+        // add-with-time path the flat form does.
+        let db = crate::db::open_test_database();
+        let handler = RemindersHandler::new(db);
+        let result = handler
+            .execute(
+                &crate::action_registry::ExecContext::default(),
+                r#"{"action":"add","text":"buy milk","when":"in 30 minutes"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(body(&result).unwrap().contains("Reminder set"));
     }
 
     #[tokio::test]

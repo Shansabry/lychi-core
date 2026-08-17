@@ -1142,6 +1142,9 @@ impl ActionHandler for ShellExec {
          an editor like vim, a REPL such as python or node, top/htop), prefix the \
          command with `--terminal ` to open it in an external terminal instead"
     }
+    fn input_schema(&self) -> Option<serde_json::Value> {
+        Some(run_input_schema())
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Developer
     }
@@ -1154,7 +1157,17 @@ impl ActionHandler for ShellExec {
         // The `run` pipeline is three clear steps: validate → pick mode →
         // dispatch. Everything it needs (cwd, terminal, output mode, routing
         // target) comes from the immutable per-run `ctx`.
-        let cmd = args.trim();
+        //
+        // A constrained model sends `{"command":..,"terminal":..}`; flatten it
+        // to the sentinel form (a plain-string caller passes through). The
+        // agent adapter already flattened before the executor — so the Rules
+        // Engine validated this same flat string — making this call
+        // defense-in-depth for any caller that skipped it. Then honour the
+        // `--terminal` sentinel itself, so the flat contract `usage()`
+        // documents works on every path, not only through the agent adapter.
+        let flat = run_args_to_flat(args);
+        let (forced_terminal, cmd) = split_terminal_sentinel(&flat);
+        let cmd = cmd.trim();
 
         // 1. Validate. Empty or an unresolvable first word never launches
         //    anything — we fail in Lychi with a clear message (and the caller
@@ -1178,11 +1191,12 @@ impl ActionHandler for ShellExec {
         //    A command that NEEDS an interactive TTY (ssh, an editor, a REPL,
         //    `sudo`, a monitor) ALWAYS opens a terminal, even when the caller
         //    asked for inline capture — captured/piped, it would fail or hang
-        //    waiting for input nobody can give. Otherwise the caller's
+        //    waiting for input nobody can give. An explicit `--terminal`
+        //    sentinel is likewise a hard override. Otherwise the caller's
         //    `output_mode` decides: Terminal is the default for the typed
         //    command; the AI defaults to Inline (so it can read the output), and
         //    Shift+Enter forces Inline for a quick read-only capture.
-        let mode = if needs_terminal(cmd) {
+        let mode = if forced_terminal || needs_terminal(cmd) {
             RunMode::Terminal
         } else {
             match ctx.output_mode {
@@ -1220,6 +1234,87 @@ impl ActionHandler for ShellExec {
 /// `run` failure paths to one line instead of a full struct literal.
 fn error_result(message: &str) -> ActionResult {
     ActionResult::err(message.to_string())
+}
+
+/// The sentinel a flat caller prefixes onto a `run` command to force an
+/// external terminal window instead of inline capture. Canonical here, next to
+/// the handler that owns the flat-args contract; the agent adapter imports it
+/// rather than declaring its own copy that could drift.
+pub const TERMINAL_PREFIX: &str = "--terminal";
+
+/// Split the [`TERMINAL_PREFIX`] sentinel off a flat `run` command: returns
+/// `(forced_terminal, command)`. The sentinel only counts as the FIRST token
+/// (`--terminal ssh …`), never mid-command (`echo --terminal is a flag`), and
+/// `--terminals` (no delimiter after the word) is a different token. The ONE
+/// splitter — the agent adapter and `execute` both call it, so the two can't
+/// disagree about what the sentinel form means.
+pub fn split_terminal_sentinel(args: &str) -> (bool, &str) {
+    let trimmed = args.trim_start();
+    match trimmed.strip_prefix(TERMINAL_PREFIX) {
+        // Strip the sentinel AND the whitespace after it, so the shell never
+        // sees a stray leading space. A bare `--terminal` with no command falls
+        // through to the "Usage: run …" guard.
+        Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => {
+            (true, rest.trim_start())
+        }
+        _ => (false, trimmed),
+    }
+}
+
+/// The JSON Schema for `run`'s args: a required `command` string plus an
+/// optional `terminal` boolean (the typed form of the [`TERMINAL_PREFIX`]
+/// sentinel). Emitted as the tool's `input_schema`.
+fn run_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "command": { "type": "string",
+                         "description": "The shell command to execute, exactly as typed at a prompt (e.g. \"ls -la ~/Downloads\", \"git status\"). Runs through the user's login shell; output is captured and returned. Pipes/redirects are allowed but require user confirmation." },
+            "terminal": { "type": "boolean",
+                          "description": "Set true to open the command in an external terminal window instead of capturing output. Use for interactive or long-running foreground commands (ssh, an editor like vim, a REPL such as python or node, top/htop). Default false; known interactive commands open a terminal automatically either way. When true you will NOT see the command's output." }
+        },
+        "required": ["command"],
+        "additionalProperties": false
+    })
+}
+
+/// Normalize the tool's `args` to the flat sentinel form the existing contract
+/// speaks: `{"command":"ssh x","terminal":true}` → `"--terminal ssh x"`,
+/// `{"command":"ls"}` → `"ls"`. A human or legacy/flat caller sends the string
+/// directly and passes through unchanged (including a shell brace group like
+/// `{ echo hi; }`, which starts with `{` but is not JSON — the parse-error arm
+/// keeps it intact).
+///
+/// SECURITY: for `run`, the Rules Engine validates `req.args` directly
+/// (`rules/mod.rs` routes `run` straight into `ShellRules::validate`), so this
+/// flattening MUST happen before the executor ever sees the args — the agent
+/// adapter (`agent_run_inputs`) calls it first, and risk assessment therefore
+/// reads the exact flat command that executes. JSON-wrapped args would defeat
+/// the shell rules' structural checks (e.g. `starts_with("rm")`). The call in
+/// `execute` is defense-in-depth for any caller that skipped the adapter.
+pub fn run_args_to_flat(args: &str) -> String {
+    let t = args.trim();
+    if !t.starts_with('{') {
+        return t.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(t) {
+        Ok(v) => {
+            let command = v
+                .get("command")
+                .and_then(|a| a.as_str())
+                .unwrap_or("")
+                .trim();
+            let terminal = v.get("terminal").and_then(|a| a.as_bool()).unwrap_or(false);
+            if terminal && !command.is_empty() {
+                format!("{TERMINAL_PREFIX} {command}")
+            } else {
+                command.to_string()
+            }
+        }
+        // Not the JSON we expected — fall back to the raw string (a brace-group
+        // shell command lands here); the usual validation still applies.
+        Err(_) => t.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1327,6 +1422,66 @@ mod tests {
             out.stdout.len()
         );
         assert!(out.stdout.ends_with("(output truncated)"));
+    }
+
+    #[test]
+    fn run_args_flatten_from_structured_json() {
+        // A constrained model sends the typed object; it flattens to the flat
+        // sentinel form the whole pipeline (Rules Engine included) speaks.
+        assert_eq!(run_args_to_flat(r#"{"command":"ls -la"}"#), "ls -la");
+        assert_eq!(
+            run_args_to_flat(r#"{"command":"git status","terminal":false}"#),
+            "git status"
+        );
+        assert_eq!(
+            run_args_to_flat(r#"{"command":"ssh nimbus","terminal":true}"#),
+            "--terminal ssh nimbus"
+        );
+        // terminal=true with no command adds no orphan sentinel — the empty
+        // command falls through to the usage guard.
+        assert_eq!(run_args_to_flat(r#"{"command":"","terminal":true}"#), "");
+        // A plain-string caller passes through unchanged, sentinel included.
+        assert_eq!(run_args_to_flat("ls -la"), "ls -la");
+        assert_eq!(
+            run_args_to_flat("--terminal ssh nimbus"),
+            "--terminal ssh nimbus"
+        );
+        // Starts with `{` but is NOT JSON — a shell brace group must survive.
+        assert_eq!(run_args_to_flat("{ echo hi; }"), "{ echo hi; }");
+    }
+
+    #[test]
+    fn run_schema_requires_command() {
+        // The schema must demand a command and forbid stray properties, so a
+        // constrained model can only emit the two fields the adapter reads.
+        let schema = run_input_schema();
+        let required = schema["required"].as_array().unwrap();
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0], "command");
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(schema["properties"]["terminal"]["type"] == "boolean");
+    }
+
+    #[test]
+    fn terminal_sentinel_split() {
+        // First-token sentinel strips (with its whitespace).
+        assert_eq!(
+            split_terminal_sentinel("--terminal ssh nimbus"),
+            (true, "ssh nimbus")
+        );
+        // Bare sentinel → empty command (usage guard fires downstream).
+        assert_eq!(split_terminal_sentinel("--terminal"), (true, ""));
+        // `--terminals` is a different token, not the sentinel.
+        assert_eq!(
+            split_terminal_sentinel("--terminals foo"),
+            (false, "--terminals foo")
+        );
+        // Mid-command occurrences are the command's own business.
+        assert_eq!(
+            split_terminal_sentinel("echo --terminal is a flag"),
+            (false, "echo --terminal is a flag")
+        );
+        assert_eq!(split_terminal_sentinel("ls -la"), (false, "ls -la"));
     }
 
     #[test]

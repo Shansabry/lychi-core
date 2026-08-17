@@ -54,6 +54,51 @@ fn split_path_and_spec(args: &str) -> Option<(String, String)> {
     Some((path.to_string(), spec.to_string()))
 }
 
+/// The JSON Schema for `resize`'s args: a required source `path` plus a
+/// required `size` spec (the four forms `parse_spec` understands). Emitted as
+/// the tool's `input_schema` so the model sends path and size as separate
+/// fields instead of guessing the ` to ` syntax.
+fn resize_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": { "type": "string",
+                      "description": "Path to the source image, e.g. \"~/Photos/img.jpg\". ~ expands to the home directory. A new file is written next to it (img.jpg → img_800x600.jpg); the source is never overwritten." },
+            "size": { "type": "string",
+                      "description": "Target size, one of four forms: \"800x600\" (exact width×height, aspect ratio NOT preserved), \"800\" (width, height scaled to keep the aspect ratio), \"x600\" (height, width scaled), or \"50%\" (scale both dimensions)." }
+        },
+        "required": ["path", "size"],
+        "additionalProperties": false
+    })
+}
+
+/// Normalize the tool's `args` to the flat `"<path> to <spec>"` string the
+/// parser already understands. A constrained model sends the structured JSON
+/// (`{"path":"img.jpg","size":"800x600"}`); a human or legacy/flat caller sends
+/// the string directly. Keeps `execute` on `&str`.
+fn resize_args_to_flat(args: &str) -> String {
+    let t = args.trim();
+    if !t.starts_with('{') {
+        return t.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(t) {
+        Ok(v) => {
+            let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("").trim();
+            let size = v.get("size").and_then(|s| s.as_str()).unwrap_or("").trim();
+            if path.is_empty() || size.is_empty() {
+                // A missing half can't form a valid command; whatever remains
+                // fails the split and yields the usage error.
+                format!("{path}{size}")
+            } else {
+                format!("{path} to {size}")
+            }
+        }
+        // Not the JSON we expected — fall back to the raw string; the parser
+        // will handle it (or reject it) as usual.
+        Err(_) => t.to_string(),
+    }
+}
+
 #[async_trait]
 impl ActionHandler for ResizeImageHandler {
     fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
@@ -76,12 +121,18 @@ impl ActionHandler for ResizeImageHandler {
     fn usage(&self) -> &str {
         "resize <path> to <800x600|800|x600|50%>"
     }
+    fn input_schema(&self) -> Option<serde_json::Value> {
+        Some(resize_input_schema())
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Files
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        let Some((path_str, spec_str)) = split_path_and_spec(args) else {
+        // A constrained model sends `{"path":..,"size":..}`; flatten it (and a
+        // plain-string caller passes through) before parsing.
+        let flat = resize_args_to_flat(args);
+        let Some((path_str, spec_str)) = split_path_and_spec(&flat) else {
             return Ok(ActionResult::err(
                 "Usage: resize <image> to <800x600 | 800 | x600 | 50%>",
             ));
@@ -152,5 +203,47 @@ mod tests {
         let (p, s) = split_path_and_spec("img.png 640").unwrap();
         assert_eq!(p, "img.png");
         assert_eq!(s, "640");
+    }
+
+    #[test]
+    fn resize_args_flatten_from_structured_json() {
+        // A constrained model sends the typed object; it flattens to the string
+        // the parser already understands.
+        assert_eq!(
+            resize_args_to_flat(r#"{"path":"~/Photos/img.jpg","size":"800x600"}"#),
+            "~/Photos/img.jpg to 800x600"
+        );
+        // All four spec forms ride the same free `size` field.
+        assert_eq!(
+            resize_args_to_flat(r#"{"path":"img.png","size":"50%"}"#),
+            "img.png to 50%"
+        );
+        // A path containing " to " survives: the appended spec is last, and
+        // the parser splits on the LAST " to ".
+        assert_eq!(
+            resize_args_to_flat(r#"{"path":"~/My Photos/to keep/img.jpg","size":"x600"}"#),
+            "~/My Photos/to keep/img.jpg to x600"
+        );
+        // A plain-string caller (human, legacy) passes straight through.
+        assert_eq!(
+            resize_args_to_flat("~/Photos/img.jpg to 800x600"),
+            "~/Photos/img.jpg to 800x600"
+        );
+        assert_eq!(resize_args_to_flat("img.png 640"), "img.png 640");
+    }
+
+    #[test]
+    fn resize_args_malformed_json_falls_back_to_raw() {
+        assert_eq!(
+            resize_args_to_flat(r#"{"path": broken"#),
+            r#"{"path": broken"#
+        );
+    }
+
+    #[test]
+    fn resize_schema_requires_path_and_size() {
+        let schema = resize_input_schema();
+        assert_eq!(schema["required"], serde_json::json!(["path", "size"]));
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
     }
 }

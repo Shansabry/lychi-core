@@ -45,6 +45,97 @@ fn text_result(output: String) -> ActionResult {
     ActionResult::ok(output, OutputType::Text)
 }
 
+/// Every dev-util verb `run` dispatches — the single list the triggers, the
+/// live-preview gate and the tool schema all read, so none of them can drift
+/// from the parser.
+const DEV_UTIL_VERBS: &[&str] = &[
+    "base64",
+    "hash",
+    "urlencode",
+    "urldecode",
+    "epoch",
+    "json",
+    "upper",
+    "lower",
+    "title",
+    "slug",
+    "reverse",
+    "count",
+];
+
+/// The JSON Schema for `devutil`'s args: a required `action` (constrained to
+/// [`DEV_UTIL_VERBS`]), the input `text`, and the per-verb modifiers (`decode`
+/// for base64, `minify` for json, `algorithm` for hash) as typed fields instead
+/// of flag strings the model would have to spell correctly.
+fn devutil_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "action": { "type": "string", "enum": DEV_UTIL_VERBS,
+                        "description": "The conversion to run — all local and deterministic: base64 encode/decode, md5/sha256 hash, URL encode/decode, unix-epoch conversion, JSON pretty-print/minify, and text transforms (upper, lower, title, slug, reverse, count)." },
+            "text": { "type": "string",
+                      "description": "The input: the string to encode/hash/transform, the base64 or URL-encoded value to decode, the raw JSON for \"json\", or unix seconds for \"epoch\" (e.g. \"1700000000\"). Omit only for bare \"epoch\", which returns the current unix time." },
+            "decode": { "type": "boolean",
+                        "description": "base64 only: true to DECODE `text` from base64 instead of encoding it. Default false (encode)." },
+            "minify": { "type": "boolean",
+                        "description": "json only: true to minify to one line instead of pretty-printing. Default false (pretty-print)." },
+            "algorithm": { "type": "string", "enum": ["sha256", "md5"],
+                           "description": "hash only: the digest algorithm. Default sha256." }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+/// Normalize the tool's `args` to the flat `"<verb> [flags] <text>"` string
+/// `execute` already parses (`base64 -d <b64>`, `json -m <text>`,
+/// `hash md5 <text>`, …). A constrained model sends the structured JSON; a
+/// human or legacy/flat caller sends the string directly. Keeps `execute` on
+/// `&str`.
+fn devutil_args_to_flat(args: &str) -> String {
+    let t = args.trim();
+    if !t.starts_with('{') {
+        return t.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(t) {
+        Ok(v) => {
+            let action = v
+                .get("action")
+                .and_then(|a| a.as_str())
+                .unwrap_or("")
+                .trim();
+            let text = v.get("text").and_then(|a| a.as_str()).unwrap_or("").trim();
+            let flag = |k: &str| v.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
+            let mut parts: Vec<&str> = vec![action];
+            // Modifiers only make sense wrapped around actual text — emitted
+            // alone they would be parsed AS the text ("base64 -d" would
+            // base64-encode the literal "-d").
+            if !text.is_empty() {
+                match action {
+                    "base64" if flag("decode") => parts.push("-d"),
+                    "json" if flag("minify") => parts.push("-m"),
+                    "hash" => {
+                        if let Some(algo) = v
+                            .get("algorithm")
+                            .and_then(|a| a.as_str())
+                            .map(str::trim)
+                            .filter(|a| !a.is_empty())
+                        {
+                            parts.push(algo);
+                        }
+                    }
+                    _ => {}
+                }
+                parts.push(text);
+            }
+            parts.join(" ")
+        }
+        // Not the JSON we expected — fall back to the raw string; `run`
+        // answers with its usual usage message.
+        Err(_) => t.to_string(),
+    }
+}
+
 /// Run one dev-util verb. Pure (no I/O) so it's fully unit-testable.
 fn run(verb: &str, args: &str) -> Result<String, String> {
     match verb {
@@ -223,23 +314,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 impl ActionHandler for DevUtilsHandler {
     fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
         use crate::action_registry::{ArgTransform, Trigger};
-        static TRIGGERS: &[Trigger] = &[Trigger::new(
-            &[
-                "base64",
-                "hash",
-                "urlencode",
-                "urldecode",
-                "epoch",
-                "json",
-                "upper",
-                "lower",
-                "title",
-                "slug",
-                "reverse",
-                "count",
-            ],
-            ArgTransform::PrependKeyword,
-        )];
+        static TRIGGERS: &[Trigger] = &[Trigger::new(DEV_UTIL_VERBS, ArgTransform::PrependKeyword)];
         TRIGGERS
     }
 
@@ -253,6 +328,9 @@ impl ActionHandler for DevUtilsHandler {
     fn usage(&self) -> &str {
         "Prepend the verb to the text. Verbs: 'base64 <text>' / 'base64 -d <b64>', 'hash [md5|sha256] <text>', 'urlencode <text>' / 'urldecode <text>', 'epoch [<unix-seconds>]', 'json <text>' (pretty-print) / 'json -m <text>' (minify), 'upper/lower/title <text>', 'slug <text>', 'reverse <text>', 'count <text>'. Use for encode/decode, format json, slugify, etc."
     }
+    fn input_schema(&self) -> Option<serde_json::Value> {
+        Some(devutil_input_schema())
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Developer
     }
@@ -264,21 +342,7 @@ impl ActionHandler for DevUtilsHandler {
         let Some((verb, args)) = trimmed.split_once(char::is_whitespace) else {
             return Vec::new();
         };
-        if !matches!(
-            verb,
-            "base64"
-                | "hash"
-                | "urlencode"
-                | "urldecode"
-                | "epoch"
-                | "json"
-                | "upper"
-                | "lower"
-                | "title"
-                | "slug"
-                | "reverse"
-                | "count"
-        ) {
+        if !DEV_UTIL_VERBS.contains(&verb) {
             return Vec::new();
         }
         match run(verb, args) {
@@ -292,8 +356,11 @@ impl ActionHandler for DevUtilsHandler {
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        let trimmed = args.trim();
-        // Called with the full "verb args" (patterns routes each verb here).
+        // Called with the full "verb args" (patterns routes each verb here). A
+        // constrained model sends `{"action":..,"text":..}`; flatten it (and a
+        // plain-string caller passes through) first.
+        let flat = devutil_args_to_flat(args);
+        let trimmed = flat.trim();
         let (verb, rest) = trimmed
             .split_once(char::is_whitespace)
             .unwrap_or((trimmed, ""));
@@ -413,5 +480,68 @@ mod tests {
     fn text_verbs_require_input() {
         assert!(run("upper", "").is_err());
         assert!(run("slug", "   ").is_err());
+    }
+
+    #[test]
+    fn devutil_args_flatten_from_structured_json() {
+        // A constrained model sends the typed object; the boolean/enum
+        // modifiers become the flag strings `run` already parses.
+        assert_eq!(
+            devutil_args_to_flat(r#"{"action":"base64","text":"hello"}"#),
+            "base64 hello"
+        );
+        assert_eq!(
+            devutil_args_to_flat(r#"{"action":"base64","text":"aGVsbG8=","decode":true}"#),
+            "base64 -d aGVsbG8="
+        );
+        assert_eq!(
+            devutil_args_to_flat(r#"{"action":"json","text":"{\"a\":1}","minify":true}"#),
+            r#"json -m {"a":1}"#
+        );
+        assert_eq!(
+            devutil_args_to_flat(r#"{"action":"hash","text":"abc","algorithm":"md5"}"#),
+            "hash md5 abc"
+        );
+        // Default algorithm is left to the parser (sha256), not restated here.
+        assert_eq!(
+            devutil_args_to_flat(r#"{"action":"hash","text":"abc"}"#),
+            "hash abc"
+        );
+        // Bare epoch (no text) is the one verb valid without input.
+        assert_eq!(devutil_args_to_flat(r#"{"action":"epoch"}"#), "epoch");
+        // A modifier without text must NOT emit a dangling flag — "base64 -d"
+        // alone would base64-encode the literal "-d".
+        assert_eq!(
+            devutil_args_to_flat(r#"{"action":"base64","decode":true}"#),
+            "base64"
+        );
+        // A plain-string caller (human, legacy) passes straight through.
+        assert_eq!(
+            devutil_args_to_flat("base64 -d aGVsbG8="),
+            "base64 -d aGVsbG8="
+        );
+        assert_eq!(devutil_args_to_flat("slug My Post"), "slug My Post");
+        // Malformed JSON → raw fallback.
+        assert_eq!(devutil_args_to_flat("{not json"), "{not json");
+    }
+
+    #[test]
+    fn devutil_schema_enum_matches_the_real_verbs() {
+        // The schema's action enum must be exactly DEV_UTIL_VERBS — the same
+        // list the triggers and the preview gate read — so the model is
+        // constrained to verbs `run` actually handles.
+        let schema = devutil_input_schema();
+        let en = schema["properties"]["action"]["enum"].as_array().unwrap();
+        assert_eq!(en.len(), DEV_UTIL_VERBS.len());
+        for v in DEV_UTIL_VERBS {
+            assert!(en.iter().any(|e| e == v), "enum missing {v}");
+            // And every schema verb must be one `run` dispatches (not "Unknown
+            // dev util") — probed with harmless input.
+            let probe = run(*v, "1");
+            assert!(
+                !matches!(&probe, Err(e) if e.starts_with("Unknown dev util")),
+                "run() does not know verb {v}"
+            );
+        }
     }
 }

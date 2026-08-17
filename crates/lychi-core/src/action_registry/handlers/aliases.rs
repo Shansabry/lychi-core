@@ -22,6 +22,59 @@ impl AliasHandler {
 
 const ALIAS_SUBCOMMANDS: &[&str] = &["add", "list", "delete"];
 
+/// The alias verbs the tool schema constrains the model to — the same set
+/// `execute`'s prefix checks dispatch on (canonical spellings only; the
+/// parser's aliases like `ls`/`del`/`rm` stay accepted on the flat path).
+const ALIAS_ACTION_VERBS: &[&str] = &["add", "update", "delete", "list"];
+
+/// The JSON Schema for `alias`'s args: a required `action` (constrained to
+/// [`ALIAS_ACTION_VERBS`]) plus the `name`/`command` operands the mutating
+/// verbs need. Emitted as the tool's `input_schema` so the model is constrained
+/// to a real verb.
+fn alias_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "action": { "type": "string", "enum": ALIAS_ACTION_VERBS,
+                        "description": "What to do: \"add\" a new shortcut, \"update\" an existing one's command, \"delete\" one, or \"list\" all saved aliases." },
+            "name": { "type": "string",
+                      "description": "The alias name — the shortcut word the user will type (e.g. \"gs\"). One word, no spaces. Required for \"add\", \"update\" and \"delete\"; omit for \"list\"." },
+            "command": { "type": "string",
+                         "description": "The full command the alias expands to (e.g. \"git status\"). Required for \"add\" and \"update\"; omit otherwise." }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+/// Normalize the tool's `args` to the flat `"<verb> <name> [<command>]"` string
+/// the parser already understands. A constrained model sends the structured
+/// JSON (`{"action":"add","name":"gs","command":"git status"}`); a human or
+/// legacy/flat caller sends the string directly. Keeps `execute` on `&str`.
+fn alias_args_to_flat(args: &str) -> String {
+    let t = args.trim();
+    if !t.starts_with('{') {
+        return t.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(t) {
+        Ok(v) => {
+            let field = |k: &str| v.get(k).and_then(|a| a.as_str()).unwrap_or("").trim();
+            let action = field("action");
+            let name = field("name");
+            let command = field("command");
+            [action, name, command]
+                .iter()
+                .filter(|s| !s.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        // Not the JSON we expected — fall back to the raw string; the parser
+        // answers with its usual usage message.
+        Err(_) => t.to_string(),
+    }
+}
+
 #[async_trait]
 impl ActionHandler for AliasHandler {
     fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
@@ -38,7 +91,10 @@ impl ActionHandler for AliasHandler {
         "Aliases — save command shortcuts. Usage: alias add <name> <command>, alias list, alias delete <name>"
     }
     fn usage(&self) -> &str {
-        "'set <name> <command>', 'remove <name>', 'list'"
+        "'add <name> <command>', 'update <name> <command>', 'delete <name>', 'list'"
+    }
+    fn input_schema(&self) -> Option<serde_json::Value> {
+        Some(alias_input_schema())
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
@@ -46,7 +102,11 @@ impl ActionHandler for AliasHandler {
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let start = Instant::now();
-        let trimmed = args.trim();
+        // A constrained model sends `{"action":..,"name":..,"command":..}`;
+        // flatten it (and a plain-string caller passes through) to the form the
+        // prefix checks below read.
+        let flat = alias_args_to_flat(args);
+        let trimmed = flat.trim();
         let store = AliasesStore::new();
 
         // No args or "list" → list all aliases
@@ -198,5 +258,54 @@ impl ActionHandler for AliasHandler {
         }
 
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alias_args_flatten_from_structured_json() {
+        // A constrained model sends the typed object; it flattens to the
+        // `<verb> <name> [<command>]` string the prefix checks read. The
+        // command may itself contain spaces — it is the trailing field.
+        assert_eq!(
+            alias_args_to_flat(r#"{"action":"add","name":"gs","command":"git status"}"#),
+            "add gs git status"
+        );
+        assert_eq!(
+            alias_args_to_flat(r#"{"action":"update","name":"gs","command":"git status -sb"}"#),
+            "update gs git status -sb"
+        );
+        assert_eq!(
+            alias_args_to_flat(r#"{"action":"delete","name":"gs"}"#),
+            "delete gs"
+        );
+        assert_eq!(alias_args_to_flat(r#"{"action":"list"}"#), "list");
+        // A verb missing its operands flattens to the bare verb, so the
+        // parser's own usage error answers.
+        assert_eq!(
+            alias_args_to_flat(r#"{"action":"add","name":"gs"}"#),
+            "add gs"
+        );
+        assert_eq!(alias_args_to_flat(r#"{"action":"delete"}"#), "delete");
+        // A plain-string caller (human, legacy) passes straight through.
+        assert_eq!(alias_args_to_flat("add gs git status"), "add gs git status");
+        assert_eq!(alias_args_to_flat("list"), "list");
+        // Malformed JSON → raw fallback.
+        assert_eq!(alias_args_to_flat("{not json"), "{not json");
+    }
+
+    #[test]
+    fn alias_schema_enum_matches_the_real_verbs() {
+        // The schema's action enum must be exactly ALIAS_ACTION_VERBS, so the
+        // model is constrained to verbs the parser actually handles.
+        let schema = alias_input_schema();
+        let en = schema["properties"]["action"]["enum"].as_array().unwrap();
+        assert_eq!(en.len(), ALIAS_ACTION_VERBS.len());
+        for v in ALIAS_ACTION_VERBS {
+            assert!(en.iter().any(|e| e == v), "enum missing {v}");
+        }
     }
 }

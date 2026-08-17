@@ -62,7 +62,7 @@ fn action_description(id: &str) -> &'static str {
             "Show current time in a timezone or convert between timezones. Args: timezone name or city (e.g. 'tokyo', 'EST', 'london'). Empty for local time"
         }
         "alias" => {
-            "Manage command aliases. Args: 'set <name> <command>', 'remove <name>', 'list'. Creates shortcuts for common commands"
+            "Manage command aliases. Args: 'add <name> <command>', 'update <name> <command>', 'delete <name>', 'list'. Creates shortcuts for common commands"
         }
         "reminder" => {
             "Set timed reminders with desktop notifications. Args: 'add <text> in/at <time>' (e.g. 'add buy milk in 30m', 'add standup at 9am', 'add meeting tomorrow 2pm'), 'list', 'delete <id>', 'clear'. Without 'add', infers from natural language"

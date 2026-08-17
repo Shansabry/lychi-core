@@ -46,6 +46,67 @@ fn have(tool: &str) -> bool {
     which::which(tool).is_ok()
 }
 
+/// Every verb `execute` dispatches — read-only `search` plus the mutating set
+/// from the central classifier ([`crate::rules::verbs`]) — as the
+/// machine-readable enum fed to the tool schema so a constrained model (cloud
+/// `enum` / local grammar) can only emit a real verb. Sourced from the same
+/// list the risk gate uses, so the enum can't drift from confirmation.
+fn package_action_verbs() -> Vec<&'static str> {
+    std::iter::once("search")
+        .chain(crate::rules::verbs::MUTATING_PACKAGE_VERBS.iter().copied())
+        .collect()
+}
+
+/// The JSON Schema for `pkg`'s args: a required `action` (constrained to
+/// [`package_action_verbs`]) plus a free `package` operand. Emitted as the
+/// tool's `input_schema` so the model is constrained to a real verb.
+fn packages_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "action": { "type": "string", "enum": package_action_verbs(),
+                        "description": "\"search\" is read-only. install/remove/uninstall/upgrade change the system: they require the user to confirm and then authenticate via a polkit prompt." },
+            "package": { "type": "string",
+                         "description": "The package name (e.g. \"neovim\", \"gcc-c++\") — or, for \"search\", the search query. Prefix \"flatpak:\" to target flatpak explicitly (e.g. \"flatpak:org.mozilla.firefox\"). Omit only for \"upgrade\", which then upgrades the whole system." }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+/// Normalize the tool's `args` to the flat `"<verb> [<package>]"` string
+/// `execute` already parses. A constrained model sends the structured JSON
+/// (`{"action":"install","package":"neovim"}`); a human or legacy/flat caller
+/// sends the string directly. Keeps `execute`/`assess_risk` on `&str`.
+fn packages_args_to_flat(args: &str) -> String {
+    let t = args.trim();
+    if !t.starts_with('{') {
+        return t.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(t) {
+        Ok(v) => {
+            let action = v
+                .get("action")
+                .and_then(|a| a.as_str())
+                .unwrap_or("")
+                .trim();
+            let package = v
+                .get("package")
+                .and_then(|a| a.as_str())
+                .unwrap_or("")
+                .trim();
+            if package.is_empty() {
+                action.to_string()
+            } else {
+                format!("{action} {package}")
+            }
+        }
+        // Not the JSON we expected — fall back to the raw string; `execute`
+        // answers with its usual usage message.
+        Err(_) => t.to_string(),
+    }
+}
+
 /// The native system package manager, detected once per call. Order follows the
 /// major distro families; the first installed one wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -584,6 +645,9 @@ impl ActionHandler for PackagesHandler {
     fn usage(&self) -> &str {
         "'search <query>' or 'install <package>'. Uses the OS package manager (dnf/apt/pacman/flatpak). NOT for web searches"
     }
+    fn input_schema(&self) -> Option<serde_json::Value> {
+        Some(packages_input_schema())
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::System
     }
@@ -594,9 +658,12 @@ impl ActionHandler for PackagesHandler {
         _ctx: &crate::action_registry::RiskContext<'_>,
     ) -> RiskAssessment {
         // Search is read-only (auto); install/remove/upgrade mutate the system
-        // (root via pkexec) and need confirmation.
-        if is_mutating(args) {
-            RiskAssessment::confirm(format!("Run 'pkg {}'?", args.trim()))
+        // (root via pkexec) and need confirmation. A constrained model sends
+        // `{"action":..,"package":..}`; flatten it (a plain-string caller
+        // passes through) so the gate sees the same verb execute dispatches on.
+        let flat = packages_args_to_flat(args);
+        if is_mutating(&flat) {
+            RiskAssessment::confirm(format!("Run 'pkg {}'?", flat.trim()))
         } else {
             RiskAssessment::level(RiskLevel::Low)
         }
@@ -653,8 +720,11 @@ impl ActionHandler for PackagesHandler {
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        // Called as "search <q>" or "install <pkg>" (verb re-prepended by router).
-        let trimmed = args.trim();
+        // Called as "search <q>" or "install <pkg>" (verb re-prepended by
+        // router). A constrained model sends `{"action":..,"package":..}`;
+        // flatten it (and a plain-string caller passes through) first.
+        let flat = packages_args_to_flat(args);
+        let trimmed = flat.trim();
         let (verb, rest) = trimmed
             .split_once(char::is_whitespace)
             .unwrap_or((trimmed, ""));
@@ -842,6 +912,80 @@ mod tests {
             h.assess_risk("search ripgrep", &Default::default()).level,
             RiskLevel::Low
         );
+    }
+
+    #[test]
+    fn assess_risk_sees_through_structured_json() {
+        // The schema path must reach the SAME risk verdict as the flat path —
+        // a JSON-wrapped install that skipped confirmation would be a hole.
+        let h = PackagesHandler::new();
+        assert_eq!(
+            h.assess_risk(
+                r#"{"action":"install","package":"neovim"}"#,
+                &Default::default()
+            )
+            .level,
+            RiskLevel::Medium
+        );
+        assert_eq!(
+            h.assess_risk(r#"{"action":"upgrade"}"#, &Default::default())
+                .level,
+            RiskLevel::Medium
+        );
+        assert_eq!(
+            h.assess_risk(
+                r#"{"action":"search","package":"ripgrep"}"#,
+                &Default::default()
+            )
+            .level,
+            RiskLevel::Low
+        );
+    }
+
+    #[test]
+    fn packages_args_flatten_from_structured_json() {
+        // A constrained model sends the typed object; it flattens to the
+        // `<verb> [<package>]` string execute already parses.
+        assert_eq!(
+            packages_args_to_flat(r#"{"action":"install","package":"neovim"}"#),
+            "install neovim"
+        );
+        assert_eq!(
+            packages_args_to_flat(r#"{"action":"search","package":"ripgrep"}"#),
+            "search ripgrep"
+        );
+        // No package → bare verb; only valid for upgrade (whole system), and
+        // the other verbs get run_pkg_op's own usage error.
+        assert_eq!(packages_args_to_flat(r#"{"action":"upgrade"}"#), "upgrade");
+        // A flatpak-prefixed target survives.
+        assert_eq!(
+            packages_args_to_flat(
+                r#"{"action":"install","package":"flatpak:org.mozilla.firefox"}"#
+            ),
+            "install flatpak:org.mozilla.firefox"
+        );
+        // A plain-string caller (human, legacy) passes straight through.
+        assert_eq!(packages_args_to_flat("install neovim"), "install neovim");
+        assert_eq!(packages_args_to_flat("upgrade"), "upgrade");
+        // Malformed JSON → raw fallback.
+        assert_eq!(packages_args_to_flat("{not json"), "{not json");
+    }
+
+    #[test]
+    fn packages_schema_enum_matches_the_real_verbs() {
+        // The schema's action enum must be search + the central mutating list,
+        // so the model is constrained to verbs execute actually dispatches.
+        let verbs = package_action_verbs();
+        let schema = packages_input_schema();
+        let en = schema["properties"]["action"]["enum"].as_array().unwrap();
+        assert_eq!(en.len(), verbs.len());
+        for v in &verbs {
+            assert!(en.iter().any(|e| e == v), "enum missing {v}");
+        }
+        assert!(verbs.contains(&"search"));
+        for v in crate::rules::verbs::MUTATING_PACKAGE_VERBS {
+            assert!(verbs.contains(v), "verb list missing {v}");
+        }
     }
 
     #[test]

@@ -377,6 +377,41 @@ pub fn invalidate_project_cache() {
     }
 }
 
+/// The JSON Schema for `project`'s args: a required `name` — the project to
+/// fuzzy-match and open. Emitted as the tool's `input_schema`.
+fn project_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string",
+                      "description": "The project's folder name (e.g. \"lychi\"), fuzzy-matched against projects discovered under the user's configured project directories. The best match opens in the code editor." }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+    })
+}
+
+/// Normalize the tool's `args` to the flat name string the fuzzy matcher reads.
+/// A constrained model sends the structured JSON (`{"name":"lychi"}`); a human
+/// or legacy/flat caller sends the name directly and passes through unchanged.
+fn project_args_to_flat(args: &str) -> String {
+    let t = args.trim();
+    if !t.starts_with('{') {
+        return t.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(t) {
+        Ok(v) => v
+            .get("name")
+            .and_then(|a| a.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        // Not the JSON we expected — fall back to the raw string; the fuzzy
+        // matcher will reject it with the usual "No project matching" error.
+        Err(_) => t.to_string(),
+    }
+}
+
 #[async_trait]
 impl ActionHandler for ProjectOpen {
     fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
@@ -395,12 +430,18 @@ impl ActionHandler for ProjectOpen {
     fn usage(&self) -> &str {
         "the project name (e.g. 'lychi'). Opens it in the code editor"
     }
+    fn input_schema(&self) -> Option<serde_json::Value> {
+        Some(project_input_schema())
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Files
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        let query = args.trim();
+        // A constrained model sends `{"name":..}`; flatten it (a plain-string
+        // caller passes through) to the bare name the fuzzy matcher reads.
+        let flat = project_args_to_flat(args);
+        let query = flat.trim();
         if query.is_empty() {
             return Ok(ActionResult::err("Usage: project <name>".to_string()));
         }
@@ -463,5 +504,25 @@ impl ActionHandler for ProjectOpen {
                 ..Default::default()
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_args_flatten_from_structured_json() {
+        // A constrained model sends the typed object; it flattens to the bare
+        // name the fuzzy matcher reads.
+        assert_eq!(project_args_to_flat(r#"{"name":"lychi"}"#), "lychi");
+        assert_eq!(project_args_to_flat(r#"{"name":" lychi "}"#), "lychi");
+        // Absent/empty name → "" (execute's usage guard fires).
+        assert_eq!(project_args_to_flat("{}"), "");
+        // A plain-string caller passes straight through.
+        assert_eq!(project_args_to_flat("lychi"), "lychi");
+        assert_eq!(project_args_to_flat(""), "");
+        // Malformed JSON falls back to the raw string.
+        assert_eq!(project_args_to_flat("{not json"), "{not json");
     }
 }

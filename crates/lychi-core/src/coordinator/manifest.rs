@@ -8,18 +8,22 @@
 //! `ask` vs `run ls`) — the "random tool call" failure. The rich usage text
 //! already existed, but in a table nothing sent to the model.
 //!
-//! This manifest folds that knowledge INTO the system prompt as compact prose:
-//! every tool with its purpose + argument syntax, and every AI command (preset)
-//! so the agent knows those exist too. It is generated from the live registry and
-//! presets store, so it never drifts from what is actually registered.
+//! This manifest folds that knowledge into compact prose: every tool with its
+//! purpose + argument syntax, and every AI command (preset) so the agent knows
+//! those exist too. It is generated from the live registry and presets store, so
+//! it never drifts from what is actually registered.
 //!
-//! The prose lists ALL capabilities (awareness is what fixes wrong calls), and the
-//! callable tool SCHEMAS now also carry the full, stable catalog every turn — so
-//! the provider can prompt-cache both (see [`crate::providers::wire`]). Selection
-//! is steered, not filtered: a per-turn relevance hint ([`super::relevance_hint`])
-//! rides a TRAILING message after the history, never the system prompt. The
-//! manifest is part of the CACHED prefix, so it must stay byte-stable across turns —
-//! never fold per-turn state into it; that belongs in the trailing hint.
+//! CURRENT WIRING: the full tool manifest ([`build_manifest`]) is NOT sent — tool
+//! knowledge rides the callable schemas instead (each `ToolDef` description
+//! carries the handler's `usage()`, and [`super::select_tools`] filters the set
+//! per query). Only the presets note ([`build_presets_note`]) is spliced into the
+//! agent's system prompt, since presets are not tools and the model can't learn
+//! them any other way. The full-manifest builder stays for any surface that wants
+//! the whole catalog as prose (e.g. a future stable-catalog design).
+//!
+//! Whatever is spliced becomes part of the system prompt, which should stay
+//! byte-stable across turns — never fold per-turn state into it; per-turn context
+//! belongs in a trailing message.
 
 use crate::action_registry::CommandInfo;
 use crate::ai_presets::AiPresetItem;

@@ -172,17 +172,6 @@ fn result_summary_and_artifact(
     (result_text(res), None)
 }
 
-/// The sentinel the model prefixes onto a `run` command when it wants an
-/// external terminal window instead of inline capture.
-///
-/// Why a prefix and not a JSON field: every Lychi tool speaks the wire layer's
-/// uniform `{ args: string }` schema (see `providers/wire.rs::anthropic_tools`),
-/// so a per-tool typed parameter does not exist to hang a boolean on. A leading
-/// keyword the adapter strips keeps the single-string contract intact while
-/// still letting the model choose per command. Documented to the model in the
-/// `run` tool description (see `ExecutorAdapter::describe_run`).
-const TERMINAL_PREFIX: &str = "--terminal";
-
 /// Decide how an agent `run` should surface its output, and return the command
 /// with any control sentinel stripped.
 ///
@@ -190,8 +179,9 @@ const TERMINAL_PREFIX: &str = "--terminal";
 /// and an agent command dumped into an external terminal is both invisible to
 /// the model and a focus thief that dismisses the launcher (the multi-step bug).
 /// The model opts into a real terminal — for `ssh`, an editor, a REPL, a
-/// long-running foreground process the user wants to watch — with the
-/// [`TERMINAL_PREFIX`] sentinel.
+/// long-running foreground process the user wants to watch — with the typed
+/// `terminal: true` field of `run`'s input schema, or the flat `--terminal`
+/// sentinel (`shell_exec::TERMINAL_PREFIX`) it normalizes to.
 /// Returns the executor input string, the `RunInputs`, and whether this
 /// dispatch will open an EXTERNAL terminal window (`opens_terminal`).
 ///
@@ -212,16 +202,16 @@ fn agent_run_inputs(name: &str, args: &str) -> (String, RunInputs, bool) {
         return (input, RunInputs::default(), false);
     }
 
-    let trimmed = args.trim_start();
-    let (forced_terminal, cmd) = match trimmed.strip_prefix(TERMINAL_PREFIX) {
-        // Strip the sentinel AND the whitespace after it, so the shell never
-        // sees a stray leading space. A bare `--terminal` with no command falls
-        // through to shell_exec's own "Usage: run …" guard.
-        Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => {
-            (true, rest.trim_start())
-        }
-        _ => (false, trimmed),
-    };
+    // Flatten a schema-typed `{"command":..,"terminal":..}` to the sentinel
+    // form FIRST (a plain string passes through unchanged). This must happen
+    // here, before the executor: the Rules Engine validates `run`'s args
+    // verbatim (`rules/mod.rs` routes them straight into ShellRules), so risk
+    // assessment has to read the exact flat command that will execute —
+    // JSON-wrapped args would defeat its structural checks. The sentinel split
+    // is the handler's own splitter, so adapter and handler cannot disagree.
+    let flat = lychi_core::action_registry::handlers::shell_exec::run_args_to_flat(args);
+    let (forced_terminal, cmd) =
+        lychi_core::action_registry::handlers::shell_exec::split_terminal_sentinel(&flat);
     // The single "does this need a terminal?" rule lives in the `run` handler
     // and applies to the typed command and the agent alike. We consult the SAME
     // function here only so the agent's own `inline` flag (and thus whether a
@@ -531,21 +521,31 @@ async fn build_coordinator(
             .unwrap_or_default();
         // No prose manifest: it would list ALL tools in the system prompt, undoing
         // the per-query tool filtering that keeps input tokens low. The callable
-        // tool SCHEMAS (name + description + args) are the single source of tool
-        // knowledge, and the coordinator sends only the query-relevant subset. The
-        // presets list is still surfaced (it is small and not a tool schema).
-        let _ = &catalog;
+        // tool SCHEMAS are the single source of tool knowledge, and the coordinator
+        // sends only the query-relevant subset. The presets list is still surfaced
+        // (it is small and not a tool schema).
         manifest = lychi_core::coordinator::build_presets_note(&presets);
 
         let full: Vec<ToolDef> = {
-            // Tool descriptions come straight from the registry — no per-tool prose
-            // injected here. The `run` tool's `--terminal` guidance lives in its
-            // handler `usage()`, which the capability manifest carries (one source).
+            // Fold each handler's `usage()` into the wire description. With the
+            // prose manifest no longer sent, the schema description is the ONLY
+            // channel that reaches the model — a bare one-liner is how `system`
+            // got called with guessed args. The cost rides only the filtered
+            // subset actually sent, and the usage text also feeds the lexical
+            // relevance ranking (it indexes name + description).
             catalog
                 .into_iter()
                 .map(|c| ToolDef {
                     name: c.id,
-                    description: c.description,
+                    description: if c.usage.trim().is_empty() {
+                        c.description
+                    } else {
+                        format!(
+                            "{}. Usage: {}",
+                            c.description.trim_end_matches('.'),
+                            c.usage.trim()
+                        )
+                    },
                     mutates: c.mutates,
                     input_schema: c.input_schema,
                 })
@@ -775,6 +775,29 @@ pub async fn agent_chat_start(
         .await
         .unwrap_or(user)
     };
+    // Ambient context rides the LATEST user turn as a trailing `<context>`
+    // block — never the system prompt, which must stay byte-stable across turns
+    // (provider prompt caching + idempotent manifest splice). Full-agent turns
+    // only: a preset is a pure text transform and gets no ambient state. The
+    // block enters the WIRE content; the UI keeps showing what the user typed —
+    // when the caller supplied no display split, one is synthesized so a
+    // recalled conversation renders the typed text plus a "Context" chip
+    // instead of the raw block.
+    let (user, display) = if with_tools {
+        let ctx = state.executor.read().await.context.clone();
+        let block = lychi_core::context::agent_context_block(ctx.as_ref());
+        let display = display.or_else(|| {
+            Some(lychi_core::providers::MessageDisplay {
+                instruction: user.clone(),
+                label: "Context".to_string(),
+                body: block.clone(),
+            })
+        });
+        (format!("{user}\n\n{block}"), display)
+    } else {
+        (user, display)
+    };
+
     let cancel = CancellationToken::new();
     {
         let mut slot = state.ai_cancel.write().await;
@@ -1031,6 +1054,25 @@ mod tests {
         let (input, _, opens_terminal) = agent_run_inputs("web", "--terminal something");
         assert_eq!(input, "web --terminal something");
         assert!(!opens_terminal);
+    }
+
+    #[test]
+    fn a_schema_typed_run_is_flattened_before_the_executor() {
+        // A schema-constrained model sends `{"command":..,"terminal":..}`. The
+        // adapter must flatten it HERE, before the executor, so the Rules
+        // Engine's shell validation reads the exact command that runs — raw
+        // JSON must never reach ShellRules.
+        let (input, inputs, opens_terminal) = agent_run_inputs("run", r#"{"command":"ls -la"}"#);
+        assert_eq!(input, "run ls -la", "JSON must not reach the executor");
+        assert!(inputs.inline);
+        assert!(!opens_terminal);
+
+        // The typed terminal boolean behaves exactly like the flat sentinel.
+        let (input, inputs, opens_terminal) =
+            agent_run_inputs("run", r#"{"command":"ssh nimbus","terminal":true}"#);
+        assert_eq!(input, "run ssh nimbus");
+        assert!(!inputs.inline);
+        assert!(opens_terminal);
     }
 
     #[test]

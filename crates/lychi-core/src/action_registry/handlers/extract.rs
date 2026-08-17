@@ -71,6 +71,58 @@ fn dest_for(archive: &std::path::Path, explicit: Option<&str>) -> PathBuf {
     base
 }
 
+/// The JSON Schema for `extract`'s args: a required `archive` path plus an
+/// optional `destination` directory. Emitted as the tool's `input_schema` so a
+/// constrained model sends the path and destination as separate fields instead
+/// of guessing the ` to ` syntax.
+fn extract_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "archive": { "type": "string",
+                         "description": "Path to the archive to unpack: .zip, .tar.gz, .tgz, or .tar. ~ expands to the home directory (e.g. \"~/Downloads/report.zip\")." },
+            "destination": { "type": "string",
+                             "description": "Directory to extract into. Omit for the safe default: a fresh sibling folder named after the archive (report.zip → report/). An explicit destination (or one that already exists) asks the user for confirmation." }
+        },
+        "required": ["archive"],
+        "additionalProperties": false
+    })
+}
+
+/// Normalize the tool's `args` to the flat `"<archive> [to <dir>]"` string the
+/// parser already understands. A constrained model sends the structured JSON
+/// (`{"archive":"a.zip","destination":"out"}`); a human or legacy/flat caller
+/// sends the string directly. Runs first in BOTH `execute` and `assess_risk` so
+/// the schema path can never diverge from the flat path's risk assessment.
+fn extract_args_to_flat(args: &str) -> String {
+    let t = args.trim();
+    if !t.starts_with('{') {
+        return t.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(t) {
+        Ok(v) => {
+            let archive = v
+                .get("archive")
+                .and_then(|a| a.as_str())
+                .unwrap_or("")
+                .trim();
+            let dest = v
+                .get("destination")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .trim();
+            if dest.is_empty() {
+                archive.to_string()
+            } else {
+                format!("{archive} to {dest}")
+            }
+        }
+        // Not the JSON we expected — fall back to the raw string; the parser
+        // will handle it (or reject it) as usual.
+        Err(_) => t.to_string(),
+    }
+}
+
 #[async_trait]
 impl ActionHandler for ExtractHandler {
     fn triggers(&self) -> &'static [Trigger] {
@@ -92,6 +144,9 @@ impl ActionHandler for ExtractHandler {
     fn usage(&self) -> &str {
         "extract <archive.zip|.tar.gz> [to <dir>]"
     }
+    fn input_schema(&self) -> Option<serde_json::Value> {
+        Some(extract_input_schema())
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Files
     }
@@ -100,7 +155,10 @@ impl ActionHandler for ExtractHandler {
     /// default; Medium (confirm) when the destination already exists or was
     /// explicitly chosen (could scatter files into a populated directory).
     fn assess_risk(&self, args: &str, _ctx: &RiskContext<'_>) -> RiskAssessment {
-        let Some((archive_str, dir)) = parse_args(args) else {
+        // Flatten a structured tool call first so the schema path assesses the
+        // same string `execute` will run.
+        let flat = extract_args_to_flat(args);
+        let Some((archive_str, dir)) = parse_args(&flat) else {
             return RiskAssessment::level(RiskLevel::Low);
         };
         let archive = expand_home(&archive_str);
@@ -113,7 +171,10 @@ impl ActionHandler for ExtractHandler {
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        let Some((archive_str, dir)) = parse_args(args) else {
+        // A constrained model sends `{"archive":..,"destination":..}`; flatten
+        // it (and a plain-string caller passes through) before parsing.
+        let flat = extract_args_to_flat(args);
+        let Some((archive_str, dir)) = parse_args(&flat) else {
             return Ok(ActionResult::err(
                 "Usage: extract <archive.zip | .tar.gz> [to <dir>]",
             ));
@@ -191,5 +252,43 @@ mod tests {
             dest_for(Path::new("/a/x.zip"), Some("/tmp/here")),
             PathBuf::from("/tmp/here")
         );
+    }
+
+    #[test]
+    fn extract_args_flatten_from_structured_json() {
+        // A constrained model sends the typed object; it flattens to the string
+        // the parser already understands.
+        assert_eq!(
+            extract_args_to_flat(r#"{"archive":"~/Downloads/report.zip","destination":"~/out"}"#),
+            "~/Downloads/report.zip to ~/out"
+        );
+        // No destination → just the archive (safe sibling-folder default).
+        assert_eq!(
+            extract_args_to_flat(r#"{"archive":"a.tar.gz"}"#),
+            "a.tar.gz"
+        );
+        // Empty destination is treated as absent.
+        assert_eq!(
+            extract_args_to_flat(r#"{"archive":"a.zip","destination":""}"#),
+            "a.zip"
+        );
+        // A plain-string caller (human, legacy) passes straight through.
+        assert_eq!(extract_args_to_flat("a.zip to out"), "a.zip to out");
+        assert_eq!(extract_args_to_flat("a.zip"), "a.zip");
+    }
+
+    #[test]
+    fn extract_args_malformed_json_falls_back_to_raw() {
+        assert_eq!(
+            extract_args_to_flat(r#"{"archive": broken"#),
+            r#"{"archive": broken"#
+        );
+    }
+
+    #[test]
+    fn extract_schema_requires_archive_only() {
+        let schema = extract_input_schema();
+        assert_eq!(schema["required"], serde_json::json!(["archive"]));
+        assert!(schema["properties"]["destination"].is_object());
     }
 }
