@@ -966,6 +966,63 @@ mod tests {
             }
         }
 
+        // ACTION requests must pull their group's tool into the shortlist —
+        // the selection precision work (stopwords, score floor) tightened
+        // recall risk, and an action request that arrives without its tool
+        // costs a find_tool round-trip at best. Run the REAL selection against
+        // the REAL catalog for a battery of action phrasings, one per surface.
+        let tool_defs: Vec<lychi_core::providers::ToolDef> = catalog
+            .iter()
+            .map(|m| lychi_core::providers::ToolDef {
+                name: m.name.clone(),
+                description: m.description.clone(),
+                mutates: m.mutates,
+                mutating_actions: m.mutating_actions.clone(),
+                input_schema: m.input_schema.clone(),
+            })
+            .collect();
+        let action_cases: &[(&str, &str)] = &[
+            ("take a screenshot of my window", "system_control"),
+            ("turn the volume up a bit", "system_control"),
+            ("install the htop package", "system_control"),
+            ("close the spotify window", "system_control"),
+            ("restart the nginx service", "system_control"),
+            ("zip up these log files", "files"),
+            ("extract that archive please", "files"),
+            ("convert this image to png", "files"),
+            ("browse my downloads folder", "files"),
+            ("add a note buy milk", "personal_data"),
+            ("remind me tomorrow at 9am", "personal_data"),
+            ("start a 10 minute timer", "personal_data"),
+            ("add a todo call the bank", "personal_data"),
+            ("base64 decode this string", "dev_tools"),
+            ("ssh into my server", "dev_tools"),
+            ("generate a strong password", "quick_tools"),
+            ("check the weather in tokyo", "quick_tools"),
+            ("pause the music playback", "media_control"),
+            // Chained intents: the request mixes model work (summarize) with
+            // an action leg — the action leg's group must still be pulled.
+            (
+                "summarize this text and add it to my notes",
+                "personal_data",
+            ),
+            (
+                "look up this word and set a reminder about it",
+                "personal_data",
+            ),
+        ];
+        for (query, expected) in action_cases {
+            let msgs = vec![lychi_core::providers::ChatMessage::user(*query)];
+            let picked = lychi_core::coordinator::select_tools(&msgs, &tool_defs);
+            let picked_names: Vec<&str> = picked.iter().map(|t| t.name.as_str()).collect();
+            assert!(
+                picked_names.contains(expected),
+                "action request {query:?} did not pull `{expected}` — got {picked_names:?}. \
+                 Add the missing domain word to that ToolGroup's description or the \
+                 relevant action name, don't loosen the score floor."
+            );
+        }
+
         // Deterministic: two projections of the same registry are identical
         // byte-for-byte (name order AND schema serialization) — the property
         // provider prompt caching keys on.

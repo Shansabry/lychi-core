@@ -1,30 +1,29 @@
-//! Per-query tool selection for the agent — sends only the tools a query plausibly
-//! needs, not the whole ~48-tool catalog.
+//! Per-query tool selection for the agent, sized to real provider budgets.
 //!
-//! WHY. A flat catalog of every tool is expensive AND error-prone. Each tool's
-//! schema is ~50 tokens, so 48 tools is ~2,300 input tokens on EVERY model
-//! round-trip — a "what is a dolphin" that needs no tools still pays it. And the
-//! research is consistent across model tiers: more tools lowers selection accuracy
-//! (position bias, tool-choice confusion), while filtering to the few relevant ones
-//! both cuts tokens ~80% and RAISES accuracy. So we send a small, query-relevant
-//! subset.
+//! WHY. The tool block ships with EVERY model round-trip on top of system
+//! prompt + history, and providers have hard per-request token budgets (Groq's
+//! free tier rejects ~8k-token requests outright). A LEAN catalog (few tools,
+//! light payload) is sent whole — byte-stable, so the provider can prompt-cache
+//! the prefix. A HEAVY catalog is rationed per query, and never falls back to
+//! "send everything" — that is exactly the request budgeted providers reject.
 //!
-//! FAIL-SAFE by construction — the bar to keep a tool is low and the agent is never
-//! starved:
-//! - a small CORE set (the verbs behind the most common asks) is ALWAYS present;
-//! - tools whose name/description match the query's words are added on top;
-//! - a short or unrankable query gets the FULL catalog (over-including is cheap;
-//!   under-including breaks the task);
-//! - and the executor dispatches ANY tool by name regardless of what was sent, so
-//!   a wrongly-dropped tool is still runnable if the model asks for it.
+//! FAIL-SAFE by construction — the agent is never starved:
+//! - a small CORE set (`run`, `web_tools`, `find_tool`) is ALWAYS present;
+//! - tools whose name/description/action-names match the query's words join it;
+//! - `find_tool` (core) lets the model search the full catalog when its
+//!   shortlist misses, and the executor dispatches ANY tool by name regardless
+//!   of what was sent, so a wrongly-dropped tool is still runnable.
 //!
-//! HOW. Rank each tool's `name + description` against the recent conversation with
-//! the same `nucleo` fuzzy matcher the launcher already trusts for file/app search
-//! — no embedding model, no new dependency, no cold-start cost. For ~48 short tool
-//! descriptions, fuzzy lexical ranking floats the right handful reliably.
-
-use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
-use nucleo_matcher::{Config, Matcher, Utf32Str};
+//! HOW. Deterministic word-level matching of the recent conversation against
+//! each tool's name + description + action names: stopwords removed, then
+//! exact word equality (strong) or 4+-char prefix overlap (morphology:
+//! remind/reminder). Deliberately NOT the launcher's nucleo fuzzy matcher —
+//! subsequence scoring could not separate a real short-word hit from scatter
+//! noise across the rich group descriptions (measured: "note" 114 vs
+//! "dolphin"-noise 102), and selection needs precision more than typo
+//! tolerance. Scores SUM across query words so a chained request ("summarize
+//! this and add it to notes") ranks every intent's group. Tuned by tests
+//! against the real group tools, in both crates.
 
 use crate::providers::{ChatMessage, Role, ToolDef};
 
@@ -33,23 +32,12 @@ use crate::providers::{ChatMessage, Role, ToolDef};
 /// disk" to "open the biggest folder" needs `open`/`file` by the later step.
 const CONTEXT_LOOKBACK_MESSAGES: usize = 6;
 
-/// Tools the agent must ALWAYS have — the verbs behind the most common asks, plus
-/// the ones a plan tends to need mid-way (open a file it found, run a follow-up).
-/// Matched against `ToolDef::name`. Keeps the agent capable no matter how the query
-/// is phrased, so filtering can never strand a common action. Carries both the
-/// group-tool names and the legacy standalone names so filtering behaves during
-/// the grammar migration (a name absent from the catalog is simply inert).
-const CORE_TOOLS: &[&str] = &[
-    "run",
-    FIND_TOOL,
-    "web_tools",
-    "files",
-    "quick_tools",
-    "web",
-    "calc",
-    "url",
-    "browse",
-];
+/// Tools the agent must ALWAYS have: shell, web, and the discovery tool that
+/// recovers from any shortlist miss. Deliberately minimal — every core entry
+/// is a token cost on EVERY turn, and the ranked groups (whose haystacks
+/// include their action names) cover domain asks. Matched against
+/// `ToolDef::name`; a name absent from the catalog is simply inert.
+const CORE_TOOLS: &[&str] = &["run", FIND_TOOL, "web_tools"];
 
 /// A catalog at or under this size — count AND serialized weight — is sent
 /// WHOLE every turn: no ranking, no per-query variation, a byte-stable prefix
@@ -71,6 +59,93 @@ const MIN_QUERY_CHARS: usize = 8;
 /// research's top-3 (that uses semantic embeddings; nucleo is lexical, so a wider
 /// net compensates) while still cutting the catalog by ~80% on a focused query.
 const MAX_MATCHED_TOOLS: usize = 8;
+
+/// Question/function words that carry no tool intent. Without this filter,
+/// nucleo's SUBSEQUENCE matching lets "what" or "please" scatter-match letters
+/// across a 150-char group description and drag the whole catalog in — the
+/// bug where "what is a dolphin" shipped every schema, twice.
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "you", "your", "with", "from", "this", "that", "these", "those", "what",
+    "when", "where", "which", "who", "whose", "why", "how", "can", "could", "would", "should",
+    "will", "shall", "may", "might", "must", "please", "know", "tell", "let", "give", "get",
+    "make", "need", "want", "like", "just", "some", "any", "all", "about", "into", "onto", "does",
+    "did", "done", "have", "has", "had", "are", "was", "were", "been", "being", "not", "now",
+    "then", "than", "there", "here", "its", "it's", "mine", "our", "out",
+];
+
+/// The floor a tool's score must clear to count as query-matched: one solid
+/// word match. A prefix match scores exactly this; an exact word match scores
+/// higher (see `score_tool`), and anything below is no lexical evidence at all.
+const MIN_MATCH_SCORE: u32 = 120;
+
+/// The meaningful words of a query: lowercased, alphanumeric-split, minus
+/// stopwords and short fragments.
+fn query_words(ctx: &str) -> Vec<String> {
+    ctx.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 3)
+        .map(|w| w.to_lowercase())
+        .filter(|w| !STOPWORDS.contains(&w.as_str()))
+        .collect()
+}
+
+/// What a tool is ranked against: its name, description, and — for a grouped
+/// tool — its action names. The action names are where the exact domain words
+/// live (`calc`, `weather`, `note_add`), so "check the weather" ranks
+/// `quick_tools` even though its prose says "instant answers".
+fn tool_haystack(t: &ToolDef) -> String {
+    let mut hay = format!("{} {}", t.name, t.description);
+    if let Some(actions) = t
+        .input_schema
+        .as_ref()
+        .and_then(|s| s["properties"]["action"]["enum"].as_array())
+    {
+        for a in actions {
+            if let Some(name) = a.as_str() {
+                hay.push(' ');
+                // Compound names split into their words so "note" hits "note_add".
+                hay.push_str(&name.replace('_', " "));
+            }
+        }
+    }
+    hay
+}
+
+/// Deterministic WORD-level scoring — not fuzzy. Nucleo's subsequence scoring
+/// could not separate a genuine short-word hit from scatter noise here (a real
+/// "note" match scored 114 while "dolphin" coincidences reached 102), so
+/// selection matches whole words: exact equality is a strong hit, and a
+/// one-sided prefix of at least 4 chars covers morphology (remind/reminder,
+/// package/packages, window/windows). Per query word take the best hay-word
+/// hit; SUM across query words so a chained request ("summarize this and add
+/// it to notes") ranks every intent's group. Typos lose their tolerance — the
+/// model recovers via `find_tool`, and agent queries are mostly clean text.
+fn score_tool(words: &[String], t: &ToolDef) -> u32 {
+    let hay = tool_haystack(t).to_lowercase();
+    let hay_words: Vec<&str> = hay
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 3)
+        .collect();
+    words
+        .iter()
+        .map(|qw| {
+            hay_words
+                .iter()
+                .map(|hw| {
+                    if qw == hw {
+                        200
+                    } else if (qw.len() >= 4 && hw.starts_with(qw.as_str()))
+                        || (hw.len() >= 4 && qw.starts_with(hw))
+                    {
+                        MIN_MATCH_SCORE
+                    } else {
+                        0
+                    }
+                })
+                .max()
+                .unwrap_or(0)
+        })
+        .sum()
+}
 
 /// Approximate wire weight of a catalog: descriptions + serialized schemas.
 fn approx_payload_bytes(catalog: &[ToolDef]) -> usize {
@@ -112,43 +187,18 @@ pub fn select_tools(messages: &[ChatMessage], catalog: &[ToolDef]) -> Vec<ToolDe
         return core_subset(catalog);
     }
 
-    // One fuzzy atom per meaningful query word. Scoring per word and summing lets a
-    // tool that matches the salient word ("screenshot") float up even when the rest
-    // of the phrase ("of my window") matches nothing.
-    let atoms: Vec<Atom> = ctx
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.chars().count() >= 3)
-        .map(|w| {
-            Atom::new(
-                w,
-                CaseMatching::Ignore,
-                Normalization::Smart,
-                AtomKind::Fuzzy,
-                false,
-            )
-        })
-        .collect();
-    if atoms.is_empty() {
+    let words = query_words(ctx);
+    if words.is_empty() {
         return core_subset(catalog);
     }
 
-    let mut matcher = Matcher::new(Config::DEFAULT);
-    let mut buf = Vec::new();
     let mut matched: Vec<(usize, u32)> = Vec::new();
     for (i, t) in catalog.iter().enumerate() {
         if CORE_TOOLS.contains(&t.name.as_str()) {
             continue; // core is always kept; don't let it crowd the matched slots
         }
-        let hay = format!("{} {}", t.name, t.description);
-        let total: u32 = atoms
-            .iter()
-            .filter_map(|a| {
-                buf.clear();
-                let haystack = Utf32Str::new(&hay, &mut buf);
-                a.score(haystack, &mut matcher).map(u32::from)
-            })
-            .sum();
-        if total > 0 {
+        let total = score_tool(&words, t);
+        if total >= MIN_MATCH_SCORE {
             matched.push((i, total));
         }
     }
@@ -241,39 +291,17 @@ const FIND_TOOL_RESULTS: usize = 5;
 /// Rank `query` against the catalog (name + description, same scoring as
 /// [`select_tools`]) and return the best matches. Empty when nothing scores.
 pub fn search_catalog<'a>(query: &str, catalog: &'a [ToolDef]) -> Vec<&'a ToolDef> {
-    let atoms: Vec<Atom> = query
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.chars().count() >= 3)
-        .map(|w| {
-            Atom::new(
-                w,
-                CaseMatching::Ignore,
-                Normalization::Smart,
-                AtomKind::Fuzzy,
-                false,
-            )
-        })
-        .collect();
-    if atoms.is_empty() {
+    let words = query_words(query);
+    if words.is_empty() {
         return Vec::new();
     }
-    let mut matcher = Matcher::new(Config::DEFAULT);
-    let mut buf = Vec::new();
     let mut matched: Vec<(usize, u32)> = Vec::new();
     for (i, t) in catalog.iter().enumerate() {
         if t.name == FIND_TOOL {
             continue; // never offer the search tool as its own answer
         }
-        let hay = format!("{} {}", t.name, t.description);
-        let total: u32 = atoms
-            .iter()
-            .filter_map(|a| {
-                buf.clear();
-                let haystack = Utf32Str::new(&hay, &mut buf);
-                a.score(haystack, &mut matcher).map(u32::from)
-            })
-            .sum();
-        if total > 0 {
+        let total = score_tool(&words, t);
+        if total >= MIN_MATCH_SCORE {
             matched.push((i, total));
         }
     }
@@ -353,7 +381,7 @@ mod tests {
             "matched tool kept: {n:?}"
         );
         // Core survives even though the query doesn't name it.
-        assert!(n.contains(&"run".to_string()) && n.contains(&"web".to_string()));
+        assert!(n.contains(&"run".to_string()), "{n:?}");
         // And it actually trimmed the catalog.
         assert!(out.len() < catalog().len(), "filtered: {n:?}");
         assert!(!n.contains(&"weather".to_string()));
@@ -368,14 +396,14 @@ mod tests {
         let out = select_tools(&msgs, &catalog());
         let n = names(&out);
         assert!(out.len() < catalog().len(), "not the full catalog: {n:?}");
-        assert!(n.contains(&"run".to_string()) && n.contains(&"web".to_string()));
+        assert!(n.contains(&"run".to_string()), "{n:?}");
     }
 
     #[test]
     fn a_query_matching_nothing_still_has_core() {
         let msgs = vec![ChatMessage::user("xyzzy plugh flooble wugga")];
         let n = names(&select_tools(&msgs, &catalog()));
-        assert!(n.contains(&"run".to_string()) && n.contains(&"calc".to_string()));
+        assert!(n.contains(&"run".to_string()), "{n:?}");
         assert!(!n.contains(&"screenshot".to_string()));
     }
 
@@ -384,6 +412,162 @@ mod tests {
         let small = vec![tool("run", "x"), tool("web", "y")];
         let msgs = vec![ChatMessage::user("take a screenshot please now")];
         assert_eq!(select_tools(&msgs, &small).len(), small.len());
+    }
+
+    // ── Precision against the REAL group tools ───────────────────────────────
+    // Built from the actual ToolGroup names/descriptions plus representative
+    // action enums, so threshold tuning tracks the strings production ships.
+
+    fn group_tool(g: crate::action_registry::grammar::ToolGroup, actions: &[&str]) -> ToolDef {
+        ToolDef {
+            name: g.tool_name().into(),
+            description: g.description().into(),
+            mutates: false,
+            mutating_actions: Vec::new(),
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "action": { "enum": actions } },
+            })),
+        }
+    }
+
+    fn production_like_catalog() -> Vec<ToolDef> {
+        use crate::action_registry::grammar::ToolGroup as G;
+        vec![
+            group_tool(
+                G::Files,
+                &[
+                    "browse", "file", "project", "zip", "extract", "convert", "resize",
+                ],
+            ),
+            group_tool(G::Web, &["web", "url", "yt", "define", "bm", "quicklink"]),
+            group_tool(
+                G::System,
+                &[
+                    "system_volume",
+                    "system_wifi",
+                    "system_shutdown",
+                    "screenshot_full",
+                    "screenshot_area",
+                    "win_focus",
+                    "win_close",
+                    "packages_install",
+                    "service_restart",
+                    "open",
+                    "sysinfo",
+                ],
+            ),
+            group_tool(G::Media, &["media"]),
+            group_tool(
+                G::Dev,
+                &["devutil_base64", "devutil_hash", "ssh", "script", "ctx"],
+            ),
+            group_tool(
+                G::Personal,
+                &[
+                    "note_add",
+                    "note_read",
+                    "todo_add",
+                    "reminder_add",
+                    "timer_start",
+                    "snip",
+                    "clip",
+                    "alias_add",
+                ],
+            ),
+            group_tool(
+                G::Utils,
+                &[
+                    "calc",
+                    "time",
+                    "weather",
+                    "emoji",
+                    "color",
+                    "qr",
+                    "generate_password",
+                    "sym",
+                ],
+            ),
+            ToolDef {
+                name: "run".into(),
+                description: "Execute a shell command on this machine".into(),
+                mutates: true,
+                mutating_actions: Vec::new(),
+                input_schema: None,
+            },
+            find_tool_def(),
+        ]
+    }
+
+    /// Force the ranking path regardless of payload heuristics: pad the
+    /// catalog past FULL_SEND_MAX_TOOLS with inert entries.
+    fn heavy(mut cat: Vec<ToolDef>) -> Vec<ToolDef> {
+        while cat.len() <= FULL_SEND_MAX_TOOLS {
+            cat.push(tool(
+                Box::leak(format!("pad{}", cat.len()).into_boxed_str()),
+                "inert padding tool",
+            ));
+        }
+        cat
+    }
+
+    #[test]
+    fn precision_a_trivia_question_matches_no_groups() {
+        // The 11K-token bug: "what is a dolphin" scatter-matched every rich
+        // group description and shipped the whole catalog, twice. Stopwords +
+        // the score floor must hold this to the core set.
+        let cat = heavy(production_like_catalog());
+        let msgs = vec![ChatMessage::user("can you let me know what is a dolphin?")];
+        let n = names(&select_tools(&msgs, &cat));
+        assert_eq!(
+            n,
+            vec![
+                "web_tools".to_string(),
+                "run".to_string(),
+                FIND_TOOL.to_string()
+            ],
+            "trivia must ship core only"
+        );
+    }
+
+    #[test]
+    fn precision_domain_words_pull_their_groups() {
+        let cat = heavy(production_like_catalog());
+        let cases: &[(&str, &str)] = &[
+            ("take a screenshot of my window", "system_control"),
+            ("remind me tomorrow at 9am to buy milk", "personal_data"),
+            ("check the weather in tokyo", "quick_tools"),
+            ("zip up these log files", "files"),
+            ("pause the music playback", "media_control"),
+            // Chained intents: every action leg must rank its group.
+            (
+                "summarize this text and add it to my notes",
+                "personal_data",
+            ),
+        ];
+        for (query, expected) in cases {
+            let msgs = vec![ChatMessage::user(*query)];
+            let n = names(&select_tools(&msgs, &cat));
+            assert!(
+                n.contains(&expected.to_string()),
+                "{query:?} should rank {expected}: got {n:?}"
+            );
+            assert!(
+                n.len() <= 3 + CORE_TOOLS.len(),
+                "{query:?} over-included: {n:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn precision_find_tool_search_stays_selective() {
+        let cat = production_like_catalog();
+        let hits = search_catalog("compress files into an archive", &cat);
+        assert_eq!(hits.first().map(|t| t.name.as_str()), Some("files"));
+        assert!(
+            search_catalog("what is it", &cat).is_empty(),
+            "stopword-only query must match nothing"
+        );
     }
 
     #[test]
