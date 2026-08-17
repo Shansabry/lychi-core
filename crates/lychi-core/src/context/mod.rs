@@ -120,9 +120,16 @@ impl EnvironmentContext {
             .is_some_and(|t| t.elapsed().as_secs() >= HARD_STALE_SECS)
     }
 
-    /// Build a concise hint string for AI routing prompts.
-    /// When hard-stale, a caveat is prepended so the router can be conservative
-    /// about trusting workspace-specific routing decisions.
+    /// Build the concise ambient-state lines for the agent's per-turn
+    /// `<context>` block (see [`agent_context_block`]).
+    ///
+    /// Scope is deliberately terminal/IDE-only (the standing context-awareness
+    /// decision): cwd, git, project, docker. NOT included: the active window
+    /// title (out of scope), clipboard content (only an explicit `@clipboard`
+    /// shares it — the H1 privacy rule), and network identity (SSID is
+    /// location-revealing and near-useless to a launcher agent).
+    /// When hard-stale, a caveat is prepended so the model can be conservative
+    /// about trusting workspace-specific details.
     pub fn ai_hint(&self) -> Option<String> {
         let mut lines = Vec::new();
 
@@ -159,41 +166,32 @@ impl EnvironmentContext {
             let n = docker.containers.len();
             lines.push(format!("- Docker: {n} running container(s)"));
         }
-        if let Some(ref win) = self.active_window
-            && !win.is_terminal
-        {
-            lines.push(format!("- Active window: {} ({})", win.title, win.wm_class));
-        }
-        if let Some(ref clip) = self.clipboard {
-            let desc = match clip {
-                clipboard_detect::ClipboardContentType::Url(u) => format!("URL: {u}"),
-                clipboard_detect::ClipboardContentType::FilePath(p) => format!("File: {p}"),
-                clipboard_detect::ClipboardContentType::IpAddress(ip) => format!("IP: {ip}"),
-                clipboard_detect::ClipboardContentType::Json => "JSON content".into(),
-                clipboard_detect::ClipboardContentType::GitHash(h) => format!("Git hash: {h}"),
-                clipboard_detect::ClipboardContentType::Uuid(u) => format!("UUID: {u}"),
-                clipboard_detect::ClipboardContentType::ErrorTrace(msg) => {
-                    format!("Error/stack trace: {msg}")
-                }
-                clipboard_detect::ClipboardContentType::Plain => "Plain text".into(),
-            };
-            lines.push(format!("- Clipboard: {desc}"));
-        }
-        if let Some(ref net) = self.network {
-            if let Some(ref ssid) = net.ssid {
-                lines.push(format!("- WiFi: {ssid}"));
-            }
-            if net.vpn_active {
-                lines.push("- VPN: active".into());
-            }
-        }
-
         if lines.is_empty() {
             None
         } else {
             Some(lines.join("\n"))
         }
     }
+}
+
+/// The per-turn ambient block appended to the agent's user message: local time
+/// (the model never knows it otherwise) plus the [`EnvironmentContext::ai_hint`]
+/// lines when context exists. Delimited with `<context>` tags so the model can
+/// tell ambient state from the user's own words. Appended to the LATEST user
+/// turn only — never the system prompt, which must stay byte-stable across
+/// turns for provider prompt caching.
+pub fn agent_context_block(ctx: Option<&EnvironmentContext>) -> String {
+    let now = chrono::Local::now();
+    let mut block = format!(
+        "<context>\n- Local time: {}\n",
+        now.format("%Y-%m-%d %A %H:%M %:z")
+    );
+    if let Some(hint) = ctx.and_then(|c| c.ai_hint()) {
+        block.push_str(&hint);
+        block.push('\n');
+    }
+    block.push_str("</context>");
+    block
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
