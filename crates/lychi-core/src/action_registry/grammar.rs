@@ -243,8 +243,8 @@ fn operand_schema(op: &Operand, used_by: Option<&str>) -> Value {
         _ => "string",
     };
     let desc = match used_by {
-        Some(actions) => format!("[for {actions}] {}", op.desc),
-        None => op.desc.to_string(),
+        Some(actions) => format!("[for {actions}] {}", wire_desc(op.desc, OPERAND_DESC_CAP)),
+        None => wire_desc(op.desc, OPERAND_DESC_CAP).to_string(),
     };
     let mut s = Map::new();
     s.insert("type".into(), json!(ty));
@@ -258,11 +258,44 @@ fn operand_schema(op: &Operand, used_by: Option<&str>) -> Value {
     Value::Object(s)
 }
 
-/// "`action` — desc" lines for an action property's description.
+/// The wire rendering of a description: its FIRST sentence, word-capped.
+///
+/// Verb/operand descs are written as full judgment prose (good documentation,
+/// and the Guide can use all of it), but the schema ships with every request —
+/// on a token-budgeted provider (Groq free tier ≈ 8k tokens/request) the
+/// uncut catalog alone blew the whole budget. The first sentence carries the
+/// "what/when"; formats and caveats belong in the OPERAND descs, which are
+/// shipped whole (they are what argument accuracy hangs on).
+fn wire_desc(s: &str, cap: usize) -> &str {
+    let first = match s.find(". ") {
+        Some(i) => &s[..i + 1],
+        None => s,
+    };
+    if first.len() <= cap {
+        return first;
+    }
+    // Over-long single sentence: cut at the last word boundary under the cap.
+    match first[..cap].rfind(' ') {
+        Some(i) => &first[..i],
+        None => &first[..cap],
+    }
+}
+
+/// Action lines get a tight cap — the compound NAMES already carry most of
+/// the signal (`note_add`, `win_close`); operand descs get a looser one, since
+/// formats and examples (what argument accuracy hangs on) live there.
+const ACTION_DESC_CAP: usize = 100;
+const OPERAND_DESC_CAP: usize = 200;
+
+/// "`action` — desc" lines for an action property's description. First
+/// sentence per action (see [`wire_desc`]).
 fn action_lines<'a>(verbs: impl Iterator<Item = (String, &'a Verb)>) -> String {
     let mut out = String::from("Which operation to perform:\n");
     for (name, v) in verbs {
-        out.push_str(&format!("- `{name}` — {}\n", v.desc));
+        out.push_str(&format!(
+            "- `{name}`: {}\n",
+            wire_desc(v.desc, ACTION_DESC_CAP)
+        ));
     }
     out.trim_end().to_string()
 }
@@ -302,7 +335,15 @@ fn merge_operand_props(
         }
     }
     for (name, _, actions, op) in fields {
-        props.insert(name, operand_schema(&op, Some(&actions.join(", "))));
+        // Cap the users-of-this-field annotation: past a few names it stops
+        // informing and starts costing (a field shared by 14 actions listed
+        // them all, per request, per turn).
+        let used_by = if actions.len() <= 3 {
+            actions.join(", ")
+        } else {
+            format!("{} +{} more", actions[..3].join(", "), actions.len() - 3)
+        };
+        props.insert(name, operand_schema(&op, Some(&used_by)));
     }
 }
 

@@ -870,6 +870,40 @@ mod tests {
         let catalog = registry.model_catalog();
         let names: Vec<&str> = catalog.iter().map(|t| t.name.as_str()).collect();
 
+        // Size report (visible with --nocapture): the whole point of the
+        // projection is a SMALL wire payload — make its weight observable.
+        let mut total = 0usize;
+        for t in &catalog {
+            let schema = serde_json::to_string(&t.input_schema).unwrap_or_default();
+            eprintln!(
+                "{:<16} desc={:>5}B schema={:>6}B actions={}",
+                t.name,
+                t.description.len(),
+                schema.len(),
+                t.input_schema
+                    .as_ref()
+                    .and_then(|s| s["properties"]["action"]["enum"]
+                        .as_array()
+                        .map(|a| a.len()))
+                    .unwrap_or(0)
+            );
+            total += t.description.len() + schema.len();
+        }
+        eprintln!(
+            "TOTAL tools payload ≈ {total}B across {} tools",
+            catalog.len()
+        );
+        if let Ok(dump) = std::env::var("LYCHI_DUMP_CATALOG") {
+            let full: Vec<serde_json::Value> = catalog
+                .iter()
+                .map(|t| {
+                    serde_json::json!({"name": t.name, "description": t.description,
+                                       "schema": t.input_schema})
+                })
+                .collect();
+            let _ = std::fs::write(&dump, serde_json::to_string_pretty(&full).unwrap());
+        }
+
         // Small enough that the whole catalog ships every turn (the stable,
         // cacheable prefix — see relevance::FULL_SEND_MAX_TOOLS).
         assert!(

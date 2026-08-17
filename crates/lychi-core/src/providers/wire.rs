@@ -226,9 +226,19 @@ impl WireClient {
                         continue;
                     }
                     // Terminal error (non-429, or 429 out of retries): read the
-                    // body, classify, notify, diverge.
+                    // body, classify, notify, diverge. The RAW body goes to the
+                    // log — the user sees the friendly classification, but
+                    // diagnosing a misclassification (or a provider quirk)
+                    // needs the provider's actual words, which are otherwise
+                    // discarded here.
                     let text = resp.text().await.unwrap_or_default();
                     let err = super::errors::classify(Some(status.as_u16()), &text, had_images);
+                    tracing::warn!(
+                        status = status.as_u16(),
+                        kind = ?err.kind,
+                        detail = %err.detail,
+                        "[wire] provider rejected the request"
+                    );
                     if let Some(obs) = &on_error { obs(&err); }
                     Err(LychiError::Ai(err.message))?;
                     return; // unreachable after `?`, explicit divergence.

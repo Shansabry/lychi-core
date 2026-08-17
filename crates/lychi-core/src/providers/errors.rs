@@ -84,6 +84,16 @@ fn classify_kind(status: Option<u16>, lower: &str, had_images: bool) -> AiErrorK
 
     // 400s need the body to disambiguate — every provider words these
     // differently, so match on the fragments they genuinely share.
+    //
+    // Checked BEFORE the context-limit fragments: Groq's free-tier
+    // tokens-per-minute rejection (HTTP 413, "Request too large for model … on
+    // tokens per minute (TPM): Limit …") talks about tokens and size, so the
+    // context-limit match would claim it — but it is a RATE limit: the same
+    // request succeeds a minute later, and telling the user their message is
+    // too long sends them shortening text that was never the problem.
+    if lower.contains("tokens per minute") || lower.contains("(tpm)") {
+        return AiErrorKind::RateLimit;
+    }
     if mentions_context_limit(lower) {
         return AiErrorKind::TooLarge;
     }

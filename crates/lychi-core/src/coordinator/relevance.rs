@@ -51,38 +51,65 @@ const CORE_TOOLS: &[&str] = &[
     "browse",
 ];
 
-/// A catalog at or under this size is sent WHOLE every turn — no ranking, no
-/// per-query variation. The grouped projection lands around ten tools, which is
-/// under every published tool-count accuracy cliff, and a byte-stable tool
-/// block is what lets the provider prompt-cache the prefix. Filtering below
-/// this size would trade cache hits for nothing.
+/// A catalog at or under this size — count AND serialized weight — is sent
+/// WHOLE every turn: no ranking, no per-query variation, a byte-stable prefix
+/// the provider can prompt-cache. Filtering a lean catalog would trade cache
+/// hits for nothing.
 const FULL_SEND_MAX_TOOLS: usize = 12;
 
-/// A query shorter than this is too ambiguous to rank safely → send everything.
-const MIN_QUERY_CHARS: usize = 8;
+/// The catalog weight cap for full-send. Providers have real per-request token
+/// budgets (Groq's free tier rejects ~8k-token requests outright), and the
+/// tool block ships with EVERY turn on top of history + system prompt — a
+/// catalog past this weight must be rationed even when the tool COUNT is
+/// small. ~16KB ≈ ~4k tokens.
+const FULL_SEND_MAX_BYTES: usize = 16 * 1024;
 
-/// If the query matches at least this fraction of the (non-core) catalog, it is
-/// broad enough that filtering saves little and risks dropping something needed —
-/// send the full catalog instead.
-const FULL_CATALOG_ABOVE_FRACTION: f32 = 0.5;
+/// A query shorter than this is too ambiguous to rank safely.
+const MIN_QUERY_CHARS: usize = 8;
 
 /// How many query-matched tools to keep beyond the core set. Generous vs. the
 /// research's top-3 (that uses semantic embeddings; nucleo is lexical, so a wider
 /// net compensates) while still cutting the catalog by ~80% on a focused query.
 const MAX_MATCHED_TOOLS: usize = 8;
 
-/// Select the tools to send for the current conversation. Never returns fewer than
-/// the core set (intersected with what's registered); returns the full `catalog`
-/// whenever filtering would be unsafe or unhelpful. See the module docs for the
-/// fail-safe guarantees.
+/// Approximate wire weight of a catalog: descriptions + serialized schemas.
+fn approx_payload_bytes(catalog: &[ToolDef]) -> usize {
+    catalog
+        .iter()
+        .map(|t| {
+            t.description.len()
+                + t.input_schema
+                    .as_ref()
+                    .map(|s| s.to_string().len())
+                    .unwrap_or(24)
+        })
+        .sum()
+}
+
+/// The always-present core subset, in catalog order.
+fn core_subset(catalog: &[ToolDef]) -> Vec<ToolDef> {
+    catalog
+        .iter()
+        .filter(|t| CORE_TOOLS.contains(&t.name.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Select the tools to send for the current conversation. A LEAN catalog (few
+/// tools, light payload) is returned whole — the stable, cacheable ideal. A
+/// heavy catalog is rationed: the core set always, query-matched tools on top,
+/// and NEVER the whole thing on a vague query (that is exactly the request a
+/// token-budgeted provider rejects). The model recovers from any miss via
+/// `find_tool` (core) and the executor's run-any-tool-by-name fail-safe.
 pub fn select_tools(messages: &[ChatMessage], catalog: &[ToolDef]) -> Vec<ToolDef> {
-    if catalog.len() <= FULL_SEND_MAX_TOOLS {
+    if catalog.len() <= FULL_SEND_MAX_TOOLS && approx_payload_bytes(catalog) <= FULL_SEND_MAX_BYTES
+    {
         return catalog.to_vec();
     }
     let context = recent_context(messages);
     let ctx = context.trim();
     if ctx.chars().count() < MIN_QUERY_CHARS {
-        return catalog.to_vec();
+        return core_subset(catalog);
     }
 
     // One fuzzy atom per meaningful query word. Scoring per word and summing lets a
@@ -102,7 +129,7 @@ pub fn select_tools(messages: &[ChatMessage], catalog: &[ToolDef]) -> Vec<ToolDe
         })
         .collect();
     if atoms.is_empty() {
-        return catalog.to_vec();
+        return core_subset(catalog);
     }
 
     let mut matcher = Matcher::new(Config::DEFAULT);
@@ -126,19 +153,6 @@ pub fn select_tools(messages: &[ChatMessage], catalog: &[ToolDef]) -> Vec<ToolDe
         }
     }
 
-    // Broad query (matched a large share) → filtering isn't earning its risk.
-    // Count the non-core tools actually present (not `len - CORE_TOOLS.len()`:
-    // the catalog need not contain every core name, and an absent core tool
-    // must not shrink the denominator).
-    let non_core = catalog
-        .iter()
-        .filter(|t| !CORE_TOOLS.contains(&t.name.as_str()))
-        .count()
-        .max(1);
-    if (matched.len() as f32) / (non_core as f32) >= FULL_CATALOG_ABOVE_FRACTION {
-        return catalog.to_vec();
-    }
-
     matched.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     matched.truncate(MAX_MATCHED_TOOLS);
     let keep_matched: std::collections::HashSet<usize> = matched.iter().map(|(i, _)| *i).collect();
@@ -158,7 +172,7 @@ pub fn select_tools(messages: &[ChatMessage], catalog: &[ToolDef]) -> Vec<ToolDe
         .collect();
 
     if selected.is_empty() {
-        return catalog.to_vec();
+        return core_subset(catalog);
     }
     selected
 }
@@ -346,9 +360,15 @@ mod tests {
     }
 
     #[test]
-    fn a_short_query_gets_the_full_catalog() {
+    fn a_short_query_on_a_heavy_catalog_gets_core_only() {
+        // A vague query used to fall back to the FULL catalog — which is
+        // exactly the request a token-budgeted provider rejects outright.
+        // Core (with find_tool for recovery) is the safe floor now.
         let msgs = vec![ChatMessage::user("hi")];
-        assert_eq!(select_tools(&msgs, &catalog()).len(), catalog().len());
+        let out = select_tools(&msgs, &catalog());
+        let n = names(&out);
+        assert!(out.len() < catalog().len(), "not the full catalog: {n:?}");
+        assert!(n.contains(&"run".to_string()) && n.contains(&"web".to_string()));
     }
 
     #[test]
