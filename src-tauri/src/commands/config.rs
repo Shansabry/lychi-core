@@ -246,15 +246,10 @@ pub async fn grant_privacy_consent(
     feature: String,
 ) -> Result<(), LychiError> {
     let mut config = state.config.write().await;
-    match feature.as_str() {
-        "ip_geolocation" => config.privacy.allow_ip_geolocation = true,
-        "public_ip" => config.privacy.allow_public_ip = true,
-        "web_access" => config.privacy.allow_web_access = true,
-        other => {
-            return Err(LychiError::Config(format!(
-                "Unknown privacy feature: {other}"
-            )));
-        }
+    if !lychi_core::rules::grant_consent_key(&mut config.privacy, &feature) {
+        return Err(LychiError::Config(format!(
+            "Unknown privacy feature: {feature}"
+        )));
     }
     config.save(&paths::config_file())
 }

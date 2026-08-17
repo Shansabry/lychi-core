@@ -308,6 +308,12 @@ impl ToolExecutor for ExecutorAdapter {
                             "args": pending.args,
                             "inline": run_inputs.inline,
                             "terminal_routing": run_inputs.terminal_routing,
+                            // When this confirmation IS a consent prompt, carry
+                            // the typed feature key so "Always allow" grants the
+                            // CONSENT (the thing the prompt asks about) — an
+                            // action grant can never bypass the consent gate,
+                            // so without this the prompt re-asks forever.
+                            "consent_feature": res.envelope.consent_feature,
                         }));
                         return Ok(ToolOutcome::NeedsApproval {
                             reason,
@@ -361,6 +367,9 @@ impl ToolExecutor for ExecutorAdapter {
                 // an external terminal (the default) when resumed.
                 "inline": run_inputs.inline,
                 "terminal_routing": run_inputs.terminal_routing,
+                // See the group-dispatch token: lets "Always allow" grant a
+                // consent prompt's feature instead of an inert action grant.
+                "consent_feature": res.envelope.consent_feature,
             }));
             return Ok(ToolOutcome::NeedsApproval {
                 reason,
@@ -960,8 +969,24 @@ async fn persist_always_allow(
     state: &AppState,
     action_id: &str,
     args: &str,
+    consent_feature: Option<&str>,
 ) -> Result<(), LychiError> {
     use lychi_core::events::{ConfigSection, DomainEvent};
+
+    // A CONSENT prompt's "Always allow" grants the consent itself — that is
+    // what the prompt asked ("Allow web access and remember?"), and an action
+    // grant would be inert against it (consent is checked before grants, by
+    // design). Saved before the resume rebuilds the coordinator, so even the
+    // rest of THIS run sees the grant.
+    if let Some(feature) = consent_feature {
+        let mut config = state.config.write().await;
+        if lychi_core::rules::grant_consent_key(&mut config.privacy, feature) {
+            tracing::info!(%feature, "[agent] always-allow consent grant");
+            config.save(&lychi_core::paths::config_file())?;
+            return Ok(());
+        }
+        tracing::warn!(%feature, "[agent] unknown consent feature on approval token");
+    }
 
     let entry = if action_id == "run" {
         let (_, cmd) =
@@ -1043,8 +1068,9 @@ pub async fn agent_approve(
         if let Some(pending) = session.pending.first() {
             let action_id = pending.resume.0["action_id"].as_str().unwrap_or_default();
             let args = pending.resume.0["args"].as_str().unwrap_or_default();
+            let consent = pending.resume.0["consent_feature"].as_str();
             if !action_id.is_empty()
-                && let Err(e) = persist_always_allow(&state, action_id, args).await
+                && let Err(e) = persist_always_allow(&state, action_id, args, consent).await
             {
                 // The grant failing must not strand the approval — approve
                 // this run anyway and tell the log.

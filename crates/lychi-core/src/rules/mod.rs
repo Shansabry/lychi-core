@@ -182,6 +182,20 @@ impl Default for RulesEngine {
     }
 }
 
+/// The REVERSE of [`consent_granted`]: set the privacy flag for a feature key
+/// (the `ConsentKind::feature_key` strings). Returns false for an unknown key.
+/// One decider for both grant surfaces — the settings command and the agent's
+/// "Always allow" on a consent prompt — so the key set can never drift.
+pub fn grant_consent_key(privacy: &mut PrivacyConfig, feature: &str) -> bool {
+    match feature {
+        "ip_geolocation" => privacy.allow_ip_geolocation = true,
+        "public_ip" => privacy.allow_public_ip = true,
+        "web_access" => privacy.allow_web_access = true,
+        _ => return false,
+    }
+    true
+}
+
 /// THE one mapping from a consent kind to its privacy-config flag. Used by
 /// `RulesEngine::decide` (the gate) AND by the executor when stamping
 /// `consent_feature` on a pending confirmation — a second copy of this match
@@ -335,6 +349,27 @@ mod tests {
             engine.validate(&r, &privacy()),
             ValidationDecision::Confirm { .. }
         ));
+    }
+
+    #[test]
+    fn grant_by_key_round_trips_every_rememberable_consent() {
+        // The reverse mapping must cover exactly the kinds that HAVE a feature
+        // key — granting by key then checking by kind closes the loop, so a
+        // new ConsentKind can't ship with a key the granter doesn't know.
+        for kind in [
+            ConsentKind::IpGeolocation,
+            ConsentKind::PublicIp,
+            ConsentKind::LargeTransfer,
+            ConsentKind::WebAccess,
+        ] {
+            let Some(key) = kind.feature_key() else {
+                continue; // per-run consents have nothing to grant
+            };
+            let mut privacy = PrivacyConfig::default();
+            assert!(grant_consent_key(&mut privacy, key), "{key} must grant");
+            assert!(consent_granted(kind, &privacy), "{key} must round-trip");
+        }
+        assert!(!grant_consent_key(&mut PrivacyConfig::default(), "nope"));
     }
 
     #[test]
