@@ -57,6 +57,8 @@ import { getComboString, loadKeybindings } from "$lib/keybindings";
 import {
 	atPartial,
 	atToken,
+	COPIED_TOKEN,
+	expandCopiedToken,
 	isEmailAt,
 	parentAtPartial,
 	parentSearchInput,
@@ -398,6 +400,24 @@ function resolveFullPath(label: string): string {
 	}
 	return label.endsWith("/") ? label.slice(0, -1) : label;
 }
+
+// A large text paste is staged HERE, off the input — the input shows only the
+// atomic [copied text] token (see CommandInput.handlePaste) and the payload
+// expands back into the query at submit. One decider for the payload's life:
+// the effect below drops it the moment the token leaves the input, whatever
+// removed it (atomic delete, submit clearing the box, Escape, a fill).
+let pastedPayload: string | null = $state(null);
+
+function stagePastedText(text: string): boolean {
+	pastedPayload = text;
+	return true;
+}
+
+$effect(() => {
+	if (pastedPayload !== null && !inputValue.includes(COPIED_TOKEN)) {
+		pastedPayload = null;
+	}
+});
 
 // Called by CommandInput on every keystroke
 function handleInput(val: string) {
@@ -943,7 +963,10 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 	// from items[index], so the stale runDecision applied to whatever row now
 	// sat at that position: the "ran the wrong thing" class, unreproducible by
 	// design. This Enter belongs to what was on screen when it was pressed.
-	const trimmed = inputValue.trim();
+	const rawTrimmed = inputValue.trim();
+	// The [copied text] token expands to its staged payload HERE — classification
+	// and execution see the real text, while the input keeps showing the token.
+	const trimmed = expandCopiedToken(rawTrimmed, pastedPayload);
 	const searchMode = completions.searchMode;
 	const atMode = completions.atMode;
 	const items = completions.items;
@@ -983,7 +1006,7 @@ async function handleSubmit(opts?: { ctrlKey?: boolean; runInline?: boolean }) {
 	// The user kept typing during the await: the decision belongs to text that
 	// is no longer in the box. Executing it would run something the user can't
 	// see anymore — drop this Enter; the next one classifies the current text.
-	if (inputValue.trim() !== trimmed) {
+	if (inputValue.trim() !== rawTrimmed) {
 		return;
 	}
 
@@ -1109,7 +1132,7 @@ async function actuate(action: SubmitAction): Promise<void> {
 			completions.items = [];
 			completions.index = -1;
 			lastResult = null; // AI answer takes over the result area
-			await chat.start(action.prompt, /* fresh */ true);
+			await chat.start(expandCopiedToken(action.prompt, submitPayload), /* fresh */ true);
 			return;
 
 		case "preset": {
@@ -1118,7 +1141,7 @@ async function actuate(action: SubmitAction): Promise<void> {
 			// window) — so `summarize` alone acts on what you've selected in a
 			// browser/editor. Runs tool-free (chat.startPreset) — a text transform
 			// needs no tools, and it is NOT the open-ended Ask AI chat.
-			let input = action.input;
+			let input = expandCopiedToken(action.input, submitPayload);
 			if (!input) {
 				const sel = await readSelection().catch(() => null);
 				if (sel) input = sel;
@@ -1183,13 +1206,28 @@ async function actuate(action: SubmitAction): Promise<void> {
  */
 let pendingQuery: string | undefined;
 
+/**
+ * The staged clipboard payload snapshotted at submit. The exits (runCommand,
+ * chat.start, presets) expand the [copied text] token through THIS, because by
+ * the time they run the input has been cleared and the live payload dropped by
+ * its lifecycle effect. Overwritten on every submit, so it can never leak a
+ * stale payload into a later, unrelated submit.
+ */
+let submitPayload: string | null = null;
+
 /** Begin a submit: record what was typed, for `runCommand` to learn from. */
 function beginSubmit() {
-	pendingQuery = inputValue.trim() || undefined;
+	submitPayload = pastedPayload;
+	// Learning uses the EXPANDED query — the token form would teach the
+	// frecency store a placeholder no future input will ever match.
+	pendingQuery = expandCopiedToken(inputValue.trim(), submitPayload) || undefined;
 }
 
 async function runCommand(command: string, opts?: { runInline?: boolean }) {
 	if (isExecuting) return;
+	// The [copied text] token expands to its staged payload at THIS choke point,
+	// so every command path — Enter, row click, correction — sees the real text.
+	command = expandCopiedToken(command, submitPayload);
 	isExecuting = true;
 	const generation = ++executeGeneration;
 	completions.items = [];
@@ -1645,7 +1683,7 @@ function runPanelAction(id: string) {
 			completions.items = [];
 			completions.index = -1;
 			lastResult = null; // AI answer takes over the result area
-			chat.start(item.label, /* fresh */ true);
+			chat.start(expandCopiedToken(item.label, pastedPayload), /* fresh */ true);
 			break;
 		case "ai_delete_chat":
 			// Delete a recalled conversation (AI-chat recent row).
@@ -2094,6 +2132,8 @@ async function handleDismiss() {
 			onactionpanel={openActionPanel}
 			onattachfile={attachSelectedFile}
 			onpastefiles={attachments.addFromClipboard}
+			onpastetext={stagePastedText}
+			pastedStaged={pastedPayload !== null}
 			onremovelastattachment={attachments.removeLast}
 			hasAttachments={attachments.any}
 		/>
@@ -2150,6 +2190,8 @@ async function handleDismiss() {
 				tokensOut={chat.tokensOut}
 				tokensCached={chat.tokensCached}
 				streaming={chat.streaming}
+				notice={chat.notice}
+				noticeDeadline={chat.noticeDeadline}
 				error={chat.error}
 				toolSteps={chat.toolSteps}
 				approval={chat.approval}

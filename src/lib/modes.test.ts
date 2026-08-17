@@ -2,12 +2,15 @@ import { describe, expect, it } from "vitest";
 import {
 	atPartial,
 	atToken,
+	expandCopiedToken,
 	isEmailAt,
 	parentAtPartial,
 	parentSearchInput,
 	parseSearchInput,
 	searchScope,
 	spliceAtToken,
+	splitOnToken,
+	tokenRange,
 } from "./modes";
 
 describe("parseSearchInput", () => {
@@ -119,5 +122,30 @@ describe("isEmailAt", () => {
 	it("does not flag an @ after a space or at the start", () => {
 		expect(isEmailAt("run @file", 4)).toBe(false);
 		expect(isEmailAt("@file", 0)).toBe(false);
+	});
+});
+
+describe("copied-text token", () => {
+	it("splits around the token and reports absence as null", () => {
+		expect(splitOnToken("summarize [copied text] please")).toEqual({
+			before: "summarize ",
+			token: "[copied text]",
+			after: " please",
+		});
+		expect(splitOnToken("no token here")).toBeNull();
+	});
+
+	it("reports the token range for atomic deletion", () => {
+		expect(tokenRange("[copied text]")).toEqual({ start: 0, end: 13 });
+		expect(tokenRange("x [copied text]")).toEqual({ start: 2, end: 15 });
+		expect(tokenRange("plain")).toBeNull();
+	});
+
+	it("expands to the payload only when one is staged", () => {
+		expect(expandCopiedToken("summarize [copied text]", "long pasted body")).toBe(
+			"summarize long pasted body",
+		);
+		// Hand-typed token with nothing staged stays literal.
+		expect(expandCopiedToken("summarize [copied text]", null)).toBe("summarize [copied text]");
 	});
 });

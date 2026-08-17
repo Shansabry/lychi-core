@@ -2,7 +2,7 @@
 import { LoaderCircle } from "lucide-svelte";
 import { matchesAction, normalizeKey } from "$lib/keybindings";
 import { inputOwnsKey } from "$lib/modalKeys";
-import { atPartial, atToken } from "$lib/modes";
+import { atPartial, atToken, COPIED_TOKEN, splitOnToken, tokenRange } from "$lib/modes";
 
 let {
 	value = $bindable(""),
@@ -30,6 +30,8 @@ let {
 	onactionpanel = () => {},
 	onattachfile = () => {},
 	onpastefiles = async () => false,
+	onpastetext = () => false,
+	pastedStaged = false,
 	onremovelastattachment = () => {},
 	hasAttachments = false,
 	decisionPending = false,
@@ -64,6 +66,10 @@ let {
 	onactionpanel?: () => void;
 	onattachfile?: () => void;
 	onpastefiles?: () => Promise<boolean>;
+	/** Stage a large text paste out-of-band; return true to show the token. */
+	onpastetext?: (text: string) => boolean;
+	/** True while a copied-text payload is staged behind the token. */
+	pastedStaged?: boolean;
 	onremovelastattachment?: () => void;
 	hasAttachments?: boolean;
 	/** A modal is awaiting a yes/no; the shortcut table stands down while true. */
@@ -82,6 +88,11 @@ let segments = $derived.by(() => {
 	if (!atMode || atStart < 0) return null;
 	return atToken(value, atStart);
 });
+
+// Copied-text token highlight — same overlay trick as the @-reference. Only
+// while a payload is actually staged: a hand-typed "[copied text]" is plain
+// text and gets no pill.
+let copiedSegments = $derived(pastedStaged ? splitOnToken(value) : null);
 
 // Ghost autofill from history — prefix match first, fuzzy fallback
 type Ghost =
@@ -300,6 +311,28 @@ function acceptGhost() {
  * restoring the pre-paste value.
  */
 function handlePaste(e: ClipboardEvent) {
+	// EVERY text paste is staged out-of-band and shown as the atomic
+	// [copied text] token — pasted bodies wreck the single-line input (newlines
+	// are flattened, long text scrolls the command out of view), and the token
+	// keeps the command readable. The staged text expands back only at submit.
+	const text = e.clipboardData?.getData("text/plain") ?? "";
+	if (text) {
+		e.preventDefault();
+		if (onpastetext(text)) {
+			// Single-token rule: if a token already stands in the input, the new
+			// paste replaced the staged payload and the existing token now stands
+			// for it — never a second token.
+			if (!value.includes(COPIED_TOKEN) && inputEl) {
+				const start = inputEl.selectionStart ?? value.length;
+				const end = inputEl.selectionEnd ?? start;
+				value = value.slice(0, start) + COPIED_TOKEN + value.slice(end);
+				oninputchange(value);
+				const caret = start + COPIED_TOKEN.length;
+				requestAnimationFrame(() => inputEl?.setSelectionRange(caret, caret));
+			}
+		}
+		return;
+	}
 	// A text/plain payload is unambiguously a text paste — leave it alone. Only
 	// probe the backend when the clipboard offers no text (a file/image copy).
 	if (e.clipboardData?.types.includes("text/plain")) return;
@@ -328,6 +361,32 @@ function handleKeydown(e: KeyboardEvent) {
 	// Typing still works — this only gates the shortcut table, and printable
 	// keys never reach it.
 	if (!inputOwnsKey(decisionPending)) return;
+
+	// The [copied text] token deletes ATOMICALLY: it stands for the whole staged
+	// payload, so removing any part of it removes all of it (the parent drops
+	// the payload when the token leaves the input).
+	if ((e.key === "Backspace" || e.key === "Delete") && pastedStaged && inputEl) {
+		const range = tokenRange(value);
+		if (range) {
+			const selStart = inputEl.selectionStart ?? 0;
+			const selEnd = inputEl.selectionEnd ?? selStart;
+			const touches =
+				selStart !== selEnd
+					? selStart < range.end && selEnd > range.start
+					: e.key === "Backspace"
+						? selStart > range.start && selStart <= range.end
+						: selStart >= range.start && selStart < range.end;
+			if (touches) {
+				e.preventDefault();
+				const cutStart = selStart !== selEnd ? Math.min(selStart, range.start) : range.start;
+				const cutEnd = selStart !== selEnd ? Math.max(selEnd, range.end) : range.end;
+				value = value.slice(0, cutStart) + value.slice(cutEnd);
+				oninputchange(value);
+				requestAnimationFrame(() => inputEl?.setSelectionRange(cutStart, cutStart));
+				return;
+			}
+		}
+	}
 
 	if (matchesAction(e, "tab_back")) {
 		e.preventDefault();
@@ -420,6 +479,10 @@ function handleKeydown(e: KeyboardEvent) {
 		{#if segments}
 			<div class="highlight-overlay" aria-hidden="true">
 				<span class="hl-text">{segments.before}</span><span class="hl-at">{segments.atPart}</span><span class="hl-text">{segments.after}</span>
+			</div>
+		{:else if copiedSegments}
+			<div class="highlight-overlay" aria-hidden="true">
+				<span class="hl-text">{copiedSegments.before}</span><span class="hl-copied">{copiedSegments.token}</span><span class="hl-text">{copiedSegments.after}</span>
 			</div>
 		{/if}
 		{#if showPlaceholder}
@@ -571,6 +634,15 @@ function handleKeydown(e: KeyboardEvent) {
 		   (the same green family) so it tracks the theme instead of staying a
 		   fixed neon that glares on the light ground. */
 		background: color-mix(in srgb, var(--success) 18%, transparent);
+		border-radius: 3px;
+		padding: 1px 0;
+	}
+
+	.hl-copied {
+		color: transparent;
+		/* The staged-clipboard token — accent family, so it reads as a distinct
+		   object from the green @-reference. */
+		background: color-mix(in srgb, var(--accent) 22%, transparent);
 		border-radius: 3px;
 		padding: 1px 0;
 	}

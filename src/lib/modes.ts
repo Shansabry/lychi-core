@@ -145,3 +145,47 @@ export function isEmailAt(value: string, atIdx: number): boolean {
 	const beforeAt = value.slice(0, atIdx);
 	return beforeAt.length > 0 && !beforeAt.endsWith(" ");
 }
+
+/**
+ * The literal placeholder the launcher shows for staged clipboard text. A large
+ * text paste is staged out-of-band and this token stands in for it, keeping the
+ * single-line input readable; it expands back to the payload only at submit.
+ */
+export const COPIED_TOKEN = "[copied text]";
+
+/** The segments of an input containing the copied-text token. */
+export interface TokenSegments {
+	before: string;
+	token: string;
+	after: string;
+}
+
+/**
+ * Split `value` around the first occurrence of the copied-text token, for the
+ * highlight overlay. Returns null when the token is absent, so callers can use
+ * this both as the splitter and the presence test.
+ */
+export function splitOnToken(value: string, token: string = COPIED_TOKEN): TokenSegments | null {
+	const i = value.indexOf(token);
+	if (i < 0) return null;
+	return { before: value.slice(0, i), token, after: value.slice(i + token.length) };
+}
+
+/** The [start, end) range of the copied-text token in `value`, or null. */
+export function tokenRange(
+	value: string,
+	token: string = COPIED_TOKEN,
+): { start: number; end: number } | null {
+	const i = value.indexOf(token);
+	return i < 0 ? null : { start: i, end: i + token.length };
+}
+
+/**
+ * Expand the copied-text token back to its staged payload for submission. A
+ * no-op when nothing is staged — a hand-typed `[copied text]` with no payload
+ * behind it stays literal rather than expanding to stale state.
+ */
+export function expandCopiedToken(value: string, payload: string | null): string {
+	if (payload === null) return value;
+	return value.replace(COPIED_TOKEN, payload);
+}
