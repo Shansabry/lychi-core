@@ -39,6 +39,20 @@ use crate::state::AppState;
 struct ExecutorAdapter {
     executor: Arc<RwLock<Executor>>,
     privacy: lychi_core::config::PrivacyConfig,
+    /// For panel-refresh events: an agent tool that mutates notes/todos/
+    /// reminders/snippets must notify the frontend exactly like a typed
+    /// command does (`finalize_exec`), or the panel shows stale data until
+    /// the next summon.
+    app: AppHandle,
+}
+
+impl ExecutorAdapter {
+    /// Mirror `finalize_exec`'s panel notification for the agent path.
+    fn notify_panel_mutation(&self, action_id: &str, success: bool) {
+        if success && crate::commands::execute::PANEL_MUTATION_ACTIONS.contains(&action_id) {
+            let _ = self.app.emit("lychi://notes-changed", ());
+        }
+    }
 }
 
 /// Upper bound on the tool-result text fed BACK to the model, per call.
@@ -286,6 +300,7 @@ impl ToolExecutor for ExecutorAdapter {
                     let res = exec
                         .run_resolved(intent.clone(), &self.privacy, &run_inputs)
                         .await?;
+                    self.notify_panel_mutation(&intent.action_id, res.result.success);
                     if let Some(reason) = res.envelope.needs_confirmation {
                         let pending = res.pending_intent.unwrap_or(intent);
                         let token = ResumeToken(serde_json::json!({
@@ -353,6 +368,8 @@ impl ToolExecutor for ExecutorAdapter {
             });
         }
 
+        // Standalone tools are handler ids (the group path returned above).
+        self.notify_panel_mutation(name, res.result.success);
         let (output, artifact) = result_summary_and_artifact(&res.result);
         Ok(ToolOutcome::Ran {
             output,
@@ -390,9 +407,11 @@ impl ToolExecutor for ExecutorAdapter {
         // Snapshot-then-release (see `execute` above) — approved actions are
         // the destructive ones, i.e. exactly the slow-shell candidates.
         let exec = self.executor.read().await.clone();
+        let action_id = intent.action_id.clone();
         let res = exec
             .run_confirmed(intent, &self.privacy, &run_inputs)
             .await?;
+        self.notify_panel_mutation(&action_id, res.result.success);
         Ok(result_text(&res.result))
     }
 }
@@ -558,6 +577,7 @@ impl AgentEventDto {
 /// exists; only the schemas cost real tokens.
 async fn build_coordinator(
     state: &AppState,
+    app: &AppHandle,
     with_tools: bool,
 ) -> Result<(Coordinator<ExecutorAdapter>, String), LychiError> {
     let provider = state
@@ -612,6 +632,7 @@ async fn build_coordinator(
     let adapter = Arc::new(ExecutorAdapter {
         executor: state.executor.clone(),
         privacy,
+        app: app.clone(),
     });
     Ok((Coordinator::new(provider, adapter, tools), manifest))
 }
@@ -894,7 +915,7 @@ pub async fn agent_chat_start(
     let mut session = session;
     session.set_last_user_display(display);
 
-    let (coord, manifest) = match build_coordinator(&state, with_tools).await {
+    let (coord, manifest) = match build_coordinator(&state, &app, with_tools).await {
         Ok(c) => c,
         Err(e) => {
             // Failed before the loop ever ran (e.g. AI disabled
@@ -952,7 +973,7 @@ pub async fn agent_approve(
     // Empty query → full catalog: mid-task we must not drop a tool the ongoing
     // plan may still call. The manifest is ignored on resume — the continued
     // session already carries it in its system prompt from the initial turn.
-    let (coord, _manifest) = match build_coordinator(&state, true).await {
+    let (coord, _manifest) = match build_coordinator(&state, &app, true).await {
         Ok(c) => c,
         Err(e) => {
             // Restore the taken session: the approval is still pending and the

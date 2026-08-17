@@ -10,7 +10,11 @@ use lychi_core::error::LychiError;
 use crate::state::AppState;
 
 /// Action IDs that mutate panel data (notes, todos, reminders).
-const PANEL_MUTATION_ACTIONS: &[&str] = &["note", "todo", "reminder"];
+/// Handlers whose successful execution changes what the notes panel shows
+/// (notes/todos tabs, reminders, snippets — everything `reloadData` refetches).
+/// Shared with the agent path: a tool-driven mutation must refresh the panel
+/// exactly like a typed command, or the user re-summons to see their own note.
+pub(crate) const PANEL_MUTATION_ACTIONS: &[&str] = &["note", "todo", "reminder", "snip"];
 
 /// Execute a command.
 ///
