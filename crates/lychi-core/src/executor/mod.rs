@@ -1492,6 +1492,16 @@ fn looks_like_app_query(query: &str) -> bool {
 }
 
 fn looks_like_shell_command(input: &str) -> bool {
+    // An English QUESTION is never a shell command, even when its first word
+    // happens to be a binary — `who`, `find`, `man`, `time`, `look`, `at` are
+    // all real commands AND common sentence openers, and "who is the chief"
+    // was offered as "run in <repo>" above Ask AI. Checked before the PATH
+    // lookup: sentence shape wins over binary coincidence. Deliberately
+    // narrow — only question-shaped prose is excluded, so `npm install
+    // express` (multi-word, all alphabetic) still counts as a command.
+    if reads_like_question(input) {
+        return false;
+    }
     // The head word is the first non-`FOO=bar` token (leading env assignments
     // are skipped, matching shell semantics).
     let Some(head) = input.split_whitespace().find(|w| !w.contains('=')) else {
@@ -1517,6 +1527,42 @@ fn looks_like_shell_command(input: &str) -> bool {
     } else {
         which::which(head).is_ok()
     }
+}
+
+/// Question-shaped prose: three or more words, none of them shell-ish (flags,
+/// paths, operators), opening with an interrogative or ending in `?`. This is
+/// a COMPLETION-DISPLAY heuristic only — routing is untouched (NoMatch input
+/// goes to the agent either way); it just stops the repo-run disambiguation
+/// rows from decorating a question.
+fn reads_like_question(input: &str) -> bool {
+    let input = input.trim();
+    let words: Vec<&str> = input.split_whitespace().collect();
+    if words.len() < 3 {
+        return false;
+    }
+    let shellish = |w: &str| {
+        w.starts_with('-')
+            || w.contains('/')
+            || w.contains('=')
+            || w.chars()
+                .any(|c| matches!(c, '|' | ';' | '&' | '<' | '>' | '$' | '`' | '(' | ')'))
+    };
+    if words.iter().any(|w| shellish(w)) {
+        return false;
+    }
+    const INTERROGATIVES: &[&str] = &[
+        "who", "what", "when", "where", "why", "how", "which", "whose", "is", "are", "was", "were",
+        "does", "do", "did", "can", "could", "should", "would", "will",
+    ];
+    // English-request tell #2: a command's first argument is a target, not an
+    // article or pronoun — "find me a recipe" / "open the settings" read as
+    // prose the moment the second word is one of these.
+    const PROSE_SECOND_WORDS: &[&str] = &["me", "my", "the", "a", "an", "some", "your", "us"];
+    input.ends_with('?')
+        || words[..2]
+            .iter()
+            .any(|w| INTERROGATIVES.contains(&w.to_lowercase().as_str()))
+        || PROSE_SECOND_WORDS.contains(&words[1].to_lowercase().as_str())
 }
 
 /// POSIX single-quote escaping: wrap in `'…'`, and render any embedded `'` as
@@ -1793,6 +1839,39 @@ mod run_row_tests {
         RunTarget {
             dir: format!("/home/u/ws/{name}"),
             name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn questions_are_not_shell_commands_even_with_binary_heads() {
+        // `who`, `find`, `man`, `time` are real binaries AND sentence openers —
+        // question-shaped prose must not get repo-run disambiguation rows.
+        for q in [
+            "who is the chief",
+            "who is the chief minister of tamilnadu?",
+            "what time is it in tokyo",
+            "how do i extract a tar file",
+            "find me a good pizza recipe",
+        ] {
+            assert!(!looks_like_shell_command(q), "{q:?} is a question");
+        }
+        // Real commands keep their rows, including alphabetic multi-word ones
+        // and the binary-head short forms.
+        for c in [
+            "git status",
+            "pnpm build",
+            "npm install express",
+            "man grep",
+            "time cargo build",
+            "find . -name main.rs",
+            "who",
+            "cargo test -p lychi-core",
+        ] {
+            // `which` must exist on the test host for the PATH-positive cases;
+            // every listed head is coreutils/toolchain-standard.
+            if which::which(c.split_whitespace().next().unwrap()).is_ok() {
+                assert!(looks_like_shell_command(c), "{c:?} is a command");
+            }
         }
     }
 
