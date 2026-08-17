@@ -87,6 +87,12 @@ class ChatSession {
 	// Streamed answer + status.
 	text = $state("");
 	streaming = $state(false);
+	/** Ephemeral infrastructure notice ("Rate limited — retry 1/3").
+	 *  Set by `notice` events; superseded by the next substantive event. */
+	notice = $state("");
+	/** Epoch ms when the notice's retry fires (drives the live countdown), or
+	 *  null for a notice with no countdown. */
+	noticeDeadline = $state<number | null>(null);
 	error = $state<string | null>(null);
 
 	// Transcript + live turn. Replaced wholesale → $state.raw.
@@ -399,6 +405,8 @@ class ChatSession {
 		this.error = null;
 		this.approval = null;
 		this.streaming = false;
+		this.notice = "";
+		this.noticeDeadline = null;
 		ui.showAi();
 		this.gen++; // fresh generation for any follow-up
 	};
@@ -409,6 +417,13 @@ class ChatSession {
 	 */
 	applyEvent = (ev: AgentEventDto): void => {
 		if (ev.gen !== this.gen) return; // stale run — ignore
+		// A notice describes a WAIT ("rate limited — retrying"); any substantive
+		// event that follows means the wait ended, so the notice clears. One rule
+		// here, rather than remembering to clear it in every case below.
+		if (ev.kind !== "notice" && ev.kind !== "usage" && ev.kind !== "reasoning") {
+			this.notice = "";
+			this.noticeDeadline = null;
+		}
 		switch (ev.kind) {
 			case "text":
 				this.text += ev.text ?? "";
@@ -484,6 +499,11 @@ class ChatSession {
 			case "error":
 				this.streaming = false;
 				this.error = ev.text ?? "The agent failed.";
+				break;
+			case "notice":
+				// Latest wins — these are one-line statuses, not a transcript.
+				this.notice = (ev.text ?? "").trim();
+				this.noticeDeadline = ev.countdown_secs ? Date.now() + ev.countdown_secs * 1000 : null;
 				break;
 			// turn_started / reasoning: no UI change for now.
 		}

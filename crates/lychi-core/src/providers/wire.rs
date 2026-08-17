@@ -55,7 +55,7 @@ pub(crate) type ErrorObserver = Arc<dyn Fn(&super::errors::AiError) + Send + Syn
 /// backed-off attempts is not a transient blip, and the user is better told than
 /// left waiting. Only retriable statuses are retried, and only before any tokens
 /// have streamed (see the retry loop) — a mid-stream failure can't be replayed.
-const MAX_RATE_LIMIT_RETRIES: u32 = 3;
+const MAX_RATE_LIMIT_RETRIES: u32 = 10;
 
 /// Whether an HTTP status is a transient "back off and try again" signal, common
 /// to every provider — not Groq- or Anthropic-specific:
@@ -71,30 +71,24 @@ fn is_retriable_status(status: u16) -> bool {
     matches!(status, 429 | 529 | 503 | 502 | 504)
 }
 
-/// Backoff before retry attempt `n` (1-based) when the provider gave no
-/// `Retry-After` hint: 1s, 2s, 4s. Capped so a bad hint can't park the turn.
-fn backoff_delay(attempt: u32) -> std::time::Duration {
-    let secs = 1u64 << (attempt.saturating_sub(1)).min(4); // 1,2,4,8,16
-    std::time::Duration::from_secs(secs)
-}
+/// The wait between rate-limit retries. Deliberately SHORT and flat rather
+/// than exponential: field evidence (2026-08-17 logs) showed Groq accepting an
+/// identical request seconds after rejecting it, and honouring its 30s
+/// `Retry-After` just parked the turn — many quick, polite probes beat one
+/// long, obedient wait. 10 tries x 5s still spans a full TPM minute window.
+const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The longest we will honour a `Retry-After` before falling back to our own
-/// backoff — a provider that says "wait 5 minutes" should surface as an error,
-/// not silently freeze the launcher for five minutes.
-const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// How long to wait before a retry: the provider's `Retry-After` header when
-/// present and sane (seconds form; most providers send this on 429/503), else
-/// our own exponential backoff for this attempt. Clamped to [`MAX_RETRY_AFTER`].
-fn retry_delay(headers: &reqwest::header::HeaderMap, attempt: u32) -> std::time::Duration {
-    let from_header = headers
+/// How long to wait before a retry: our flat interval, shortened further only
+/// when the provider's `Retry-After` header promises the window clears sooner.
+/// A LONGER hint is ignored on purpose — see [`RETRY_INTERVAL`].
+fn retry_delay(headers: &reqwest::header::HeaderMap, _attempt: u32) -> std::time::Duration {
+    headers
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(std::time::Duration::from_secs);
-    from_header
-        .unwrap_or_else(|| backoff_delay(attempt))
-        .min(MAX_RETRY_AFTER)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(RETRY_INTERVAL)
+        .min(RETRY_INTERVAL)
 }
 
 /// A configured client for one HTTP endpoint + dialect. Owns the complete
@@ -233,12 +227,12 @@ impl WireClient {
                         } else {
                             "Provider busy"
                         };
-                        // Surface the wait as ephemeral reasoning text — visible,
-                        // separate from the answer, and not baked into it.
-                        yield StreamEvent::ReasoningDelta(format!(
-                            "{cause} — retrying in {}s (attempt {attempt}/{MAX_RATE_LIMIT_RETRIES})…\n",
-                            delay.as_secs().max(1)
-                        ));
+                        // Surface the wait as a typed NOTICE — the UI renders it
+                        // beside the thinking indicator and ticks the countdown.
+                        yield StreamEvent::Notice {
+                            text: format!("{cause} — retry {attempt}/{MAX_RATE_LIMIT_RETRIES}"),
+                            countdown_secs: Some(delay.as_secs().max(1)),
+                        };
                         // Interruptible wait: Escape must not be stuck behind it.
                         tokio::select! {
                             _ = tokio::time::sleep(delay) => {}
@@ -260,6 +254,28 @@ impl WireClient {
                         detail = %err.detail,
                         "[wire] provider rejected the request"
                     );
+                    // Some retryable failures hide behind non-retriable
+                    // statuses: Groq's TPM rejections are HTTP 413, so only
+                    // the classified BODY reveals them as rate limits. That
+                    // includes BudgetExceeded — Groq's pre-check ESTIMATE is
+                    // crude (observed ~2x real tokens) and the same request
+                    // can pass seconds later, so it earns the same bounded
+                    // retries before its trim-your-input message surfaces.
+                    if err.kind.is_retryable() && attempt < MAX_RATE_LIMIT_RETRIES {
+                        attempt += 1;
+                        // Headers are gone with the body read — use the flat
+                        // interval; 10 probes still cross a full TPM window.
+                        let delay = RETRY_INTERVAL;
+                        yield StreamEvent::Notice {
+                            text: format!("Rate limited — retry {attempt}/{MAX_RATE_LIMIT_RETRIES}"),
+                            countdown_secs: Some(delay.as_secs()),
+                        };
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            _ = cancel.cancelled() => { return; }
+                        }
+                        continue;
+                    }
                     if let Some(obs) = &on_error { obs(&err); }
                     Err(LychiError::Ai(err.message))?;
                     return; // unreachable after `?`, explicit divergence.
@@ -985,24 +1001,29 @@ mod tests {
     use crate::providers::{CancellationToken, ContentPart, StopReason, StreamEvent, ToolCall};
 
     #[test]
-    fn retry_delay_prefers_retry_after_header_then_backs_off() {
+    fn retry_delay_is_flat_and_only_shortened_by_the_header() {
         use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 
         // Header present and sane → honoured verbatim (clamped to the ceiling).
+        // A header LONGER than the flat interval is ignored — quick polite
+        // probes beat one long obedient wait (see RETRY_INTERVAL's doc).
         let mut h = HeaderMap::new();
         h.insert(RETRY_AFTER, HeaderValue::from_static("8"));
-        assert_eq!(retry_delay(&h, 1), std::time::Duration::from_secs(8));
+        assert_eq!(retry_delay(&h, 1), RETRY_INTERVAL);
 
-        // A wild Retry-After is clamped, never a multi-minute freeze.
         let mut h = HeaderMap::new();
         h.insert(RETRY_AFTER, HeaderValue::from_static("600"));
-        assert_eq!(retry_delay(&h, 1), MAX_RETRY_AFTER);
+        assert_eq!(retry_delay(&h, 1), RETRY_INTERVAL);
 
-        // No header → exponential backoff by attempt: 1s, 2s, 4s.
+        // A header promising a SOONER clear shortens the wait.
+        let mut h = HeaderMap::new();
+        h.insert(RETRY_AFTER, HeaderValue::from_static("2"));
+        assert_eq!(retry_delay(&h, 1), std::time::Duration::from_secs(2));
+
+        // No header → the flat interval, regardless of attempt.
         let none = HeaderMap::new();
-        assert_eq!(retry_delay(&none, 1), std::time::Duration::from_secs(1));
-        assert_eq!(retry_delay(&none, 2), std::time::Duration::from_secs(2));
-        assert_eq!(retry_delay(&none, 3), std::time::Duration::from_secs(4));
+        assert_eq!(retry_delay(&none, 1), RETRY_INTERVAL);
+        assert_eq!(retry_delay(&none, 7), RETRY_INTERVAL);
 
         // A non-numeric header (HTTP-date form we don't parse) falls back too.
         let mut h = HeaderMap::new();
@@ -1010,7 +1031,7 @@ mod tests {
             RETRY_AFTER,
             HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
         );
-        assert_eq!(retry_delay(&h, 2), std::time::Duration::from_secs(2));
+        assert_eq!(retry_delay(&h, 2), RETRY_INTERVAL);
     }
 
     #[test]

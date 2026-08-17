@@ -543,6 +543,10 @@ pub struct AgentEventDto {
     /// show the caching working; 0/None when the provider doesn't report it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_input_tokens: Option<u32>,
+    /// Seconds until the retry a `notice` describes fires — the UI ticks this
+    /// down live (kind = notice).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub countdown_secs: Option<u32>,
     /// A rich tool artifact for inline render (kind = tool_completed):
     /// artifact_kind = "svg" | "weather" | …, artifact_content = the raw payload.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -566,6 +570,7 @@ impl AgentEventDto {
             input_tokens: None,
             output_tokens: None,
             cached_input_tokens: None,
+            countdown_secs: None,
             artifact_kind: None,
             artifact_content: None,
         };
@@ -581,6 +586,14 @@ impl AgentEventDto {
             AgentEvent::ReasoningDelta(t) => {
                 d.kind = "reasoning".into();
                 d.text = Some(t);
+            }
+            AgentEvent::Notice {
+                text,
+                countdown_secs,
+            } => {
+                d.kind = "notice".into();
+                d.text = Some(text);
+                d.countdown_secs = countdown_secs.map(|s| s.min(u64::from(u32::MAX)) as u32);
             }
             AgentEvent::ToolCallStarted {
                 call_id,

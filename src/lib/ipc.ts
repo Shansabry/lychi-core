@@ -167,6 +167,8 @@ export interface AgentEventDto {
 	output_tokens?: number;
 	/** usage: how many input tokens were prompt-cache hits (caching made visible). */
 	cached_input_tokens?: number;
+	/** notice: seconds until the retry fires — the UI ticks this down live. */
+	countdown_secs?: number;
 	/** tool_completed: a rich artifact to render inline (svg | weather | …). */
 	artifact_kind?: string;
 	artifact_content?: string;

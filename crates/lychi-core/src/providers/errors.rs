@@ -23,6 +23,13 @@ pub enum AiErrorKind {
     Auth,
     /// Rate limited or out of quota — retryable later.
     RateLimit,
+    /// The request outgrew the provider tier's per-minute token budget (Groq
+    /// free tier: "TPM: Limit 8000, Requested 10041"). Observed in the field:
+    /// Groq's pre-check ESTIMATES tokens (~bytes/2.5, nearly 2x our real count)
+    /// and an identical request can be accepted seconds later — so this IS
+    /// worth a bounded retry. If retries exhaust, the fix is trimming the
+    /// conversation, and the message says so.
+    BudgetExceeded,
     /// The conversation (or an attachment) exceeded the model's context.
     TooLarge,
     /// The named model doesn't exist for this provider/key.
@@ -38,7 +45,10 @@ pub enum AiErrorKind {
 impl AiErrorKind {
     /// Whether retrying the same request could plausibly succeed.
     pub fn is_retryable(self) -> bool {
-        matches!(self, Self::RateLimit | Self::Network | Self::ServerError)
+        matches!(
+            self,
+            Self::RateLimit | Self::BudgetExceeded | Self::Network | Self::ServerError
+        )
     }
 }
 
@@ -92,6 +102,16 @@ fn classify_kind(status: Option<u16>, lower: &str, had_images: bool) -> AiErrorK
     // request succeeds a minute later, and telling the user their message is
     // too long sends them shortening text that was never the problem.
     if lower.contains("tokens per minute") || lower.contains("(tpm)") {
+        // Two very different failures share this wording. When the request
+        // needs FEWER tokens than the budget, the minute window is simply
+        // spent — a true rate limit, retryable. When the request alone
+        // OUTGROWS the budget, no amount of waiting helps and "try again"
+        // is a lie. The provider states both numbers; believe them.
+        if let Some((limit, requested)) = tpm_numbers(lower) {
+            if requested > limit {
+                return AiErrorKind::BudgetExceeded;
+            }
+        }
         return AiErrorKind::RateLimit;
     }
     if mentions_context_limit(lower) {
@@ -108,6 +128,21 @@ fn classify_kind(status: Option<u16>, lower: &str, had_images: bool) -> AiErrorK
         return AiErrorKind::Auth;
     }
     AiErrorKind::Unknown
+}
+
+/// The `Limit N, Requested M` pair from a TPM rejection body, if both parse.
+/// Scoped to the already-matched TPM arm — this never runs on other errors.
+fn tpm_numbers(lower: &str) -> Option<(u64, u64)> {
+    let num_after = |key: &str| -> Option<u64> {
+        let idx = lower.find(key)? + key.len();
+        let digits: String = lower[idx..]
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse().ok()
+    };
+    Some((num_after("limit")?, num_after("requested")?))
 }
 
 /// Context-window overflow, across dialects.
@@ -149,6 +184,10 @@ fn message_for(kind: AiErrorKind, had_images: bool) -> String {
         }
         AiErrorKind::RateLimit => {
             "Rate limit reached. Wait a moment and try again.".to_string()
+        }
+        AiErrorKind::BudgetExceeded => {
+            "This request is larger than your provider's per-minute token budget. Start a fresh chat or trim the input."
+                .to_string()
         }
         AiErrorKind::TooLarge => {
             if had_images {
@@ -285,5 +324,36 @@ mod tests {
             true,
         );
         assert_eq!(e.kind, AiErrorKind::VisionUnsupported);
+    }
+
+    #[test]
+    fn tpm_request_over_budget_is_budget_exceeded_and_still_retryable() {
+        // Groq's actual free-tier body: the request's ESTIMATE outgrows the
+        // budget. Field evidence (2026-08-17 logs): the estimate is crude and
+        // an identical request can pass seconds later — so this retries, but
+        // keeps its own trim-your-input message for when retries exhaust.
+        let raw = r#"{"error":{"message":"Request too large for model `openai/gpt-oss-120b` on tokens per minute (TPM): Limit 8000, Requested 10041, please reduce your message size and try again.","type":"tokens","code":"rate_limit_exceeded"}}"#;
+        let err = classify(Some(413), raw, false);
+        assert_eq!(err.kind, AiErrorKind::BudgetExceeded);
+        assert!(err.kind.is_retryable());
+        assert!(err.message.contains("Start a fresh chat"));
+    }
+
+    #[test]
+    fn tpm_request_within_budget_is_a_true_rate_limit() {
+        // Same wording, but the request FITS the budget — the minute is just
+        // spent. Retrying after the window rolls succeeds.
+        let raw = "Request too large for model on tokens per minute (TPM): Limit 8000, Requested 5000, please try again";
+        let err = classify(Some(413), raw, false);
+        assert_eq!(err.kind, AiErrorKind::RateLimit);
+        assert!(err.kind.is_retryable());
+    }
+
+    #[test]
+    fn tpm_without_parsable_numbers_stays_rate_limit() {
+        // Unknown wording → the safe default (retryable) rather than a
+        // confident "trim your input" we can't support.
+        let err = classify(Some(413), "throttled on tokens per minute (TPM)", false);
+        assert_eq!(err.kind, AiErrorKind::RateLimit);
     }
 }

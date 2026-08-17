@@ -316,6 +316,14 @@ pub enum StreamEvent {
     TextDelta(String),
     /// A chunk of extended-thinking / reasoning text (shown separately, if at all).
     ReasoningDelta(String),
+    /// An ephemeral infrastructure notice the user should SEE — "rate limited,
+    /// retrying" — as opposed to model reasoning (which the UI may hide).
+    /// Typed so the UI never has to sniff prose out of the reasoning channel;
+    /// `countdown_secs` lets the UI tick the wait down live.
+    Notice {
+        text: String,
+        countdown_secs: Option<u64>,
+    },
     /// A tool call began — its id + name are known; args stream after.
     ToolCallStart { id: String, name: String },
     /// A fragment of a tool call's argument JSON (accumulate by `id`).

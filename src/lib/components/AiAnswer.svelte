@@ -39,6 +39,11 @@ let {
 	text = "",
 	/** Whether tokens are still arriving (shows a blinking cursor + Stop). */
 	streaming = false,
+	/** Ephemeral wait notice ("Rate limited — retry 1/3"), shown beside the
+	 *  thinking quip so a throttled turn reads as waiting, not frozen. */
+	notice = "",
+	/** Epoch ms when the notice's retry fires — drives the live countdown. */
+	noticeDeadline = null,
 	/** An error message, if the stream failed. */
 	error = null,
 	/** Tool calls the agent has run this turn. */
@@ -77,6 +82,8 @@ let {
 	lastFiles?: TurnFile[];
 	text?: string;
 	streaming?: boolean;
+	notice?: string;
+	noticeDeadline?: number | null;
 	error?: string | null;
 	toolSteps?: ToolStep[];
 	approval?: Approval | null;
@@ -244,6 +251,16 @@ const THINKING_VERBS: { face: string; text: string }[] = [
 	{ face: "(•̀_•́)", text: "Herding processes" },
 	{ face: "(-_-)", text: "Waiting on the mutex" },
 	{ face: "(¬‿¬)", text: "Almost definitely working" },
+	{ face: "┬─┬ノ(º_ºノ)", text: "Un-flipping the table" },
+	{ face: "(ಥ_ಥ)", text: "Reading the Arch wiki again" },
+	{ face: "(°□°)", text: "It works on my machine" },
+	{ face: "(☉_☉)", text: "Forgot sudo again" },
+	{ face: "(¬º-°)¬", text: "Arguing with systemd" },
+	{ face: "(≖_≖)", text: "Checking who broke main" },
+	{ face: "(＾▽＾)", text: "Zero warnings. Suspicious." },
+	{ face: "(⊙﹏⊙)", text: "Exorcising a segfault" },
+	{ face: "(⌐■_■)ノ", text: "Asking the rules engine politely" },
+	{ face: "( ﾟдﾟ)", text: "It compiled first try?!" },
 ];
 // Start on a random quip and rotate through a shuffled order, so two runs in a
 // row don't open with the same word.
@@ -273,6 +290,22 @@ $effect(() => {
 	}, 2500);
 	return () => clearInterval(id);
 });
+// Live countdown for the wait notice: re-derive remaining seconds on a 1s
+// tick while a deadline is set. Interval, not decrement — a missed tick (tab
+// throttling) self-corrects because the wall clock is the source of truth.
+let noticeNow = $state(Date.now());
+$effect(() => {
+	if (noticeDeadline === null) return;
+	noticeNow = Date.now();
+	const id = setInterval(() => {
+		noticeNow = Date.now();
+	}, 1000);
+	return () => clearInterval(id);
+});
+let noticeSecs = $derived(
+	noticeDeadline === null ? null : Math.max(0, Math.ceil((noticeDeadline - noticeNow) / 1000)),
+);
+
 // The quip (face + text) to show right now, via the shuffled order.
 let thinkingVerb = $derived(THINKING_VERBS[verbOrder[verbIndex]] ?? THINKING_VERBS[0]);
 // A colour for the current quip, drawn from the app's own accent set (the Guide
@@ -492,11 +525,18 @@ function onWindowKeydown(e: KeyboardEvent) {
 			<!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized above -->
 			<div class="ai-md md-body" role="presentation" onclick={onAnswerClick}>{@html html}</div>{#if streaming && !approval}<span class="cursor" aria-hidden="true"></span>{/if}
 		{:else if streaming && !approval}
-			<div class="thinking" aria-live="polite" style:color={thinkingHue}>
-				{#key verbIndex}
-					<span class="thinking-face" aria-hidden="true">{thinkingVerb.face}</span>
-					<span class="thinking-verb">{thinkingVerb.text}<span class="thinking-ellipsis">…</span></span>
-				{/key}
+			<div class="thinking-row">
+				<div class="thinking" aria-live="polite" style:color={thinkingHue}>
+					{#key verbIndex}
+						<span class="thinking-face" aria-hidden="true">{thinkingVerb.face}</span>
+						<span class="thinking-verb">{thinkingVerb.text}<span class="thinking-ellipsis">…</span></span>
+					{/key}
+				</div>
+				{#if notice}
+					<span class="wait-notice" aria-live="polite"
+						>{notice}{noticeSecs !== null ? ` · ${noticeSecs}s` : ""}</span
+					>
+				{/if}
 			</div>
 		{/if}
 
@@ -1030,6 +1070,24 @@ function onWindowKeydown(e: KeyboardEvent) {
 	   accent from the app's palette, theme-tuned in both light and dark). Full
 	   strength — no muted colour or dimming — and a slow opacity pulse so the
 	   line reads as "alive" while the model works. */
+	.thinking-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 8px;
+	}
+
+	/* The provider-wait notice — a quiet right-side hint next to the quip, not
+	   a headline: the quip keeps saying "working", this says why it's slow. */
+	.wait-notice {
+		flex-shrink: 0;
+		font-size: 9px;
+		font-family: var(--font-mono);
+		color: color-mix(in srgb, var(--warning, #ffaa00) 55%, var(--fg-muted));
+		opacity: 0.85;
+		white-space: nowrap;
+	}
+
 	.thinking {
 		min-height: 1em;
 		display: flex;

@@ -36,6 +36,13 @@ pub enum AgentEvent {
     TextDelta(String),
     /// A chunk of extended-thinking text.
     ReasoningDelta(String),
+    /// An ephemeral infrastructure notice ("rate limited — retrying"). Shown to
+    /// the user while the loop waits; superseded by the next event. The UI
+    /// ticks `countdown_secs` down live when present.
+    Notice {
+        text: String,
+        countdown_secs: Option<u64>,
+    },
     /// A tool call is about to run.
     ToolCallStarted {
         call_id: String,
@@ -570,6 +577,15 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                 StreamEvent::TextDelta(d) => {
                     text.push_str(&d);
                     self.emit(AgentEvent::TextDelta(d));
+                }
+                StreamEvent::Notice {
+                    text,
+                    countdown_secs,
+                } => {
+                    self.emit(AgentEvent::Notice {
+                        text,
+                        countdown_secs,
+                    });
                 }
                 StreamEvent::ReasoningDelta(d) => {
                     self.emit(AgentEvent::ReasoningDelta(d));
