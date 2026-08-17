@@ -281,8 +281,10 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
 
         // ── The turn loop ────────────────────────────────────────────────────
         let mut step = 0usize;
-        // One free retry for a provider returning a fully-empty turn (see below).
+        // One free retry each for the two provider-flake classes (see below):
+        // a fully-empty turn, and a mid-stream rejection before any prose.
         let mut retried_empty_turn = false;
+        let mut retried_flaky_turn = false;
         loop {
             if self.cancel.is_cancelled() {
                 // Esc ends the TURN, not the conversation — the session (with
@@ -320,6 +322,23 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
             let turn = match self.consume_turn(&session.messages, &step_tools).await {
                 Ok(t) => t,
                 Err((e, partial)) => {
+                    // A MID-STREAM provider rejection with nothing on screen yet
+                    // is a re-rollable flake, not a verdict — gpt-oss on Groq
+                    // sometimes leaks its harmony channel marker into a tool
+                    // name ("web_tools<|channel|>commentary"), which the
+                    // provider's validator rejects. The same request typically
+                    // succeeds on the next roll. Only when the wire tagged it as
+                    // an in-band provider error (pre-stream failures like auth
+                    // or rate limits already have their own handling), and only
+                    // when no prose streamed (a retry must not double-print).
+                    if partial.is_empty()
+                        && !retried_flaky_turn
+                        && e.to_string().contains("provider reported an error")
+                    {
+                        retried_flaky_turn = true;
+                        tracing::warn!("[agent] mid-stream provider error — retrying once: {e}");
+                        continue;
+                    }
                     // The prose that already streamed is on the user's screen —
                     // it is context the model must keep. Push it before
                     // surfacing the error, or the follow-up answers as if the
@@ -943,6 +962,10 @@ mod tests {
     // multi-turn behavior with zero network / real model.
     struct MockProvider {
         turns: Mutex<std::collections::VecDeque<Vec<StreamEvent>>>,
+        /// Turn indexes (0-based) that ERROR mid-stream instead of playing
+        /// their events — the wire-level "provider reported an error" path.
+        error_turns: Mutex<std::collections::VecDeque<usize>>,
+        calls: Mutex<usize>,
         /// Records the messages passed on each `chat` call (to assert the loop
         /// fed tool results back).
         seen: Mutex<Vec<usize>>,
@@ -951,8 +974,17 @@ mod tests {
         fn new(turns: Vec<Vec<StreamEvent>>) -> Arc<Self> {
             Arc::new(Self {
                 turns: Mutex::new(turns.into()),
+                error_turns: Mutex::new(Default::default()),
+                calls: Mutex::new(0),
                 seen: Mutex::new(Vec::new()),
             })
+        }
+        /// `new`, plus: the given 0-based call indexes fail mid-stream with the
+        /// wire's in-band provider-error shape (before yielding any event).
+        fn with_stream_errors(turns: Vec<Vec<StreamEvent>>, errors: &[usize]) -> Arc<Self> {
+            let p = Self::new(turns);
+            *p.error_turns.lock().unwrap() = errors.iter().copied().collect();
+            p
         }
     }
     #[async_trait]
@@ -970,6 +1002,18 @@ mod tests {
             _cancel: CancellationToken,
         ) -> ProviderStream {
             self.seen.lock().unwrap().push(messages.len());
+            let call_idx = {
+                let mut c = self.calls.lock().unwrap();
+                let i = *c;
+                *c += 1;
+                i
+            };
+            if self.error_turns.lock().unwrap().contains(&call_idx) {
+                return stream::iter(vec![Err(LychiError::Ai(
+                    "The AI provider reported an error: tool call validation failed".into(),
+                ))])
+                .boxed();
+            }
             let events = self.turns.lock().unwrap().pop_front().unwrap_or_else(|| {
                 vec![
                     StreamEvent::TextDelta("(no more scripted turns)".into()),
@@ -1279,6 +1323,32 @@ mod tests {
         let exec = Arc::new(MockExecutor::new());
         let coord = Coordinator::new(provider, exec, Vec::new());
         assert!(coord.tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mid_stream_provider_error_is_retried_once() {
+        // Call 0 dies mid-stream (the gpt-oss channel-marker flake); the loop
+        // must re-roll and the second call answers.
+        let provider = MockProvider::with_stream_errors(vec![answer("recovered")], &[0]);
+        let exec = Arc::new(MockExecutor::new());
+        let (stream, handle) =
+            coordinator(provider, exec).run(Session::new("sys", "hi"), CancellationToken::new());
+        let events = drain(stream).await;
+        assert_eq!(final_text(&events), Some("recovered"));
+        assert!(matches!(handle.wait().await, Outcome::Done { .. }));
+
+        // Two in a row → surfaced as an error, no infinite roll.
+        let provider = MockProvider::with_stream_errors(vec![answer("never")], &[0, 1]);
+        let exec = Arc::new(MockExecutor::new());
+        let (stream, handle) =
+            coordinator(provider, exec).run(Session::new("sys", "hi"), CancellationToken::new());
+        let events = drain(stream).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Error(m) if m.contains("provider reported"))),
+        );
+        assert!(matches!(handle.wait().await, Outcome::Error { .. }));
     }
 
     #[tokio::test]
