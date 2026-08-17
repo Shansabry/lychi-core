@@ -259,6 +259,15 @@ pub struct ToolDef {
     /// one, not all. Read-only tools (`false`) stay freely parallel.
     #[serde(default)]
     pub mutates: bool,
+    /// For a GROUPED tool (one model tool fronting several handlers), the
+    /// compound `action` values that mutate state — mutation is per action
+    /// there, not per tool (`personal_data` holds both `note_add` and
+    /// `note_read`). Non-empty ⇒ the coordinator judges a call by its parsed
+    /// action against this list and ignores `mutates`. Internal metadata only:
+    /// the wire encoders build provider payloads from name/description/schema
+    /// and never send this.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mutating_actions: Vec<String>,
     /// Optional JSON Schema for the tool's `args`, for the BOUNDED tools whose
     /// first token is a fixed verb (`system`, `media`, …). `None` → the uniform
     /// free-text `{args: string}` every open-ended tool uses (`run`, `web`).

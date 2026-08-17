@@ -1374,6 +1374,7 @@ mod tests {
             name: "open".into(),
             description: "Open an app".into(),
             mutates: false,
+            mutating_actions: Vec::new(),
             input_schema: None,
         }];
         assert_eq!(
@@ -1398,6 +1399,7 @@ mod tests {
             name: "system".into(),
             description: "System controls".into(),
             mutates: false,
+            mutating_actions: Vec::new(),
             input_schema: Some(schema),
         }];
         let a = &anthropic_tools(&tools)[0];
@@ -1423,6 +1425,7 @@ mod tests {
             name: "open".into(),
             description: "d".into(),
             mutates: false,
+            mutating_actions: Vec::new(),
             input_schema: None,
         }];
 

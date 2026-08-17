@@ -1,7 +1,38 @@
 use std::collections::HashMap;
 
+use crate::action_registry::grammar::{self, ToolGroup};
 use crate::action_registry::trigger::ArgTransform;
 use crate::action_registry::{ActionHandler, CommandCategory, CommandInfo, CompletionItem};
+
+/// One model-facing tool as projected by [`ActionRegistry::model_catalog`]:
+/// either a group tool fronting several grammared handlers, or a standalone
+/// handler exposed as before.
+#[derive(Clone, Debug)]
+pub struct ModelTool {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Option<serde_json::Value>,
+    /// Standalone tools: whether the whole tool mutates state.
+    pub mutates: bool,
+    /// Group tools: the compound actions that mutate state (empty for
+    /// standalone tools — use `mutates`).
+    pub mutating_actions: Vec<String>,
+}
+
+/// The outcome of [`ActionRegistry::resolve_group_call`].
+#[derive(Debug)]
+pub enum GroupDispatch {
+    /// Not a group tool — dispatch the name to the executor unchanged.
+    NotAGroup,
+    /// A group call resolved to its member handler and flat args.
+    Resolved {
+        handler_id: String,
+        flat_args: String,
+    },
+    /// A group call that cannot run (bad JSON, unknown action, missing
+    /// required operand). The message is the model-facing error tool_result.
+    Invalid(String),
+}
 
 /// Build a `CommandInfo`, denormalising the category's title + order so the
 /// frontend groups without needing its own category table.
@@ -187,6 +218,167 @@ impl ActionRegistry {
         items
     }
 
+    /// The MODEL-facing tool catalog: grammared handlers fold into their
+    /// [`ToolGroup`]'s single tool (compound actions, merged operands,
+    /// per-action mutation list); everything else stays a standalone tool as
+    /// before. Deterministic order — groups in `ToolGroup::ALL` order, then
+    /// standalone tools alphabetically — because a byte-stable tool block is
+    /// what provider prompt caching keys on.
+    ///
+    /// A standalone tool's description folds in its `usage()` text: with no
+    /// prose manifest sent, the wire description is the only channel the model
+    /// gets. Grouped tools don't need the fold — their knowledge is in the
+    /// generated action list and operand descriptions.
+    pub fn model_catalog(&self) -> Vec<ModelTool> {
+        let mut groups: HashMap<ToolGroup, Vec<(String, grammar::Verb)>> = HashMap::new();
+        let mut standalone: Vec<ModelTool> = Vec::new();
+
+        let mut handlers: Vec<&std::sync::Arc<dyn ActionHandler>> = self
+            .handlers
+            .values()
+            // Same visibility rule as `command_catalog`: keyword-less handlers
+            // (structural/internal) are not model tools either.
+            .filter(|h| {
+                h.triggers()
+                    .iter()
+                    .any(|t| !t.prefixes.is_empty())
+            })
+            .collect();
+        handlers.sort_by_key(|h| h.id());
+
+        for h in handlers {
+            match (h.grammar(), h.tool_group()) {
+                (Some(g), group) if group != ToolGroup::Standalone => {
+                    let bucket = groups.entry(group).or_default();
+                    for v in g.verbs {
+                        bucket.push((grammar::compound_action(h.id(), v), *v));
+                    }
+                }
+                _ => {
+                    let description = if h.usage().trim().is_empty() {
+                        h.description().to_string()
+                    } else {
+                        format!(
+                            "{}. Usage: {}",
+                            h.description().trim_end_matches('.'),
+                            h.usage().trim()
+                        )
+                    };
+                    standalone.push(ModelTool {
+                        name: h.id().to_string(),
+                        description,
+                        input_schema: h.input_schema(),
+                        mutates: h.mutates_state(),
+                        mutating_actions: Vec::new(),
+                    });
+                }
+            }
+        }
+
+        let mut out: Vec<ModelTool> = Vec::new();
+        for &group in ToolGroup::ALL {
+            let Some(actions) = groups.remove(&group) else {
+                continue;
+            };
+            let mutating_actions: Vec<String> = actions
+                .iter()
+                .filter(|(_, v)| v.mutates)
+                .map(|(n, _)| n.clone())
+                .collect();
+            out.push(ModelTool {
+                name: group.tool_name().to_string(),
+                description: group.description().to_string(),
+                input_schema: Some(grammar::group_schema(&actions)),
+                mutates: false, // per-action via mutating_actions
+                mutating_actions,
+            });
+        }
+        out.extend(standalone);
+        out
+    }
+
+    /// Resolve a model tool call against the group projection: a group call
+    /// becomes its member handler + the flat args that handler's parser (and,
+    /// upstream of execution, the Rules Engine) understands. Anything that is
+    /// not a group tool passes through untouched — the executor dispatches
+    /// handler ids exactly as before, so the model calling a handler by name
+    /// (stale hint, old conversation) still works.
+    pub fn resolve_group_call(&self, tool: &str, args: &str) -> GroupDispatch {
+        let Some(group) = ToolGroup::ALL
+            .iter()
+            .copied()
+            .find(|g| g.tool_name() == tool)
+        else {
+            return GroupDispatch::NotAGroup;
+        };
+
+        let parsed: serde_json::Value = match serde_json::from_str(args.trim()) {
+            Ok(v) => v,
+            Err(_) => {
+                return GroupDispatch::Invalid(format!(
+                    "`{tool}` takes a JSON object with an `action` field, e.g. \
+                     {{\"action\": \"…\"}} — got a non-JSON argument."
+                ));
+            }
+        };
+        let Some(map) = parsed.as_object() else {
+            return GroupDispatch::Invalid(format!(
+                "`{tool}` takes a JSON object with an `action` field."
+            ));
+        };
+        let Some(action) = map.get("action").and_then(|a| a.as_str()) else {
+            return GroupDispatch::Invalid(
+                "Missing required `action` field — pick one of this tool's listed actions."
+                    .to_string(),
+            );
+        };
+
+        // Find the member handler whose compound action this is. Scan members
+        // rather than split the string: handler ids may contain underscores.
+        for h in self.handlers.values() {
+            if h.tool_group() != group {
+                continue;
+            }
+            let Some(g) = h.grammar() else { continue };
+            for v in g.verbs {
+                if grammar::compound_action(h.id(), v) != action {
+                    continue;
+                }
+                // Required-operand check here, where the field names are known
+                // — the flat parser's usage error mentions flat syntax the
+                // model never sees.
+                let missing: Vec<&str> = v
+                    .operands
+                    .iter()
+                    .filter(|op| op.required)
+                    .filter(|op| {
+                        !map.get(op.name).is_some_and(|val| match val {
+                            serde_json::Value::String(s) => !s.trim().is_empty(),
+                            serde_json::Value::Array(a) => !a.is_empty(),
+                            serde_json::Value::Null => false,
+                            _ => true,
+                        })
+                    })
+                    .map(|op| op.name)
+                    .collect();
+                if !missing.is_empty() {
+                    return GroupDispatch::Invalid(format!(
+                        "`{action}` requires: {}.",
+                        missing.join(", ")
+                    ));
+                }
+                return GroupDispatch::Resolved {
+                    handler_id: h.id().to_string(),
+                    flat_args: g.to_flat(v, map),
+                };
+            }
+        }
+        GroupDispatch::Invalid(format!(
+            "Unknown action `{action}` for `{tool}` — pick one of the actions listed in \
+             the tool's schema."
+        ))
+    }
+
     /// Build the dynamic Triggers list for the Guide. Structural sigils (`=`,
     /// `>`, `~/`, …) carry fixed descriptions; shorthand colon-triggers (`e:`,
     /// `w:`, …) pull their description from the SAME live handler the command
@@ -290,6 +482,222 @@ mod tests {
         assert!(!registry.has("nope"));
         assert_eq!(registry.get("test").unwrap().id(), "test");
         assert_eq!(registry.get("test").unwrap().default_risk(), RiskLevel::Low);
+    }
+
+    // ── Model catalog projection ─────────────────────────────────────────────
+
+    use crate::action_registry::grammar::{ArgKind, Grammar, Operand, Verb};
+    use crate::action_registry::trigger::Trigger;
+
+    /// A grammared handler in the Personal group: `note` with add/read.
+    struct GNote;
+    #[async_trait]
+    impl ActionHandler for GNote {
+        fn id(&self) -> &str {
+            "note"
+        }
+        fn description(&self) -> &str {
+            "Notes"
+        }
+        fn triggers(&self) -> &'static [Trigger] {
+            const T: &[Trigger] = &[Trigger::new(&["note"], ArgTransform::PassThrough)];
+            T
+        }
+        fn tool_group(&self) -> ToolGroup {
+            ToolGroup::Personal
+        }
+        fn grammar(&self) -> Option<Grammar> {
+            Some(Grammar {
+                verbs: &[
+                    Verb {
+                        name: "add",
+                        desc: "Add a note",
+                        mutates: true,
+                        operands: &[Operand {
+                            name: "text",
+                            desc: "The note text",
+                            required: true,
+                            kind: ArgKind::Text,
+                            prefix: None,
+                        }],
+                    },
+                    Verb {
+                        name: "read",
+                        desc: "List notes",
+                        mutates: false,
+                        operands: &[],
+                    },
+                ],
+            })
+        }
+        async fn execute(
+            &self,
+            _ctx: &crate::action_registry::ExecContext,
+            args: &str,
+        ) -> Result<ActionResult, LychiError> {
+            Ok(ActionResult::ok(
+                format!("note: {args}"),
+                OutputType::Status,
+            ))
+        }
+    }
+
+    /// A free-form grammared handler in the same group.
+    struct GSnip;
+    #[async_trait]
+    impl ActionHandler for GSnip {
+        fn id(&self) -> &str {
+            "snip"
+        }
+        fn description(&self) -> &str {
+            "Snippets"
+        }
+        fn triggers(&self) -> &'static [Trigger] {
+            const T: &[Trigger] = &[Trigger::new(&["snip"], ArgTransform::PassThrough)];
+            T
+        }
+        fn tool_group(&self) -> ToolGroup {
+            ToolGroup::Personal
+        }
+        fn grammar(&self) -> Option<Grammar> {
+            Some(Grammar {
+                verbs: &[Verb {
+                    name: "",
+                    desc: "Search snippets",
+                    mutates: false,
+                    operands: &[Operand {
+                        name: "query",
+                        desc: "Search text",
+                        required: false,
+                        kind: ArgKind::Text,
+                        prefix: None,
+                    }],
+                }],
+            })
+        }
+        async fn execute(
+            &self,
+            _ctx: &crate::action_registry::ExecContext,
+            args: &str,
+        ) -> Result<ActionResult, LychiError> {
+            Ok(ActionResult::ok(
+                format!("snip: {args}"),
+                OutputType::Status,
+            ))
+        }
+    }
+
+    /// A keyword-bearing handler with no grammar — stays standalone.
+    struct GPlain;
+    #[async_trait]
+    impl ActionHandler for GPlain {
+        fn id(&self) -> &str {
+            "plain"
+        }
+        fn description(&self) -> &str {
+            "Plain tool"
+        }
+        fn usage(&self) -> &str {
+            "plain <thing>"
+        }
+        fn triggers(&self) -> &'static [Trigger] {
+            const T: &[Trigger] = &[Trigger::new(&["plain"], ArgTransform::PassThrough)];
+            T
+        }
+        async fn execute(
+            &self,
+            _ctx: &crate::action_registry::ExecContext,
+            args: &str,
+        ) -> Result<ActionResult, LychiError> {
+            Ok(ActionResult::ok(
+                format!("plain: {args}"),
+                OutputType::Status,
+            ))
+        }
+    }
+
+    fn projected_registry() -> ActionRegistry {
+        let mut r = ActionRegistry::new();
+        r.register(Box::new(GNote));
+        r.register(Box::new(GSnip));
+        r.register(Box::new(GPlain));
+        r
+    }
+
+    #[test]
+    fn grammared_handlers_fold_into_one_group_tool() {
+        let cat = projected_registry().model_catalog();
+        let personal = cat.iter().find(|t| t.name == "personal_data").unwrap();
+        let schema = personal.input_schema.as_ref().unwrap();
+        let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
+        let names: Vec<&str> = actions.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(names, vec!["note_add", "note_read", "snip"]);
+        // Mutation is per action, not per tool.
+        assert!(!personal.mutates);
+        assert_eq!(personal.mutating_actions, vec!["note_add".to_string()]);
+        // The grammarless handler stays standalone, usage folded in.
+        let plain = cat.iter().find(|t| t.name == "plain").unwrap();
+        assert!(plain.description.contains("Usage: plain <thing>"));
+        // Group tools come first, so the tool block is stable as handlers churn.
+        assert!(
+            cat.iter().position(|t| t.name == "personal_data").unwrap()
+                < cat.iter().position(|t| t.name == "plain").unwrap()
+        );
+    }
+
+    #[test]
+    fn group_call_resolves_to_handler_and_flat_args() {
+        let r = projected_registry();
+        match r.resolve_group_call(
+            "personal_data",
+            r#"{"action":"note_add","text":"buy milk"}"#,
+        ) {
+            GroupDispatch::Resolved {
+                handler_id,
+                flat_args,
+            } => {
+                assert_eq!(handler_id, "note");
+                assert_eq!(flat_args, "add buy milk");
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+        // Free-form member: action is the handler id, flat is just the operands.
+        match r.resolve_group_call("personal_data", r#"{"action":"snip","query":"ssh"}"#) {
+            GroupDispatch::Resolved {
+                handler_id,
+                flat_args,
+            } => {
+                assert_eq!(handler_id, "snip");
+                assert_eq!(flat_args, "ssh");
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_call_rejects_missing_required_and_unknown_action() {
+        let r = projected_registry();
+        match r.resolve_group_call("personal_data", r#"{"action":"note_add"}"#) {
+            GroupDispatch::Invalid(msg) => assert!(msg.contains("text"), "{msg}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        match r.resolve_group_call("personal_data", r#"{"action":"nope"}"#) {
+            GroupDispatch::Invalid(msg) => assert!(msg.contains("nope"), "{msg}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_group_names_pass_through() {
+        let r = projected_registry();
+        assert!(matches!(
+            r.resolve_group_call("note", "add hi"),
+            GroupDispatch::NotAGroup
+        ));
+        assert!(matches!(
+            r.resolve_group_call("run", "ls"),
+            GroupDispatch::NotAGroup
+        ));
     }
 
     #[test]

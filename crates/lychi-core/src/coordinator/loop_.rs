@@ -398,7 +398,7 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
             // pre-mutation state is correct; and if the mutating call suspends on
             // approval, every read has already answered its tool_use id.
             let (mutating, reads): (Vec<ToolCall>, Vec<ToolCall>) =
-                calls.into_iter().partition(|c| self.is_mutating(&c.name));
+                calls.into_iter().partition(|c| self.is_mutating(c));
 
             let read_results =
                 futures_util::future::join_all(reads.iter().map(|c| self.execute_tool_call(c)))
@@ -756,15 +756,30 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
         None
     }
 
-    /// Whether a tool name is a state-mutating tool, per its `ToolDef.mutates`
-    /// (declared by the handler). Unknown names default to non-mutating — the
-    /// hold is a safety cap, and a tool absent from the catalog is one the
-    /// executor will reject anyway, so it is never worth blocking a sibling for.
-    fn is_mutating(&self, name: &str) -> bool {
-        self.tools
-            .iter()
-            .find(|t| t.name == name)
-            .is_some_and(|t| t.mutates)
+    /// Whether a specific call is state-mutating. For a standalone tool that
+    /// is its `ToolDef.mutates`; for a GROUP tool (non-empty
+    /// `mutating_actions`) it is per action — `personal_data` holds both
+    /// `note_add` (mutating) and `note_read` (not), so judging the tool as a
+    /// whole would serialize harmless reads. A group call whose args don't
+    /// parse or name no known action counts as non-mutating: dispatch rejects
+    /// it before anything runs, so it cannot mutate. Unknown tool names
+    /// default to non-mutating — the executor will reject them anyway, so it
+    /// is never worth blocking a sibling for.
+    fn is_mutating(&self, call: &ToolCall) -> bool {
+        let Some(def) = self.tools.iter().find(|t| t.name == call.name) else {
+            return false;
+        };
+        if def.mutating_actions.is_empty() {
+            return def.mutates;
+        }
+        serde_json::from_str::<serde_json::Value>(call.args.trim())
+            .ok()
+            .and_then(|v| {
+                v.get("action")
+                    .and_then(|a| a.as_str())
+                    .map(|a| def.mutating_actions.iter().any(|m| m == a))
+            })
+            .unwrap_or(false)
     }
 
     /// Filter a single turn's tool batch before execution: exact-duplicate
@@ -793,7 +808,7 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
             }
             seen.push(key);
 
-            if self.is_mutating(&call.name) {
+            if self.is_mutating(&call) {
                 if ran_mutating {
                     // A second state-mutating tool in the same turn. The model
                     // is almost certainly hedging (variants of one operation);
@@ -1078,6 +1093,7 @@ mod tests {
                 name: "weather".into(),
                 description: "get weather".into(),
                 mutates: false,
+                mutating_actions: Vec::new(),
                 input_schema: None,
             }],
         )
@@ -1098,6 +1114,7 @@ mod tests {
                 name: name.into(),
                 description: name.into(),
                 mutates,
+                mutating_actions: Vec::new(),
                 input_schema: None,
             }],
         )
@@ -1179,12 +1196,14 @@ mod tests {
                 name: "weather".into(),
                 description: "get weather".into(),
                 mutates: false,
+                mutating_actions: Vec::new(),
                 input_schema: None,
             },
             ToolDef {
                 name: "screenshot".into(),
                 description: "capture the screen or a window".into(),
                 mutates: false,
+                mutating_actions: Vec::new(),
                 input_schema: None,
             },
         ];
@@ -1384,6 +1403,7 @@ mod tests {
                 name: "run".into(),
                 description: "shell".into(),
                 mutates: true,
+                mutating_actions: Vec::new(),
                 input_schema: None,
             }],
         );
@@ -1468,6 +1488,7 @@ mod tests {
                 name: "delete".into(),
                 description: "delete".into(),
                 mutates: false,
+                mutating_actions: Vec::new(),
                 input_schema: None,
             }],
         );
@@ -1500,6 +1521,7 @@ mod tests {
                 name: "delete".into(),
                 description: "delete".into(),
                 mutates: false,
+                mutating_actions: Vec::new(),
                 input_schema: None,
             }],
         );
@@ -1519,6 +1541,7 @@ mod tests {
                 name: "delete".into(),
                 description: "delete".into(),
                 mutates: false,
+                mutating_actions: Vec::new(),
                 input_schema: None,
             }],
         );
@@ -1542,6 +1565,7 @@ mod tests {
                 name: "delete".into(),
                 description: "delete".into(),
                 mutates: false,
+                mutating_actions: Vec::new(),
                 input_schema: None,
             }],
         );
@@ -1560,6 +1584,7 @@ mod tests {
                 name: "delete".into(),
                 description: "delete".into(),
                 mutates: false,
+                mutating_actions: Vec::new(),
                 input_schema: None,
             }],
         );
@@ -1613,12 +1638,14 @@ mod tests {
                     name: "delete".into(),
                     description: "delete".into(),
                     mutates: false,
+                    mutating_actions: Vec::new(),
                     input_schema: None,
                 },
                 ToolDef {
                     name: "weather".into(),
                     description: "get weather".into(),
                     mutates: false,
+                    mutating_actions: Vec::new(),
                     input_schema: None,
                 },
             ],
@@ -1649,6 +1676,7 @@ mod tests {
                 name: "delete".into(),
                 description: "delete".into(),
                 mutates: false,
+                mutating_actions: Vec::new(),
                 input_schema: None,
             }],
         );
@@ -1684,12 +1712,14 @@ mod tests {
                 name: "delete".into(),
                 description: "delete".into(),
                 mutates: false,
+                mutating_actions: Vec::new(),
                 input_schema: None,
             },
             ToolDef {
                 name: "format".into(),
                 description: "format".into(),
                 mutates: false,
+                mutating_actions: Vec::new(),
                 input_schema: None,
             },
         ];
@@ -1764,6 +1794,7 @@ mod tests {
                 name: "delete".into(),
                 description: "delete".into(),
                 mutates: false,
+                mutating_actions: Vec::new(),
                 input_schema: None,
             }],
         );

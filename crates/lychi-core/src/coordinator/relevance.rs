@@ -36,8 +36,27 @@ const CONTEXT_LOOKBACK_MESSAGES: usize = 6;
 /// Tools the agent must ALWAYS have — the verbs behind the most common asks, plus
 /// the ones a plan tends to need mid-way (open a file it found, run a follow-up).
 /// Matched against `ToolDef::name`. Keeps the agent capable no matter how the query
-/// is phrased, so filtering can never strand a common action.
-const CORE_TOOLS: &[&str] = &["run", "web", "calc", "url", "browse", FIND_TOOL];
+/// is phrased, so filtering can never strand a common action. Carries both the
+/// group-tool names and the legacy standalone names so filtering behaves during
+/// the grammar migration (a name absent from the catalog is simply inert).
+const CORE_TOOLS: &[&str] = &[
+    "run",
+    FIND_TOOL,
+    "web_tools",
+    "files",
+    "quick_tools",
+    "web",
+    "calc",
+    "url",
+    "browse",
+];
+
+/// A catalog at or under this size is sent WHOLE every turn — no ranking, no
+/// per-query variation. The grouped projection lands around ten tools, which is
+/// under every published tool-count accuracy cliff, and a byte-stable tool
+/// block is what lets the provider prompt-cache the prefix. Filtering below
+/// this size would trade cache hits for nothing.
+const FULL_SEND_MAX_TOOLS: usize = 12;
 
 /// A query shorter than this is too ambiguous to rank safely → send everything.
 const MIN_QUERY_CHARS: usize = 8;
@@ -57,7 +76,7 @@ const MAX_MATCHED_TOOLS: usize = 8;
 /// whenever filtering would be unsafe or unhelpful. See the module docs for the
 /// fail-safe guarantees.
 pub fn select_tools(messages: &[ChatMessage], catalog: &[ToolDef]) -> Vec<ToolDef> {
-    if catalog.len() <= CORE_TOOLS.len() {
+    if catalog.len() <= FULL_SEND_MAX_TOOLS {
         return catalog.to_vec();
     }
     let context = recent_context(messages);
@@ -189,6 +208,7 @@ pub fn find_tool_def() -> ToolDef {
                       \"wifi\"), not questions."
             .to_string(),
         mutates: false,
+        mutating_actions: Vec::new(),
         input_schema: Some(serde_json::json!({
             "type": "object",
             "properties": {
@@ -269,6 +289,7 @@ mod tests {
             name: name.into(),
             description: desc.into(),
             mutates: false,
+            mutating_actions: Vec::new(),
             input_schema: None,
         }
     }
@@ -287,7 +308,21 @@ mod tests {
             tool("timer", "Countdown timers and stopwatch"),
             tool("define", "Look up a word definition"),
             tool("media", "Control media playback"),
+            // Padding beyond FULL_SEND_MAX_TOOLS so these tests exercise the
+            // RANKING path — a catalog at or under the threshold is sent whole
+            // and never filtered (covered by its own test below).
+            tool("note", "Save and list notes"),
+            tool("service", "Manage systemd services"),
+            tool("emoji", "Search emoji"),
+            tool("color", "Convert color formats"),
         ]
+    }
+
+    #[test]
+    fn a_small_catalog_is_sent_whole() {
+        let small: Vec<ToolDef> = catalog().into_iter().take(FULL_SEND_MAX_TOOLS).collect();
+        let msgs = vec![ChatMessage::user("take a screenshot of my window please")];
+        assert_eq!(select_tools(&msgs, &small).len(), small.len());
     }
 
     fn names(tools: &[ToolDef]) -> Vec<String> {

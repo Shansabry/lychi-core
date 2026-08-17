@@ -656,6 +656,23 @@ impl Executor {
             .await
     }
 
+    /// Execute a PRE-RESOLVED intent WITHOUT confirmation — the agent's
+    /// group-tool dispatch path. The registry already resolved a group call to
+    /// (handler, flat args); re-parsing a synthesized command line here would
+    /// be a second resolver that could route somewhere else. Unlike
+    /// [`Executor::run_confirmed`], the full policy path runs: risk assessment
+    /// and the Rules Engine see the exact flat args, and a destructive action
+    /// still comes back as `needs_confirmation` for the approval flow.
+    pub async fn run_resolved(
+        &self,
+        intent: crate::intent::ResolvedIntent,
+        privacy: &PrivacyConfig,
+        inputs: &RunInputs,
+    ) -> Result<ExecuteResult, LychiError> {
+        self.run_inner("", Some(intent), false, privacy, inputs)
+            .await
+    }
+
     async fn run_inner(
         &self,
         input: &str,

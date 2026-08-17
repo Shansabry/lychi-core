@@ -1,3 +1,4 @@
+pub mod grammar;
 pub mod handlers;
 pub mod registry;
 pub mod trigger;
@@ -943,8 +944,35 @@ pub trait ActionHandler: Send + Sync {
     ///
     /// Derive the schema's `enum` from the same constant the handler matches on,
     /// so the schema and the parser can never drift.
+    ///
+    /// The default derives from [`ActionHandler::grammar`] when one is
+    /// declared — a handler with a grammar should NOT also hand-write a
+    /// schema (that would be the same information twice). Override only for a
+    /// schema the grammar model genuinely cannot express.
     fn input_schema(&self) -> Option<serde_json::Value> {
+        self.grammar().map(|g| g.handler_schema())
+    }
+
+    /// The handler's argument surface as data — verbs, operands, per-action
+    /// mutation flags. Declared ONCE; the JSON schema, the structured→flat
+    /// adapter, and the model-facing action list all derive from it, and the
+    /// registry uses it to fold this handler into its model-facing group tool
+    /// (see [`grammar::ToolGroup`] and `ActionRegistry::model_catalog`).
+    ///
+    /// `None` (the default) keeps the handler a standalone model tool with
+    /// whatever `input_schema()` says — the pre-grammar behavior, so migration
+    /// is incremental. Pair every grammar with a drift test proving the
+    /// handler's parser accepts each verb's flat rendering.
+    fn grammar(&self) -> Option<grammar::Grammar> {
         None
+    }
+
+    /// The model-facing group this handler's actions surface under. Only
+    /// consulted when [`ActionHandler::grammar`] is `Some`; `Standalone` keeps
+    /// a grammared handler as its own tool (e.g. `run`, whose risk surface
+    /// deserves its own name).
+    fn tool_group(&self) -> grammar::ToolGroup {
+        grammar::ToolGroup::Standalone
     }
 
     /// The family this handler belongs to, for grouping in the Guide. Override to

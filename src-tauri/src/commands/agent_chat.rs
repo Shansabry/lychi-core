@@ -245,6 +245,70 @@ impl ToolExecutor for ExecutorAdapter {
         args: &str,
         output: Option<lychi_core::coordinator::ToolOutputChannel>,
     ) -> Result<ToolOutcome, LychiError> {
+        // GROUP-tool dispatch first: a call like `personal_data
+        // {"action":"note_add",…}` resolves to its member handler + the flat
+        // args that handler's parser AND the Rules Engine both read — resolved
+        // here, before the executor, so risk assessment can never see
+        // different args than execution (the same invariant `run`'s flatten
+        // upholds below). Anything not a group tool falls through unchanged,
+        // so handler ids remain directly callable (stale hints, recalled
+        // conversations).
+        {
+            use lychi_core::action_registry::registry::GroupDispatch;
+            let exec = self.executor.read().await.clone();
+            match exec.registry.resolve_group_call(name, args) {
+                GroupDispatch::NotAGroup => {}
+                GroupDispatch::Invalid(msg) => {
+                    // A malformed group call never reaches the executor; the
+                    // message is the model-facing error result so it can fix
+                    // the call.
+                    return Ok(ToolOutcome::Ran {
+                        output: msg,
+                        is_error: true,
+                        artifact: None,
+                    });
+                }
+                GroupDispatch::Resolved {
+                    handler_id,
+                    flat_args,
+                } => {
+                    // Pre-resolved: run the member handler directly instead of
+                    // re-parsing a synthesized command line (which would be a
+                    // second resolver). Group members are never `run`, so the
+                    // inline/terminal duality and the streaming sink don't
+                    // apply — RunInputs defaults are correct.
+                    let intent = lychi_core::intent::ResolvedIntent {
+                        action_id: handler_id,
+                        args: flat_args,
+                        routing: lychi_core::intent::RoutingMethod::Ai,
+                    };
+                    let run_inputs = RunInputs::default();
+                    let res = exec
+                        .run_resolved(intent.clone(), &self.privacy, &run_inputs)
+                        .await?;
+                    if let Some(reason) = res.envelope.needs_confirmation {
+                        let pending = res.pending_intent.unwrap_or(intent);
+                        let token = ResumeToken(serde_json::json!({
+                            "action_id": pending.action_id,
+                            "args": pending.args,
+                            "inline": run_inputs.inline,
+                            "terminal_routing": run_inputs.terminal_routing,
+                        }));
+                        return Ok(ToolOutcome::NeedsApproval {
+                            reason,
+                            resume: token,
+                        });
+                    }
+                    let (output, artifact) = result_summary_and_artifact(&res.result);
+                    return Ok(ToolOutcome::Ran {
+                        output,
+                        is_error: !res.result.success,
+                        artifact,
+                    });
+                }
+            }
+        }
+
         let (input, mut run_inputs, _opens_terminal) = agent_run_inputs(name, args);
         // Bridge the coordinator's live-output channel into the executor's
         // `OutputSink` on RunInputs, so a captured `run` streams each line into
@@ -515,47 +579,32 @@ async fn build_coordinator(
     let mut manifest = String::new();
 
     let tools: Vec<ToolDef> = if with_tools {
-        let catalog = state.executor.read().await.registry.command_catalog();
+        // The MODEL-facing projection: grammared handlers folded into their
+        // group tools (compound actions, merged operand schemas, per-action
+        // mutation lists), everything else standalone with its usage() folded
+        // into the description. Small (~10 group tools once migration lands)
+        // and byte-stable across turns — which is what makes the provider's
+        // prompt cache actually hit. Group calls are resolved back to member
+        // handlers by the ExecutorAdapter, so the executor and Rules Engine
+        // only ever see handler ids + flat args.
+        let catalog = state.executor.read().await.registry.model_catalog();
         let presets = lychi_core::ai_presets::store::AiPresetsStore::new()
             .get_presets(&state.db)
             .unwrap_or_default();
-        // No prose manifest: it would list ALL tools in the system prompt, undoing
-        // the per-query tool filtering that keeps input tokens low. The callable
-        // tool SCHEMAS are the single source of tool knowledge, and the coordinator
-        // sends only the query-relevant subset. The presets list is still surfaced
-        // (it is small and not a tool schema).
+        // No prose manifest: the tool schemas carry the knowledge. The presets
+        // list is still surfaced (it is small and not a tool schema).
         manifest = lychi_core::coordinator::build_presets_note(&presets);
 
-        let full: Vec<ToolDef> = {
-            // Fold each handler's `usage()` into the wire description. With the
-            // prose manifest no longer sent, the schema description is the ONLY
-            // channel that reaches the model — a bare one-liner is how `system`
-            // got called with guessed args. The cost rides only the filtered
-            // subset actually sent, and the usage text also feeds the lexical
-            // relevance ranking (it indexes name + description).
-            catalog
-                .into_iter()
-                .map(|c| ToolDef {
-                    name: c.id,
-                    description: if c.usage.trim().is_empty() {
-                        c.description
-                    } else {
-                        format!(
-                            "{}. Usage: {}",
-                            c.description.trim_end_matches('.'),
-                            c.usage.trim()
-                        )
-                    },
-                    mutates: c.mutates,
-                    input_schema: c.input_schema,
-                })
-                .collect()
-        };
-        // Pass the FULL catalog: the coordinator re-selects the model-facing
-        // shortlist from the evolving conversation before every turn (frozen-
-        // per-task filtering would strand a tool a later step needs). `query`
-        // is no longer used to pre-filter here.
-        full
+        catalog
+            .into_iter()
+            .map(|m| ToolDef {
+                name: m.name,
+                description: m.description,
+                mutates: m.mutates,
+                mutating_actions: m.mutating_actions,
+                input_schema: m.input_schema,
+            })
+            .collect()
     } else {
         Vec::new()
     };
