@@ -346,7 +346,7 @@ pub(crate) fn anthropic_messages(messages: &[ChatMessage]) -> Vec<Value> {
                             "type": "tool_use",
                             "id": tc.id,
                             "name": tc.name,
-                            "input": { "args": tc.args },
+                            "input": rewrap_args(&tc.args),
                         }));
                     }
                     out.push(json!({ "role": "assistant", "content": blocks }));
@@ -478,7 +478,7 @@ pub(crate) fn openai_messages(messages: &[ChatMessage]) -> Vec<Value> {
                                 "type": "function",
                                 "function": {
                                     "name": tc.name,
-                                    "arguments": json!({ "args": tc.args }).to_string(),
+                                    "arguments": rewrap_args(&tc.args).to_string(),
                                 },
                             })
                         })
@@ -818,6 +818,20 @@ where
 /// the `args` string; for the typed shape there is no `args` key, so we pass the
 /// whole object JSON through — the handler flattens it (see `system_args_to_flat`).
 /// On a parse failure, best-effort return the raw buffer.
+/// The OUTGOING mirror of [`unwrap_args`]: re-encode a stored `ToolCall.args`
+/// into the wire `arguments` value. A typed call was stored as its bare JSON
+/// object — echo it VERBATIM; a legacy flat string gets the uniform
+/// `{args: "..."}` wrapper back. Asymmetry here is not cosmetic: gpt-oss saw
+/// its own `{"action":"search",…}` call replayed as `{"args":"{\"action\"…}"}`,
+/// concluded the interface must be namespaced, and started inventing
+/// `web_tools.fetch` — rejected by the provider on every chained call.
+pub(crate) fn rewrap_args(args: &str) -> Value {
+    match serde_json::from_str::<Value>(args) {
+        Ok(v) if v.is_object() => v,
+        _ => json!({ "args": args }),
+    }
+}
+
 pub(crate) fn unwrap_args(buf: &str) -> String {
     if buf.trim().is_empty() {
         return String::new();
@@ -1294,6 +1308,38 @@ mod tests {
             !events
                 .iter()
                 .any(|e| matches!(e, StreamEvent::TextDelta(_)))
+        );
+    }
+
+    #[test]
+    fn tool_calls_round_trip_in_their_original_shape() {
+        // Typed call: the bare JSON object the model emitted must replay
+        // VERBATIM — re-wrapping it taught gpt-oss a phantom interface and it
+        // began inventing `web_tools.fetch`.
+        let typed = r#"{"action":"search","query":"cm of tamil nadu"}"#;
+        assert_eq!(
+            rewrap_args(typed),
+            serde_json::from_str::<Value>(typed).unwrap()
+        );
+        // Legacy flat args get the uniform wrapper back.
+        assert_eq!(rewrap_args("ls -la"), json!({ "args": "ls -la" }));
+
+        // And through the full message encoders, both dialects.
+        let mut msg = ChatMessage::assistant("");
+        msg.tool_calls = vec![ToolCall {
+            id: "c1".into(),
+            name: "web_tools".into(),
+            args: typed.into(),
+        }];
+        let openai = openai_messages(std::slice::from_ref(&msg));
+        assert_eq!(
+            openai[0]["tool_calls"][0]["function"]["arguments"],
+            serde_json::to_string(&serde_json::from_str::<Value>(typed).unwrap()).unwrap()
+        );
+        let anthropic = anthropic_messages(&[msg]);
+        assert_eq!(
+            anthropic[0]["content"][0]["input"]["action"], "search",
+            "{anthropic:?}"
         );
     }
 
