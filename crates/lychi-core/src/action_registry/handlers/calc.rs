@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
@@ -76,6 +77,33 @@ impl CalcHandler {
     }
 }
 
+/// `calc`'s argument surface: a single free-form action whose flat form IS the
+/// expression. The JSON Schema and the structured→flat adapter both derive
+/// from this; the drift tests below pin its renderings to the real parsers
+/// (`evaluate` / `parse_conversion`).
+const CALC_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Evaluate a math expression, unit conversion, or currency conversion and \
+               return the numeric answer instantly. Fully local except currency rates \
+               (fetched live, cached 10 minutes). Read-only: nothing changes.",
+        mutates: false,
+        operands: &[Operand {
+            name: "expression",
+            desc: "A math expression in calculator syntax (\"2+2\", \"sqrt(144)\", \
+                   \"2^10\", \"sin(pi/4)\"); a unit conversion \"<number> <unit> to \
+                   <unit>\" covering length/weight/temperature/volume/data/area/speed/\
+                   time/pressure/energy/angle (\"5 kg to lb\", \"100 km/h to mph\", \
+                   \"72 f to c\" — \"in\" also works as the separator); or a currency \
+                   conversion \"<amount> <code> to <code>\" with ISO 4217 codes \
+                   (\"250 usd to eur\").",
+            required: true,
+            kind: ArgKind::Text,
+            prefix: None,
+        }],
+    }],
+};
+
 #[async_trait]
 impl ActionHandler for CalcHandler {
     fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
@@ -93,6 +121,12 @@ impl ActionHandler for CalcHandler {
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
+    }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(CALC_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Utils
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
@@ -1145,6 +1179,38 @@ mod tests {
         // Invalid
         assert!(parse_conversion("hello world").is_none());
         assert!(parse_conversion("5 kg").is_none()); // No "to"
+    }
+
+    #[test]
+    fn calc_args_flatten_from_structured_json() {
+        // The grammar's flat rendering must be exactly what the parsers accept:
+        // math via `evaluate`, conversions via `parse_conversion`. This pins
+        // the declared grammar to the hand-written parser.
+        let flat = CALC_GRAMMAR
+            .flatten_json(r#"{"expression":"2+2"}"#)
+            .unwrap();
+        assert_eq!(flat, "2+2");
+        assert!(CalcHandler::evaluate(&flat).is_some());
+
+        let flat = CALC_GRAMMAR
+            .flatten_json(r#"{"expression":"5 kg to lb"}"#)
+            .unwrap();
+        assert_eq!(flat, "5 kg to lb");
+        assert!(matches!(
+            parse_conversion(&flat),
+            Some(Conversion::Unit { .. })
+        ));
+
+        let flat = CALC_GRAMMAR
+            .flatten_json(r#"{"expression":"250 usd to eur"}"#)
+            .unwrap();
+        assert!(matches!(
+            parse_conversion(&flat),
+            Some(Conversion::Currency { .. })
+        ));
+
+        // Flat/legacy callers pass through untouched (caller keeps raw).
+        assert_eq!(CALC_GRAMMAR.flatten_json("2+2"), None);
     }
 
     #[test]

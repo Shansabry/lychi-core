@@ -8,12 +8,60 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
     RiskLevel,
 };
 use crate::context::pin;
 use crate::error::LychiError;
+
+/// `pin_workspace`'s argument surface: one free-form action whose flat form is
+/// the directory path, the literal `clear`, or empty for the status query. The
+/// JSON Schema and the structured→flat adapter both derive from this.
+const PIN_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Pin a workspace directory so context detection (active project, \
+               run cwd) uses it instead of auto-detecting from the focused \
+               window — session-only, cleared on restart. Pass `clear` to \
+               unpin and resume auto-detection, or call with no arguments to \
+               see the current pin.",
+        mutates: true,
+        operands: &[
+            // Named `unpin` (not `clear`) so it can never merge with `clip`'s
+            // clear flag in the group schema — the flat rendering is still the
+            // literal `clear` the parser reads.
+            Operand {
+                name: "unpin",
+                desc: "Unpin the workspace and resume auto-detection. When \
+                       true, `path` does not apply.",
+                required: false,
+                kind: ArgKind::Bool { flag: "clear" },
+                prefix: None,
+            },
+            Operand {
+                name: "path",
+                desc: "The directory to pin (must exist), e.g. \
+                       \"/home/user/projects/lychi\". Omit (with `unpin` \
+                       false) to report the current pin status.",
+                required: false,
+                kind: ArgKind::Text,
+                prefix: None,
+            },
+        ],
+    }],
+};
+
+/// Normalize the tool's `args` to the flat string the checks in `execute`
+/// read. A constrained model sends the structured JSON (`{"path":"/x"}` /
+/// `{"unpin":true}`); a human or legacy/flat caller sends the string directly,
+/// and malformed JSON falls back to the raw string.
+fn pin_args_to_flat(args: &str) -> String {
+    PIN_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
+}
 
 pub struct PinWorkspaceHandler;
 
@@ -35,6 +83,12 @@ impl ActionHandler for PinWorkspaceHandler {
     fn description(&self) -> &str {
         "Pin a workspace directory for context detection"
     }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(PIN_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Personal
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
     }
@@ -44,7 +98,11 @@ impl ActionHandler for PinWorkspaceHandler {
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        let args = args.trim();
+        // A constrained model sends `{"path":..}` / `{"unpin":true}`; flatten
+        // it (and a plain-string caller passes through) to the form the checks
+        // below read.
+        let flat = pin_args_to_flat(args);
+        let args = flat.trim();
 
         // Show current pin status
         if args.is_empty() {
@@ -104,5 +162,40 @@ impl ActionHandler for PinWorkspaceHandler {
         }
 
         items
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drift guard: the grammar's flat renderings are exactly the strings
+    /// `execute`'s checks read — `clear` verbatim for the unpin branch, the
+    /// bare path for the pin branch, empty for the status query.
+    #[test]
+    fn pin_args_flatten_from_structured_json() {
+        assert_eq!(pin_args_to_flat(r#"{"unpin":true}"#), "clear");
+        assert_eq!(pin_args_to_flat(r#"{"unpin":false}"#), "");
+        assert_eq!(
+            pin_args_to_flat(r#"{"path":"/home/user/projects/lychi"}"#),
+            "/home/user/projects/lychi"
+        );
+        // Nothing set → empty → the status branch.
+        assert_eq!(pin_args_to_flat("{}"), "");
+        // A plain-string caller (human, legacy) passes straight through.
+        assert_eq!(pin_args_to_flat("clear"), "clear");
+        assert_eq!(pin_args_to_flat("/tmp"), "/tmp");
+        // Malformed JSON → raw fallback.
+        assert_eq!(pin_args_to_flat("{not json"), "{not json");
+    }
+
+    #[test]
+    fn pin_grammar_is_free_form() {
+        assert!(PIN_GRAMMAR.is_free_form());
+        let schema = PIN_GRAMMAR.handler_schema();
+        assert_eq!(schema["properties"]["unpin"]["type"], "boolean");
+        assert_eq!(schema["properties"]["path"]["type"], "string");
+        // Nothing is required — a bare call is the status query.
+        assert_eq!(schema["required"], serde_json::json!([]));
     }
 }

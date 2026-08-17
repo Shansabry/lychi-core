@@ -9,6 +9,7 @@ use std::process::Command;
 use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
@@ -377,39 +378,40 @@ pub fn invalidate_project_cache() {
     }
 }
 
-/// The JSON Schema for `project`'s args: a required `name` — the project to
-/// fuzzy-match and open. Emitted as the tool's `input_schema`.
-fn project_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "name": { "type": "string",
-                      "description": "The project's folder name (e.g. \"lychi\"), fuzzy-matched against projects discovered under the user's configured project directories. The best match opens in the code editor." }
-        },
-        "required": ["name"],
-        "additionalProperties": false
-    })
-}
+/// `project`'s argument surface: a single free-form action whose flat form IS
+/// the project name. The JSON Schema and the structured→flat adapter both
+/// derive from this.
+const PROJECT_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Open a code project in the user's code editor. The name is \
+               fuzzy-matched against project roots (git repos, Cargo/npm/… \
+               projects) discovered under the user's configured project \
+               directories, and the best match opens. Use when the user wants \
+               to start working on a project they name — not for arbitrary \
+               folders (use the file/browse actions for those).",
+        mutates: false,
+        operands: &[Operand {
+            name: "name",
+            desc: "The project's folder name (e.g. \"lychi\"), fuzzy-matched \
+                   against discovered projects — a partial or approximate name \
+                   is fine. The best match opens in the code editor.",
+            required: true,
+            kind: ArgKind::Text,
+            prefix: None,
+        }],
+    }],
+};
 
 /// Normalize the tool's `args` to the flat name string the fuzzy matcher reads.
 /// A constrained model sends the structured JSON (`{"name":"lychi"}`); a human
 /// or legacy/flat caller sends the name directly and passes through unchanged.
+/// Malformed JSON falls back to the raw string; the fuzzy matcher rejects it
+/// with the usual "No project matching" error.
 fn project_args_to_flat(args: &str) -> String {
-    let t = args.trim();
-    if !t.starts_with('{') {
-        return t.to_string();
-    }
-    match serde_json::from_str::<serde_json::Value>(t) {
-        Ok(v) => v
-            .get("name")
-            .and_then(|a| a.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string(),
-        // Not the JSON we expected — fall back to the raw string; the fuzzy
-        // matcher will reject it with the usual "No project matching" error.
-        Err(_) => t.to_string(),
-    }
+    PROJECT_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
 }
 
 #[async_trait]
@@ -430,8 +432,11 @@ impl ActionHandler for ProjectOpen {
     fn usage(&self) -> &str {
         "the project name (e.g. 'lychi'). Opens it in the code editor"
     }
-    fn input_schema(&self) -> Option<serde_json::Value> {
-        Some(project_input_schema())
+    fn grammar(&self) -> Option<Grammar> {
+        Some(PROJECT_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Files
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::Files
@@ -524,5 +529,12 @@ mod tests {
         assert_eq!(project_args_to_flat(""), "");
         // Malformed JSON falls back to the raw string.
         assert_eq!(project_args_to_flat("{not json"), "{not json");
+    }
+
+    #[test]
+    fn project_schema_requires_the_name() {
+        let schema = PROJECT_GRAMMAR.handler_schema();
+        assert_eq!(schema["required"], serde_json::json!(["name"]));
+        assert_eq!(schema["properties"]["name"]["type"], "string");
     }
 }

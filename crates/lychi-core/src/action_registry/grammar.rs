@@ -107,9 +107,9 @@ impl Grammar {
                     let joined = match v {
                         Some(Value::Array(items)) => items
                             .iter()
-                            .filter_map(|i| match i {
-                                Value::String(s) => Some(s.clone()),
-                                other => Some(other.to_string()),
+                            .map(|i| match i {
+                                Value::String(s) => s.clone(),
+                                other => other.to_string(),
                             })
                             .collect::<Vec<_>>()
                             .join(" "),

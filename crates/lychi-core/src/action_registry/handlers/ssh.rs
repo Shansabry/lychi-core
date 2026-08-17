@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher};
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, Output, OutputType,
     Row, Section,
@@ -503,6 +504,47 @@ fn is_valid_host_alias(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@'))
 }
 
+/// `ssh`'s argument surface: a single free-form action whose flat form IS the
+/// host (or empty, to list hosts). Host aliases are USER data (their
+/// ~/.ssh/config, /etc/hosts, known_hosts), so the grammar deliberately does
+/// not enumerate them — the operand desc points the model at the empty-args
+/// listing instead. `mutates` is true because the connect form spawns an
+/// interactive terminal session — a side-effectful, non-idempotent action the
+/// coordinator must not hedge into several parallel variants (three terminals
+/// for one intent). The empty-args host LISTING is read-only, but it shares
+/// the single free-form verb, so the flag honestly reports the worst case.
+const SSH_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Connect to an SSH host in a new terminal window, or list the \
+               user's known hosts. With a host, launches `ssh <host>` in the \
+               configured terminal emulator — an interactive session the user \
+               takes over. With no host, returns the merged host list (from \
+               ~/.ssh/config, /etc/hosts, and known_hosts) as rows.",
+        mutates: true,
+        operands: &[Operand {
+            name: "host",
+            desc: "The host to connect to: an alias from ~/.ssh/config, a known \
+                   host name, or a raw user@host. Host aliases are the user's own \
+                   data — omit this to LIST them (returned as rows) rather than \
+                   guessing a name.",
+            required: false,
+            kind: ArgKind::Text,
+            prefix: None,
+        }],
+    }],
+};
+
+/// Normalize the tool's `args` to the flat host string `execute` reads. A
+/// constrained model sends the structured JSON (`{"host":"web-prod"}` or `{}`
+/// to list); a human or legacy/flat caller sends the host directly and passes
+/// through unchanged. Malformed JSON falls back to the raw string.
+fn ssh_args_to_flat(args: &str) -> String {
+    SSH_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
+}
+
 pub struct SshHandler;
 
 impl Default for SshHandler {
@@ -535,9 +577,18 @@ impl ActionHandler for SshHandler {
     fn category(&self) -> CommandCategory {
         CommandCategory::Developer
     }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(SSH_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Dev
+    }
 
     async fn execute(&self, ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        let query = args.trim();
+        // A constrained model sends `{"host":..}` (or `{}` to list); flatten it
+        // (a plain-string caller passes through) to the bare host query.
+        let flat = ssh_args_to_flat(args);
+        let query = flat.trim();
 
         if query.is_empty() {
             let hosts = load_ssh_hosts();
@@ -902,6 +953,36 @@ Host web-prod web-staging web-dev
             );
             assert_eq!(h.user.as_deref(), Some("deploy"), "user for {alias}");
             assert_eq!(h.port, Some(2222), "port for {alias}");
+        }
+    }
+
+    #[test]
+    fn ssh_args_flatten_from_structured_json() {
+        // A constrained model sends the typed object; it flattens to the bare
+        // host string the alias matcher reads. `execute` is not run here — it
+        // would open a real terminal — but the flat form below is exactly the
+        // `query` string it parses, so the rendering IS the parser's input.
+        assert_eq!(ssh_args_to_flat(r#"{"host":"web-prod"}"#), "web-prod");
+        assert_eq!(
+            ssh_args_to_flat(r#"{"host":"deploy@web1.example.com"}"#),
+            "deploy@web1.example.com"
+        );
+        // No host → empty query, which `execute` treats as "list hosts".
+        assert_eq!(ssh_args_to_flat("{}"), "");
+        assert_eq!(ssh_args_to_flat(r#"{"host":""}"#), "");
+        // A plain-string caller (human, legacy) passes straight through.
+        assert_eq!(ssh_args_to_flat("web-prod"), "web-prod");
+        // Malformed JSON falls back to the raw string.
+        assert_eq!(ssh_args_to_flat("{not json"), "{not json");
+    }
+
+    /// Drift guard: the flat rendering of a structured call is a host string
+    /// the alias vocabulary accepts — the same validation row actions apply.
+    #[test]
+    fn structured_call_renders_a_valid_host_alias() {
+        for host in ["web-prod", "deploy@web1.example.com", "db_2"] {
+            let flat = ssh_args_to_flat(&format!(r#"{{"host":"{host}"}}"#));
+            assert!(is_valid_host_alias(&flat), "must accept: {flat}");
         }
     }
 

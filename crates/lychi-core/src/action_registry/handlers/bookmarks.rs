@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext,
 };
@@ -185,6 +186,43 @@ fn get_bookmarks() -> Vec<Bookmark> {
     bookmarks
 }
 
+/// `bm`'s argument surface: a single free-form action whose flat form IS the
+/// title query (or a URL taken from a completion row). The JSON Schema and the
+/// structured→flat adapter both derive from this.
+const BM_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Open one of the user's browser bookmarks (Chrome, Chromium, Brave, \
+               Edge) by title. The launcher resolves the best case-insensitive \
+               title match and opens its URL in the browser. Read-only: bookmark \
+               files are only read, never modified.",
+        mutates: false,
+        operands: &[Operand {
+            // Named `bookmark`, not `query`, so the Web group schema does not
+            // merge this field with the web/yt search `query` — a bookmark
+            // title is a different thing from a search phrase.
+            name: "bookmark",
+            desc: "The bookmark to open: its title or a distinctive fragment of it \
+                   (matched case-insensitively), or a full http(s):// URL taken \
+                   from a completion row. Bookmark titles are the user's own data \
+                   — discover them via completions rather than inventing names.",
+            required: true,
+            kind: ArgKind::Text,
+            prefix: None,
+        }],
+    }],
+};
+
+/// Normalize the tool's `args` to the flat query string `execute` reads. A
+/// constrained model sends the structured JSON (`{"bookmark":"rust book"}`); a
+/// human or legacy/flat caller sends the title/URL directly and passes through
+/// unchanged. Malformed JSON falls back to the raw string.
+fn bm_args_to_flat(args: &str) -> String {
+    BM_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
+}
+
 pub struct BookmarkHandler;
 
 impl Default for BookmarkHandler {
@@ -227,9 +265,18 @@ impl ActionHandler for BookmarkHandler {
     fn category(&self) -> CommandCategory {
         CommandCategory::Web
     }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(BM_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Web
+    }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        let trimmed = args.trim();
+        // A constrained model sends `{"bookmark":..}`; flatten it (a
+        // plain-string caller passes through) to the bare title/URL query.
+        let flat = bm_args_to_flat(args);
+        let trimmed = flat.trim();
         if trimmed.is_empty() {
             return Ok(ActionResult::err("Usage: bm <query>".to_string()));
         }
@@ -371,5 +418,40 @@ mod tests {
     fn test_detect_chromium_paths_runs() {
         // Should not panic, may return empty on systems without Chrome
         let _paths = detect_chromium_paths();
+    }
+
+    #[test]
+    fn bm_args_flatten_from_structured_json() {
+        // A constrained model sends the typed object; it flattens to the bare
+        // title (or URL) query `execute` reads.
+        assert_eq!(bm_args_to_flat(r#"{"bookmark":"rust book"}"#), "rust book");
+        // A URL from a completion row survives — `execute` opens it directly.
+        assert_eq!(
+            bm_args_to_flat(r#"{"bookmark":"https://doc.rust-lang.org/book/"}"#),
+            "https://doc.rust-lang.org/book/"
+        );
+        // A plain-string caller (human, legacy) passes straight through.
+        assert_eq!(bm_args_to_flat("rust book"), "rust book");
+        // Malformed JSON falls back to the raw string.
+        assert_eq!(bm_args_to_flat("{not json"), "{not json");
+    }
+
+    /// Drift guard: the grammar's flat rendering must be accepted by the
+    /// parser — a structured URL call navigates directly, independent of what
+    /// bookmark files exist on the machine running the tests.
+    #[tokio::test]
+    async fn structured_url_call_navigates_like_the_flat_form() {
+        use crate::action_registry::Output;
+        let r = BookmarkHandler::new()
+            .execute(
+                &ExecContext::default(),
+                r#"{"bookmark":"https://example.com/x"}"#,
+            )
+            .await
+            .unwrap();
+        match r.output {
+            Output::Navigate { url, .. } => assert_eq!(url, "https://example.com/x"),
+            other => panic!("expected navigate, got {other:?}"),
+        }
     }
 }

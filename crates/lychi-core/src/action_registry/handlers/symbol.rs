@@ -3,6 +3,7 @@ use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use std::sync::Mutex;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::handlers::clipboard::write_to_clipboard;
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
@@ -1273,6 +1274,30 @@ const SYMBOLS: &[SymbolEntry] = &[
     },
 ];
 
+/// `sym`'s argument surface: a single free-form action whose flat form IS the
+/// search query. The JSON Schema derives from this; the drift test pins its
+/// rendering to the name/keyword lookup `execute` performs over [`SYMBOLS`].
+const SYM_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Search typographic and technical symbols — arrows, math operators, \
+               currency signs, Greek letters, keyboard glyphs, punctuation — by name \
+               or keyword, and copy the best match to the clipboard. Fully local, \
+               instant, read-only.",
+        mutates: false,
+        operands: &[Operand {
+            name: "query",
+            desc: "The symbol to find, by name or keyword: \"arrow\", \"infinity\", \
+                   \"degree\", \"lambda\", \"check\", \"em dash\". The first substring \
+                   match on name or keywords is copied. A literal symbol character is \
+                   copied as-is.",
+            required: true,
+            kind: ArgKind::Text,
+            prefix: None,
+        }],
+    }],
+};
+
 pub struct SymbolHandler;
 
 impl Default for SymbolHandler {
@@ -1308,6 +1333,12 @@ impl ActionHandler for SymbolHandler {
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
+    }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(SYM_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Utils
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
@@ -1434,5 +1465,22 @@ mod tests {
         let results = handler.completions("infinity").await;
         assert!(!results.is_empty());
         assert!(results[0].label.contains('∞'));
+    }
+
+    #[test]
+    fn sym_args_flatten_from_structured_json() {
+        // The grammar's flat rendering must be exactly what `execute`'s
+        // name/keyword lookup accepts.
+        let flat = SYM_GRAMMAR.flatten_json(r#"{"query":"arrow"}"#).unwrap();
+        assert_eq!(flat, "arrow");
+        let lower = flat.to_lowercase();
+        assert!(
+            SYMBOLS
+                .iter()
+                .any(|s| s.name.contains(&lower) || s.keywords.contains(&lower)),
+            "lookup should find a match for {flat:?}"
+        );
+        // Flat/legacy callers pass through untouched (caller keeps raw).
+        assert_eq!(SYM_GRAMMAR.flatten_json("arrow"), None);
     }
 }

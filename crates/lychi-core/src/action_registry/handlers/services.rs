@@ -26,6 +26,7 @@ use std::process::Command;
 
 use async_trait::async_trait;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, BadgeTone, CommandCategory, CompletionItem, ExecContext, Output,
     OutputType, RiskAssessment, RiskLevel, Row, Section,
@@ -54,66 +55,112 @@ pub const MUTATING_VERBS: &[&str] = crate::rules::verbs::MUTATING_SERVICE_VERBS;
 /// Read-only verbs that never need confirmation.
 const READONLY_VERBS: &[&str] = crate::rules::verbs::READONLY_SERVICE_VERBS;
 
-/// Every verb the dispatch match accepts — the mutating set plus the read-only
-/// set — as the machine-readable enum fed to the tool schema so a constrained
-/// model (cloud `enum` / local grammar) can only emit one `execute`/`parse`
-/// handle. Sourced from the same two central lists the parser and risk gate use,
-/// so the enum can't drift from dispatch.
-fn service_action_verbs() -> Vec<&'static str> {
-    MUTATING_VERBS
-        .iter()
-        .chain(READONLY_VERBS.iter())
-        .copied()
-        .collect()
-}
+/// The unit operand every verb shares.
+const UNIT_OPERAND: Operand = Operand {
+    name: "unit",
+    desc: "The systemd unit/service name (e.g. \"nginx\", \"docker\"). A bare \
+           name gets \".service\" appended; other unit suffixes (.socket, \
+           .timer, …) are kept as given. User units are resolved first, then \
+           system units.",
+    required: true,
+    kind: ArgKind::Text,
+    prefix: None,
+};
 
-/// The JSON Schema for `service`'s args: a required free `name` operand plus an
-/// optional `action` verb (constrained to [`service_action_verbs`]). `action` is
-/// optional because a bare `<name>` defaults to a status check. Emitted as the
-/// tool's `input_schema` so the model is constrained to a real verb.
-fn service_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "name": { "type": "string",
-                      "description": "The systemd unit/service name (e.g. \"nginx\", \"docker\")." },
-            "action": { "type": "string", "enum": service_action_verbs(),
-                        "description": "What to do with the service. Omit to check its status." }
+/// `service`'s grammar: one verb per systemctl verb the dispatch accepts,
+/// rendered in the verb-first flat form (`restart nginx`) `parse` reads. The
+/// verb set and each verb's `mutates` flag are pinned to the central
+/// classifier ([`crate::rules::verbs`]) by
+/// `grammar_verbs_match_the_central_classifier` — a verb cannot be added,
+/// dropped, or re-classified here without that drift test failing.
+const SERVICE_GRAMMAR: Grammar = Grammar {
+    verbs: &[
+        Verb {
+            name: "status",
+            desc: "Check a service: active state, enabled-at-boot state, and \
+                   scope (user/system). Read-only — the go-to verb for \"is X \
+                   running?\".",
+            mutates: false,
+            operands: &[UNIT_OPERAND],
         },
-        "required": ["name"],
-        "additionalProperties": false
-    })
-}
+        Verb {
+            name: "show",
+            desc: "Same read-only status check as `status` (accepted alias).",
+            mutates: false,
+            operands: &[UNIT_OPERAND],
+        },
+        Verb {
+            name: "is-active",
+            desc: "Read-only status check (systemctl is-active spelling; same \
+                   output as `status`).",
+            mutates: false,
+            operands: &[UNIT_OPERAND],
+        },
+        Verb {
+            name: "is-enabled",
+            desc: "Read-only status check (systemctl is-enabled spelling; same \
+                   output as `status`).",
+            mutates: false,
+            operands: &[UNIT_OPERAND],
+        },
+        Verb {
+            name: "start",
+            desc: "Start a stopped service. System units escalate via a polkit \
+                   prompt; the user confirms first.",
+            mutates: true,
+            operands: &[UNIT_OPERAND],
+        },
+        Verb {
+            name: "stop",
+            desc: "Stop a running service. The user confirms first.",
+            mutates: true,
+            operands: &[UNIT_OPERAND],
+        },
+        Verb {
+            name: "restart",
+            desc: "Restart a service (stop + start). The user confirms first.",
+            mutates: true,
+            operands: &[UNIT_OPERAND],
+        },
+        Verb {
+            name: "reload",
+            desc: "Reload a service's configuration without a full restart. The \
+                   user confirms first.",
+            mutates: true,
+            operands: &[UNIT_OPERAND],
+        },
+        Verb {
+            name: "enable",
+            desc: "Enable a service to start at boot. The user confirms first.",
+            mutates: true,
+            operands: &[UNIT_OPERAND],
+        },
+        Verb {
+            name: "disable",
+            desc: "Disable a service from starting at boot. The user confirms \
+                   first.",
+            mutates: true,
+            operands: &[UNIT_OPERAND],
+        },
+        Verb {
+            name: "kill",
+            desc: "Send the kill signal to a unit's processes (systemctl kill) \
+                   — harsher than stop. The user confirms first.",
+            mutates: true,
+            operands: &[UNIT_OPERAND],
+        },
+    ],
+};
 
-/// Normalize the tool's `args` to the flat `"<name> [<verb>]"` string the parser
-/// already understands. A constrained model sends the structured JSON
-/// (`{"name":"nginx","action":"restart"}`); a human or legacy/flat caller sends
-/// the string directly. The name comes FIRST — matching `parse`'s canonical
-/// `<name> <verb>` form. A bare name (no `action`) flattens to just the name,
-/// which `parse` reads as a status check. Keeps `execute`/`assess_risk` on `&str`.
+/// Normalize the tool's `args` to the flat `"<verb> <unit>"` string `parse`
+/// already understands (it accepts verb-first as well as name-first), via the
+/// ONE structured→flat decider ([`Grammar::flatten_json`]). A human or
+/// legacy/flat caller passes through unchanged. `assess_risk` MUST keep calling
+/// this first, so the risk gate sees the same flat form execution sees.
 fn service_args_to_flat(args: &str) -> String {
-    let t = args.trim();
-    if !t.starts_with('{') {
-        return t.to_string();
-    }
-    match serde_json::from_str::<serde_json::Value>(t) {
-        Ok(v) => {
-            let name = v.get("name").and_then(|a| a.as_str()).unwrap_or("").trim();
-            let action = v
-                .get("action")
-                .and_then(|a| a.as_str())
-                .unwrap_or("")
-                .trim();
-            if action.is_empty() {
-                name.to_string()
-            } else {
-                format!("{name} {action}")
-            }
-        }
-        // Not the JSON we expected — fall back to the raw string; `parse` will
-        // reject it with the usual usage message.
-        Err(_) => t.to_string(),
-    }
+    SERVICE_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
 }
 
 fn have(tool: &str) -> bool {
@@ -385,8 +432,11 @@ impl ActionHandler for ServicesHandler {
     fn usage(&self) -> &str {
         "'<name>' or '<name> status' to check it; '<name> start|stop|restart|reload|enable|disable' to control it"
     }
-    fn input_schema(&self) -> Option<serde_json::Value> {
-        Some(service_input_schema())
+    fn grammar(&self) -> Option<Grammar> {
+        Some(SERVICE_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::System
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::System
@@ -400,9 +450,11 @@ impl ActionHandler for ServicesHandler {
         // Read-only verbs (status/list) auto-execute; mutating verbs
         // (start/stop/restart/…) need confirmation. This decision lives here,
         // where the handler already knows its verbs — not in the Rules Engine.
-        // A constrained model sends `{"name":..,"action":..}`; flatten it (a
+        // A structured caller sends `{"action":..,"unit":..}`; flatten it (a
         // plain-string caller passes through) so the gate sees the same verb
-        // execute will dispatch on.
+        // execute will dispatch on. Security invariant: this adapter runs
+        // BEFORE the verb check, so risk assessment sees the same flat form
+        // execution sees.
         let flat = service_args_to_flat(args);
         if is_mutating(&flat) {
             RiskAssessment::confirm(format!("Run 'systemctl {}'?", flat.trim()))
@@ -447,8 +499,8 @@ impl ActionHandler for ServicesHandler {
             ));
         }
 
-        // A constrained model sends `{"name":..,"action":..}`; flatten it (and a
-        // plain-string caller passes through) to the `<name> [verb]` form `parse`
+        // A structured caller sends `{"action":..,"unit":..}`; flatten it (and a
+        // plain-string caller passes through) to the `<verb> <unit>` form `parse`
         // reads.
         let flat = service_args_to_flat(args);
         let trimmed = flat.trim();
@@ -516,6 +568,23 @@ impl ActionHandler for ServicesListHandler {
 
     fn description(&self) -> &str {
         "List running systemd services"
+    }
+    fn grammar(&self) -> Option<Grammar> {
+        // A single free-form action with no operands: `execute` ignores args,
+        // so any structured call flattens to the empty string it expects.
+        const G: Grammar = Grammar {
+            verbs: &[Verb {
+                name: "",
+                desc: "List every running systemd service, with per-row \
+                       restart/stop/status actions. Read-only.",
+                mutates: false,
+                operands: &[],
+            }],
+        };
+        Some(G)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::System
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::System
@@ -644,39 +713,84 @@ mod tests {
 
     #[test]
     fn service_args_flatten_from_structured_json() {
-        // A constrained model sends the typed object; it flattens to the
-        // name-first string `parse` reads.
+        // A structured caller sends the typed object; it flattens to the
+        // verb-first string `parse` reads.
         assert_eq!(
-            service_args_to_flat(r#"{"name":"nginx","action":"restart"}"#),
-            "nginx restart"
+            service_args_to_flat(r#"{"action":"restart","unit":"nginx"}"#),
+            "restart nginx"
         );
-        // Bare name (no action) → just the name, which parse reads as status.
-        assert_eq!(service_args_to_flat(r#"{"name":"docker"}"#), "docker");
-        // Empty action is treated as no action.
         assert_eq!(
-            service_args_to_flat(r#"{"name":"sshd","action":""}"#),
-            "sshd"
+            service_args_to_flat(r#"{"action":"status","unit":"docker"}"#),
+            "status docker"
         );
-        // A plain-string caller (human, legacy) passes straight through.
+        // Missing unit → bare verb (execute answers with its usage error;
+        // group dispatch rejects it earlier via the required-operand check).
+        assert_eq!(service_args_to_flat(r#"{"action":"stop"}"#), "stop");
+        // A plain-string caller (human, legacy) passes straight through, in
+        // both orders parse accepts.
         assert_eq!(service_args_to_flat("nginx restart"), "nginx restart");
         assert_eq!(service_args_to_flat("docker"), "docker");
+        // Malformed JSON falls back to the raw string.
+        assert_eq!(service_args_to_flat("{not json"), "{not json");
+    }
+
+    /// The grammar's verb set and per-verb mutates flags are pinned to the
+    /// central classifier — the drift guard for declaring the verbs statically
+    /// while `crate::rules::verbs` stays the audit surface.
+    #[test]
+    fn grammar_verbs_match_the_central_classifier() {
+        use std::collections::HashSet;
+        let names: HashSet<&str> = SERVICE_GRAMMAR.verbs.iter().map(|v| v.name).collect();
+        let expected: HashSet<&str> = MUTATING_VERBS
+            .iter()
+            .chain(READONLY_VERBS.iter())
+            .copied()
+            .collect();
+        assert_eq!(names, expected, "grammar verbs != central verb lists");
+        for v in SERVICE_GRAMMAR.verbs {
+            assert_eq!(
+                v.mutates,
+                crate::rules::verbs::is_mutating_service_verb(v.name),
+                "mutates flag for {} disagrees with the classifier",
+                v.name
+            );
+        }
+    }
+
+    /// Per-verb drift test: every grammar verb's flat rendering must be parsed
+    /// back to (that unit, that verb) — the verb-first form is load-bearing.
+    #[test]
+    fn service_grammar_flat_renderings_are_accepted_by_the_parser() {
+        for v in SERVICE_GRAMMAR.verbs {
+            let flat =
+                service_args_to_flat(&format!(r#"{{"action":"{}","unit":"nginx"}}"#, v.name));
+            let (unit, verb) = parse(&flat).unwrap_or_else(|| panic!("{flat:?} did not parse"));
+            assert_eq!(unit, "nginx.service", "unit lost in {flat:?}");
+            assert_eq!(verb, v.name, "verb lost in {flat:?}");
+            // And the risk gate agrees with the declared mutates flag.
+            assert_eq!(is_mutating(&flat), v.mutates, "{flat:?}");
+        }
     }
 
     #[test]
-    fn service_schema_enum_matches_the_real_verbs() {
-        // The schema's action enum must be exactly the mutating + read-only verb
-        // sets, so the model is constrained to verbs `parse`/`execute` handle.
-        let verbs = service_action_verbs();
-        let schema = service_input_schema();
-        let en = schema["properties"]["action"]["enum"].as_array().unwrap();
-        assert_eq!(en.len(), verbs.len());
-        for v in &verbs {
-            assert!(en.iter().any(|e| e == v), "enum missing {v}");
-        }
-        // The two source lists together are what the parser treats as verbs.
-        for v in MUTATING_VERBS.iter().chain(READONLY_VERBS.iter()) {
-            assert!(verbs.contains(v), "verb list missing {v}");
-        }
+    fn assess_risk_sees_through_structured_json() {
+        // The structured path must reach the SAME risk verdict as the flat
+        // path — a JSON-wrapped restart that skipped confirmation would be a
+        // hole.
+        let h = ServicesHandler::new();
+        assert_eq!(
+            h.assess_risk(
+                r#"{"action":"restart","unit":"nginx"}"#,
+                &Default::default()
+            )
+            .level,
+            RiskLevel::Medium
+        );
+        assert_eq!(
+            h.assess_risk(r#"{"action":"status","unit":"nginx"}"#, &Default::default())
+                .level,
+            RiskLevel::Low
+        );
     }
 
     #[test]

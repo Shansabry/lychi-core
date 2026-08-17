@@ -5,6 +5,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use serde::Serialize;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
@@ -331,61 +332,133 @@ const TIMER_SUBCOMMANDS: &[(&str, &str)] = &[
     ("clear", "Remove all timers"),
 ];
 
-/// The base timer VERBS the agent chooses between — the machine-readable enum
-/// fed to the tool schema so a constrained model (cloud `enum` / local grammar)
-/// can only emit one the `execute_verb` match handles. Derived from the verb
-/// column of [`TIMER_SUBCOMMANDS`] so the schema can't drift from that list.
-fn timer_action_verbs() -> Vec<&'static str> {
-    TIMER_SUBCOMMANDS.iter().map(|(verb, _)| *verb).collect()
-}
+/// The optional target-name operand `stop`/`pause`/`resume` share.
+const TIMER_TARGET: Operand = Operand {
+    name: "name",
+    desc: "The timer's name, as it was started (case-insensitive). Omit to \
+           target the obvious one: the only timer (stop), the first running \
+           one (pause), or the first paused one (resume).",
+    required: false,
+    kind: ArgKind::Text,
+    prefix: None,
+};
 
-/// The JSON Schema for `timer`'s args: a required `action` (constrained to the
-/// [`TIMER_SUBCOMMANDS`] verbs) plus an optional free `value` operand (a name
-/// and/or duration, e.g. "workout 5m", "25m"). Emitted as the tool's
-/// `input_schema` so the model is constrained to a real verb.
-fn timer_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "action": { "type": "string", "enum": timer_action_verbs(),
-                        "description": "The timer action to perform." },
-            "value": { "type": "string",
-                       "description": "Operand when the action needs one: a duration (\"25m\", \"1:30\"), an optional name plus duration (\"workout 5m\"), or a timer name for stop/pause/resume. Omit for status/clear." }
+/// `timer`'s argument surface: one verb per [`TIMER_SUBCOMMANDS`] row — the
+/// enum-matches-verbs test pins the two lists together. The JSON Schema and
+/// the structured→flat adapter both derive from this. The bare-duration
+/// shorthand (`timer 25m`) stays a flat/human form; the model states `start`.
+const TIMER_GRAMMAR: Grammar = Grammar {
+    verbs: &[
+        Verb {
+            name: "start",
+            desc: "Start a countdown timer that fires a desktop notification \
+                   when it completes. At most 10 timers run at once.",
+            mutates: true,
+            operands: &[
+                Operand {
+                    name: "name",
+                    desc: "Optional display name (e.g. \"tea\"). May contain \
+                           spaces; the duration always comes last.",
+                    required: false,
+                    kind: ArgKind::Text,
+                    prefix: None,
+                },
+                Operand {
+                    name: "duration",
+                    desc: "The countdown length as ONE compact token: \
+                           \"25m\", \"90s\", \"1h30m\", \"5m30s\", \"1:30\" \
+                           (M:SS, or H:MM when the first number exceeds 59), \
+                           or a bare number of minutes. Spaced phrases like \
+                           \"5 minutes\" will NOT parse here.",
+                    required: true,
+                    kind: ArgKind::Text,
+                    prefix: None,
+                },
+            ],
         },
-        "required": ["action"],
-        "additionalProperties": false
-    })
-}
+        Verb {
+            name: "stopwatch",
+            desc: "Start a stopwatch — counts up from zero, no deadline, no \
+                   notification. Avoid naming it \"start\", \"stop\", \
+                   \"pause\", or \"resume\" (those first words are \
+                   sub-commands of the flat form).",
+            mutates: true,
+            operands: &[Operand {
+                name: "name",
+                desc: "Optional display name for the stopwatch.",
+                required: false,
+                kind: ArgKind::Text,
+                prefix: None,
+            }],
+        },
+        Verb {
+            name: "stop",
+            desc: "Stop a timer or stopwatch and remove it.",
+            mutates: true,
+            operands: &[TIMER_TARGET],
+        },
+        Verb {
+            name: "pause",
+            desc: "Pause a running timer or stopwatch; elapsed time freezes \
+                   until resumed.",
+            mutates: true,
+            operands: &[TIMER_TARGET],
+        },
+        Verb {
+            name: "resume",
+            desc: "Resume a paused timer or stopwatch.",
+            mutates: true,
+            operands: &[TIMER_TARGET],
+        },
+        Verb {
+            name: "status",
+            desc: "Show all active timers and stopwatches with remaining or \
+                   elapsed time.",
+            mutates: false,
+            operands: &[],
+        },
+        Verb {
+            name: "clear",
+            desc: "Remove ALL timers and stopwatches at once.",
+            mutates: true,
+            operands: &[],
+        },
+    ],
+};
 
-/// Normalize the tool's `args` to the flat `"<action> <value>"` string the
-/// parser already understands. A constrained model sends the structured JSON
-/// (`{"action":"start","value":"25m"}`); a human or legacy/flat caller sends the
-/// string directly — including the bare-duration shorthand ("25m"), which is NOT
-/// JSON and so passes straight through to `execute`'s duration arm. Keeps
+/// Normalize the tool's `args` to the flat `"<verb> …"` string the parser
+/// already understands. A constrained model sends the grammar's structured
+/// JSON (`{"action":"start","name":"tea","duration":"5m"}`); the pre-grammar
+/// schema's `{"action":..,"value":..}` shape is still flattened by its own
+/// branch (its `value` bundles name+duration, which the grammar's named
+/// operands cannot express); and a human or legacy/flat caller sends the
+/// string directly — including the bare-duration shorthand ("25m"), which is
+/// NOT JSON and so passes straight through to `execute`'s duration arm. Keeps
 /// `execute` on `&str`.
 fn timer_args_to_flat(args: &str) -> String {
     let t = args.trim();
     if !t.starts_with('{') {
         return t.to_string();
     }
-    match serde_json::from_str::<serde_json::Value>(t) {
-        Ok(v) => {
-            let action = v
-                .get("action")
-                .and_then(|a| a.as_str())
-                .unwrap_or("")
-                .trim();
-            let value = v.get("value").and_then(|a| a.as_str()).unwrap_or("").trim();
-            if value.is_empty() {
-                action.to_string()
-            } else {
-                format!("{action} {value}")
-            }
-        }
-        // Not the JSON we expected — fall back to the raw string; the parser
-        // will handle it (or reject it) as usual.
-        Err(_) => t.to_string(),
+    // Legacy pre-grammar shape: {"action": .., "value": ..}.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(t)
+        && v.get("value").is_some()
+    {
+        let action = v
+            .get("action")
+            .and_then(|a| a.as_str())
+            .unwrap_or("")
+            .trim();
+        let value = v.get("value").and_then(|a| a.as_str()).unwrap_or("").trim();
+        return if value.is_empty() {
+            action.to_string()
+        } else {
+            format!("{action} {value}")
+        };
     }
+    TIMER_GRAMMAR
+        .flatten_json(t)
+        .unwrap_or_else(|| t.to_string())
 }
 
 #[async_trait]
@@ -409,8 +482,11 @@ impl ActionHandler for TimerHandler {
     fn usage(&self) -> &str {
         "'start [name] <duration>' (e.g. 'start 25m', 'start workout 5m'), 'stopwatch [name]' to start a count-up stopwatch, 'stop [name]', 'pause [name]', 'resume [name]', 'status', 'clear'. Shorthand: a bare duration like '25m' starts a timer"
     }
-    fn input_schema(&self) -> Option<serde_json::Value> {
-        Some(timer_input_schema())
+    fn grammar(&self) -> Option<Grammar> {
+        Some(TIMER_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Personal
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
@@ -984,8 +1060,30 @@ mod tests {
 
     #[test]
     fn timer_args_flatten_from_structured_json() {
-        // A constrained model sends the typed object; it flattens to the string
-        // the parser splits on.
+        // A constrained model sends the grammar's typed object; it flattens to
+        // the string the parser splits on — the duration last, so the parser's
+        // last-token-is-duration rule reads it back.
+        assert_eq!(
+            timer_args_to_flat(r#"{"action":"start","duration":"25m"}"#),
+            "start 25m"
+        );
+        assert_eq!(
+            timer_args_to_flat(r#"{"action":"start","name":"workout","duration":"5m"}"#),
+            "start workout 5m"
+        );
+        assert_eq!(
+            timer_args_to_flat(r#"{"action":"stopwatch","name":"run"}"#),
+            "stopwatch run"
+        );
+        assert_eq!(
+            timer_args_to_flat(r#"{"action":"stop","name":"tea"}"#),
+            "stop tea"
+        );
+        assert_eq!(timer_args_to_flat(r#"{"action":"pause"}"#), "pause");
+        assert_eq!(timer_args_to_flat(r#"{"action":"resume"}"#), "resume");
+        // No operand → just the verb.
+        assert_eq!(timer_args_to_flat(r#"{"action":"status"}"#), "status");
+        // The pre-grammar {"action","value"} shape still flattens the same way.
         assert_eq!(
             timer_args_to_flat(r#"{"action":"start","value":"25m"}"#),
             "start 25m"
@@ -994,8 +1092,6 @@ mod tests {
             timer_args_to_flat(r#"{"action":"start","value":"workout 5m"}"#),
             "start workout 5m"
         );
-        // No operand → just the verb.
-        assert_eq!(timer_args_to_flat(r#"{"action":"status"}"#), "status");
         assert_eq!(
             timer_args_to_flat(r#"{"action":"clear","value":""}"#),
             "clear"
@@ -1005,17 +1101,22 @@ mod tests {
         assert_eq!(timer_args_to_flat("start 25m"), "start 25m");
         assert_eq!(timer_args_to_flat("25m"), "25m");
         assert_eq!(timer_args_to_flat("status"), "status");
+        // Malformed JSON → raw fallback.
+        assert_eq!(timer_args_to_flat("{not json"), "{not json");
     }
 
     #[test]
-    fn timer_schema_enum_matches_the_real_verbs() {
-        // The schema's action enum must be exactly the TIMER_SUBCOMMANDS verbs,
-        // so the model is constrained to verbs execute_verb actually handles.
-        let verbs = timer_action_verbs();
-        let schema = timer_input_schema();
+    fn timer_schema_enum_matches_the_grammar_verbs() {
+        // Grammar verbs must be exactly the TIMER_SUBCOMMANDS verb column (the
+        // completions list), and the derived schema's action enum must follow —
+        // all three pinned to what execute_verb actually handles.
+        let names: Vec<&str> = TIMER_GRAMMAR.verbs.iter().map(|v| v.name).collect();
+        let subcommands: Vec<&str> = TIMER_SUBCOMMANDS.iter().map(|(verb, _)| *verb).collect();
+        assert_eq!(names, subcommands);
+        let schema = TIMER_GRAMMAR.handler_schema();
         let en = schema["properties"]["action"]["enum"].as_array().unwrap();
-        assert_eq!(en.len(), verbs.len());
-        for v in &verbs {
+        assert_eq!(en.len(), names.len());
+        for v in &names {
             assert!(en.iter().any(|e| e == v), "enum missing {v}");
         }
     }
@@ -1334,6 +1435,74 @@ mod tests {
 
         let timers = get_all_timers(&state);
         assert!(timers.is_empty());
+    }
+
+    /// Drift guard: every verb's flat rendering (via the grammar) must be
+    /// accepted by the hand-written parser — end to end through `execute`.
+    #[tokio::test]
+    async fn grammar_flat_rendering_is_accepted_by_the_parser() {
+        let state = new_timer_state();
+        let handler = test_handler(state.clone());
+        let ctx = crate::action_registry::ExecContext::default();
+
+        let r = handler
+            .execute(
+                &ctx,
+                r#"{"action":"start","name":"focus","duration":"10m"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(r.success);
+        let timers = get_all_timers(&state);
+        assert_eq!(timers.len(), 1);
+        assert_eq!(timers[0].name, "focus");
+        assert_eq!(timers[0].duration_secs, 600);
+
+        let r = handler
+            .execute(&ctx, r#"{"action":"pause","name":"focus"}"#)
+            .await
+            .unwrap();
+        assert!(r.success);
+        assert!(get_all_timers(&state)[0].paused);
+
+        let r = handler
+            .execute(&ctx, r#"{"action":"resume","name":"focus"}"#)
+            .await
+            .unwrap();
+        assert!(r.success);
+        assert!(!get_all_timers(&state)[0].paused);
+
+        let r = handler
+            .execute(&ctx, r#"{"action":"stopwatch","name":"laps"}"#)
+            .await
+            .unwrap();
+        assert!(r.success);
+        assert!(
+            get_all_timers(&state)
+                .iter()
+                .any(|t| t.name == "laps" && t.stopwatch)
+        );
+
+        let r = handler
+            .execute(&ctx, r#"{"action":"status"}"#)
+            .await
+            .unwrap();
+        assert!(r.success);
+        assert_eq!(body(&r), Some("__timer_panel__"));
+
+        let r = handler
+            .execute(&ctx, r#"{"action":"stop","name":"focus"}"#)
+            .await
+            .unwrap();
+        assert!(r.success);
+        assert_eq!(get_all_timers(&state).len(), 1);
+
+        let r = handler
+            .execute(&ctx, r#"{"action":"clear"}"#)
+            .await
+            .unwrap();
+        assert!(r.success);
+        assert!(get_all_timers(&state).is_empty());
     }
 
     #[tokio::test]

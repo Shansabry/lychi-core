@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, ExecContext, OutputType,
 };
@@ -28,41 +29,41 @@ impl BrowseHandler {
     }
 }
 
-/// The JSON Schema for `browse`'s args: an optional `path` — the directory to
-/// open in the interactive browser panel. `path` is optional because empty args
-/// are a valid request (the home directory). Emitted as the tool's
-/// `input_schema`.
-fn browse_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "path": { "type": "string",
-                      "description": "The directory to browse, absolute or ~-relative (e.g. \"~/Downloads\", \"/etc\"). Must be an existing directory, not a file. Omit for the home directory." }
-        },
-        "additionalProperties": false
-    })
-}
+/// `browse`'s argument surface: a single free-form action whose flat form IS
+/// the path. `path` is optional because empty args are a valid request (the
+/// home directory). The JSON Schema and the structured→flat adapter both
+/// derive from this.
+const BROWSE_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Open a directory in the launcher's interactive file-browser panel, where \
+               the user can navigate, preview, and act on entries. Use ONLY to open a \
+               whole folder without filtering (e.g. the Downloads folder); when the user \
+               names specific files or search terms, list or find them with a shell \
+               command instead. Read-only: nothing on disk changes.",
+        mutates: false,
+        operands: &[Operand {
+            name: "path",
+            desc: "The directory to browse, absolute or ~-relative (e.g. \"~/Downloads\", \
+                   \"/etc\"). Must be an existing directory, not a file. Omit for the \
+                   home directory.",
+            required: false,
+            kind: ArgKind::Text,
+            prefix: None,
+        }],
+    }],
+};
 
 /// Normalize the tool's `args` to the flat path string `execute` reads. A
 /// constrained model sends the structured JSON (`{"path":"~/Downloads"}`); a
 /// human or legacy/flat caller sends the path directly and passes through
-/// unchanged (`""` — the home directory — included).
+/// unchanged (`""` — the home directory — included). Malformed JSON falls back
+/// to the raw string; the existence check rejects it with the usual
+/// "Directory not found" message.
 fn browse_args_to_flat(args: &str) -> String {
-    let t = args.trim();
-    if !t.starts_with('{') {
-        return t.to_string();
-    }
-    match serde_json::from_str::<serde_json::Value>(t) {
-        Ok(v) => v
-            .get("path")
-            .and_then(|a| a.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string(),
-        // Not the JSON we expected — fall back to the raw string; the existence
-        // check will reject it with the usual "Directory not found" message.
-        Err(_) => t.to_string(),
-    }
+    BROWSE_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
 }
 
 #[async_trait]
@@ -83,8 +84,11 @@ impl ActionHandler for BrowseHandler {
     fn usage(&self) -> &str {
         "ONLY use to open/browse a whole folder without filtering (e.g. 'browse downloads'). If the user mentions specific filenames or search terms, use 'run' with ls/find instead"
     }
-    fn input_schema(&self) -> Option<serde_json::Value> {
-        Some(browse_input_schema())
+    fn grammar(&self) -> Option<Grammar> {
+        Some(BROWSE_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Files
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::Files
@@ -137,5 +141,15 @@ mod tests {
         assert_eq!(browse_args_to_flat(""), "");
         // Malformed JSON falls back to the raw string.
         assert_eq!(browse_args_to_flat("{not json"), "{not json");
+    }
+
+    #[test]
+    fn browse_schema_keeps_path_optional() {
+        // The grammar-derived schema must keep `path` optional — empty args
+        // are a valid request (the home directory).
+        let schema = BROWSE_GRAMMAR.handler_schema();
+        assert!(schema["properties"]["path"].is_object());
+        assert_eq!(schema["required"], serde_json::json!([]));
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
     }
 }

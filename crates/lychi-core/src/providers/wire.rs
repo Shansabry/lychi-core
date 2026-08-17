@@ -352,7 +352,33 @@ pub(crate) fn anthropic_messages(messages: &[ChatMessage]) -> Vec<Value> {
             }
         }
     }
+    attach_history_breakpoint(&mut out);
     out
+}
+
+/// PROMPT CACHING, third breakpoint: mark the last content block of the FINAL
+/// message so the next request reuses the whole conversation prefix, not just
+/// tools+system (which carry their own breakpoints). History is append-only
+/// (the session contract), so each step/turn extends the previous request's
+/// prefix and reads it back at ~0.1× — this is what stops a 10-step tool loop
+/// re-billing the transcript at full price every round-trip. Uses 3 of
+/// Anthropic's 4 allowed breakpoints in total.
+fn attach_history_breakpoint(out: &mut [Value]) {
+    let Some(last) = out.last_mut() else { return };
+    // A bare-string content must become a block array to carry cache_control.
+    // An empty string stays as-is — an empty text block is a wire error.
+    if let Some(s) = last["content"].as_str() {
+        if s.is_empty() {
+            return;
+        }
+        last["content"] = json!([{ "type": "text", "text": s }]);
+    }
+    if let Some(block) = last["content"]
+        .as_array_mut()
+        .and_then(|blocks| blocks.last_mut())
+    {
+        block["cache_control"] = json!({ "type": "ephemeral" });
+    }
 }
 
 /// Collect all System messages into one string for Anthropic's top-level
@@ -1286,13 +1312,39 @@ mod tests {
 
     #[test]
     fn text_only_user_still_encodes_as_bare_string() {
-        // No images → the compact string form on BOTH dialects (no needless array).
-        let msg = ChatMessage::user("hello");
+        // No images → the compact string form (no needless array) — except the
+        // FINAL message, whose content becomes a block array to carry the
+        // history cache breakpoint. Prove both: a non-final message stays a
+        // bare string, the final one is tagged.
+        let msgs = vec![ChatMessage::user("hello"), ChatMessage::assistant("hi")];
+        let wire = anthropic_messages(&msgs);
+        assert_eq!(wire[0]["content"], "hello");
         assert_eq!(
-            anthropic_messages(std::slice::from_ref(&msg))[0]["content"],
+            wire[1]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert_eq!(wire[1]["content"][0]["text"], "hi");
+        // OpenAI keeps the compact form everywhere (its caching is automatic).
+        assert_eq!(
+            openai_messages(&[ChatMessage::user("hello")])[0]["content"],
             "hello"
         );
-        assert_eq!(openai_messages(&[msg])[0]["content"], "hello");
+    }
+
+    #[test]
+    fn history_breakpoint_rides_the_last_tool_result() {
+        // The common agent-loop shape: the request ends on tool results. The
+        // breakpoint must land on the LAST result block of that user message.
+        let msgs = vec![
+            ChatMessage::user("do things"),
+            ChatMessage::tool_result("c1", "one".to_string(), false),
+            ChatMessage::tool_result("c2", "two".to_string(), false),
+        ];
+        let wire = anthropic_messages(&msgs);
+        let blocks = wire.last().unwrap()["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0]["cache_control"].is_null());
+        assert_eq!(blocks[1]["cache_control"], json!({ "type": "ephemeral" }));
     }
 
     #[test]

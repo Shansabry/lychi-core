@@ -4,6 +4,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use redb::Database;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
@@ -27,69 +28,78 @@ const REMINDER_SUBCOMMANDS: &[(&str, &str)] = &[
     ("delete", "Delete a reminder by ID"),
 ];
 
-/// The reminder verbs the tool schema constrains the model to — the same set
-/// `execute`'s match dispatches on (canonical spellings only; the parser's
-/// aliases like `ls`/`del`/`rm` stay accepted on the flat path).
-const REMINDER_ACTION_VERBS: &[&str] = &["add", "list", "delete", "clear"];
-
-/// The JSON Schema for `reminder`'s args: a required `action` (constrained to
-/// [`REMINDER_ACTION_VERBS`]) plus the operands `add`/`delete` need. `text` and
-/// `when` are separate properties so the model states the time phrase
-/// deliberately instead of hoping it lands inside free text.
-fn reminder_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "action": { "type": "string", "enum": REMINDER_ACTION_VERBS,
-                        "description": "What to do: \"add\" a timed reminder, \"list\" all reminders, \"delete\" one by id, or \"clear\" all already-fired ones." },
-            "text": { "type": "string",
-                      "description": "What to be reminded of, without the time (e.g. \"buy milk\", \"standup\"). Required for \"add\"; omit otherwise." },
-            "when": { "type": "string",
-                      "description": "When to fire, as a phrase starting with \"in\", \"at\", or \"tomorrow\": e.g. \"in 30m\", \"in 2 hours\", \"at 9am\", \"at 17:30\", \"tomorrow 2pm\". Required for \"add\"; omit otherwise." },
-            "id": { "type": "string",
-                    "description": "The reminder's id, as shown by \"list\". Required for \"delete\"; omit otherwise." }
+/// `reminder`'s argument surface: the verbs `execute`'s match dispatches on
+/// (canonical spellings only; the parser's aliases like `ls`/`del`/`rm` stay
+/// accepted on the flat path). `text` and `when` are separate operands so the
+/// model states the time phrase deliberately instead of hoping it lands inside
+/// free text — `split_text_and_time` re-splits the rejoined rendering, so the
+/// flat form loses nothing. The JSON Schema and the structured→flat adapter
+/// both derive from this.
+const REMINDER_GRAMMAR: Grammar = Grammar {
+    verbs: &[
+        Verb {
+            name: "add",
+            desc: "Set a timed reminder that fires a desktop notification.",
+            mutates: true,
+            operands: &[
+                Operand {
+                    name: "text",
+                    desc: "What to be reminded of, WITHOUT the time (e.g. \
+                           \"buy milk\", \"standup\").",
+                    required: true,
+                    kind: ArgKind::Text,
+                    prefix: None,
+                },
+                Operand {
+                    name: "when",
+                    desc: "When to fire, as a phrase starting with \"in\", \
+                           \"at\", or \"tomorrow\": e.g. \"in 30m\", \"in 2 \
+                           hours\", \"at 9am\", \"at 17:30\", \"tomorrow \
+                           2pm\". Any other phrasing fails to parse.",
+                    required: true,
+                    kind: ArgKind::Text,
+                    prefix: None,
+                },
+            ],
         },
-        "required": ["action"],
-        "additionalProperties": false
-    })
-}
+        Verb {
+            name: "list",
+            desc: "List all reminders with their due times, ids, and \
+                   fired/active state.",
+            mutates: false,
+            operands: &[],
+        },
+        Verb {
+            name: "delete",
+            desc: "Delete one reminder by its id.",
+            mutates: true,
+            operands: &[Operand {
+                name: "id",
+                desc: "The reminder's id, as shown by `list`.",
+                required: true,
+                kind: ArgKind::Text,
+                prefix: None,
+            }],
+        },
+        Verb {
+            name: "clear",
+            desc: "Delete every reminder that has already fired.",
+            mutates: true,
+            operands: &[],
+        },
+    ],
+};
 
 /// Normalize the tool's `args` to the flat string the parser already
 /// understands (`"add <text> <when>"`, `"list"`, `"delete <id>"`, `"clear"`).
 /// A constrained model sends the structured JSON; a human or legacy/flat caller
-/// sends the string directly. Keeps `execute` on `&str`.
+/// sends the string directly, and malformed JSON falls back to the raw string
+/// (a missing `when` gets the parser's own "couldn't parse time" message).
+/// Keeps `execute` on `&str`.
 fn reminder_args_to_flat(args: &str) -> String {
-    let t = args.trim();
-    if !t.starts_with('{') {
-        return t.to_string();
-    }
-    match serde_json::from_str::<serde_json::Value>(t) {
-        Ok(v) => {
-            let field = |k: &str| v.get(k).and_then(|a| a.as_str()).unwrap_or("").trim();
-            let action = field("action");
-            let operand = match action {
-                // `split_text_and_time` re-splits text from the time phrase, so
-                // rejoining them here loses nothing — and a missing `when` gets
-                // the parser's own "couldn't parse time" message.
-                "add" => [field("text"), field("when")]
-                    .iter()
-                    .filter(|s| !s.is_empty())
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                "delete" => field("id").to_string(),
-                _ => String::new(),
-            };
-            if operand.is_empty() {
-                action.to_string()
-            } else {
-                format!("{action} {operand}")
-            }
-        }
-        // Not the JSON we expected — fall back to the raw string; the parser
-        // treats it like typed input.
-        Err(_) => t.to_string(),
-    }
+    REMINDER_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
 }
 
 fn ok_result(start: Instant, output: String) -> ActionResult {
@@ -180,8 +190,11 @@ impl ActionHandler for RemindersHandler {
     fn usage(&self) -> &str {
         "'add <text> in/at <time>' (e.g. 'add buy milk in 30m', 'add standup at 9am', 'add meeting tomorrow 2pm'), 'list', 'delete <id>', 'clear'. Without 'add', infers from natural language"
     }
-    fn input_schema(&self) -> Option<serde_json::Value> {
-        Some(reminder_input_schema())
+    fn grammar(&self) -> Option<Grammar> {
+        Some(REMINDER_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Personal
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
@@ -408,13 +421,15 @@ mod tests {
     }
 
     #[test]
-    fn reminder_schema_enum_matches_the_real_verbs() {
-        // The schema's action enum must be exactly REMINDER_ACTION_VERBS, so
-        // the model is constrained to verbs the parser actually handles.
-        let schema = reminder_input_schema();
+    fn reminder_schema_enum_matches_the_grammar_verbs() {
+        // The derived schema's action enum must be exactly the grammar's verbs
+        // — and those must stay the set `execute`'s match dispatches on.
+        let names: Vec<&str> = REMINDER_GRAMMAR.verbs.iter().map(|v| v.name).collect();
+        assert_eq!(names, vec!["add", "list", "delete", "clear"]);
+        let schema = REMINDER_GRAMMAR.handler_schema();
         let en = schema["properties"]["action"]["enum"].as_array().unwrap();
-        assert_eq!(en.len(), REMINDER_ACTION_VERBS.len());
-        for v in REMINDER_ACTION_VERBS {
+        assert_eq!(en.len(), names.len());
+        for v in &names {
             assert!(en.iter().any(|e| e == v), "enum missing {v}");
         }
     }
@@ -434,6 +449,45 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert!(body(&result).unwrap().contains("Reminder set"));
+    }
+
+    /// Drift guard: every verb's flat rendering (via the grammar) must be
+    /// accepted by the hand-written parser — end to end through `execute`.
+    #[tokio::test]
+    async fn grammar_flat_rendering_is_accepted_by_the_parser() {
+        let db = crate::db::open_test_database();
+        let handler = RemindersHandler::new(db.clone());
+        let ctx = crate::action_registry::ExecContext::default();
+
+        let r = handler
+            .execute(
+                &ctx,
+                r#"{"action":"add","text":"standup","when":"in 2 hours"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(r.success, "{:?}", body(&r));
+
+        let r = handler.execute(&ctx, r#"{"action":"list"}"#).await.unwrap();
+        assert!(r.success);
+        assert!(body(&r).unwrap().contains("standup"));
+
+        let store = RemindersStore::new();
+        let id = store.list_reminders(&db).unwrap()[0].id.clone();
+        let r = handler
+            .execute(&ctx, &format!(r#"{{"action":"delete","id":"{id}"}}"#))
+            .await
+            .unwrap();
+        assert!(r.success);
+        assert!(body(&r).unwrap().contains("Reminder deleted"));
+
+        // Nothing has fired, so clear is a no-op — but the verb must route.
+        let r = handler
+            .execute(&ctx, r#"{"action":"clear"}"#)
+            .await
+            .unwrap();
+        assert!(r.success);
+        assert!(body(&r).unwrap().contains("No fired reminders"));
     }
 
     #[tokio::test]

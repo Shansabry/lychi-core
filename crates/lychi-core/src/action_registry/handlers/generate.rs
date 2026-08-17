@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
@@ -144,73 +145,94 @@ fn generate_token(length: usize) -> Result<String, LychiError> {
 }
 
 /// The canonical subcommand VERBS the agent chooses between — the parser also
-/// accepts aliases (`pw`, `tok`, `num`…), but the schema constrains a model to
-/// one canonical spelling each. Kept next to the parser it feeds.
+/// accepts aliases (`pw`, `tok`, `num`…), but [`GENERATE_GRAMMAR`] constrains
+/// a model to one canonical spelling each. Kept next to the parser it feeds;
+/// a drift test pins the grammar's verbs to this list.
+#[cfg(test)] // drift guard only — the grammar is the live source
 const GENERATE_KINDS: &[&str] = &["password", "uuid", "token", "random"];
 
-/// The JSON Schema for `generate`'s args: a required `kind` (constrained to
-/// [`GENERATE_KINDS`]) plus optional numeric operands — `length` for
-/// password/token, `min`/`max` for random. Emitted as the tool's `input_schema`
-/// so the model is constrained to a real subcommand.
-fn generate_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "kind": { "type": "string", "enum": GENERATE_KINDS,
-                      "description": "What to generate: a random password, a UUIDv4, a URL-safe token, or a random integer. The result is copied to the clipboard." },
-            "length": { "type": "integer",
-                        "description": "Output length for kind=password (8-128, default 16) or kind=token (8-256, default 32). Ignored for uuid/random." },
-            "min": { "type": "integer",
-                     "description": "Inclusive lower bound for kind=random (default 0). Only meaningful together with max." },
-            "max": { "type": "integer",
-                     "description": "Inclusive upper bound for kind=random (default 100), e.g. min=1, max=6 for a dice roll." }
-        },
-        "required": ["kind"],
-        "additionalProperties": false
-    })
-}
+/// Shared `length` description — password and token merge into one schema
+/// field, so the one description must cover both.
+const LENGTH_DESC: &str =
+    "Output length: 8-128 for password (default 16), 8-256 for token (default 32).";
 
-/// Read a numeric operand that a model may send as a JSON number or a string.
-fn num_field(v: &serde_json::Value, key: &str) -> Option<String> {
-    match v.get(key)? {
-        serde_json::Value::Number(n) => Some(n.to_string()),
-        serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
-        _ => None,
-    }
-}
+/// `generate`'s argument surface: one verb per kind ([`GENERATE_KINDS`]),
+/// numeric operands in flat order. Renders exactly the verb-led strings the
+/// subcommand matcher parses ("password 20", "random 1 6") — the same shape
+/// the Prepend triggers deliver from launcher input. `random`'s lone-bound
+/// rule survives the derivation: with only one bound present, `to_flat` skips
+/// the absent operand and renders "random <n>", which the parser reads as the
+/// upper bound (lower defaults to 0) — identical to the old hand-written
+/// adapter. Nothing here mutates: results are values copied to the clipboard.
+const GENERATE_GRAMMAR: Grammar = Grammar {
+    verbs: &[
+        Verb {
+            name: "password",
+            desc: "Generate a cryptographically random password (uppercase, lowercase, \
+                   digit, and symbol all guaranteed) and copy it to the clipboard.",
+            mutates: false,
+            operands: &[Operand {
+                name: "length",
+                desc: LENGTH_DESC,
+                required: false,
+                kind: ArgKind::Int,
+                prefix: None,
+            }],
+        },
+        Verb {
+            name: "uuid",
+            desc: "Generate a UUIDv4 and copy it to the clipboard.",
+            mutates: false,
+            operands: &[],
+        },
+        Verb {
+            name: "token",
+            desc: "Generate a URL-safe random token (A-Z, a-z, 0-9, '-', '_') and copy \
+                   it to the clipboard.",
+            mutates: false,
+            operands: &[Operand {
+                name: "length",
+                desc: LENGTH_DESC,
+                required: false,
+                kind: ArgKind::Int,
+                prefix: None,
+            }],
+        },
+        Verb {
+            name: "random",
+            desc: "Return a uniformly random integer in an inclusive range and copy it \
+                   to the clipboard — e.g. min=1, max=6 for a dice roll.",
+            mutates: false,
+            operands: &[
+                Operand {
+                    name: "min",
+                    desc: "Inclusive lower bound (default 0). Send max too — a single \
+                           bound is treated as the upper bound.",
+                    required: false,
+                    kind: ArgKind::Int,
+                    prefix: None,
+                },
+                Operand {
+                    name: "max",
+                    desc: "Inclusive upper bound (default 100).",
+                    required: false,
+                    kind: ArgKind::Int,
+                    prefix: None,
+                },
+            ],
+        },
+    ],
+};
 
 /// Normalize the tool's `args` to the flat `"<kind> [operands]"` string the
 /// subcommand matcher already understands. A constrained model sends the
-/// structured JSON (`{"kind":"password","length":20}`); a human or legacy/flat
-/// caller sends the string directly. Keeps `execute` on `&str`.
+/// structured JSON (`{"action":"password","length":20}`); a human or
+/// legacy/flat caller sends the string directly and passes through unchanged.
+/// Keeps `execute` on `&str`.
 fn generate_args_to_flat(args: &str) -> String {
-    let t = args.trim();
-    if !t.starts_with('{') {
-        return t.to_string();
-    }
-    match serde_json::from_str::<serde_json::Value>(t) {
-        Ok(v) => {
-            let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("").trim();
-            match kind {
-                "password" | "token" => match num_field(&v, "length") {
-                    Some(len) => format!("{kind} {len}"),
-                    None => kind.to_string(),
-                },
-                "random" => match (num_field(&v, "min"), num_field(&v, "max")) {
-                    (Some(min), Some(max)) => format!("random {min} {max}"),
-                    // A lone bound is the upper bound (the flat form's
-                    // "random <max>" — the parser defaults the lower to 0).
-                    (None, Some(b)) | (Some(b), None) => format!("random {b}"),
-                    (None, None) => "random".to_string(),
-                },
-                // uuid (and anything else): the bare subcommand.
-                _ => kind.to_string(),
-            }
-        }
-        // Not the JSON we expected — fall back to the raw string; the parser
-        // will handle it (or reject it) as usual.
-        Err(_) => t.to_string(),
-    }
+    GENERATE_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
 }
 
 #[async_trait]
@@ -241,16 +263,20 @@ impl ActionHandler for GenerateHandler {
     fn usage(&self) -> &str {
         "'password [length]', 'uuid', 'token [length]', 'random [min] <max>' (random integer, default 0-100). Use for 'generate a password', 'give me a uuid', 'random number between 1 and 100'"
     }
-    fn input_schema(&self) -> Option<serde_json::Value> {
-        Some(generate_input_schema())
-    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
     }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(GENERATE_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Utils
+    }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        // A constrained model sends `{"kind":..,"length":..}`; flatten it (and a
-        // plain-string caller passes through) to the form the matcher parses.
+        // A constrained model sends `{"action":..,"length":..}`; flatten it
+        // (and a plain-string caller passes through) to the form the matcher
+        // parses.
         let flat = generate_args_to_flat(args);
         let args = flat.trim();
         let (subcmd, rest) = match args.split_once(' ') {
@@ -484,30 +510,40 @@ mod tests {
 
     #[test]
     fn generate_args_flatten_from_structured_json() {
-        // A constrained model sends the typed object; it flattens to the string
-        // the subcommand matcher already parses. Numbers may arrive as JSON
-        // numbers or strings.
+        // A constrained model sends the typed object; the grammar flattens it
+        // to the string the subcommand matcher already parses. Numbers may
+        // arrive as JSON numbers or strings.
         assert_eq!(
-            generate_args_to_flat(r#"{"kind":"password","length":20}"#),
+            generate_args_to_flat(r#"{"action":"password","length":20}"#),
             "password 20"
         );
         assert_eq!(
-            generate_args_to_flat(r#"{"kind":"token","length":"64"}"#),
+            generate_args_to_flat(r#"{"action":"token","length":"64"}"#),
             "token 64"
         );
         // No operand → bare subcommand (parser applies its defaults).
-        assert_eq!(generate_args_to_flat(r#"{"kind":"password"}"#), "password");
-        assert_eq!(generate_args_to_flat(r#"{"kind":"uuid"}"#), "uuid");
-        // Random bounds: both, only max, neither.
         assert_eq!(
-            generate_args_to_flat(r#"{"kind":"random","min":1,"max":6}"#),
+            generate_args_to_flat(r#"{"action":"password"}"#),
+            "password"
+        );
+        assert_eq!(generate_args_to_flat(r#"{"action":"uuid"}"#), "uuid");
+        // Random bounds: both, only max, only min, neither. A lone bound (min
+        // OR max) renders "random <n>", which the parser reads as the upper
+        // bound — the old adapter's lone-bound rule, preserved by operand
+        // skipping in to_flat.
+        assert_eq!(
+            generate_args_to_flat(r#"{"action":"random","min":1,"max":6}"#),
             "random 1 6"
         );
         assert_eq!(
-            generate_args_to_flat(r#"{"kind":"random","max":50}"#),
+            generate_args_to_flat(r#"{"action":"random","max":50}"#),
             "random 50"
         );
-        assert_eq!(generate_args_to_flat(r#"{"kind":"random"}"#), "random");
+        assert_eq!(
+            generate_args_to_flat(r#"{"action":"random","min":50}"#),
+            "random 50"
+        );
+        assert_eq!(generate_args_to_flat(r#"{"action":"random"}"#), "random");
         // A plain-string caller (human, legacy) passes straight through.
         assert_eq!(generate_args_to_flat("password 20"), "password 20");
         assert_eq!(generate_args_to_flat("uuid"), "uuid");
@@ -517,20 +553,49 @@ mod tests {
     #[test]
     fn generate_args_malformed_json_falls_back_to_raw() {
         assert_eq!(
-            generate_args_to_flat(r#"{"kind": broken"#),
-            r#"{"kind": broken"#
+            generate_args_to_flat(r#"{"action": broken"#),
+            r#"{"action": broken"#
+        );
+        // An unknown action also falls back to the raw string (rejected by the
+        // parser with the usual message rather than silently rewritten).
+        assert_eq!(
+            generate_args_to_flat(r#"{"action":"nope"}"#),
+            r#"{"action":"nope"}"#
         );
     }
 
     #[test]
-    fn generate_schema_enum_matches_the_real_kinds() {
-        // The schema's kind enum must be exactly GENERATE_KINDS, so the model
-        // is constrained to subcommands the parser actually handles.
-        let schema = generate_input_schema();
-        let en = schema["properties"]["kind"]["enum"].as_array().unwrap();
+    fn grammar_verbs_match_the_real_kinds() {
+        // The grammar's verbs must be exactly GENERATE_KINDS, so the derived
+        // schema constrains the model to subcommands the parser handles, and
+        // every flat rendering starts with a verb `execute` matches.
+        let verbs: Vec<&str> = GENERATE_GRAMMAR.verbs.iter().map(|v| v.name).collect();
+        assert_eq!(verbs, GENERATE_KINDS);
+        // The derived schema's action enum follows.
+        let schema = GENERATE_GRAMMAR.handler_schema();
+        let en = schema["properties"]["action"]["enum"].as_array().unwrap();
         assert_eq!(en.len(), GENERATE_KINDS.len());
         for v in GENERATE_KINDS {
             assert!(en.iter().any(|e| e == v), "enum missing {v}");
         }
+        // Numeric operands survive the merge: length (password+token), min/max
+        // (random) — all integers.
+        for field in ["length", "min", "max"] {
+            assert_eq!(schema["properties"][field]["type"], "integer", "{field}");
+        }
+    }
+
+    #[test]
+    fn grammar_flat_renderings_parse() {
+        // Per verb, the grammar's flat rendering must be accepted by the
+        // parser: the range parser for random, the length parse for
+        // password/token (covered by the subcommand match on the verb name).
+        assert_eq!(
+            GENERATE_GRAMMAR.flatten_json(r#"{"action":"random","min":10,"max":20}"#),
+            Some("random 10 20".to_string())
+        );
+        assert_eq!(parse_random_range("10 20").unwrap(), (10, 20));
+        assert_eq!(parse_random_range("50").unwrap(), (0, 50));
+        assert_eq!(parse_random_range("").unwrap(), (0, 100));
     }
 }

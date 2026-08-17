@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use chrono::{Datelike, Local, NaiveTime, Offset, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
     RiskLevel,
@@ -426,42 +427,43 @@ pub fn is_tz_conversion(input: &str) -> bool {
     resolve_tz(last_word).is_some()
 }
 
-/// The JSON Schema for `time`'s args: one optional free `query` — the parser is
-/// a text grammar (world clock vs "<time> <tz> to <tz>" conversion), not a verb
-/// set, so the win here is the rich description, not structure. `query` is
-/// optional because empty args are a valid request (local time + UTC). Emitted
-/// as the tool's `input_schema`.
-fn time_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "query": { "type": "string",
-                       "description": "World clock: a city, timezone abbreviation, or IANA zone — e.g. \"tokyo\", \"EST\", \"America/Chicago\" (IANA names are case-sensitive). Conversion: \"<time> <source> to <target>\" — e.g. \"3pm EST to IST\", \"noon UTC to JST\", \"14:00 london to tokyo\". Omit for local time + UTC." }
-        },
-        "additionalProperties": false
-    })
-}
+/// `time`'s argument surface: a single free-form action whose flat form IS
+/// the query — the parser is a text grammar (world clock vs "<time> <tz> to
+/// <tz>" conversion), not a verb set, so the win here is the rich operand
+/// description, not structure. `query` is optional because empty args are a
+/// valid request (local time + UTC). The JSON Schema and the structured→flat
+/// adapter both derive from this.
+const TIME_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "World clock and time-zone conversion — read-only, instant, fully local.",
+        mutates: false,
+        operands: &[Operand {
+            name: "query",
+            desc: "Three forms. (1) Omit (or send empty) for the user's local time plus \
+                   UTC. (2) A city, timezone abbreviation, or IANA zone for a world \
+                   clock — \"tokyo\", \"EST\", \"America/Chicago\" (IANA names are \
+                   case-sensitive). (3) \"<time> <source> to <target>\" for a \
+                   conversion — \"3pm EST to IST\", \"noon UTC to JST\", \
+                   \"14:00 london to tokyo\"; times accept 12h (\"3:30pm\"), 24h \
+                   (\"14:00\"), \"noon\", \"midnight\", and \"now\".",
+            required: false,
+            kind: ArgKind::Text,
+            prefix: None,
+        }],
+    }],
+};
 
 /// Normalize the tool's `args` to the flat query string `execute` reads. A
 /// constrained model sends the structured JSON (`{"query":"3pm EST to IST"}`);
 /// a human or legacy/flat caller sends the query directly and passes through
-/// unchanged (`""` — local time — included).
+/// unchanged (`""` — local time — included). Malformed JSON falls back to the
+/// raw string; `resolve_tz` rejects it with the usual "Unknown timezone"
+/// message.
 fn time_args_to_flat(args: &str) -> String {
-    let t = args.trim();
-    if !t.starts_with('{') {
-        return t.to_string();
-    }
-    match serde_json::from_str::<serde_json::Value>(t) {
-        Ok(v) => v
-            .get("query")
-            .and_then(|a| a.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string(),
-        // Not the JSON we expected — fall back to the raw string; resolve_tz
-        // will reject it with the usual "Unknown timezone" message.
-        Err(_) => t.to_string(),
-    }
+    TIME_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
 }
 
 #[async_trait]
@@ -485,11 +487,14 @@ impl ActionHandler for TimeHandler {
     fn usage(&self) -> &str {
         "a timezone name or city (e.g. 'tokyo', 'EST', 'london'). Empty for local time"
     }
-    fn input_schema(&self) -> Option<serde_json::Value> {
-        Some(time_input_schema())
-    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
+    }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(TIME_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Utils
     }
 
     fn default_risk(&self) -> RiskLevel {
@@ -658,6 +663,21 @@ mod tests {
         assert_eq!(time_args_to_flat(""), "");
         // Malformed JSON falls back to the raw string.
         assert_eq!(time_args_to_flat("{not json"), "{not json");
+        // The renderings are accepted by the real parsers — world clock and
+        // conversion — pinning the grammar to the parser.
+        assert!(resolve_tz(&time_args_to_flat(r#"{"query":"tokyo"}"#)).is_some());
+        assert!(is_tz_conversion(&time_args_to_flat(
+            r#"{"query":"3pm EST to IST"}"#
+        )));
+    }
+
+    #[test]
+    fn time_schema_keeps_query_optional() {
+        // The grammar-derived schema must keep `query` optional — empty args
+        // are a valid request (local time + UTC).
+        let schema = TIME_GRAMMAR.handler_schema();
+        assert!(schema["properties"]["query"].is_object());
+        assert_eq!(schema["required"], serde_json::json!([]));
     }
 
     #[test]

@@ -8,6 +8,7 @@
 
 use async_trait::async_trait;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType, Trigger,
 };
@@ -55,53 +56,49 @@ fn split_path_and_format(args: &str) -> Option<(String, String)> {
 /// (`crate::files::image_ops::convert_file`).
 const CONVERT_FORMATS: &[&str] = &["png", "jpg", "webp", "gif", "bmp", "tiff"];
 
-/// The JSON Schema for `convert`'s args: a required source `path` plus a
-/// required `format` (constrained to [`CONVERT_FORMATS`]). Emitted as the
-/// tool's `input_schema` so the model sends path and format as separate fields
-/// instead of guessing the ` to ` syntax.
-fn convert_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "path": { "type": "string",
-                      "description": "Path to the source image, e.g. \"~/Pictures/photo.png\". ~ expands to the home directory. A new file is written next to it with the new extension (photo.png → photo.webp); the source is never overwritten." },
-            "format": { "type": "string", "enum": CONVERT_FORMATS,
-                        "description": "The target image format." }
-        },
-        "required": ["path", "format"],
-        "additionalProperties": false
-    })
-}
+/// `convert`'s argument surface: one free-form action whose flat form is
+/// `<path> to <format>`. The `format` Choice shares [`CONVERT_FORMATS`] with
+/// the converter, so the schema's enum and the formats the parser actually
+/// handles can never drift. The JSON Schema and the structured→flat adapter
+/// both derive from this.
+const CONVERT_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Convert an image file to another format (png, jpg, webp, gif, bmp, \
+               tiff). Writes a NEW file next to the original with the new extension \
+               (photo.png → photo.webp); the source is never overwritten. Use when \
+               the user wants an image in a different format — e.g. a webp for the \
+               web, or a png from a tiff.",
+        mutates: true,
+        operands: &[
+            Operand {
+                name: "path",
+                desc: "Path to the source image, e.g. \"~/Pictures/photo.png\". \
+                       ~ expands to the home directory. Must be an existing image file.",
+                required: true,
+                kind: ArgKind::Text,
+                prefix: None,
+            },
+            Operand {
+                name: "format",
+                desc: "The target image format to convert to.",
+                required: true,
+                kind: ArgKind::Choice(CONVERT_FORMATS),
+                prefix: Some("to"),
+            },
+        ],
+    }],
+};
 
 /// Normalize the tool's `args` to the flat `"<path> to <fmt>"` string the
 /// parser already understands. A constrained model sends the structured JSON
 /// (`{"path":"img.png","format":"webp"}`); a human or legacy/flat caller sends
-/// the string directly. Keeps `execute` on `&str`.
+/// the string directly, and malformed JSON falls back to the raw string — the
+/// parser handles (or rejects) it as usual. Keeps `execute` on `&str`.
 fn convert_args_to_flat(args: &str) -> String {
-    let t = args.trim();
-    if !t.starts_with('{') {
-        return t.to_string();
-    }
-    match serde_json::from_str::<serde_json::Value>(t) {
-        Ok(v) => {
-            let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("").trim();
-            let fmt = v
-                .get("format")
-                .and_then(|f| f.as_str())
-                .unwrap_or("")
-                .trim();
-            if path.is_empty() || fmt.is_empty() {
-                // A missing half can't form a valid command; whatever remains
-                // fails the split and yields the usage error.
-                format!("{path}{fmt}")
-            } else {
-                format!("{path} to {fmt}")
-            }
-        }
-        // Not the JSON we expected — fall back to the raw string; the parser
-        // will handle it (or reject it) as usual.
-        Err(_) => t.to_string(),
-    }
+    CONVERT_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
 }
 
 #[async_trait]
@@ -125,8 +122,11 @@ impl ActionHandler for ConvertImageHandler {
     fn usage(&self) -> &str {
         "convert <path> to <png|jpg|webp|gif|bmp|tiff>"
     }
-    fn input_schema(&self) -> Option<serde_json::Value> {
-        Some(convert_input_schema())
+    fn grammar(&self) -> Option<Grammar> {
+        Some(CONVERT_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Files
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::Files
@@ -228,13 +228,29 @@ mod tests {
 
     #[test]
     fn convert_schema_enum_lists_the_supported_formats() {
-        // The schema's format enum must be exactly CONVERT_FORMATS, so the
-        // model is constrained to formats the converter actually handles.
-        let schema = convert_input_schema();
+        // The grammar-derived schema's format enum must be exactly
+        // CONVERT_FORMATS, so the model is constrained to formats the
+        // converter actually handles.
+        let schema = CONVERT_GRAMMAR.handler_schema();
         let en = schema["properties"]["format"]["enum"].as_array().unwrap();
         assert_eq!(en.len(), CONVERT_FORMATS.len());
         for f in CONVERT_FORMATS {
             assert!(en.iter().any(|e| e == f), "enum missing {f}");
+        }
+        assert_eq!(schema["required"], serde_json::json!(["path", "format"]));
+    }
+
+    #[test]
+    fn grammar_flat_rendering_is_accepted_by_the_parser() {
+        // Drift guard: the grammar's flat rendering must round-trip through
+        // the hand-written parser — every format, including a path with " to ".
+        for fmt in CONVERT_FORMATS {
+            let flat = convert_args_to_flat(&format!(
+                r#"{{"path":"~/My Photos/to keep/img.png","format":"{fmt}"}}"#
+            ));
+            let (p, f) = split_path_and_format(&flat).unwrap();
+            assert_eq!(p, "~/My Photos/to keep/img.png");
+            assert_eq!(&f, fmt);
         }
     }
 }

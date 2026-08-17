@@ -2,6 +2,7 @@ use std::process::{Command, Stdio};
 
 use async_trait::async_trait;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
@@ -527,6 +528,32 @@ fn pick_system_color() -> Result<String, LychiError> {
 
 // ── Handler ─────────────────────────────────────────────────────────────
 
+/// `color`'s argument surface: a single free-form action whose flat form IS
+/// the color value (or the `picker` subcommand). The JSON Schema derives from
+/// this; the drift test pins its renderings to `parse_color` and the picker
+/// match in `execute`.
+const COLOR_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Convert a color between hex, RGB, and HSL, name the nearest Tailwind CSS \
+               color, and copy the hex value to the clipboard. Fully local, instant, \
+               read-only.",
+        mutates: false,
+        operands: &[Operand {
+            name: "value",
+            desc: "The color to convert, in any supported format: hex \"#FF5733\", \
+                   shorthand \"#F53\", bare \"ff5733\", or 8-digit-with-alpha \
+                   \"#FF5733FF\" (alpha ignored); \"rgb(255, 87, 51)\"; \
+                   \"hsl(11, 100%, 60%)\". The special value \"picker\" opens the \
+                   system color picker (hyprpicker/kcolorchooser/xcolor/gpick) and \
+                   converts whatever the user picks on screen.",
+            required: true,
+            kind: ArgKind::Text,
+            prefix: None,
+        }],
+    }],
+};
+
 pub struct ColorHandler;
 
 impl Default for ColorHandler {
@@ -558,6 +585,12 @@ impl ActionHandler for ColorHandler {
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
+    }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(COLOR_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Utils
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
@@ -782,6 +815,34 @@ mod tests {
         assert!(parse_color("not a color").is_none());
         assert!(parse_color("#GGG").is_none());
         assert!(parse_color("rgb(300, 0, 0)").is_none()); // 300 > u8::MAX
+    }
+
+    #[test]
+    fn color_args_flatten_from_structured_json() {
+        // The grammar's flat rendering must be exactly what the parser
+        // accepts: color values via `parse_color`, and the literal "picker"
+        // subcommand `execute` matches case-insensitively.
+        let flat = COLOR_GRAMMAR
+            .flatten_json(r##"{"value":"#FF5733"}"##)
+            .unwrap();
+        assert_eq!(flat, "#FF5733");
+        assert!(parse_color(&flat).is_some());
+
+        let flat = COLOR_GRAMMAR
+            .flatten_json(r#"{"value":"rgb(255, 87, 51)"}"#)
+            .unwrap();
+        assert!(parse_color(&flat).is_some());
+
+        let flat = COLOR_GRAMMAR
+            .flatten_json(r#"{"value":"hsl(11, 100%, 60%)"}"#)
+            .unwrap();
+        assert!(parse_color(&flat).is_some());
+
+        let flat = COLOR_GRAMMAR.flatten_json(r#"{"value":"picker"}"#).unwrap();
+        assert!(flat.eq_ignore_ascii_case("picker"));
+
+        // Flat/legacy callers pass through untouched (caller keeps raw).
+        assert_eq!(COLOR_GRAMMAR.flatten_json("#FF5733"), None);
     }
 
     #[test]

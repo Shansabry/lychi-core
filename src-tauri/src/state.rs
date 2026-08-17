@@ -836,6 +836,119 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    /// The model-facing projection of the REAL production registry. This is
+    /// the contract the whole grammar migration exists to deliver: a small,
+    /// deterministic, group-shaped tool catalog. Built against
+    /// `build_builtin_registry` so a new ungrammared handler that would bloat
+    /// the model's tool list is caught here, not noticed in a token bill.
+    #[test]
+    fn production_model_catalog_is_small_grouped_and_deterministic() {
+        let path = std::env::temp_dir().join(format!(
+            "lychi-model-catalog-test-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = lychi_core::db::open_database(&path).expect("temp db");
+        let config = Config::default();
+        let timer_state = lychi_core::action_registry::handlers::timer::new_timer_state();
+        #[cfg(feature = "mpris")]
+        let mpris = Arc::new(RwLock::new(None));
+
+        let registry = AppState::build_builtin_registry(
+            &db,
+            &config,
+            &timer_state,
+            #[cfg(feature = "mpris")]
+            &mpris,
+        );
+
+        let catalog = registry.model_catalog();
+        let names: Vec<&str> = catalog.iter().map(|t| t.name.as_str()).collect();
+
+        // Small enough that the whole catalog ships every turn (the stable,
+        // cacheable prefix — see relevance::FULL_SEND_MAX_TOOLS).
+        assert!(
+            catalog.len() <= 12,
+            "model catalog grew past the full-send threshold ({} tools): {names:?} — \
+             give the new handler a grammar + tool_group instead of shipping it standalone",
+            catalog.len()
+        );
+
+        // The group tools exist, and `run` stays its own tool.
+        for expected in [
+            "files",
+            "web_tools",
+            "system_control",
+            "dev_tools",
+            "personal_data",
+            "quick_tools",
+            "run",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing `{expected}` in {names:?}"
+            );
+        }
+
+        // Every group action must resolve back to a member handler — the
+        // schema promises the model an action list, and an unresolvable entry
+        // is a broken promise. Renders each with empty args purely to check
+        // action resolution (missing-required is a valid, informative outcome).
+        for tool in &catalog {
+            let Some(schema) = &tool.input_schema else {
+                continue;
+            };
+            let Some(actions) = schema["properties"]["action"]["enum"].as_array() else {
+                continue; // free-form standalone tool
+            };
+            for action in actions {
+                let args = format!(r#"{{"action":{action}}}"#);
+                match registry.resolve_group_call(&tool.name, &args) {
+                    lychi_core::action_registry::registry::GroupDispatch::NotAGroup => {
+                        panic!("`{}` lists actions but is not a group", tool.name)
+                    }
+                    lychi_core::action_registry::registry::GroupDispatch::Invalid(msg) => {
+                        assert!(
+                            msg.contains("requires"),
+                            "action {action} of `{}` failed to resolve: {msg}",
+                            tool.name
+                        );
+                    }
+                    lychi_core::action_registry::registry::GroupDispatch::Resolved { .. } => {}
+                }
+            }
+            // Every mutating action must be a listed action.
+            for m in &tool.mutating_actions {
+                assert!(
+                    actions.iter().any(|a| a.as_str() == Some(m)),
+                    "mutating action `{m}` of `{}` is not in its action enum",
+                    tool.name
+                );
+            }
+        }
+
+        // Deterministic: two projections of the same registry are identical
+        // byte-for-byte (name order AND schema serialization) — the property
+        // provider prompt caching keys on.
+        let again = registry.model_catalog();
+        assert_eq!(catalog.len(), again.len());
+        for (a, b) in catalog.iter().zip(again.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(
+                serde_json::to_string(&a.input_schema).unwrap(),
+                serde_json::to_string(&b.input_schema).unwrap(),
+                "schema serialization not stable for `{}`",
+                a.name
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[cfg(test)]

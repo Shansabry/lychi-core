@@ -11,10 +11,33 @@ use async_trait::async_trait;
 use qrcode::render::svg;
 use qrcode::{EcLevel, QrCode};
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::error::LychiError;
+
+/// `qr`'s argument surface: a single free-form action whose flat form IS the
+/// text to encode. The JSON Schema derives from this; the drift test pins its
+/// rendering to `render_qr`.
+const QR_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Render text or a URL as a scannable QR code, shown as a crisp SVG in \
+               the launcher — handy for beaming a link, wifi credentials, or any short \
+               text to a phone. Fully local; nothing is stored or sent anywhere.",
+        mutates: false,
+        operands: &[Operand {
+            name: "text",
+            desc: "The content to encode: a URL (\"https://lychi.app\"), plain text, or \
+                   a wifi string in the standard format \
+                   \"WIFI:S:<ssid>;T:WPA;P:<password>;;\".",
+            required: true,
+            kind: ArgKind::Text,
+            prefix: None,
+        }],
+    }],
+};
 
 pub struct QrHandler;
 
@@ -70,6 +93,12 @@ impl ActionHandler for QrHandler {
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
     }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(QR_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Utils
+    }
 
     async fn completions(&self, partial: &str) -> Vec<CompletionItem> {
         let text = partial.trim();
@@ -115,5 +144,18 @@ mod tests {
     #[test]
     fn handles_wifi_string() {
         assert!(render_qr("WIFI:S:MyNet;T:WPA;P:secret;;").is_ok());
+    }
+
+    #[test]
+    fn qr_args_flatten_from_structured_json() {
+        // The grammar's flat rendering must be exactly what `render_qr`
+        // accepts.
+        let flat = QR_GRAMMAR
+            .flatten_json(r#"{"text":"https://lychi.app"}"#)
+            .unwrap();
+        assert_eq!(flat, "https://lychi.app");
+        assert!(render_qr(&flat).is_ok());
+        // Flat/legacy callers pass through untouched (caller keeps raw).
+        assert_eq!(QR_GRAMMAR.flatten_json("https://lychi.app"), None);
     }
 }

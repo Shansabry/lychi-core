@@ -22,6 +22,7 @@ use std::process::Command;
 
 use async_trait::async_trait;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, Output, OutputType,
     RiskAssessment, RiskLevel, Row, Section,
@@ -46,65 +47,88 @@ fn have(tool: &str) -> bool {
     which::which(tool).is_ok()
 }
 
-/// Every verb `execute` dispatches — read-only `search` plus the mutating set
-/// from the central classifier ([`crate::rules::verbs`]) — as the
-/// machine-readable enum fed to the tool schema so a constrained model (cloud
-/// `enum` / local grammar) can only emit a real verb. Sourced from the same
-/// list the risk gate uses, so the enum can't drift from confirmation.
-fn package_action_verbs() -> Vec<&'static str> {
-    std::iter::once("search")
-        .chain(crate::rules::verbs::MUTATING_PACKAGE_VERBS.iter().copied())
-        .collect()
-}
+/// The package operand for the three verbs that require one.
+const PACKAGE_OPERAND: Operand = Operand {
+    name: "package",
+    desc: "The package name (e.g. \"neovim\", \"gcc-c++\"). Prefix \
+           \"flatpak:\" to target flatpak explicitly (e.g. \
+           \"flatpak:org.mozilla.firefox\").",
+    required: true,
+    kind: ArgKind::Text,
+    prefix: None,
+};
 
-/// The JSON Schema for `pkg`'s args: a required `action` (constrained to
-/// [`package_action_verbs`]) plus a free `package` operand. Emitted as the
-/// tool's `input_schema` so the model is constrained to a real verb.
-fn packages_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "action": { "type": "string", "enum": package_action_verbs(),
-                        "description": "\"search\" is read-only. install/remove/uninstall/upgrade change the system: they require the user to confirm and then authenticate via a polkit prompt." },
-            "package": { "type": "string",
-                         "description": "The package name (e.g. \"neovim\", \"gcc-c++\") — or, for \"search\", the search query. Prefix \"flatpak:\" to target flatpak explicitly (e.g. \"flatpak:org.mozilla.firefox\"). Omit only for \"upgrade\", which then upgrades the whole system." }
+/// `packages`'s grammar: the flat `"<verb> [<package>]"` form `execute`
+/// already parses. The verb set and per-verb mutates flags are pinned to
+/// `search` + the central classifier ([`crate::rules::verbs`]) by
+/// `grammar_verbs_match_the_central_classifier`, so the static declaration
+/// cannot drift from the audit surface the risk gate uses.
+const PACKAGES_GRAMMAR: Grammar = Grammar {
+    verbs: &[
+        Verb {
+            name: "search",
+            desc: "Search available packages by name across the native manager \
+                   AND flatpak. Read-only, auto-executes. This searches the \
+                   OS package repositories — NOT the web.",
+            mutates: false,
+            operands: &[Operand {
+                name: "query",
+                desc: "What to search for — a package name or part of one \
+                       (e.g. \"ripgrep\").",
+                required: true,
+                kind: ArgKind::Text,
+                prefix: None,
+            }],
         },
-        "required": ["action"],
-        "additionalProperties": false
-    })
-}
+        Verb {
+            name: "install",
+            desc: "Install a package. Changes the system: the user confirms, \
+                   then authenticates via a polkit prompt (flatpak targets are \
+                   user-scope, no root).",
+            mutates: true,
+            operands: &[PACKAGE_OPERAND],
+        },
+        Verb {
+            name: "remove",
+            desc: "Remove/uninstall a package (just the named package, no \
+                   recursive dependency sweep). The user confirms, then \
+                   authenticates via polkit.",
+            mutates: true,
+            operands: &[PACKAGE_OPERAND],
+        },
+        Verb {
+            name: "uninstall",
+            desc: "Alias of remove — same confirmation and polkit flow.",
+            mutates: true,
+            operands: &[PACKAGE_OPERAND],
+        },
+        Verb {
+            name: "upgrade",
+            desc: "Upgrade one package — or, with no package named, the whole \
+                   system (pacman/zypper always full-upgrade). The user \
+                   confirms, then authenticates via polkit.",
+            mutates: true,
+            operands: &[Operand {
+                name: "package",
+                desc: "The package to upgrade. Omit to upgrade the whole \
+                       system.",
+                required: false,
+                kind: ArgKind::Text,
+                prefix: None,
+            }],
+        },
+    ],
+};
 
 /// Normalize the tool's `args` to the flat `"<verb> [<package>]"` string
-/// `execute` already parses. A constrained model sends the structured JSON
-/// (`{"action":"install","package":"neovim"}`); a human or legacy/flat caller
-/// sends the string directly. Keeps `execute`/`assess_risk` on `&str`.
+/// `execute` already parses, via the ONE structured→flat decider
+/// ([`Grammar::flatten_json`]). A human or legacy/flat caller passes through
+/// unchanged. `assess_risk` MUST keep calling this first, so the risk gate
+/// sees the same flat form execution sees.
 fn packages_args_to_flat(args: &str) -> String {
-    let t = args.trim();
-    if !t.starts_with('{') {
-        return t.to_string();
-    }
-    match serde_json::from_str::<serde_json::Value>(t) {
-        Ok(v) => {
-            let action = v
-                .get("action")
-                .and_then(|a| a.as_str())
-                .unwrap_or("")
-                .trim();
-            let package = v
-                .get("package")
-                .and_then(|a| a.as_str())
-                .unwrap_or("")
-                .trim();
-            if package.is_empty() {
-                action.to_string()
-            } else {
-                format!("{action} {package}")
-            }
-        }
-        // Not the JSON we expected — fall back to the raw string; `execute`
-        // answers with its usual usage message.
-        Err(_) => t.to_string(),
-    }
+    PACKAGES_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
 }
 
 /// The native system package manager, detected once per call. Order follows the
@@ -645,8 +669,11 @@ impl ActionHandler for PackagesHandler {
     fn usage(&self) -> &str {
         "'search <query>' or 'install <package>'. Uses the OS package manager (dnf/apt/pacman/flatpak). NOT for web searches"
     }
-    fn input_schema(&self) -> Option<serde_json::Value> {
-        Some(packages_input_schema())
+    fn grammar(&self) -> Option<Grammar> {
+        Some(PACKAGES_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::System
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::System
@@ -658,9 +685,10 @@ impl ActionHandler for PackagesHandler {
         _ctx: &crate::action_registry::RiskContext<'_>,
     ) -> RiskAssessment {
         // Search is read-only (auto); install/remove/upgrade mutate the system
-        // (root via pkexec) and need confirmation. A constrained model sends
+        // (root via pkexec) and need confirmation. A structured caller sends
         // `{"action":..,"package":..}`; flatten it (a plain-string caller
         // passes through) so the gate sees the same verb execute dispatches on.
+        // Security invariant: the adapter runs BEFORE the verb check.
         let flat = packages_args_to_flat(args);
         if is_mutating(&flat) {
             RiskAssessment::confirm(format!("Run 'pkg {}'?", flat.trim()))
@@ -934,7 +962,7 @@ mod tests {
         );
         assert_eq!(
             h.assess_risk(
-                r#"{"action":"search","package":"ripgrep"}"#,
+                r#"{"action":"search","query":"ripgrep"}"#,
                 &Default::default()
             )
             .level,
@@ -944,14 +972,14 @@ mod tests {
 
     #[test]
     fn packages_args_flatten_from_structured_json() {
-        // A constrained model sends the typed object; it flattens to the
+        // A structured caller sends the typed object; it flattens to the
         // `<verb> [<package>]` string execute already parses.
         assert_eq!(
             packages_args_to_flat(r#"{"action":"install","package":"neovim"}"#),
             "install neovim"
         );
         assert_eq!(
-            packages_args_to_flat(r#"{"action":"search","package":"ripgrep"}"#),
+            packages_args_to_flat(r#"{"action":"search","query":"ripgrep"}"#),
             "search ripgrep"
         );
         // No package → bare verb; only valid for upgrade (whole system), and
@@ -971,20 +999,45 @@ mod tests {
         assert_eq!(packages_args_to_flat("{not json"), "{not json");
     }
 
+    /// The grammar's verb set and per-verb mutates flags are pinned to
+    /// `search` + the central mutating list — the drift guard for declaring
+    /// the verbs statically while `crate::rules::verbs` stays the audit
+    /// surface the risk gate uses.
     #[test]
-    fn packages_schema_enum_matches_the_real_verbs() {
-        // The schema's action enum must be search + the central mutating list,
-        // so the model is constrained to verbs execute actually dispatches.
-        let verbs = package_action_verbs();
-        let schema = packages_input_schema();
-        let en = schema["properties"]["action"]["enum"].as_array().unwrap();
-        assert_eq!(en.len(), verbs.len());
-        for v in &verbs {
-            assert!(en.iter().any(|e| e == v), "enum missing {v}");
+    fn grammar_verbs_match_the_central_classifier() {
+        use std::collections::HashSet;
+        let names: HashSet<&str> = PACKAGES_GRAMMAR.verbs.iter().map(|v| v.name).collect();
+        let expected: HashSet<&str> = std::iter::once("search")
+            .chain(crate::rules::verbs::MUTATING_PACKAGE_VERBS.iter().copied())
+            .collect();
+        assert_eq!(names, expected, "grammar verbs != search + central list");
+        for v in PACKAGES_GRAMMAR.verbs {
+            assert_eq!(
+                v.mutates,
+                crate::rules::verbs::is_mutating_package_verb(v.name),
+                "mutates flag for {} disagrees with the classifier",
+                v.name
+            );
         }
-        assert!(verbs.contains(&"search"));
-        for v in crate::rules::verbs::MUTATING_PACKAGE_VERBS {
-            assert!(verbs.contains(v), "verb list missing {v}");
+    }
+
+    /// Per-verb drift test: every grammar verb's flat rendering must split
+    /// back into (that verb, that operand) exactly as execute does, and the
+    /// risk gate must agree with the declared mutates flag.
+    #[test]
+    fn packages_grammar_flat_renderings_are_accepted_by_the_parser() {
+        for v in PACKAGES_GRAMMAR.verbs {
+            let operand = v.operands[0].name;
+            let flat = packages_args_to_flat(&format!(
+                r#"{{"action":"{}","{operand}":"ripgrep"}}"#,
+                v.name
+            ));
+            let (verb, rest) = flat
+                .split_once(char::is_whitespace)
+                .unwrap_or((flat.as_str(), ""));
+            assert_eq!(verb, v.name, "verb lost in {flat:?}");
+            assert_eq!(rest, "ripgrep", "operand lost in {flat:?}");
+            assert_eq!(is_mutating(&flat), v.mutates, "{flat:?}");
         }
     }
 

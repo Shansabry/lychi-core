@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, RiskAssessment,
     RiskLevel,
@@ -19,6 +20,55 @@ use crate::error::LychiError;
 use crate::script_commands::{ScriptCommand, ScriptMode};
 
 use super::shell_exec::Clearance;
+
+/// `script`'s argument surface: a single free-form action whose flat form is
+/// `<keyword> <arguments>`. The keyword set is USER data (whatever executables
+/// live in ~/.config/lychi/scripts/), so the grammar deliberately does not
+/// enumerate it — the operand desc points the model at completions instead.
+const SCRIPT_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Run one of the user's own Script Commands — executables in \
+               ~/.config/lychi/scripts/ surfaced as named launcher commands. The \
+               script runs through the shell (captured inline or in a terminal, \
+               per its metadata), and its assembled command line is still vetted \
+               by the shell rules. Scripts do arbitrary work, so treat every \
+               invocation as state-changing. Only invoke script keywords the user \
+               actually has.",
+        mutates: true,
+        operands: &[
+            Operand {
+                name: "keyword",
+                desc: "The script's keyword (its registered command name). Script \
+                       names are user-defined and vary per user — discover them \
+                       via completions; never invent one.",
+                required: true,
+                kind: ArgKind::Text,
+                prefix: None,
+            },
+            Operand {
+                name: "arguments",
+                desc: "Arguments appended to the script invocation, passed through \
+                       the shell exactly as written. Omit when the script takes \
+                       none.",
+                required: false,
+                kind: ArgKind::Text,
+                prefix: None,
+            },
+        ],
+    }],
+};
+
+/// Normalize the tool's `args` to the flat `"<keyword> <arguments>"` string the
+/// resolver reads. A constrained model sends the structured JSON
+/// (`{"keyword":"deploy","arguments":"prod"}`); a human or legacy/flat caller
+/// sends the string directly and passes through unchanged. Malformed JSON falls
+/// back to the raw string.
+fn script_args_to_flat(args: &str) -> String {
+    SCRIPT_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
+}
 
 /// Timeout for an inline (captured) script — a hanging script must not wedge the
 /// launcher. Terminal-mode scripts detach and aren't bounded here.
@@ -47,9 +97,13 @@ impl ScriptCommandsHandler {
         self.scripts.keys().cloned().collect()
     }
 
-    /// Split `"<keyword> <args>"` into the matched script + the remaining args.
+    /// Split `"<keyword> <args>"` (or its structured-JSON spelling) into the
+    /// matched script + the remaining args. Flattening HERE keeps the string
+    /// `assess_risk` judges byte-for-byte the string `execute` runs, for a
+    /// constrained model's JSON call too.
     fn resolve<'a>(&'a self, input: &str) -> Option<(&'a ScriptCommand, String)> {
-        let trimmed = input.trim();
+        let flat = script_args_to_flat(input);
+        let trimmed = flat.trim();
         let (first, rest) = match trimmed.split_once(char::is_whitespace) {
             Some((f, r)) => (f, r.trim().to_string()),
             None => (trimmed, String::new()),
@@ -88,6 +142,12 @@ impl ActionHandler for ScriptCommandsHandler {
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::Developer
+    }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(SCRIPT_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Dev
     }
 
     // User-authored scripts in the user's own scripts dir auto-run by default
@@ -221,6 +281,36 @@ mod tests {
         let (c, args) = h.resolve("backup").unwrap();
         assert_eq!(c.keyword, "backup");
         assert_eq!(args, "");
+    }
+
+    #[test]
+    fn script_args_flatten_from_structured_json() {
+        // A constrained model sends the typed object; it flattens to the
+        // "<keyword> <arguments>" string the resolver reads.
+        assert_eq!(
+            script_args_to_flat(r#"{"keyword":"deploy","arguments":"prod --force"}"#),
+            "deploy prod --force"
+        );
+        // No arguments → bare keyword.
+        assert_eq!(script_args_to_flat(r#"{"keyword":"backup"}"#), "backup");
+        // A plain-string caller (human, legacy) passes straight through.
+        assert_eq!(script_args_to_flat("deploy prod"), "deploy prod");
+        // Malformed JSON falls back to the raw string.
+        assert_eq!(script_args_to_flat("{not json"), "{not json");
+    }
+
+    /// Drift guard: the grammar's flat rendering must be accepted by the
+    /// parser — a structured call resolves to the same script + args as the
+    /// flat form, on both entry points (resolve feeds risk AND execute).
+    #[test]
+    fn structured_call_resolves_like_the_flat_form() {
+        let h =
+            ScriptCommandsHandler::new(vec![cmd("deploy", ScriptMode::Inline)], "/bin/sh".into());
+        let (c, args) = h
+            .resolve(r#"{"keyword":"deploy","arguments":"prod --force"}"#)
+            .unwrap();
+        assert_eq!(c.keyword, "deploy");
+        assert_eq!(args, "prod --force");
     }
 
     #[test]

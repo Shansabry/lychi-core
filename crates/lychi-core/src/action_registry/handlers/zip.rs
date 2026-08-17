@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType, Trigger,
 };
@@ -48,66 +49,53 @@ fn parse_args(args: &str) -> (Vec<String>, Option<String>) {
     (args.split_whitespace().map(String::from).collect(), None)
 }
 
-/// The JSON Schema for `zip`'s args: a required `paths` array plus an optional
-/// `output` archive path. Emitted as the tool's `input_schema` so a constrained
-/// model sends inputs and output as separate fields instead of guessing the
-/// ` to ` syntax.
-fn zip_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "paths": { "type": "array", "items": { "type": "string" }, "minItems": 1,
-                       "description": "Files and/or folders to bundle, e.g. [\"~/Docs/report.pdf\", \"~/Docs/img\"]. ~ expands to the home directory. Paths must not contain spaces (the launcher's flat syntax is whitespace-separated)." },
-            "output": { "type": "string",
-                        "description": "Output archive path. A .zip extension (the default) writes a zip; .tar.gz or .tgz writes a gzip-compressed tarball. Omit to create <first-input-stem>.zip next to the first input (report.pdf → report.zip). Never overwrites an input." }
-        },
-        "required": ["paths"],
-        "additionalProperties": false
-    })
-}
+/// `zip`'s argument surface: one free-form action whose flat form is
+/// `<path...> [to <out>]` — a space-joined List of inputs, then the optional
+/// output riding the `to` prefix. The JSON Schema and the structured→flat
+/// adapter both derive from this.
+const ZIP_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Bundle files and/or folders into an archive: .zip by default, or a \
+               gzip-compressed tarball when the output ends in .tar.gz/.tgz. \
+               Writes a NEW archive and never overwrites an input — creating one \
+               is non-destructive. Use when the user wants to compress, bundle, \
+               or package files for sharing or storage.",
+        mutates: true,
+        operands: &[
+            Operand {
+                name: "paths",
+                desc: "Files and/or folders to bundle, e.g. [\"~/Docs/report.pdf\", \
+                       \"~/Docs/img\"]. ~ expands to the home directory. Paths must \
+                       not contain spaces — the list renders space-joined into the \
+                       launcher's whitespace-separated flat syntax.",
+                required: true,
+                kind: ArgKind::List,
+                prefix: None,
+            },
+            Operand {
+                name: "output",
+                desc: "Output archive path. A .zip extension (the default) writes a \
+                       zip; .tar.gz or .tgz writes a gzip-compressed tarball. Omit \
+                       to create <first-input-stem>.zip next to the first input \
+                       (report.pdf → report.zip). Never overwrites an input.",
+                required: false,
+                kind: ArgKind::Text,
+                prefix: Some("to"),
+            },
+        ],
+    }],
+};
 
 /// Normalize the tool's `args` to the flat `"<path...> [to <out>]"` string the
 /// parser already understands. A constrained model sends the structured JSON
 /// (`{"paths":["a","b"],"output":"out.zip"}`); a human or legacy/flat caller
-/// sends the string directly. Keeps `execute` on `&str`.
+/// sends the string directly, and malformed JSON falls back to the raw string —
+/// the parser handles (or rejects) it as usual. Keeps `execute` on `&str`.
 fn zip_args_to_flat(args: &str) -> String {
-    let t = args.trim();
-    if !t.starts_with('{') {
-        return t.to_string();
-    }
-    match serde_json::from_str::<serde_json::Value>(t) {
-        Ok(v) => {
-            let paths: Vec<&str> = v
-                .get("paths")
-                .and_then(|p| p.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| x.as_str())
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default();
-            // No inputs → empty string; execute reports the usage error.
-            if paths.is_empty() {
-                return String::new();
-            }
-            let joined = paths.join(" ");
-            let out = v
-                .get("output")
-                .and_then(|o| o.as_str())
-                .unwrap_or("")
-                .trim();
-            if out.is_empty() {
-                joined
-            } else {
-                format!("{joined} to {out}")
-            }
-        }
-        // Not the JSON we expected — fall back to the raw string; the parser
-        // will handle it (or reject it) as usual.
-        Err(_) => t.to_string(),
-    }
+    ZIP_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
 }
 
 #[async_trait]
@@ -131,8 +119,11 @@ impl ActionHandler for ZipHandler {
     fn usage(&self) -> &str {
         "zip <path...> [to <out.zip>]"
     }
-    fn input_schema(&self) -> Option<serde_json::Value> {
-        Some(zip_input_schema())
+    fn grammar(&self) -> Option<Grammar> {
+        Some(ZIP_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Files
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::Files
@@ -250,8 +241,23 @@ mod tests {
 
     #[test]
     fn zip_schema_requires_paths_only() {
-        let schema = zip_input_schema();
+        let schema = ZIP_GRAMMAR.handler_schema();
         assert_eq!(schema["required"], serde_json::json!(["paths"]));
         assert_eq!(schema["properties"]["paths"]["type"], "array");
+        assert_eq!(schema["properties"]["paths"]["items"]["type"], "string");
+    }
+
+    #[test]
+    fn grammar_flat_rendering_is_accepted_by_the_parser() {
+        // Drift guard: the grammar's flat rendering (space-joined list, `to`
+        // prefix on the output) must round-trip through the hand-written parser.
+        let flat = zip_args_to_flat(r#"{"paths":["a.txt","b.txt"],"output":"bundle.zip"}"#);
+        let (ins, out) = parse_args(&flat);
+        assert_eq!(ins, vec!["a.txt", "b.txt"]);
+        assert_eq!(out.as_deref(), Some("bundle.zip"));
+        let flat = zip_args_to_flat(r#"{"paths":["~/Docs/report.pdf"]}"#);
+        let (ins, out) = parse_args(&flat);
+        assert_eq!(ins, vec!["~/Docs/report.pdf"]);
+        assert_eq!(out, None);
     }
 }

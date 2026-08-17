@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
     RiskAssessment, RiskContext, RiskLevel, Trigger,
@@ -71,56 +72,51 @@ fn dest_for(archive: &std::path::Path, explicit: Option<&str>) -> PathBuf {
     base
 }
 
-/// The JSON Schema for `extract`'s args: a required `archive` path plus an
-/// optional `destination` directory. Emitted as the tool's `input_schema` so a
-/// constrained model sends the path and destination as separate fields instead
-/// of guessing the ` to ` syntax.
-fn extract_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "archive": { "type": "string",
-                         "description": "Path to the archive to unpack: .zip, .tar.gz, .tgz, or .tar. ~ expands to the home directory (e.g. \"~/Downloads/report.zip\")." },
-            "destination": { "type": "string",
-                             "description": "Directory to extract into. Omit for the safe default: a fresh sibling folder named after the archive (report.zip → report/). An explicit destination (or one that already exists) asks the user for confirmation." }
-        },
-        "required": ["archive"],
-        "additionalProperties": false
-    })
-}
+/// `extract`'s argument surface: one free-form action whose flat form is
+/// `<archive> [to <dir>]` (the optional destination rides the `to` prefix).
+/// The JSON Schema and the structured→flat adapter both derive from this.
+const EXTRACT_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Unpack an archive (.zip, .tar.gz, .tgz, or .tar) into a directory. \
+               By default it extracts into a fresh sibling folder named after the \
+               archive (report.zip → report/) — the safe, auto-run case; an explicit \
+               or already-existing destination asks the user to confirm first. \
+               Path-traversal (zip-slip) and symlink entries are refused.",
+        mutates: true,
+        operands: &[
+            Operand {
+                name: "archive",
+                desc: "Path to the archive to unpack: .zip, .tar.gz, .tgz, or .tar. \
+                       ~ expands to the home directory (e.g. \"~/Downloads/report.zip\").",
+                required: true,
+                kind: ArgKind::Text,
+                prefix: None,
+            },
+            Operand {
+                name: "destination",
+                desc: "Directory to extract into. Omit for the safe default: a fresh \
+                       sibling folder named after the archive (report.zip → report/). \
+                       An explicit destination (or one that already exists) asks the \
+                       user for confirmation.",
+                required: false,
+                kind: ArgKind::Text,
+                prefix: Some("to"),
+            },
+        ],
+    }],
+};
 
 /// Normalize the tool's `args` to the flat `"<archive> [to <dir>]"` string the
 /// parser already understands. A constrained model sends the structured JSON
 /// (`{"archive":"a.zip","destination":"out"}`); a human or legacy/flat caller
-/// sends the string directly. Runs first in BOTH `execute` and `assess_risk` so
-/// the schema path can never diverge from the flat path's risk assessment.
+/// sends the string directly, and malformed JSON falls back to the raw string.
+/// Runs first in BOTH `execute` and `assess_risk` so the schema path can never
+/// diverge from the flat path's risk assessment.
 fn extract_args_to_flat(args: &str) -> String {
-    let t = args.trim();
-    if !t.starts_with('{') {
-        return t.to_string();
-    }
-    match serde_json::from_str::<serde_json::Value>(t) {
-        Ok(v) => {
-            let archive = v
-                .get("archive")
-                .and_then(|a| a.as_str())
-                .unwrap_or("")
-                .trim();
-            let dest = v
-                .get("destination")
-                .and_then(|d| d.as_str())
-                .unwrap_or("")
-                .trim();
-            if dest.is_empty() {
-                archive.to_string()
-            } else {
-                format!("{archive} to {dest}")
-            }
-        }
-        // Not the JSON we expected — fall back to the raw string; the parser
-        // will handle it (or reject it) as usual.
-        Err(_) => t.to_string(),
-    }
+    EXTRACT_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
 }
 
 #[async_trait]
@@ -144,8 +140,11 @@ impl ActionHandler for ExtractHandler {
     fn usage(&self) -> &str {
         "extract <archive.zip|.tar.gz> [to <dir>]"
     }
-    fn input_schema(&self) -> Option<serde_json::Value> {
-        Some(extract_input_schema())
+    fn grammar(&self) -> Option<Grammar> {
+        Some(EXTRACT_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Files
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::Files
@@ -287,8 +286,25 @@ mod tests {
 
     #[test]
     fn extract_schema_requires_archive_only() {
-        let schema = extract_input_schema();
+        let schema = EXTRACT_GRAMMAR.handler_schema();
         assert_eq!(schema["required"], serde_json::json!(["archive"]));
         assert!(schema["properties"]["destination"].is_object());
+    }
+
+    #[test]
+    fn grammar_flat_rendering_is_accepted_by_the_parser() {
+        // Drift guard: the grammar's flat rendering must round-trip through
+        // the hand-written parser, with and without a destination.
+        let flat =
+            extract_args_to_flat(r#"{"archive":"~/Downloads/report.zip","destination":"~/out"}"#);
+        assert_eq!(
+            parse_args(&flat),
+            Some((
+                "~/Downloads/report.zip".to_string(),
+                Some("~/out".to_string())
+            ))
+        );
+        let flat = extract_args_to_flat(r#"{"archive":"a.tar.gz"}"#);
+        assert_eq!(parse_args(&flat), Some(("a.tar.gz".to_string(), None)));
     }
 }

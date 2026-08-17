@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
     RiskLevel,
@@ -208,6 +209,70 @@ pub(crate) fn find_window<'a>(
         .map(|(_, w)| w)
 }
 
+/// Shared by `focus` and `quit`: both act on a running window matched the same
+/// way. Named `window` (not `app`) because the match is against window class
+/// and title, and the field merges with the `win` handler's identically-shaped
+/// operand in the group schema.
+const WINDOW_OPERAND: Operand = Operand {
+    name: "window",
+    desc: "The running application/window to act on, fuzzy-matched against \
+           window class and title (e.g. \"firefox\", \"slack\"). An exact class \
+           match always beats a substring hit.",
+    required: true,
+    kind: ArgKind::Text,
+    prefix: None,
+};
+
+/// `appctl`'s grammar: verb-first flat form, exactly what
+/// [`parse_verb_and_target`] splits. `close` stays an accepted input alias of
+/// `quit` but is not a separate model-facing action.
+const APPCTL_GRAMMAR: Grammar = Grammar {
+    verbs: &[
+        Verb {
+            name: "focus",
+            desc: "Bring an already-running application's window to the front. \
+                   Read-only in effect: nothing is closed or changed beyond which \
+                   window has focus.",
+            mutates: false,
+            operands: &[WINDOW_OPERAND],
+        },
+        Verb {
+            name: "quit",
+            desc: "Gracefully close an application's window (like clicking its \
+                   close button) — the app can prompt to save. Prefer this over \
+                   kill.",
+            mutates: true,
+            operands: &[WINDOW_OPERAND],
+        },
+        Verb {
+            name: "kill",
+            desc: "Force-terminate a process (SIGTERM, then SIGKILL). Accepts an \
+                   app/process name or a PID; a name matching several processes \
+                   of the same program kills them all. Last resort — unsaved \
+                   state is lost.",
+            mutates: true,
+            operands: &[Operand {
+                name: "target",
+                desc: "What to kill: an application/process name (e.g. \
+                       \"spotify\") or a numeric PID for one exact process.",
+                required: true,
+                kind: ArgKind::Text,
+                prefix: None,
+            }],
+        },
+    ],
+};
+
+/// Normalize the tool's `args` to the flat `"<verb> <target>"` string
+/// [`parse_verb_and_target`] splits, via the ONE structured→flat decider
+/// ([`Grammar::flatten_json`]). A human or legacy/flat caller passes through
+/// unchanged.
+fn appctl_args_to_flat(args: &str) -> String {
+    APPCTL_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
+}
+
 /// Parse the verb and target from args.
 /// "focus firefox" → ("focus", "firefox")
 /// "quit code" → ("quit", "code")
@@ -318,6 +383,12 @@ impl ActionHandler for AppControlHandler {
     fn description(&self) -> &str {
         "Focus, quit, or kill running applications"
     }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(APPCTL_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::System
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::System
     }
@@ -327,7 +398,11 @@ impl ActionHandler for AppControlHandler {
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        let (verb, target) = parse_verb_and_target(args);
+        // A structured caller sends `{"action":..,"window"/"target":..}`;
+        // flatten it (a plain-string caller passes through) to the verb-first
+        // form the split below reads.
+        let flat = appctl_args_to_flat(args);
+        let (verb, target) = parse_verb_and_target(&flat);
 
         if target.is_empty() {
             return Ok(ActionResult::err(format!(
@@ -647,6 +722,61 @@ impl ActionHandler for AppControlHandler {
         }
 
         items
+    }
+}
+
+#[cfg(test)]
+mod grammar_tests {
+    use super::*;
+
+    #[test]
+    fn appctl_args_flatten_from_structured_json() {
+        // A structured caller sends the typed object; it flattens to the
+        // verb-first string parse_verb_and_target splits.
+        assert_eq!(
+            appctl_args_to_flat(r#"{"action":"focus","window":"firefox"}"#),
+            "focus firefox"
+        );
+        assert_eq!(
+            appctl_args_to_flat(r#"{"action":"quit","window":"code"}"#),
+            "quit code"
+        );
+        assert_eq!(
+            appctl_args_to_flat(r#"{"action":"kill","target":"spotify"}"#),
+            "kill spotify"
+        );
+        // A PID kill survives numerically.
+        assert_eq!(
+            appctl_args_to_flat(r#"{"action":"kill","target":"1234"}"#),
+            "kill 1234"
+        );
+        // A plain-string caller (human, legacy) passes straight through.
+        assert_eq!(appctl_args_to_flat("focus firefox"), "focus firefox");
+        assert_eq!(appctl_args_to_flat("kill 1234"), "kill 1234");
+        // Unknown-verb JSON falls back to the raw string.
+        assert_eq!(
+            appctl_args_to_flat(r#"{"action":"nope"}"#),
+            r#"{"action":"nope"}"#
+        );
+    }
+
+    /// Per-verb drift test: every grammar verb's flat rendering must split
+    /// into a verb execute's dispatch (and completions' verb list) accepts.
+    #[test]
+    fn appctl_grammar_flat_renderings_are_accepted_by_the_parser() {
+        for v in APPCTL_GRAMMAR.verbs {
+            let operand = v.operands[0].name;
+            let flat = appctl_args_to_flat(&format!(
+                r#"{{"action":"{}","{operand}":"firefox"}}"#,
+                v.name
+            ));
+            let (verb, target) = parse_verb_and_target(&flat);
+            assert!(
+                ["focus", "quit", "close", "kill"].contains(&verb),
+                "{verb:?} is not a dispatch verb"
+            );
+            assert_eq!(target, "firefox");
+        }
     }
 }
 

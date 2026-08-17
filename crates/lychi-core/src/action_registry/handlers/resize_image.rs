@@ -13,6 +13,7 @@
 
 use async_trait::async_trait;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
@@ -54,49 +55,51 @@ fn split_path_and_spec(args: &str) -> Option<(String, String)> {
     Some((path.to_string(), spec.to_string()))
 }
 
-/// The JSON Schema for `resize`'s args: a required source `path` plus a
-/// required `size` spec (the four forms `parse_spec` understands). Emitted as
-/// the tool's `input_schema` so the model sends path and size as separate
-/// fields instead of guessing the ` to ` syntax.
-fn resize_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "path": { "type": "string",
-                      "description": "Path to the source image, e.g. \"~/Photos/img.jpg\". ~ expands to the home directory. A new file is written next to it (img.jpg → img_800x600.jpg); the source is never overwritten." },
-            "size": { "type": "string",
-                      "description": "Target size, one of four forms: \"800x600\" (exact width×height, aspect ratio NOT preserved), \"800\" (width, height scaled to keep the aspect ratio), \"x600\" (height, width scaled), or \"50%\" (scale both dimensions)." }
-        },
-        "required": ["path", "size"],
-        "additionalProperties": false
-    })
-}
+/// `resize`'s argument surface: one free-form action whose flat form is
+/// `<path> to <size>`. `size` stays free text because the spec mini-language
+/// (`800x600` / `800` / `x600` / `50%`) is open-ended — the operand desc
+/// carries the four forms `parse_spec` understands. The JSON Schema and the
+/// structured→flat adapter both derive from this.
+const RESIZE_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Resize an image to a target size. Writes a NEW file next to the \
+               original (img.jpg → img_800x600.jpg); the source is never \
+               overwritten. Use for shrinking screenshots/photos, making \
+               thumbnails, or fitting an image to exact dimensions.",
+        mutates: true,
+        operands: &[
+            Operand {
+                name: "path",
+                desc: "Path to the source image, e.g. \"~/Photos/img.jpg\". \
+                       ~ expands to the home directory. Must be an existing image file.",
+                required: true,
+                kind: ArgKind::Text,
+                prefix: None,
+            },
+            Operand {
+                name: "size",
+                desc: "Target size, one of four forms: \"800x600\" (exact \
+                       width×height, aspect ratio NOT preserved), \"800\" (width, \
+                       height scaled to keep the aspect ratio), \"x600\" (height, \
+                       width scaled), or \"50%\" (scale both dimensions).",
+                required: true,
+                kind: ArgKind::Text,
+                prefix: Some("to"),
+            },
+        ],
+    }],
+};
 
 /// Normalize the tool's `args` to the flat `"<path> to <spec>"` string the
 /// parser already understands. A constrained model sends the structured JSON
 /// (`{"path":"img.jpg","size":"800x600"}`); a human or legacy/flat caller sends
-/// the string directly. Keeps `execute` on `&str`.
+/// the string directly, and malformed JSON falls back to the raw string — the
+/// parser handles (or rejects) it as usual. Keeps `execute` on `&str`.
 fn resize_args_to_flat(args: &str) -> String {
-    let t = args.trim();
-    if !t.starts_with('{') {
-        return t.to_string();
-    }
-    match serde_json::from_str::<serde_json::Value>(t) {
-        Ok(v) => {
-            let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("").trim();
-            let size = v.get("size").and_then(|s| s.as_str()).unwrap_or("").trim();
-            if path.is_empty() || size.is_empty() {
-                // A missing half can't form a valid command; whatever remains
-                // fails the split and yields the usage error.
-                format!("{path}{size}")
-            } else {
-                format!("{path} to {size}")
-            }
-        }
-        // Not the JSON we expected — fall back to the raw string; the parser
-        // will handle it (or reject it) as usual.
-        Err(_) => t.to_string(),
-    }
+    RESIZE_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
 }
 
 #[async_trait]
@@ -121,8 +124,11 @@ impl ActionHandler for ResizeImageHandler {
     fn usage(&self) -> &str {
         "resize <path> to <800x600|800|x600|50%>"
     }
-    fn input_schema(&self) -> Option<serde_json::Value> {
-        Some(resize_input_schema())
+    fn grammar(&self) -> Option<Grammar> {
+        Some(RESIZE_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Files
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::Files
@@ -242,8 +248,23 @@ mod tests {
 
     #[test]
     fn resize_schema_requires_path_and_size() {
-        let schema = resize_input_schema();
+        let schema = RESIZE_GRAMMAR.handler_schema();
         assert_eq!(schema["required"], serde_json::json!(["path", "size"]));
         assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn grammar_flat_rendering_is_accepted_by_the_parser() {
+        // Drift guard: the grammar's flat rendering must round-trip through
+        // the hand-written parser AND the spec mini-language, for every form.
+        for spec in ["800x600", "800", "x600", "50%"] {
+            let flat = resize_args_to_flat(&format!(
+                r#"{{"path":"~/My Photos/to keep/img.jpg","size":"{spec}"}}"#
+            ));
+            let (p, s) = split_path_and_spec(&flat).unwrap();
+            assert_eq!(p, "~/My Photos/to keep/img.jpg");
+            assert_eq!(&s, spec);
+            assert!(parse_spec(&s).is_some(), "parse_spec rejected {s}");
+        }
     }
 }

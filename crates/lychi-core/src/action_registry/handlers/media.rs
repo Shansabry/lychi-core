@@ -4,6 +4,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
@@ -181,57 +182,65 @@ const MEDIA_SUBCOMMANDS: &[&str] = &[
 /// canonical spelling). Kept next to the parser it feeds so the two can't drift.
 const MEDIA_ACTION_VERBS: &[&str] = &["play", "pause", "next", "prev", "toggle", "stop"];
 
-/// The JSON Schema for `media`'s args: a required transport `action` (constrained
-/// to [`MEDIA_ACTION_VERBS`]) plus an optional `provider` prefix that targets a
-/// specific player (e.g. "spotify", "yt"). Emitted as the tool's `input_schema`
-/// so the model is constrained to a real verb.
-fn media_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "action": { "type": "string", "enum": MEDIA_ACTION_VERBS,
-                        "description": "The media transport action to perform." },
-            "provider": { "type": "string",
-                          "description": "Optional player to target (e.g. \"spotify\", \"yt\"). Omit to target the currently-playing player." }
-        },
-        "required": ["action"],
-        "additionalProperties": false
-    })
-}
+/// The provider keys the flat grammar reads off the first token — a static
+/// mirror of [`KNOWN_PROVIDERS`]'s names for the schema `Choice`. Pinned to the
+/// dynamic source by `provider_choice_matches_known_providers` so the two
+/// cannot diverge.
+const MEDIA_PROVIDER_KEYS: &[&str] = &["spotify", "yt"];
 
-/// Normalize the tool's `args` to the flat `"[<provider>] <action>"` string the
-/// parser already understands. A constrained model sends the structured JSON
-/// (`{"action":"pause","provider":"spotify"}`); a human or legacy/flat caller
-/// sends the string directly. The provider comes FIRST — matching
-/// [`parse_provider_and_args`], which reads the provider off the first token.
-/// Keeps `execute` on `&str`.
+/// The `media` grammar: a single free-form action whose flat rendering is the
+/// provider-first `"[<provider>] <command> [all]"` string
+/// [`parse_provider_and_args`] + `execute_media` already parse. Free-form
+/// (rather than one verb per transport) because the provider must render
+/// BEFORE the command, and a named verb always renders first. Declared
+/// mutating: transport control changes live playback state on another
+/// application — reversible, but state-changing, like `volume`.
+const MEDIA_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Control media playback via MPRIS — works with Spotify, browser \
+               tabs (YouTube), and local players. Pick the transport command and \
+               optionally target one player.",
+        mutates: true,
+        operands: &[
+            Operand {
+                name: "provider",
+                desc: "Which player to target: \"spotify\" for the Spotify app, \
+                       \"yt\" for a browser player (YouTube). Omit to target the \
+                       currently-playing player.",
+                required: false,
+                kind: ArgKind::Choice(MEDIA_PROVIDER_KEYS),
+                prefix: None,
+            },
+            Operand {
+                name: "command",
+                desc: "The transport action: play, pause, stop (halt + reset \
+                       position), next, prev, or toggle (play/pause flip).",
+                required: true,
+                kind: ArgKind::Choice(MEDIA_ACTION_VERBS),
+                prefix: None,
+            },
+            Operand {
+                name: "all",
+                desc: "Apply to every running player at once instead of one. \
+                       Only meaningful with pause or stop (e.g. \"silence \
+                       everything\"); omit the provider when using it.",
+                required: false,
+                kind: ArgKind::Bool { flag: "all" },
+                prefix: None,
+            },
+        ],
+    }],
+};
+
+/// Normalize the tool's `args` to the flat `"[<provider>] <command> [all]"`
+/// string the parser already understands, via the ONE structured→flat decider
+/// ([`Grammar::flatten_json`]). A human or legacy/flat caller passes through
+/// unchanged. Keeps `execute` on `&str`.
 fn media_args_to_flat(args: &str) -> String {
-    let t = args.trim();
-    if !t.starts_with('{') {
-        return t.to_string();
-    }
-    match serde_json::from_str::<serde_json::Value>(t) {
-        Ok(v) => {
-            let action = v
-                .get("action")
-                .and_then(|a| a.as_str())
-                .unwrap_or("")
-                .trim();
-            let provider = v
-                .get("provider")
-                .and_then(|a| a.as_str())
-                .unwrap_or("")
-                .trim();
-            if provider.is_empty() {
-                action.to_string()
-            } else {
-                format!("{provider} {action}")
-            }
-        }
-        // Not the JSON we expected — fall back to the raw string; the parser
-        // will reject it with the usual "unknown action" message.
-        Err(_) => t.to_string(),
-    }
+    MEDIA_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
 }
 
 fn media_completions(partial: &str) -> Vec<CompletionItem> {
@@ -416,15 +425,18 @@ impl ActionHandler for MediaHandler {
     fn usage(&self) -> &str {
         "play, pause, next, prev, toggle, 'pause all'. Prefix with a provider to target a specific player (e.g. 'spotify pause', 'yt next')"
     }
-    fn input_schema(&self) -> Option<serde_json::Value> {
-        Some(media_input_schema())
+    fn grammar(&self) -> Option<Grammar> {
+        Some(MEDIA_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Media
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::Media
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        // A constrained model sends `{"action":..,"provider":..}`; flatten it
+        // A structured caller sends `{"command":..,"provider":..}`; flatten it
         // (and a plain-string caller passes through) to the provider-first form
         // the parser reads.
         let flat = media_args_to_flat(args);
@@ -557,31 +569,66 @@ mod tests {
         // A constrained model sends the typed object; it flattens to the
         // provider-first string parse_provider_and_args reads.
         assert_eq!(
-            media_args_to_flat(r#"{"action":"pause","provider":"spotify"}"#),
+            media_args_to_flat(r#"{"command":"pause","provider":"spotify"}"#),
             "spotify pause"
         );
         // No provider → just the verb.
-        assert_eq!(media_args_to_flat(r#"{"action":"next"}"#), "next");
+        assert_eq!(media_args_to_flat(r#"{"command":"next"}"#), "next");
         // Empty provider is treated as no provider.
         assert_eq!(
-            media_args_to_flat(r#"{"action":"toggle","provider":""}"#),
+            media_args_to_flat(r#"{"command":"toggle","provider":""}"#),
             "toggle"
+        );
+        // The `all` flag renders after the command — the exact "pause all"
+        // phrase execute_media's control-all branch matches.
+        assert_eq!(
+            media_args_to_flat(r#"{"command":"pause","all":true}"#),
+            "pause all"
+        );
+        assert_eq!(
+            media_args_to_flat(r#"{"command":"stop","all":true}"#),
+            "stop all"
         );
         // A plain-string caller (human, legacy) passes straight through.
         assert_eq!(media_args_to_flat("spotify pause"), "spotify pause");
         assert_eq!(media_args_to_flat("next"), "next");
+        assert_eq!(media_args_to_flat("{not json"), "{not json");
     }
 
+    /// Per-verb drift test: every command the grammar's Choice offers must
+    /// flatten to a string the provider/transport parsers accept.
     #[test]
-    fn media_schema_enum_matches_the_real_verbs() {
-        // The schema's action enum must be exactly MEDIA_ACTION_VERBS, and each
-        // one must be a canonical arm the transport match handles — so the model
-        // is constrained to verbs execute_media actually dispatches.
-        let schema = media_input_schema();
-        let en = schema["properties"]["action"]["enum"].as_array().unwrap();
+    fn media_grammar_flat_renderings_are_accepted_by_the_parser() {
+        // The grammar's command Choice IS MEDIA_ACTION_VERBS — same const the
+        // transport match documents as its canonical arms.
+        let schema = MEDIA_GRAMMAR.handler_schema();
+        let en = schema["properties"]["command"]["enum"].as_array().unwrap();
         assert_eq!(en.len(), MEDIA_ACTION_VERBS.len());
         for v in MEDIA_ACTION_VERBS {
             assert!(en.iter().any(|e| e == v), "enum missing {v}");
+            // Bare command flattens to itself and reads as provider-less.
+            let flat = media_args_to_flat(&format!(r#"{{"command":"{v}"}}"#));
+            assert_eq!(&flat, v);
+            let (target, action) = parse_provider_and_args(&flat);
+            assert!(matches!(target, Target::Any));
+            assert_eq!(action, *v);
+            // With a provider, the provider is read off the first token and the
+            // command survives intact for the transport match.
+            for p in MEDIA_PROVIDER_KEYS {
+                let flat = media_args_to_flat(&format!(r#"{{"provider":"{p}","command":"{v}"}}"#));
+                let (target, action) = parse_provider_and_args(&flat);
+                assert!(!matches!(target, Target::Any), "{p} not read as provider");
+                assert_eq!(action, *v);
+            }
         }
+    }
+
+    /// The static provider Choice must match the dynamic parser table — the
+    /// drift guard for declaring [`MEDIA_PROVIDER_KEYS`] separately from
+    /// [`KNOWN_PROVIDERS`].
+    #[test]
+    fn provider_choice_matches_known_providers() {
+        let known: Vec<&str> = KNOWN_PROVIDERS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(MEDIA_PROVIDER_KEYS, known.as_slice());
     }
 }

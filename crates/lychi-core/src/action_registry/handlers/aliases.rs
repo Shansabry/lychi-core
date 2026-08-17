@@ -4,6 +4,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use redb::Database;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
@@ -22,57 +23,71 @@ impl AliasHandler {
 
 const ALIAS_SUBCOMMANDS: &[&str] = &["add", "list", "delete"];
 
-/// The alias verbs the tool schema constrains the model to — the same set
-/// `execute`'s prefix checks dispatch on (canonical spellings only; the
-/// parser's aliases like `ls`/`del`/`rm` stay accepted on the flat path).
-const ALIAS_ACTION_VERBS: &[&str] = &["add", "update", "delete", "list"];
+/// The alias name operand, shared by every verb that targets one alias.
+const ALIAS_NAME: Operand = Operand {
+    name: "name",
+    desc: "The alias name — the shortcut word the user will type (e.g. \"gs\"). \
+           One word, no spaces.",
+    required: true,
+    kind: ArgKind::Text,
+    prefix: None,
+};
 
-/// The JSON Schema for `alias`'s args: a required `action` (constrained to
-/// [`ALIAS_ACTION_VERBS`]) plus the `name`/`command` operands the mutating
-/// verbs need. Emitted as the tool's `input_schema` so the model is constrained
-/// to a real verb.
-fn alias_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "action": { "type": "string", "enum": ALIAS_ACTION_VERBS,
-                        "description": "What to do: \"add\" a new shortcut, \"update\" an existing one's command, \"delete\" one, or \"list\" all saved aliases." },
-            "name": { "type": "string",
-                      "description": "The alias name — the shortcut word the user will type (e.g. \"gs\"). One word, no spaces. Required for \"add\", \"update\" and \"delete\"; omit for \"list\"." },
-            "command": { "type": "string",
-                         "description": "The full command the alias expands to (e.g. \"git status\"). Required for \"add\" and \"update\"; omit otherwise." }
+/// The expansion operand `add`/`update` need. Free text with spaces — it is the
+/// trailing field of the flat form, so it survives whole.
+const ALIAS_COMMAND: Operand = Operand {
+    name: "command",
+    desc: "The full command the alias expands to (e.g. \"git status\"). May \
+           contain spaces.",
+    required: true,
+    kind: ArgKind::Text,
+    prefix: None,
+};
+
+/// `alias`'s argument surface: the verbs `execute`'s prefix checks dispatch on
+/// (canonical spellings only; the parser's aliases like `ls`/`del`/`rm` stay
+/// accepted on the flat path). The JSON Schema and the structured→flat adapter
+/// both derive from this.
+const ALIAS_GRAMMAR: Grammar = Grammar {
+    verbs: &[
+        Verb {
+            name: "add",
+            desc: "Save a new command shortcut: typing the alias name in the \
+                   launcher expands to the full command.",
+            mutates: true,
+            operands: &[ALIAS_NAME, ALIAS_COMMAND],
         },
-        "required": ["action"],
-        "additionalProperties": false
-    })
-}
+        Verb {
+            name: "update",
+            desc: "Change what an existing alias expands to.",
+            mutates: true,
+            operands: &[ALIAS_NAME, ALIAS_COMMAND],
+        },
+        Verb {
+            name: "delete",
+            desc: "Delete a saved alias by name.",
+            mutates: true,
+            operands: &[ALIAS_NAME],
+        },
+        Verb {
+            name: "list",
+            desc: "List every saved alias and the command it expands to.",
+            mutates: false,
+            operands: &[],
+        },
+    ],
+};
 
 /// Normalize the tool's `args` to the flat `"<verb> <name> [<command>]"` string
 /// the parser already understands. A constrained model sends the structured
 /// JSON (`{"action":"add","name":"gs","command":"git status"}`); a human or
-/// legacy/flat caller sends the string directly. Keeps `execute` on `&str`.
+/// legacy/flat caller sends the string directly, and malformed JSON falls back
+/// to the raw string (the parser answers with its usual usage message). Keeps
+/// `execute` on `&str`.
 fn alias_args_to_flat(args: &str) -> String {
-    let t = args.trim();
-    if !t.starts_with('{') {
-        return t.to_string();
-    }
-    match serde_json::from_str::<serde_json::Value>(t) {
-        Ok(v) => {
-            let field = |k: &str| v.get(k).and_then(|a| a.as_str()).unwrap_or("").trim();
-            let action = field("action");
-            let name = field("name");
-            let command = field("command");
-            [action, name, command]
-                .iter()
-                .filter(|s| !s.is_empty())
-                .copied()
-                .collect::<Vec<_>>()
-                .join(" ")
-        }
-        // Not the JSON we expected — fall back to the raw string; the parser
-        // answers with its usual usage message.
-        Err(_) => t.to_string(),
-    }
+    ALIAS_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
 }
 
 #[async_trait]
@@ -93,8 +108,11 @@ impl ActionHandler for AliasHandler {
     fn usage(&self) -> &str {
         "'add <name> <command>', 'update <name> <command>', 'delete <name>', 'list'"
     }
-    fn input_schema(&self) -> Option<serde_json::Value> {
-        Some(alias_input_schema())
+    fn grammar(&self) -> Option<Grammar> {
+        Some(ALIAS_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Personal
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
@@ -293,19 +311,74 @@ mod tests {
         // A plain-string caller (human, legacy) passes straight through.
         assert_eq!(alias_args_to_flat("add gs git status"), "add gs git status");
         assert_eq!(alias_args_to_flat("list"), "list");
-        // Malformed JSON → raw fallback.
+        // Malformed JSON (and JSON naming a verb the grammar lacks) → raw
+        // fallback; the parser answers with its usual usage message.
         assert_eq!(alias_args_to_flat("{not json"), "{not json");
+        assert_eq!(
+            alias_args_to_flat(r#"{"action":"frobnicate","name":"gs"}"#),
+            r#"{"action":"frobnicate","name":"gs"}"#
+        );
     }
 
     #[test]
-    fn alias_schema_enum_matches_the_real_verbs() {
-        // The schema's action enum must be exactly ALIAS_ACTION_VERBS, so the
-        // model is constrained to verbs the parser actually handles.
-        let schema = alias_input_schema();
+    fn alias_schema_enum_matches_the_grammar_verbs() {
+        // The derived schema's action enum must be exactly the grammar's verbs
+        // — and those must stay the set `execute`'s prefix checks dispatch on.
+        let names: Vec<&str> = ALIAS_GRAMMAR.verbs.iter().map(|v| v.name).collect();
+        assert_eq!(names, vec!["add", "update", "delete", "list"]);
+        let schema = ALIAS_GRAMMAR.handler_schema();
         let en = schema["properties"]["action"]["enum"].as_array().unwrap();
-        assert_eq!(en.len(), ALIAS_ACTION_VERBS.len());
-        for v in ALIAS_ACTION_VERBS {
+        assert_eq!(en.len(), names.len());
+        for v in &names {
             assert!(en.iter().any(|e| e == v), "enum missing {v}");
         }
+    }
+
+    /// Extract the text body from a result's output, for assertions.
+    fn body(r: &ActionResult) -> Option<&str> {
+        match &r.output {
+            crate::action_registry::Output::Text { body, .. } => Some(body.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Drift guard: every verb's flat rendering (via the grammar) must be
+    /// accepted by the hand-written parser — end to end through `execute`.
+    #[tokio::test]
+    async fn grammar_flat_rendering_is_accepted_by_the_parser() {
+        let db = crate::db::open_test_database();
+        let handler = AliasHandler::new(db);
+        let ctx = crate::action_registry::ExecContext::default();
+
+        let r = handler
+            .execute(
+                &ctx,
+                r#"{"action":"add","name":"gs","command":"git status"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(r.success, "{:?}", body(&r));
+        assert!(body(&r).unwrap().contains("gs → git status"));
+
+        let r = handler
+            .execute(
+                &ctx,
+                r#"{"action":"update","name":"gs","command":"git status -sb"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(r.success);
+        assert!(body(&r).unwrap().contains("gs → git status -sb"));
+
+        let r = handler.execute(&ctx, r#"{"action":"list"}"#).await.unwrap();
+        assert!(r.success);
+        assert!(body(&r).unwrap().contains("gs → git status -sb"));
+
+        let r = handler
+            .execute(&ctx, r#"{"action":"delete","name":"gs"}"#)
+            .await
+            .unwrap();
+        assert!(r.success);
+        assert!(body(&r).unwrap().contains("Alias deleted: gs"));
     }
 }

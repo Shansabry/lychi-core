@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use std::time::Instant;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::handlers::icons::resolve_icon_cached;
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext,
@@ -58,8 +59,53 @@ impl AppLauncher {
     }
 }
 
+/// `open`'s grammar: a single free-form action (the flat form is just the app
+/// name `execute` fuzzy-matches). Declared NOT mutating: launching is
+/// idempotent-by-design here — smart-open focuses the running instance instead
+/// of spawning a second one — and opening two different apps in one turn is a
+/// legitimate parallel request, not a hedge to serialize.
+const OPEN_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Launch an installed desktop application by name — or, if it is \
+               already running, focus its window instead (smart open). For GUI \
+               applications only; not for shell commands, files, or URLs.",
+        mutates: false,
+        operands: &[Operand {
+            name: "app",
+            desc: "The application name as the user knows it (e.g. \"firefox\", \
+                   \"gnome terminal\") — fuzzy-matched against the installed \
+                   .desktop entries. An absolute .desktop file path is also \
+                   accepted as an exact reference.",
+            required: true,
+            kind: ArgKind::Text,
+            prefix: None,
+        }],
+    }],
+};
+
+/// Normalize the tool's `args` to the flat app-name string `execute` already
+/// parses, via the ONE structured→flat decider ([`Grammar::flatten_json`]).
+/// A human or legacy/flat caller passes through unchanged.
+fn open_args_to_flat(args: &str) -> String {
+    OPEN_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
+}
+
 #[async_trait]
 impl ActionHandler for AppLauncher {
+    fn triggers(&self) -> &'static [crate::action_registry::Trigger] {
+        use crate::action_registry::Trigger;
+        // `open` is ALSO a conditional case in `intent/patterns.rs` (URL/path
+        // redirects), which runs before this data-driven route and wins for
+        // typed input — declaring the keyword here doesn't change routing, it
+        // makes the handler visible to the catalogs (Guide + model tools),
+        // which only list keyword-bearing handlers.
+        static TRIGGERS: &[Trigger] = &[Trigger::keywords(&["open"])];
+        TRIGGERS
+    }
+
     fn id(&self) -> &str {
         "open"
     }
@@ -67,12 +113,21 @@ impl ActionHandler for AppLauncher {
     fn description(&self) -> &str {
         "Launch a desktop application"
     }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(OPEN_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::System
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::System
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        let query = args.trim();
+        // A structured caller sends `{"app":"…"}`; flatten it (a plain-string
+        // caller passes through) to the bare name the matcher reads.
+        let flat = open_args_to_flat(args);
+        let query = flat.trim();
         if query.is_empty() {
             return Ok(ActionResult::err(
                 "Usage: open <application name>".to_string(),
@@ -196,5 +251,32 @@ impl ActionHandler for AppLauncher {
         });
         items.truncate(8);
         items
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_args_flatten_from_structured_json() {
+        // A structured caller sends the typed object; it flattens to the bare
+        // app name execute fuzzy-matches (the whole flat grammar of `open`).
+        assert_eq!(open_args_to_flat(r#"{"app":"firefox"}"#), "firefox");
+        // Multi-word names survive as one query string.
+        assert_eq!(
+            open_args_to_flat(r#"{"app":"gnome terminal"}"#),
+            "gnome terminal"
+        );
+        // A .desktop path is passed through for the exact-path fast path.
+        assert_eq!(
+            open_args_to_flat(r#"{"app":"/usr/share/applications/firefox.desktop"}"#),
+            "/usr/share/applications/firefox.desktop"
+        );
+        // A plain-string caller (human, legacy) passes straight through.
+        assert_eq!(open_args_to_flat("firefox"), "firefox");
+        assert_eq!(open_args_to_flat(""), "");
+        // Malformed JSON falls back to the raw string.
+        assert_eq!(open_args_to_flat("{not json"), "{not json");
     }
 }

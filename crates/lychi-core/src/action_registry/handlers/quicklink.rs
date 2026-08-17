@@ -41,12 +41,64 @@
 
 use async_trait::async_trait;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, RiskAssessment,
     RiskContext, RiskLevel,
 };
 use crate::error::LychiError;
 use crate::quicklinks::{Quicklink, QuicklinkKind, expand_template};
+
+/// `quicklink`'s argument surface: a single free-form action whose flat form is
+/// `<keyword> <input>`. The keyword set is USER data (each user authors their
+/// own shortcuts), so the grammar deliberately does not enumerate it — the
+/// operand desc points the model at completions instead. `mutates` is true
+/// because a quicklink's kind is unknown at declaration time: a `Shell`
+/// quicklink expands to a command that runs through `run` (gated by the Rules
+/// Engine but still mutating), so the honest per-action answer is the worst
+/// case, not the common URL case.
+const QUICKLINK_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Run one of the user's saved quicklink shortcuts by keyword, \
+               substituting the input into its template. A quicklink can open a \
+               templated URL or file path, expand to another launcher command, or \
+               expand to a shell command (which is then vetted and may require \
+               confirmation). Only invoke keywords the user actually has.",
+        mutates: true,
+        operands: &[
+            Operand {
+                name: "keyword",
+                desc: "The shortcut's keyword (e.g. \"gh\", \"mdn\", \"npm\"). \
+                       Quicklinks are user-defined — the set varies per user and is \
+                       discoverable via completions; never guess a keyword.",
+                required: true,
+                kind: ArgKind::Text,
+                prefix: None,
+            },
+            Operand {
+                name: "input",
+                desc: "The text substituted into the shortcut's {placeholder} \
+                       template — a search phrase, branch name, path segment, etc. \
+                       Omit when the template takes no input.",
+                required: false,
+                kind: ArgKind::Text,
+                prefix: None,
+            },
+        ],
+    }],
+};
+
+/// Normalize the tool's `args` to the flat `"<keyword> <input>"` string the
+/// resolver reads. A constrained model sends the structured JSON
+/// (`{"keyword":"gh","input":"tokio"}`); a human or legacy/flat caller sends
+/// the string directly and passes through unchanged. Malformed JSON falls back
+/// to the raw string.
+fn quicklink_args_to_flat(args: &str) -> String {
+    QUICKLINK_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
+}
 
 pub struct QuicklinkHandler {
     links: Vec<Quicklink>,
@@ -72,17 +124,21 @@ impl QuicklinkHandler {
             .find(|l| l.keyword.eq_ignore_ascii_case(keyword.trim()))
     }
 
-    /// Resolve `"keyword input"` to its quicklink and expanded template.
+    /// Resolve `"keyword input"` (or its structured-JSON spelling) to its
+    /// quicklink and expanded template.
     ///
-    /// Shared by [`ActionHandler::assess_risk`] and [`ActionHandler::execute`]
-    /// so the string that gets *judged* is byte-for-byte the string that gets
-    /// *run*. Two independent expansions could drift apart, and that gap is
-    /// precisely the time-of-check/time-of-use hole this handler exists to
-    /// close.
+    /// Shared by [`ActionHandler::assess_risk`], [`ActionHandler::execute`] and
+    /// [`Self::resolve_route`] so the string that gets *judged* is byte-for-byte
+    /// the string that gets *run*. Two independent expansions could drift apart,
+    /// and that gap is precisely the time-of-check/time-of-use hole this handler
+    /// exists to close. Flattening structured args HERE keeps that property for
+    /// a constrained model's JSON call too — every entry point sees the same
+    /// flat form.
     fn resolve(&self, args: &str) -> Option<(&Quicklink, String)> {
-        let (keyword, input) = match args.trim().split_once(char::is_whitespace) {
+        let flat = quicklink_args_to_flat(args);
+        let (keyword, input) = match flat.trim().split_once(char::is_whitespace) {
             Some((k, q)) => (k, q.trim()),
-            None => (args.trim(), ""),
+            None => (flat.trim(), ""),
         };
         let link = self.find(keyword)?;
         let expanded = expand_template(&link.template, input, link.kind).ok()?;
@@ -98,7 +154,10 @@ impl QuicklinkHandler {
     /// meet the gates that already guard those actions. Keeping the mapping in
     /// one function means "which gate applies to which kind" is stated once.
     pub fn resolve_route(&self, args: &str) -> Option<(String, String)> {
-        let (link, expanded) = self.resolve(args)?;
+        // Flatten once so the args carried forward to `execute` are the same
+        // flat form `resolve` judged (a structured-JSON caller included).
+        let flat = quicklink_args_to_flat(args);
+        let (link, expanded) = self.resolve(&flat)?;
         Some(match link.kind {
             // Through `run`: Rules Engine + shell_exec's spawn-point decider.
             QuicklinkKind::Shell => ("run".to_string(), expanded),
@@ -106,7 +165,7 @@ impl QuicklinkHandler {
             QuicklinkKind::Command => ("__reroute__".to_string(), expanded),
             // Handled here — the URI and path deciders run in `execute`.
             QuicklinkKind::Url | QuicklinkKind::Open => {
-                ("quicklink".to_string(), args.trim().to_string())
+                ("quicklink".to_string(), flat.trim().to_string())
             }
         })
     }
@@ -141,6 +200,12 @@ impl ActionHandler for QuicklinkHandler {
 
     fn category(&self) -> CommandCategory {
         CommandCategory::Web
+    }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(QUICKLINK_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Web
     }
 
     /// Judge the EXPANDED command, before anything runs.
@@ -179,12 +244,16 @@ impl ActionHandler for QuicklinkHandler {
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        let (keyword, _) = match args.trim().split_once(char::is_whitespace) {
+        // A constrained model sends `{"keyword":..,"input":..}`; flatten it (a
+        // plain-string caller passes through). `resolve` flattens for itself,
+        // but the keyword shown in the error message must match too.
+        let flat = quicklink_args_to_flat(args);
+        let (keyword, _) = match flat.trim().split_once(char::is_whitespace) {
             Some((k, q)) => (k, q),
-            None => (args.trim(), ""),
+            None => (flat.trim(), ""),
         };
 
-        let Some((link, expanded)) = self.resolve(args) else {
+        let Some((link, expanded)) = self.resolve(&flat) else {
             // Either an unknown keyword, or a template that fails to parse
             // (only reachable via a hand-edited config, since save-time
             // validation rejects malformed templates).
@@ -403,6 +472,51 @@ mod tests {
     #[test]
     fn an_unknown_keyword_is_low_risk_rather_than_panicking() {
         assert_eq!(risk("nope whatever").level, RiskLevel::Low);
+    }
+
+    // ---- grammar drift ---------------------------------------------------
+
+    #[test]
+    fn quicklink_args_flatten_from_structured_json() {
+        // A constrained model sends the typed object; it flattens to the
+        // "<keyword> <input>" string the resolver reads.
+        assert_eq!(
+            quicklink_args_to_flat(r#"{"keyword":"gh","input":"tokio runtime"}"#),
+            "gh tokio runtime"
+        );
+        // No input → bare keyword (templates that take no input).
+        assert_eq!(quicklink_args_to_flat(r#"{"keyword":"gh"}"#), "gh");
+        // A plain-string caller (human, legacy) passes straight through.
+        assert_eq!(quicklink_args_to_flat("gh tokio"), "gh tokio");
+        // Malformed JSON falls back to the raw string.
+        assert_eq!(quicklink_args_to_flat("{not json"), "{not json");
+    }
+
+    /// Drift guard: the grammar's flat rendering must be accepted end-to-end —
+    /// a structured call resolves, expands, and routes exactly like the flat
+    /// form, on every entry point (risk, route, execute).
+    #[tokio::test]
+    async fn structured_call_matches_the_flat_form_everywhere() {
+        let json = r#"{"keyword":"gh","input":"tokio runtime"}"#;
+        // execute: the URL kind navigates with the encoded input.
+        match run(json).await.output {
+            Output::Navigate { url, .. } => {
+                assert_eq!(url, "https://github.com/search?q=tokio%20runtime");
+            }
+            other => panic!("expected navigate, got {other:?}"),
+        }
+        // resolve_route: a Shell kind still dispatches through `run`.
+        let (action, args) = handler()
+            .resolve_route(r#"{"keyword":"co","input":"main"}"#)
+            .unwrap();
+        assert_eq!(action, "run");
+        assert_eq!(args, "git checkout 'main'");
+        // assess_risk: the expansion is judged for a structured call too.
+        assert_ne!(
+            risk(r#"{"keyword":"wipe","input":"/"}"#).level,
+            RiskLevel::Low,
+            "a destructive structured expansion must not slip through"
+        );
     }
 
     #[test]

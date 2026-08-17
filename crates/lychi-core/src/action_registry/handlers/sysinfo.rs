@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
@@ -38,44 +39,46 @@ const SUBCOMMANDS: &[&str] = &[
     "speedtest",
 ];
 
-/// The JSON Schema for `sysinfo`'s args: an optional `action` constrained to the
-/// real [`SUBCOMMANDS`], so a constrained model (cloud `enum` / local grammar)
-/// can only emit a subcommand the dispatch match actually handles. There is no
-/// operand — a subcommand carries all the meaning — so the schema has no `value`
-/// field. `action` is optional: empty args are a valid request (the full
-/// overview). Sourced from `SUBCOMMANDS` so the enum can't drift from dispatch.
-fn sysinfo_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "action": { "type": "string", "enum": SUBCOMMANDS,
-                        "description": "The info subcommand to run. Omit for a full system overview." }
-        },
-        "additionalProperties": false
-    })
-}
+/// `sysinfo`'s grammar: a single free-form read with an optional `topic`
+/// Choice — reusing [`SUBCOMMANDS`] directly, the SAME const the dispatch
+/// match, triggers, and completions are built from, so the schema enum cannot
+/// drift from dispatch. Free-form (not one verb per topic) so "omit the topic"
+/// stays expressible: the empty flat form is the combined overview, which a
+/// verb-per-topic grammar could not render. Everything here is a read —
+/// nothing mutates.
+const SYSINFO_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Read local system information (hardware, OS, network, sensors). \
+               Read-only and instant, except: `net` also looks up the public IP \
+               via ifconfig.me (the user consents first), and `speedtest` \
+               transfers ~11 MB to Cloudflare (consented every run, takes \
+               ~15-45s).",
+        mutates: false,
+        operands: &[Operand {
+            name: "topic",
+            desc: "Which reading to take: ip (local addresses only), cpu, mem, \
+                   disk, temp, gpu, battery, net (interfaces + WiFi + public \
+                   IP), audio, display, os, or speedtest. Omit for a combined \
+                   overview (ip, memory, disk, uptime, temps, battery, WiFi, \
+                   volume).",
+            required: false,
+            kind: ArgKind::Choice(SUBCOMMANDS),
+            prefix: None,
+        }],
+    }],
+};
 
-/// Normalize the tool's `args` to the flat subcommand string `execute` parses.
-/// A constrained model sends the structured JSON (`{"action":"cpu"}`); a human
-/// or legacy/flat caller sends the string directly. sysinfo has no operand, so
-/// the flattened form is just the verb (or `""` for the overview when `action`
-/// is absent). Keeps `execute`/`assess_risk` on `&str`.
+/// Normalize the tool's `args` to the flat subcommand string `execute` parses,
+/// via the ONE structured→flat decider ([`Grammar::flatten_json`]). A human or
+/// legacy/flat caller passes through unchanged; a structured call with no
+/// `topic` flattens to `""`, the combined overview. Keeps
+/// `execute`/`assess_risk` on `&str` — and `assess_risk` MUST keep calling
+/// this first, so the consent gate sees the same verb execute dispatches on.
 fn sysinfo_args_to_flat(args: &str) -> String {
-    let t = args.trim();
-    if !t.starts_with('{') {
-        return t.to_string();
-    }
-    match serde_json::from_str::<serde_json::Value>(t) {
-        Ok(v) => v
-            .get("action")
-            .and_then(|a| a.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string(),
-        // Not the JSON we expected — fall back to the raw string; the dispatch
-        // match will reject it with the usual "unknown" message.
-        Err(_) => t.to_string(),
-    }
+    SYSINFO_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
 }
 
 #[async_trait]
@@ -116,8 +119,11 @@ impl ActionHandler for SysInfoHandler {
     fn usage(&self) -> &str {
         "Subcommands: ip, cpu, mem, disk, temp, gpu, battery, net, audio, display, os. Empty args shows a full overview"
     }
-    fn input_schema(&self) -> Option<serde_json::Value> {
-        Some(sysinfo_input_schema())
+    fn grammar(&self) -> Option<Grammar> {
+        Some(SYSINFO_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::System
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::System
@@ -129,7 +135,7 @@ impl ActionHandler for SysInfoHandler {
         _ctx: &crate::action_registry::RiskContext<'_>,
     ) -> crate::action_registry::RiskAssessment {
         use crate::action_registry::{ConsentKind, RiskAssessment, RiskLevel};
-        // A constrained model sends `{"action":..}`; flatten it (a plain-string
+        // A structured caller sends `{"topic":..}`; flatten it (a plain-string
         // caller passes through) so the consent match sees the same verb execute
         // will dispatch on.
         let args = sysinfo_args_to_flat(args);
@@ -160,7 +166,7 @@ impl ActionHandler for SysInfoHandler {
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
         let start = Instant::now();
-        // A constrained model sends `{"action":..}`; flatten it (and a
+        // A structured caller sends `{"topic":..}`; flatten it (and a
         // plain-string caller passes through) to the subcommand the match parses.
         let flat = sysinfo_args_to_flat(args);
         let cmd = flat.trim().to_lowercase();
@@ -1203,28 +1209,46 @@ mod tests {
 
     #[test]
     fn sysinfo_args_flatten_from_structured_json() {
-        // A constrained model sends the typed object; it flattens to the bare
-        // subcommand the dispatch match parses. sysinfo has no operand.
-        assert_eq!(sysinfo_args_to_flat(r#"{"action":"cpu"}"#), "cpu");
-        assert_eq!(sysinfo_args_to_flat(r#"{"action":"battery"}"#), "battery");
-        // No action → the full-overview empty string.
+        // A structured caller sends the typed object; it flattens to the bare
+        // subcommand the dispatch match parses.
+        assert_eq!(sysinfo_args_to_flat(r#"{"topic":"cpu"}"#), "cpu");
+        assert_eq!(sysinfo_args_to_flat(r#"{"topic":"battery"}"#), "battery");
+        // No topic → the full-overview empty string.
         assert_eq!(sysinfo_args_to_flat("{}"), "");
-        assert_eq!(sysinfo_args_to_flat(r#"{"action":""}"#), "");
+        assert_eq!(sysinfo_args_to_flat(r#"{"topic":""}"#), "");
         // A plain-string caller (human, legacy) passes straight through.
         assert_eq!(sysinfo_args_to_flat("cpu"), "cpu");
         assert_eq!(sysinfo_args_to_flat(""), "");
+        assert_eq!(sysinfo_args_to_flat("{not json"), "{not json");
     }
 
+    /// Drift test: the grammar's topic Choice IS `SUBCOMMANDS` — the same
+    /// const dispatch, triggers, and completions are built from — and every
+    /// value flattens to itself, i.e. to a string the dispatch match handles.
+    /// The consent gate rides the same adapter, so a structured `net` call
+    /// must reach the same consent verdict as the flat spelling.
     #[test]
-    fn sysinfo_schema_enum_matches_the_real_verbs() {
-        // The schema's action enum must be exactly SUBCOMMANDS, so the model is
-        // constrained to subcommands the dispatch match actually handles.
-        let schema = sysinfo_input_schema();
-        let en = schema["properties"]["action"]["enum"].as_array().unwrap();
+    fn sysinfo_grammar_topics_match_dispatch_and_consent() {
+        use crate::action_registry::{ConsentKind, RiskContext};
+        let schema = SYSINFO_GRAMMAR.handler_schema();
+        let en = schema["properties"]["topic"]["enum"].as_array().unwrap();
         assert_eq!(en.len(), SUBCOMMANDS.len());
         for v in SUBCOMMANDS {
             assert!(en.iter().any(|e| e == v), "enum missing {v}");
+            assert_eq!(sysinfo_args_to_flat(&format!(r#"{{"topic":"{v}"}}"#)), *v);
         }
+        // Nothing here mutates.
+        assert!(!SYSINFO_GRAMMAR.verbs[0].mutates);
+        // Consent flows through the structured path identically.
+        let h = SysInfoHandler;
+        let ctx = RiskContext::default();
+        let kind = |args: &str| h.assess_risk(args, &ctx).consent.map(|c| c.kind);
+        assert_eq!(kind(r#"{"topic":"net"}"#), Some(ConsentKind::PublicIp));
+        assert_eq!(
+            kind(r#"{"topic":"speedtest"}"#),
+            Some(ConsentKind::LargeTransfer)
+        );
+        assert_eq!(kind(r#"{"topic":"ip"}"#), None);
     }
 
     #[test]

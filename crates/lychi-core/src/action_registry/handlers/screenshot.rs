@@ -26,6 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 
+use crate::action_registry::grammar::{Grammar, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
@@ -84,49 +85,55 @@ impl Mode {
     }
 }
 
-/// The canonical capture-mode VERBS the agent chooses between — the
-/// machine-readable enum fed to the tool schema so a constrained model (cloud
-/// `enum` / local grammar) can only emit one [`Mode::parse`] recognizes. Each is
-/// a distinct `Mode::canonical`, so the enum can't drift from the parser.
+/// The canonical capture-mode VERBS the agent chooses between — the exact verb
+/// names [`SCREENSHOT_GRAMMAR`] declares, so a constrained model can only emit
+/// one [`Mode::parse`] recognizes. Each is a distinct `Mode::canonical`; the
+/// grammar drift test pins all three together.
+#[cfg(test)] // drift guard only — the grammar is the live source
 const SCREENSHOT_MODES: &[&str] = &["full", "area", "window"];
 
-/// The JSON Schema for `screenshot`'s args: an optional `action` constrained to
-/// [`SCREENSHOT_MODES`], with no operand (a mode carries all the meaning).
-/// `action` is optional — empty args are a valid request (the full screen, the
-/// default). Emitted as the tool's `input_schema` so the model is constrained to
-/// a real mode.
-fn screenshot_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "action": { "type": "string", "enum": SCREENSHOT_MODES,
-                        "description": "What to capture. Omit or \"full\" for the whole screen." }
+/// `screenshot`'s grammar: one verb per capture mode, no operands (the mode
+/// carries all the meaning). Verb names are exactly [`SCREENSHOT_MODES`] — the
+/// canonical spellings [`Mode::parse`] recognizes — pinned by the drift test.
+/// Every mode mutates: a capture always writes a timestamped PNG into the
+/// user's Pictures directory (and puts it on the clipboard).
+const SCREENSHOT_GRAMMAR: Grammar = Grammar {
+    verbs: &[
+        Verb {
+            name: "full",
+            desc: "Capture the whole screen (all monitors), with no user \
+                   interaction. Saves a timestamped PNG to Pictures and copies \
+                   it to the clipboard.",
+            mutates: true,
+            operands: &[],
         },
-        "additionalProperties": false
-    })
-}
+        Verb {
+            name: "area",
+            desc: "Let the user drag-select a region to capture (interactive — \
+                   waits on the user). Saves to Pictures + clipboard.",
+            mutates: true,
+            operands: &[],
+        },
+        Verb {
+            name: "window",
+            desc: "Capture one window (interactive pick where the tool supports \
+                   it; degrades to region select elsewhere). Saves to Pictures \
+                   + clipboard.",
+            mutates: true,
+            operands: &[],
+        },
+    ],
+};
 
-/// Normalize the tool's `args` to the flat mode string [`Mode::parse`] reads. A
-/// constrained model sends the structured JSON (`{"action":"area"}`); a human or
-/// legacy/flat caller sends the string directly. Screenshot has no operand, so
-/// the flattened form is just the mode (or `""` — parsed as the default full
-/// screen — when `action` is absent).
+/// Normalize the tool's `args` to the flat mode string [`Mode::parse`] reads,
+/// via the ONE structured→flat decider ([`Grammar::flatten_json`]). A human or
+/// legacy/flat caller passes through unchanged — and `Mode::parse` treats
+/// anything unrecognized as the full-screen default, so even a fallen-through
+/// raw JSON string degrades to a full capture rather than an error.
 fn screenshot_args_to_flat(args: &str) -> String {
-    let t = args.trim();
-    if !t.starts_with('{') {
-        return t.to_string();
-    }
-    match serde_json::from_str::<serde_json::Value>(t) {
-        Ok(v) => v
-            .get("action")
-            .and_then(|a| a.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string(),
-        // Not the JSON we expected — fall back to the raw string; Mode::parse
-        // treats anything unrecognized as the full-screen default.
-        Err(_) => t.to_string(),
-    }
+    SCREENSHOT_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
 }
 
 /// Whether the tool copies to clipboard on its own, so we don't double-handle.
@@ -673,8 +680,11 @@ impl ActionHandler for ScreenshotHandler {
     fn usage(&self) -> &str {
         "empty or 'full' for the whole screen, 'area' (aliases: region, select) to select a region, 'window' for the active window"
     }
-    fn input_schema(&self) -> Option<serde_json::Value> {
-        Some(screenshot_input_schema())
+    fn grammar(&self) -> Option<Grammar> {
+        Some(SCREENSHOT_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::System
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::System
@@ -833,32 +843,34 @@ mod tests {
 
     #[test]
     fn screenshot_args_flatten_from_structured_json() {
-        // A constrained model sends the typed object; it flattens to the bare
+        // A structured caller sends the typed object; it flattens to the bare
         // mode string Mode::parse reads. Screenshot has no operand.
         assert_eq!(screenshot_args_to_flat(r#"{"action":"area"}"#), "area");
         assert_eq!(screenshot_args_to_flat(r#"{"action":"window"}"#), "window");
         assert_eq!(screenshot_args_to_flat(r#"{"action":"full"}"#), "full");
-        // No action → the full-screen-default empty string.
-        assert_eq!(screenshot_args_to_flat("{}"), "");
-        assert_eq!(screenshot_args_to_flat(r#"{"action":""}"#), "");
+        // A verb-less JSON object falls back to the raw string, which
+        // Mode::parse still reads as the full-screen default.
+        assert_eq!(Mode::parse(&screenshot_args_to_flat("{}")), Mode::Full);
         // A plain-string caller (human, legacy) passes straight through.
         assert_eq!(screenshot_args_to_flat("area"), "area");
         assert_eq!(screenshot_args_to_flat(""), "");
     }
 
+    /// Per-verb drift test: the grammar's verb names must be exactly
+    /// [`SCREENSHOT_MODES`], and each must round-trip through the parser to
+    /// the Mode whose canonical spelling it is.
     #[test]
-    fn screenshot_schema_enum_matches_the_real_modes() {
-        // The schema's action enum must be exactly SCREENSHOT_MODES, and each
-        // must be a distinct canonical Mode — so the model is constrained to
-        // modes Mode::parse recognizes and none collide.
-        let schema = screenshot_input_schema();
-        let en = schema["properties"]["action"]["enum"].as_array().unwrap();
-        assert_eq!(en.len(), SCREENSHOT_MODES.len());
-        for m in SCREENSHOT_MODES {
-            assert!(en.iter().any(|e| e == m), "enum missing {m}");
-            // The mode round-trips: parse(canonical) is a variant whose own
-            // canonical() is that same string.
-            assert_eq!(Mode::parse(m).canonical(), *m, "mode {m} not canonical");
+    fn screenshot_grammar_verbs_match_the_real_modes() {
+        let names: Vec<&str> = SCREENSHOT_GRAMMAR.verbs.iter().map(|v| v.name).collect();
+        assert_eq!(names, SCREENSHOT_MODES);
+        for v in SCREENSHOT_GRAMMAR.verbs {
+            // The flat rendering is the bare verb name…
+            let flat = screenshot_args_to_flat(&format!(r#"{{"action":"{}"}}"#, v.name));
+            assert_eq!(flat, v.name);
+            // …and it parses to the mode whose canonical spelling it is.
+            assert_eq!(Mode::parse(&flat).canonical(), v.name);
+            // Every capture writes a file → every verb is honestly mutating.
+            assert!(v.mutates, "{} must be mutating (writes a PNG)", v.name);
         }
     }
 

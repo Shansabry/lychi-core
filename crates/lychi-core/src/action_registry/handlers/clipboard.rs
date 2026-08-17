@@ -1,10 +1,55 @@
 use async_trait::async_trait;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::clipboard::store::ClipboardStore;
 use crate::error::LychiError;
+
+/// `clip`'s argument surface: one free-form action whose flat form is the
+/// entry selector (or the literal `clear`). The JSON Schema and the
+/// structured→flat adapter both derive from this.
+const CLIP_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Work with the launcher's clipboard history: re-copy a stored \
+               entry back to the system clipboard, erase the whole history, or \
+               (with no arguments) report how many entries are stored. \
+               Re-copying overwrites the current clipboard contents.",
+        mutates: true,
+        operands: &[
+            Operand {
+                name: "clear",
+                desc: "Erase the entire clipboard history. When true, no other \
+                       field applies.",
+                required: false,
+                kind: ArgKind::Bool { flag: "clear" },
+                prefix: None,
+            },
+            Operand {
+                name: "entry",
+                desc: "Which history entry to copy back to the clipboard: the \
+                       entry's id, or a prefix of its text. Omit (with `clear` \
+                       false) to just get the count of stored entries.",
+                required: false,
+                kind: ArgKind::Text,
+                prefix: None,
+            },
+        ],
+    }],
+};
+
+/// Normalize the tool's `args` to the flat string the parser already reads: an
+/// entry selector, the literal `clear`, or empty for the count. A constrained
+/// model sends the structured JSON (`{"entry":"abc"}` / `{"clear":true}`); a
+/// human or legacy/flat caller sends the string directly, and malformed JSON
+/// falls back to the raw string.
+fn clip_args_to_flat(args: &str) -> String {
+    CLIP_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
+}
 
 #[derive(Default)]
 pub struct ClipboardHandler {
@@ -56,12 +101,22 @@ impl ActionHandler for ClipboardHandler {
     fn description(&self) -> &str {
         "Browse and paste from clipboard history"
     }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(CLIP_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Personal
+    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        let args = args.trim();
+        // A constrained model sends `{"entry":..}` / `{"clear":true}`; flatten
+        // it (and a plain-string caller passes through) to the form the checks
+        // below read.
+        let flat = clip_args_to_flat(args);
+        let args = flat.trim();
 
         // "clear" subcommand
         if args == "clear" {
@@ -272,5 +327,43 @@ fn write_image_to_clipboard(path: &str) -> Result<(), arboard::Error> {
             bytes: std::borrow::Cow::Owned(rgba),
         };
         cb.set_image(img)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drift guard: the grammar's flat renderings are exactly the strings
+    /// `execute`'s checks read — `clear` verbatim for the clear branch, the
+    /// bare selector for the entry lookup, empty for the count.
+    #[test]
+    fn clip_args_flatten_from_structured_json() {
+        // The clear flag renders the literal `clear` the parser compares against.
+        assert_eq!(clip_args_to_flat(r#"{"clear":true}"#), "clear");
+        assert_eq!(clip_args_to_flat(r#"{"clear":false}"#), "");
+        // An entry selector renders bare — id or text prefix, as-is.
+        assert_eq!(clip_args_to_flat(r#"{"entry":"0198f2ab"}"#), "0198f2ab");
+        assert_eq!(
+            clip_args_to_flat(r#"{"entry":"some copied text"}"#),
+            "some copied text"
+        );
+        // Nothing set → empty → the count branch.
+        assert_eq!(clip_args_to_flat("{}"), "");
+        // A plain-string caller (human, legacy) passes straight through.
+        assert_eq!(clip_args_to_flat("clear"), "clear");
+        assert_eq!(clip_args_to_flat("some text"), "some text");
+        // Malformed JSON → raw fallback.
+        assert_eq!(clip_args_to_flat("{not json"), "{not json");
+    }
+
+    #[test]
+    fn clip_grammar_is_free_form() {
+        assert!(CLIP_GRAMMAR.is_free_form());
+        let schema = CLIP_GRAMMAR.handler_schema();
+        assert_eq!(schema["properties"]["clear"]["type"], "boolean");
+        assert_eq!(schema["properties"]["entry"]["type"], "string");
+        // Nothing is required — a bare call is the count query.
+        assert_eq!(schema["required"], serde_json::json!([]));
     }
 }

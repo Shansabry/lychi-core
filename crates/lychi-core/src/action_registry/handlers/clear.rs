@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 
+use crate::action_registry::grammar::{Grammar, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
@@ -16,6 +17,46 @@ const TARGETS: &[(&str, &str)] = &[
     ("suggestions", "Reset learned ranking (frecency)"),
     ("all", "Clear history, clipboard, and suggestions"),
 ];
+
+/// `clear`'s argument surface: one verb per wipe target, no operands — the
+/// flat form is just the target name, exactly what `execute` matches on. Every
+/// verb mutates (each wipe erases stored data irreversibly); the Medium risk
+/// level additionally makes the Rules Engine confirm each one. A drift test
+/// pins the verb names to [`TARGETS`], which `execute`'s match accepts.
+const CLEAR_GRAMMAR: Grammar = Grammar {
+    verbs: &[
+        Verb {
+            name: "history",
+            desc: "Erase the user's entire launcher command history. Irreversible; the \
+                   launcher asks the user to confirm before running.",
+            mutates: true,
+            operands: &[],
+        },
+        Verb {
+            name: "clipboard",
+            desc: "Erase the launcher's stored clipboard history. Irreversible; the \
+                   launcher asks the user to confirm before running.",
+            mutates: true,
+            operands: &[],
+        },
+        Verb {
+            name: "suggestions",
+            desc: "Reset the learned suggestion ranking (frecency scores), returning \
+                   result ordering to defaults. Irreversible; the launcher asks the \
+                   user to confirm before running.",
+            mutates: true,
+            operands: &[],
+        },
+        Verb {
+            name: "all",
+            desc: "Erase command history, clipboard history, AND learned ranking in one \
+                   step. Irreversible; the launcher asks the user to confirm before \
+                   running. Use only when the user clearly wants everything wiped.",
+            mutates: true,
+            operands: &[],
+        },
+    ],
+};
 
 #[derive(Default)]
 pub struct ClearHandler;
@@ -60,6 +101,12 @@ impl ActionHandler for ClearHandler {
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
+    }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(CLEAR_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Utils
     }
 
     /// Every clear is irreversible, so the Rules Engine asks for confirmation
@@ -172,6 +219,41 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.is_some());
+    }
+
+    #[test]
+    fn grammar_verbs_match_the_real_targets() {
+        // Each grammar verb renders flat to just its name (no operands), and
+        // every name must be a target `execute`'s match accepts — TARGETS is
+        // that same list (it drives the completions off the same match arms).
+        assert_eq!(CLEAR_GRAMMAR.verbs.len(), TARGETS.len());
+        for verb in CLEAR_GRAMMAR.verbs {
+            let flat = CLEAR_GRAMMAR.to_flat(verb, &serde_json::Map::new());
+            assert_eq!(flat, verb.name);
+            assert!(
+                TARGETS.iter().any(|(name, _)| *name == verb.name),
+                "grammar verb '{}' is not a target execute accepts",
+                verb.name
+            );
+            // Every wipe is destructive — the grammar must say so.
+            assert!(verb.mutates, "'{}' must be declared mutating", verb.name);
+        }
+    }
+
+    #[test]
+    fn grammar_flatten_resolves_each_action() {
+        // The group-tool JSON shape resolves through the grammar to the flat
+        // target string.
+        assert_eq!(
+            CLEAR_GRAMMAR.flatten_json(r#"{"action":"history"}"#),
+            Some("history".to_string())
+        );
+        assert_eq!(
+            CLEAR_GRAMMAR.flatten_json(r#"{"action":"all"}"#),
+            Some("all".to_string())
+        );
+        // Flat/legacy callers pass through untouched (caller keeps raw).
+        assert_eq!(CLEAR_GRAMMAR.flatten_json("history"), None);
     }
 
     #[test]

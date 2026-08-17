@@ -7,11 +7,64 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::context::EnvironmentContext;
 use crate::error::LychiError;
+
+/// `ctx`'s argument surface: a single free-form action whose flat forms are
+/// exactly the four spellings the string-matching below accepts — "",
+/// "metrics", "metrics --reset", "metrics --rate". A Choice operand renders
+/// its value verbatim, so the mode values ARE the flag spellings; the JSON
+/// Schema constrains a model to them, and the structured→flat adapter derives
+/// from this. Read-only diagnostics: `--reset` only rebases an in-process
+/// counter baseline — no file, system, or stored data changes.
+const CTX_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Inspect the launcher's own context-awareness state — read-only \
+               diagnostics for debugging why a suggestion or routing decision \
+               happened. Returns either the full snapshot of detected environment \
+               signals or the context system's internal counters; never needed \
+               for ordinary user tasks.",
+        mutates: false,
+        operands: &[
+            Operand {
+                name: "topic",
+                desc: "Omit entirely to dump the full context snapshot: active \
+                       window, cwd, git, project, docker containers, terminal, \
+                       clipboard type, network, cache ages, focus ring, and the \
+                       derived suggestions. Pass \"metrics\" for the context \
+                       system's process-lifetime counters instead.",
+                required: false,
+                kind: ArgKind::Choice(&["metrics"]),
+                prefix: None,
+            },
+            Operand {
+                name: "mode",
+                desc: "Only meaningful with topic \"metrics\": \"--reset\" sets a \
+                       new baseline for delta tracking; \"--rate\" reports counter \
+                       deltas and per-second rates since that baseline. Omit for \
+                       lifetime totals.",
+                required: false,
+                kind: ArgKind::Choice(&["--reset", "--rate"]),
+                prefix: None,
+            },
+        ],
+    }],
+};
+
+/// Normalize the tool's `args` to the flat string the matcher below reads. A
+/// constrained model sends the structured JSON (`{"topic":"metrics"}`); a
+/// human or legacy/flat caller sends the string directly and passes through
+/// unchanged. Malformed JSON falls back to the raw string.
+fn ctx_args_to_flat(args: &str) -> String {
+    CTX_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
+}
 
 /// Snapshot of the current context, set by the executor before execute().
 static CONTEXT_SNAPSHOT: Mutex<Option<EnvironmentContext>> = Mutex::new(None);
@@ -55,9 +108,18 @@ impl ActionHandler for ContextDebugHandler {
     fn category(&self) -> CommandCategory {
         CommandCategory::Developer
     }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(CTX_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Dev
+    }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        let args_trimmed = args.trim();
+        // A constrained model sends `{"topic":..,"mode":..}`; flatten it (a
+        // plain-string caller passes through) to the spellings matched below.
+        let flat = ctx_args_to_flat(args);
+        let args_trimmed = flat.trim();
 
         // `ctx metrics` — process-lifetime totals
         if args_trimmed == "metrics" {
@@ -588,4 +650,71 @@ fn format_context(ctx: &EnvironmentContext) -> String {
     }
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctx_args_flatten_from_structured_json() {
+        // A constrained model sends the typed object; it flattens to the exact
+        // spellings the string-matcher in `execute` accepts.
+        assert_eq!(ctx_args_to_flat("{}"), "");
+        assert_eq!(ctx_args_to_flat(r#"{"topic":"metrics"}"#), "metrics");
+        assert_eq!(
+            ctx_args_to_flat(r#"{"topic":"metrics","mode":"--reset"}"#),
+            "metrics --reset"
+        );
+        assert_eq!(
+            ctx_args_to_flat(r#"{"topic":"metrics","mode":"--rate"}"#),
+            "metrics --rate"
+        );
+        // A plain-string caller (human, legacy) passes straight through.
+        assert_eq!(ctx_args_to_flat("metrics --rate"), "metrics --rate");
+        // Malformed JSON falls back to the raw string.
+        assert_eq!(ctx_args_to_flat("{not json"), "{not json");
+    }
+
+    /// Drift guard: every flat rendering the grammar can produce must land on
+    /// the branch it names — the string matcher accepts each spelling.
+    #[tokio::test]
+    async fn structured_calls_hit_the_branches_they_name() {
+        let h = ContextDebugHandler::new();
+        let ctx = ExecContext::default();
+
+        let run = |args: &'static str| {
+            let h = ContextDebugHandler::new();
+            let ctx = ctx.clone();
+            async move { h.execute(&ctx, args).await.unwrap() }
+        };
+
+        // Lifetime counters.
+        let r = run(r#"{"topic":"metrics"}"#).await;
+        let body = match r.output {
+            crate::action_registry::Output::Text { ref body, .. } => body.clone(),
+            ref other => panic!("expected text, got {other:?}"),
+        };
+        assert!(body.contains("process lifetime totals"), "{body}");
+
+        // Baseline reset.
+        let r = run(r#"{"topic":"metrics","mode":"--reset"}"#).await;
+        let body = match r.output {
+            crate::action_registry::Output::Text { ref body, .. } => body.clone(),
+            ref other => panic!("expected text, got {other:?}"),
+        };
+        assert!(body.contains("Baseline reset"), "{body}");
+
+        // Rate report (baseline was just set above).
+        let r = run(r#"{"topic":"metrics","mode":"--rate"}"#).await;
+        let body = match r.output {
+            crate::action_registry::Output::Text { ref body, .. } => body.clone(),
+            ref other => panic!("expected text, got {other:?}"),
+        };
+        assert!(body.contains("delta since last reset"), "{body}");
+
+        // Empty call → the context snapshot branch (no snapshot set in tests).
+        let r = h.execute(&ctx, "{}").await.unwrap();
+        assert!(r.success);
+    }
 }

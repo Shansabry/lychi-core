@@ -22,6 +22,7 @@
 use async_trait::async_trait;
 use base64::Engine;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
@@ -63,77 +64,153 @@ const DEV_UTIL_VERBS: &[&str] = &[
     "count",
 ];
 
-/// The JSON Schema for `devutil`'s args: a required `action` (constrained to
-/// [`DEV_UTIL_VERBS`]), the input `text`, and the per-verb modifiers (`decode`
-/// for base64, `minify` for json, `algorithm` for hash) as typed fields instead
-/// of flag strings the model would have to spell correctly.
-fn devutil_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "action": { "type": "string", "enum": DEV_UTIL_VERBS,
-                        "description": "The conversion to run — all local and deterministic: base64 encode/decode, md5/sha256 hash, URL encode/decode, unix-epoch conversion, JSON pretty-print/minify, and text transforms (upper, lower, title, slug, reverse, count)." },
-            "text": { "type": "string",
-                      "description": "The input: the string to encode/hash/transform, the base64 or URL-encoded value to decode, the raw JSON for \"json\", or unix seconds for \"epoch\" (e.g. \"1700000000\"). Omit only for bare \"epoch\", which returns the current unix time." },
-            "decode": { "type": "boolean",
-                        "description": "base64 only: true to DECODE `text` from base64 instead of encoding it. Default false (encode)." },
-            "minify": { "type": "boolean",
-                        "description": "json only: true to minify to one line instead of pretty-printing. Default false (pretty-print)." },
-            "algorithm": { "type": "string", "enum": ["sha256", "md5"],
-                           "description": "hash only: the digest algorithm. Default sha256." }
+/// The input-text operand shared by the text-in/text-out verbs. One const so
+/// the merged group-schema field carries one coherent description across every
+/// verb that reads it.
+const TEXT: Operand = Operand {
+    name: "text",
+    desc: "The input text: the string to encode/hash/transform, the base64 or \
+           URL-encoded value to decode, or the raw JSON to format.",
+    required: true,
+    kind: ArgKind::Text,
+    prefix: None,
+};
+
+/// `devutil`'s argument surface: one verb per [`DEV_UTIL_VERBS`] entry (a
+/// drift test pins the two lists together), with the per-verb modifiers
+/// (`decode`, `minify`, `algorithm`) as typed operands whose flat renderings
+/// are the flag strings the parser already reads (`-d`, `-m`, `md5`). The
+/// JSON Schema and the structured→flat adapter both derive from this. All
+/// verbs are pure, local, deterministic text conversions — nothing mutates.
+const DEVUTIL_GRAMMAR: Grammar = Grammar {
+    verbs: &[
+        Verb {
+            name: "base64",
+            desc: "Base64-encode text, or decode a base64 string back to text \
+                   (set decode).",
+            mutates: false,
+            operands: &[
+                Operand {
+                    name: "decode",
+                    desc: "true to DECODE `text` from base64 instead of encoding \
+                           it. Default false (encode).",
+                    required: false,
+                    kind: ArgKind::Bool { flag: "-d" },
+                    prefix: None,
+                },
+                TEXT,
+            ],
         },
-        "required": ["action"],
-        "additionalProperties": false
-    })
-}
+        Verb {
+            name: "hash",
+            desc: "Compute a hex digest of the text — sha256 by default, or md5.",
+            mutates: false,
+            operands: &[
+                Operand {
+                    name: "algorithm",
+                    desc: "The digest algorithm. Default sha256 when omitted.",
+                    required: false,
+                    kind: ArgKind::Choice(&["sha256", "md5"]),
+                    prefix: None,
+                },
+                TEXT,
+            ],
+        },
+        Verb {
+            name: "urlencode",
+            desc: "Percent-encode text for safe inclusion in a URL.",
+            mutates: false,
+            operands: &[TEXT],
+        },
+        Verb {
+            name: "urldecode",
+            desc: "Decode a percent-encoded (URL-encoded) string back to plain \
+                   text.",
+            mutates: false,
+            operands: &[TEXT],
+        },
+        Verb {
+            name: "epoch",
+            desc: "Convert unix seconds to a UTC datetime, or get the current \
+                   unix time when no seconds are given.",
+            mutates: false,
+            operands: &[Operand {
+                name: "seconds",
+                desc: "Unix seconds to render as a UTC datetime (e.g. \
+                       1700000000). Omit for the current unix time.",
+                required: false,
+                kind: ArgKind::Int,
+                prefix: None,
+            }],
+        },
+        Verb {
+            name: "json",
+            desc: "Pretty-print JSON with 2-space indentation, or minify it to \
+                   one line (set minify).",
+            mutates: false,
+            operands: &[
+                Operand {
+                    name: "minify",
+                    desc: "true to minify to one line instead of pretty-printing. \
+                           Default false (pretty-print).",
+                    required: false,
+                    kind: ArgKind::Bool { flag: "-m" },
+                    prefix: None,
+                },
+                TEXT,
+            ],
+        },
+        Verb {
+            name: "upper",
+            desc: "Uppercase the text.",
+            mutates: false,
+            operands: &[TEXT],
+        },
+        Verb {
+            name: "lower",
+            desc: "Lowercase the text.",
+            mutates: false,
+            operands: &[TEXT],
+        },
+        Verb {
+            name: "title",
+            desc: "Title-Case Each Word of the text.",
+            mutates: false,
+            operands: &[TEXT],
+        },
+        Verb {
+            name: "slug",
+            desc: "Turn text into a url/filename-safe slug (\"My Post\" → \
+                   \"my-post\").",
+            mutates: false,
+            operands: &[TEXT],
+        },
+        Verb {
+            name: "reverse",
+            desc: "Reverse the characters of the text.",
+            mutates: false,
+            operands: &[TEXT],
+        },
+        Verb {
+            name: "count",
+            desc: "Count characters, words, and lines in the text.",
+            mutates: false,
+            operands: &[TEXT],
+        },
+    ],
+};
 
 /// Normalize the tool's `args` to the flat `"<verb> [flags] <text>"` string
 /// `execute` already parses (`base64 -d <b64>`, `json -m <text>`,
 /// `hash md5 <text>`, …). A constrained model sends the structured JSON; a
-/// human or legacy/flat caller sends the string directly. Keeps `execute` on
-/// `&str`.
+/// human or legacy/flat caller sends the string directly and passes through
+/// unchanged (malformed/unknown-action JSON included — `run` answers with its
+/// usual usage message). Keeps `execute` on `&str`. The walk itself lives in
+/// [`Grammar::flatten_json`] — the ONE structured→flat decider.
 fn devutil_args_to_flat(args: &str) -> String {
-    let t = args.trim();
-    if !t.starts_with('{') {
-        return t.to_string();
-    }
-    match serde_json::from_str::<serde_json::Value>(t) {
-        Ok(v) => {
-            let action = v
-                .get("action")
-                .and_then(|a| a.as_str())
-                .unwrap_or("")
-                .trim();
-            let text = v.get("text").and_then(|a| a.as_str()).unwrap_or("").trim();
-            let flag = |k: &str| v.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
-            let mut parts: Vec<&str> = vec![action];
-            // Modifiers only make sense wrapped around actual text — emitted
-            // alone they would be parsed AS the text ("base64 -d" would
-            // base64-encode the literal "-d").
-            if !text.is_empty() {
-                match action {
-                    "base64" if flag("decode") => parts.push("-d"),
-                    "json" if flag("minify") => parts.push("-m"),
-                    "hash" => {
-                        if let Some(algo) = v
-                            .get("algorithm")
-                            .and_then(|a| a.as_str())
-                            .map(str::trim)
-                            .filter(|a| !a.is_empty())
-                        {
-                            parts.push(algo);
-                        }
-                    }
-                    _ => {}
-                }
-                parts.push(text);
-            }
-            parts.join(" ")
-        }
-        // Not the JSON we expected — fall back to the raw string; `run`
-        // answers with its usual usage message.
-        Err(_) => t.to_string(),
-    }
+    DEVUTIL_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
 }
 
 /// Run one dev-util verb. Pure (no I/O) so it's fully unit-testable.
@@ -328,11 +405,14 @@ impl ActionHandler for DevUtilsHandler {
     fn usage(&self) -> &str {
         "Prepend the verb to the text. Verbs: 'base64 <text>' / 'base64 -d <b64>', 'hash [md5|sha256] <text>', 'urlencode <text>' / 'urldecode <text>', 'epoch [<unix-seconds>]', 'json <text>' (pretty-print) / 'json -m <text>' (minify), 'upper/lower/title <text>', 'slug <text>', 'reverse <text>', 'count <text>'. Use for encode/decode, format json, slugify, etc."
     }
-    fn input_schema(&self) -> Option<serde_json::Value> {
-        Some(devutil_input_schema())
-    }
     fn category(&self) -> CommandCategory {
         CommandCategory::Developer
+    }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(DEVUTIL_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Dev
     }
 
     async fn completions(&self, partial: &str) -> Vec<CompletionItem> {
@@ -507,13 +587,20 @@ mod tests {
             devutil_args_to_flat(r#"{"action":"hash","text":"abc"}"#),
             "hash abc"
         );
-        // Bare epoch (no text) is the one verb valid without input.
+        // Bare epoch (no text) is the one verb valid without input; `seconds`
+        // renders as its decimal form when present.
         assert_eq!(devutil_args_to_flat(r#"{"action":"epoch"}"#), "epoch");
-        // A modifier without text must NOT emit a dangling flag — "base64 -d"
-        // alone would base64-encode the literal "-d".
+        assert_eq!(
+            devutil_args_to_flat(r#"{"action":"epoch","seconds":1700000000}"#),
+            "epoch 1700000000"
+        );
+        // A modifier without text renders its flag verbatim — `text` is a
+        // REQUIRED operand, and that requirement is enforced by the group
+        // dispatcher (`resolve_group_call`), not re-implemented here: the
+        // adapter is a pure rendering of the grammar's ONE flatten decider.
         assert_eq!(
             devutil_args_to_flat(r#"{"action":"base64","decode":true}"#),
-            "base64"
+            "base64 -d"
         );
         // A plain-string caller (human, legacy) passes straight through.
         assert_eq!(
@@ -526,21 +613,44 @@ mod tests {
     }
 
     #[test]
-    fn devutil_schema_enum_matches_the_real_verbs() {
-        // The schema's action enum must be exactly DEV_UTIL_VERBS — the same
-        // list the triggers and the preview gate read — so the model is
-        // constrained to verbs `run` actually handles.
-        let schema = devutil_input_schema();
+    fn devutil_grammar_verbs_match_the_real_verbs() {
+        // The grammar's verb list must be exactly DEV_UTIL_VERBS — the same
+        // list the triggers and the preview gate read — so the derived schema
+        // constrains the model to verbs `run` actually handles, in the same
+        // stable order.
+        let names: Vec<&str> = DEVUTIL_GRAMMAR.verbs.iter().map(|v| v.name).collect();
+        assert_eq!(names, DEV_UTIL_VERBS);
+        // And the derived schema's enum is that list verbatim.
+        let schema = DEVUTIL_GRAMMAR.handler_schema();
         let en = schema["properties"]["action"]["enum"].as_array().unwrap();
-        assert_eq!(en.len(), DEV_UTIL_VERBS.len());
-        for v in DEV_UTIL_VERBS {
-            assert!(en.iter().any(|e| e == v), "enum missing {v}");
-            // And every schema verb must be one `run` dispatches (not "Unknown
-            // dev util") — probed with harmless input.
-            let probe = run(*v, "1");
+        let schema_names: Vec<&str> = en.iter().filter_map(|e| e.as_str()).collect();
+        assert_eq!(schema_names, DEV_UTIL_VERBS);
+    }
+
+    #[test]
+    fn every_grammar_verbs_flat_rendering_is_accepted_by_the_parser() {
+        // Drift guard: for each verb, render a structured call through the
+        // grammar and feed the result to the real parser — it must dispatch
+        // (never "Unknown dev util") and, where the input is well-formed,
+        // succeed. Uses each verb's own operands so modifiers render too.
+        for verb in DEVUTIL_GRAMMAR.verbs {
+            let json = match verb.name {
+                "base64" => r#"{"action":"base64","text":"aGk=","decode":true}"#.to_string(),
+                "hash" => r#"{"action":"hash","text":"abc","algorithm":"md5"}"#.to_string(),
+                "epoch" => r#"{"action":"epoch","seconds":1700000000}"#.to_string(),
+                "json" => r#"{"action":"json","text":"{\"a\":1}","minify":true}"#.to_string(),
+                name => format!(r#"{{"action":"{name}","text":"abc def"}}"#),
+            };
+            let flat = devutil_args_to_flat(&json);
+            let (verb_tok, rest) = flat
+                .split_once(char::is_whitespace)
+                .unwrap_or((flat.as_str(), ""));
+            assert_eq!(verb_tok, verb.name, "flat form must lead with the verb");
+            let out = run(verb_tok, rest);
             assert!(
-                !matches!(&probe, Err(e) if e.starts_with("Unknown dev util")),
-                "run() does not know verb {v}"
+                out.is_ok(),
+                "parser rejected the grammar's rendering for {}: {flat:?} → {out:?}",
+                verb.name
             );
         }
     }

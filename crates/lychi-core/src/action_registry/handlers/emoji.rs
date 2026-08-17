@@ -3,6 +3,7 @@ use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use std::sync::Mutex;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::handlers::clipboard::write_to_clipboard;
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
@@ -35,6 +36,28 @@ const POPULAR: &[(&str, &str)] = &[
     ("💡", "light bulb"),
     ("👀", "eyes"),
 ];
+
+/// `emoji`'s argument surface: a single free-form action whose flat form IS
+/// the search query. The JSON Schema derives from this; the drift test pins
+/// its rendering to the name/shortcode lookup `execute` performs.
+const EMOJI_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Search emoji by name or shortcode and copy the best match to the \
+               clipboard. Fully local, instant, read-only.",
+        mutates: false,
+        operands: &[Operand {
+            name: "query",
+            desc: "The emoji to find: a fragment of its name or shortcode (\"fire\", \
+                   \"thumbs up\", \"party popper\", \"joy\") — the first match on the \
+                   name, then on shortcodes, is copied. A literal emoji character is \
+                   copied as-is.",
+            required: true,
+            kind: ArgKind::Text,
+            prefix: None,
+        }],
+    }],
+};
 
 pub struct EmojiHandler;
 
@@ -73,6 +96,12 @@ impl ActionHandler for EmojiHandler {
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
+    }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(EMOJI_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Utils
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
@@ -216,5 +245,19 @@ mod tests {
         let handler = EmojiHandler::new();
         let results = handler.completions("heart").await;
         assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn emoji_args_flatten_from_structured_json() {
+        // The grammar's flat rendering must be exactly what `execute`'s
+        // name/shortcode lookup accepts.
+        let flat = EMOJI_GRAMMAR.flatten_json(r#"{"query":"fire"}"#).unwrap();
+        assert_eq!(flat, "fire");
+        assert!(
+            emojis::iter().any(|e| e.name().to_lowercase().contains(&flat.to_lowercase())),
+            "lookup should find a match for {flat:?}"
+        );
+        // Flat/legacy callers pass through untouched (caller keeps raw).
+        assert_eq!(EMOJI_GRAMMAR.flatten_json("fire"), None);
     }
 }

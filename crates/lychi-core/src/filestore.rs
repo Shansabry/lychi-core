@@ -521,6 +521,7 @@ mod tests {
         {
             let mut f = OpenOptions::new()
                 .create(true)
+                .truncate(true)
                 .write(true)
                 .open(log.path())
                 .unwrap();

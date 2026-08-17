@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher};
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
@@ -134,61 +135,54 @@ fn find_window_by_label<'a>(
     })
 }
 
-/// The two verbs `win`'s parser understands: `focus` (the default — the parser
-/// treats a bare query as focus) and the `close ` prefix. Kept next to the
-/// parser it feeds so the schema enum can't drift.
-const WIN_ACTION_VERBS: &[&str] = &["focus", "close"];
-
-/// The JSON Schema for `win`'s args: an optional `action` (constrained to
-/// [`WIN_ACTION_VERBS`], defaulting to focus) plus an optional `query`. Both
-/// optional because empty args are a valid request (list all open windows).
-/// Emitted as the tool's `input_schema`.
-fn win_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "action": { "type": "string", "enum": WIN_ACTION_VERBS,
-                        "description": "What to do with the matched window: \"focus\" (the default) switches to it, \"close\" closes it." },
-            "query": { "type": "string",
-                       "description": "The app or window name to match, fuzzy (e.g. \"firefox\", \"Slack\"). Required for close. Omit to list all open windows." }
+/// `win`'s grammar: two verbs whose flat renderings (`focus [<window>]`,
+/// `close <window>`) are prefix forms `execute` strips — the bare-query flat
+/// form humans type stays the focus default. `focus` is honestly non-mutating
+/// (only which window has focus changes); `close` mutates. The `window`
+/// operand deliberately shares its name/shape with `appctl`'s so the group
+/// schema merges them into one field.
+const WIN_GRAMMAR: Grammar = Grammar {
+    verbs: &[
+        Verb {
+            name: "focus",
+            desc: "Switch to a window that is already open. Prefer this over \
+                   launching when the user wants something they already have \
+                   open. With no window named, lists every open window.",
+            mutates: false,
+            operands: &[Operand {
+                name: "window",
+                desc: "The app or window to match, fuzzy against class and \
+                       title (e.g. \"firefox\", \"slack\"). Omit to list all \
+                       open windows.",
+                required: false,
+                kind: ArgKind::Text,
+                prefix: None,
+            }],
         },
-        "additionalProperties": false
-    })
-}
+        Verb {
+            name: "close",
+            desc: "Gracefully close the best-matching open window.",
+            mutates: true,
+            operands: &[Operand {
+                name: "window",
+                desc: "The app or window to close, fuzzy-matched against class \
+                       and title.",
+                required: true,
+                kind: ArgKind::Text,
+                prefix: None,
+            }],
+        },
+    ],
+};
 
-/// Normalize the tool's `args` to the flat `"[close ]<query>"` string the
-/// parser already understands. A constrained model sends the structured JSON
-/// (`{"action":"close","query":"firefox"}`); a human or legacy/flat caller
-/// sends the string directly and passes through unchanged.
+/// Normalize the tool's `args` to the flat `"focus|close [<query>]"` string
+/// `execute` strips, via the ONE structured→flat decider
+/// ([`Grammar::flatten_json`]). A human or legacy/flat caller passes through
+/// unchanged (a bare query is still the focus default).
 fn win_args_to_flat(args: &str) -> String {
-    let t = args.trim();
-    if !t.starts_with('{') {
-        return t.to_string();
-    }
-    match serde_json::from_str::<serde_json::Value>(t) {
-        Ok(v) => {
-            let action = v
-                .get("action")
-                .and_then(|a| a.as_str())
-                .unwrap_or("")
-                .trim();
-            let query = v.get("query").and_then(|a| a.as_str()).unwrap_or("").trim();
-            if action == "close" {
-                if query.is_empty() {
-                    // "close" alone → execute's own "Usage: win close …" guard.
-                    "close".to_string()
-                } else {
-                    format!("close {query}")
-                }
-            } else {
-                // focus (or absent) is the parser's default: a bare query.
-                query.to_string()
-            }
-        }
-        // Not the JSON we expected — fall back to the raw string; the fuzzy
-        // window match will reject it with the usual "No window matching".
-        Err(_) => t.to_string(),
-    }
+    WIN_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
 }
 
 #[async_trait]
@@ -209,25 +203,34 @@ impl ActionHandler for WindowSwitcherHandler {
     fn usage(&self) -> &str {
         "the app/window name (e.g. 'win firefox'). Use to switch TO something already open rather than launch it"
     }
-    fn input_schema(&self) -> Option<serde_json::Value> {
-        Some(win_input_schema())
+    fn grammar(&self) -> Option<Grammar> {
+        Some(WIN_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::System
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::System
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        // A constrained model sends `{"action":..,"query":..}`; flatten it (a
+        // A structured caller sends `{"action":..,"window":..}`; flatten it (a
         // plain-string caller passes through) to the form the prefix parse
         // below splits.
         let flat = win_args_to_flat(args);
         let args = flat.trim();
 
-        // Check for "close <query>" mode
+        // Check for the "close <query>" / "focus <query>" prefix forms (the
+        // grammar renders both); a bare query stays the focus default.
         let (close_mode, query) = if let Some(rest) = args.strip_prefix("close ") {
             (true, rest.trim())
         } else if args == "close" {
             return Ok(ActionResult::err("Usage: win close <app name>"));
+        } else if let Some(rest) = args.strip_prefix("focus ") {
+            (false, rest.trim())
+        } else if args == "focus" {
+            // Bare `focus` — same as no query: list all open windows.
+            (false, "")
         } else {
             (false, args)
         };
@@ -432,40 +435,57 @@ mod tests {
 
     #[test]
     fn win_args_flatten_from_structured_json() {
-        // A constrained model sends the typed object; it flattens to the
-        // "[close ]<query>" string the prefix parse splits.
+        // A structured caller sends the typed object; it flattens to the
+        // "focus|close [<query>]" prefix form execute strips.
         assert_eq!(
-            win_args_to_flat(r#"{"action":"close","query":"firefox"}"#),
+            win_args_to_flat(r#"{"action":"close","window":"firefox"}"#),
             "close firefox"
         );
         assert_eq!(
-            win_args_to_flat(r#"{"action":"focus","query":"firefox"}"#),
-            "firefox"
+            win_args_to_flat(r#"{"action":"focus","window":"firefox"}"#),
+            "focus firefox"
         );
-        // action omitted → focus, the parser's default.
-        assert_eq!(win_args_to_flat(r#"{"query":"slack"}"#), "slack");
-        // Empty everything → "" (list all open windows).
-        assert_eq!(win_args_to_flat("{}"), "");
-        // close with no query → bare "close", so execute's usage guard fires.
+        // focus with no window → bare "focus" (execute lists all windows).
+        assert_eq!(win_args_to_flat(r#"{"action":"focus"}"#), "focus");
+        // close with no window → bare "close", so execute's usage guard fires.
         assert_eq!(win_args_to_flat(r#"{"action":"close"}"#), "close");
-        // A plain-string caller passes straight through.
+        // A plain-string caller passes straight through — a bare query is
+        // still the focus default, and "" still lists all windows.
         assert_eq!(win_args_to_flat("close firefox"), "close firefox");
         assert_eq!(win_args_to_flat("firefox"), "firefox");
         assert_eq!(win_args_to_flat(""), "");
-        // Malformed JSON falls back to the raw string.
+        // Malformed / verb-less JSON falls back to the raw string.
         assert_eq!(win_args_to_flat("{not json"), "{not json");
     }
 
+    /// Per-verb drift test: each grammar verb's flat rendering must be split
+    /// by execute's prefix parse into the mode + query it encodes.
     #[test]
-    fn win_schema_enum_matches_the_real_verbs() {
-        // The schema's action enum must be exactly the verbs the parser
-        // understands (focus default + the close prefix).
-        let schema = win_input_schema();
-        let en = schema["properties"]["action"]["enum"].as_array().unwrap();
-        assert_eq!(en.len(), WIN_ACTION_VERBS.len());
-        for v in WIN_ACTION_VERBS {
-            assert!(en.iter().any(|e| e == v), "enum missing {v}");
-        }
+    fn win_grammar_flat_renderings_are_accepted_by_the_parser() {
+        // Mirror of execute's prefix parse, applied to the grammar renderings.
+        let split = |args: &str| -> (bool, String) {
+            if let Some(rest) = args.strip_prefix("close ") {
+                (true, rest.trim().to_string())
+            } else if let Some(rest) = args.strip_prefix("focus ") {
+                (false, rest.trim().to_string())
+            } else if args == "focus" {
+                (false, String::new())
+            } else {
+                (false, args.to_string())
+            }
+        };
+        assert_eq!(
+            split(&win_args_to_flat(r#"{"action":"focus","window":"slack"}"#)),
+            (false, "slack".to_string())
+        );
+        assert_eq!(
+            split(&win_args_to_flat(r#"{"action":"focus"}"#)),
+            (false, String::new())
+        );
+        assert_eq!(
+            split(&win_args_to_flat(r#"{"action":"close","window":"slack"}"#)),
+            (true, "slack".to_string())
+        );
     }
 
     #[test]

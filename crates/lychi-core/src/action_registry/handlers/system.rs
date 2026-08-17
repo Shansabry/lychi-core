@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use std::process::Command;
 use std::time::Instant;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
     RiskAssessment, RiskLevel,
@@ -653,74 +654,170 @@ fn logout_session() -> Result<(), String> {
     ])
 }
 
-/// The base action VERBS the agent chooses between — the machine-readable enum
-/// fed to the tool schema so a constrained model (cloud `enum` / local grammar)
-/// can only emit a valid one. The operand ("50" for `volume`, "30m" for
-/// `shutdown in`, a device name for `connect bluetooth`) rides the separate
-/// free-text `value`. Kept next to the parser it feeds so the two can't drift.
-const SYSTEM_ACTION_VERBS: &[&str] = &[
-    "shutdown",
-    "cancel shutdown",
-    "reboot",
-    "suspend",
-    "hibernate",
-    "lock",
-    "logout",
-    "mute",
-    "unmute",
-    "volume",
-    "brightness",
-    "wifi",
-    "bluetooth",
-    "connect bluetooth",
-    "disconnect bluetooth",
-];
+/// The two radio states — one source for the schema enum and the flat rendering
+/// (`"wifi on"`, `"bluetooth off"` are exact `simple_actions` names).
+const RADIO_STATES: &[&str] = &["on", "off"];
 
-/// The JSON Schema for `system`'s args: a required `action` (constrained to
-/// [`SYSTEM_ACTION_VERBS`]) plus an optional free `value` operand. Emitted as the
-/// tool's `input_schema` so the model is constrained to a real verb.
-fn system_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "action": { "type": "string", "enum": SYSTEM_ACTION_VERBS,
-                        "description": "The system action to perform." },
-            "value": { "type": "string",
-                       "description": "Operand when the action needs one: a percentage for volume/brightness (e.g. \"50\"), \"up\"/\"down\", \"on\"/\"off\" for wifi/bluetooth, a duration for shutdown (e.g. \"30m\"), or a device name for bluetooth connect/disconnect. Omit for actions that take none (lock, mute, reboot…)." }
+/// Shared by `volume` and `brightness` so the merged schema field reads once.
+const LEVEL_OPERAND: Operand = Operand {
+    name: "level",
+    desc: "\"up\" / \"down\" for a small step (5% for volume, 10% for brightness), \
+           or an absolute percentage like \"50\" (volume accepts up to 150 for \
+           PipeWire over-amplification). A trailing \"%\" is accepted.",
+    required: true,
+    kind: ArgKind::Text,
+    prefix: None,
+};
+
+/// Shared by `wifi` and `bluetooth`.
+const RADIO_STATE_OPERAND: Operand = Operand {
+    name: "state",
+    desc: "\"on\" to enable the radio, \"off\" to disable it.",
+    required: true,
+    kind: ArgKind::Choice(RADIO_STATES),
+    prefix: None,
+};
+
+/// Shared by `connect` and `disconnect`. The `bluetooth` prefix literal makes
+/// the flat rendering (`connect bluetooth <device>`) the exact phrase
+/// `try_bluetooth_connect` parses.
+const BT_DEVICE_OPERAND: Operand = Operand {
+    name: "device",
+    desc: "The paired Bluetooth device's name, matched case-insensitively — \
+           exact name first, then substring (e.g. \"speaker\" matches \
+           \"Mi Portable BT Speaker 16W\").",
+    required: true,
+    kind: ArgKind::Text,
+    prefix: Some("bluetooth"),
+};
+
+/// The `system` grammar: one verb per action family, whose flat renderings are
+/// exactly the phrases the three matchers below parse (`simple_actions`,
+/// `try_parameterized`, `try_bluetooth_connect`). The JSON schema, the
+/// structured→flat adapter and the model-facing action list all derive from
+/// this one declaration; the drift test at the bottom pins each verb's
+/// rendering to the parser. Every verb mutates: each one changes live system
+/// state (power, audio, radio, backlight) — none is a read.
+const SYSTEM_GRAMMAR: Grammar = Grammar {
+    verbs: &[
+        Verb {
+            name: "shutdown",
+            desc: "Power off the machine — immediately, on a delay (`delay`), or \
+                   cancel a previously scheduled shutdown (`cancel`). Destructive: \
+                   the user is asked to confirm.",
+            mutates: true,
+            operands: &[
+                Operand {
+                    name: "delay",
+                    desc: "Schedule the shutdown instead of powering off now: a \
+                           duration like \"30 minutes\", \"2 hours\", or \"30m\" \
+                           (a bare number means minutes). Omit for immediate.",
+                    required: false,
+                    kind: ArgKind::Text,
+                    prefix: Some("in"),
+                },
+                Operand {
+                    name: "cancel",
+                    desc: "Cancel a previously scheduled shutdown instead of \
+                           starting one. Do not combine with `delay`.",
+                    required: false,
+                    kind: ArgKind::Bool { flag: "cancel" },
+                    prefix: None,
+                },
+            ],
         },
-        "required": ["action"],
-        "additionalProperties": false
-    })
-}
+        Verb {
+            name: "reboot",
+            desc: "Restart the machine. Destructive: the user is asked to confirm.",
+            mutates: true,
+            operands: &[],
+        },
+        Verb {
+            name: "suspend",
+            desc: "Suspend to RAM (sleep). Resumes where the user left off.",
+            mutates: true,
+            operands: &[],
+        },
+        Verb {
+            name: "hibernate",
+            desc: "Hibernate to disk. The user is asked to confirm.",
+            mutates: true,
+            operands: &[],
+        },
+        Verb {
+            name: "lock",
+            desc: "Lock the screen; the session keeps running.",
+            mutates: true,
+            operands: &[],
+        },
+        Verb {
+            name: "logout",
+            desc: "End the desktop session. The user is asked to confirm.",
+            mutates: true,
+            operands: &[],
+        },
+        Verb {
+            name: "mute",
+            desc: "Mute system audio output.",
+            mutates: true,
+            operands: &[],
+        },
+        Verb {
+            name: "unmute",
+            desc: "Unmute system audio output.",
+            mutates: true,
+            operands: &[],
+        },
+        Verb {
+            name: "volume",
+            desc: "Set or step the system output volume; replies with the new level.",
+            mutates: true,
+            operands: &[LEVEL_OPERAND],
+        },
+        Verb {
+            name: "brightness",
+            desc: "Set or step the screen backlight brightness.",
+            mutates: true,
+            operands: &[LEVEL_OPERAND],
+        },
+        Verb {
+            name: "wifi",
+            desc: "Turn the WiFi radio on or off.",
+            mutates: true,
+            operands: &[RADIO_STATE_OPERAND],
+        },
+        Verb {
+            name: "bluetooth",
+            desc: "Turn the Bluetooth radio on or off (the whole adapter, not one \
+                   device — use `connect`/`disconnect` for a device).",
+            mutates: true,
+            operands: &[RADIO_STATE_OPERAND],
+        },
+        Verb {
+            name: "connect",
+            desc: "Connect a paired Bluetooth device by name.",
+            mutates: true,
+            operands: &[BT_DEVICE_OPERAND],
+        },
+        Verb {
+            name: "disconnect",
+            desc: "Disconnect a connected Bluetooth device by name.",
+            mutates: true,
+            operands: &[BT_DEVICE_OPERAND],
+        },
+    ],
+};
 
-/// Normalize the tool's `args` to the flat `"<action> <value>"` string the
-/// parser already understands. A constrained model sends the structured JSON
-/// (`{"action":"volume","value":"50"}`); a human or a legacy/flat caller sends
-/// the string directly. Accepting both keeps the schema win without rewriting
-/// the three matchers below — and keeps `execute`/`assess_risk` on `&str`.
+/// Normalize the tool's `args` to the flat `"<action> [operands…]"` string the
+/// parser already understands, via the ONE structured→flat decider
+/// ([`Grammar::flatten_json`]). A human or legacy/flat caller passes through
+/// unchanged. Keeps `execute`/`assess_risk` on `&str` — and `assess_risk` MUST
+/// keep calling this first, so the risk gate sees the same flat form execution
+/// sees.
 fn system_args_to_flat(args: &str) -> String {
-    let t = args.trim();
-    if !t.starts_with('{') {
-        return t.to_string();
-    }
-    match serde_json::from_str::<serde_json::Value>(t) {
-        Ok(v) => {
-            let action = v
-                .get("action")
-                .and_then(|a| a.as_str())
-                .unwrap_or("")
-                .trim();
-            let value = v.get("value").and_then(|a| a.as_str()).unwrap_or("").trim();
-            if value.is_empty() {
-                action.to_string()
-            } else {
-                format!("{action} {value}")
-            }
-        }
-        // Not the JSON we expected — fall back to the raw string; the parser
-        // will reject it with the usual "unknown action" message.
-        Err(_) => t.to_string(),
-    }
+    SYSTEM_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
 }
 
 /// All action names for completions (simple + parameterized).
@@ -789,8 +886,11 @@ impl ActionHandler for SystemCommand {
     fn usage(&self) -> &str {
         "shutdown, reboot, suspend, hibernate, lock, logout, mute, unmute, volume <up|down|0-100>, brightness <up|down|0-100>, wifi <on|off>, bluetooth <on|off>, connect bluetooth <device>, disconnect bluetooth <device>, shutdown in <duration> (e.g. 'shutdown in 30m'), cancel shutdown"
     }
-    fn input_schema(&self) -> Option<serde_json::Value> {
-        Some(system_input_schema())
+    fn grammar(&self) -> Option<Grammar> {
+        Some(SYSTEM_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::System
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::System
@@ -818,7 +918,7 @@ impl ActionHandler for SystemCommand {
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        // A constrained model sends `{"action":..,"value":..}`; flatten it (and a
+        // A structured caller sends `{"action":..,…operands}`; flatten it (and a
         // plain-string caller passes through) to the form the matchers parse.
         let flat = system_args_to_flat(args);
         let input = flat.trim();
@@ -1119,35 +1219,120 @@ mod tests {
         // A constrained model sends the typed object; it flattens to the string
         // the matchers already parse.
         assert_eq!(
-            system_args_to_flat(r#"{"action":"volume","value":"50"}"#),
+            system_args_to_flat(r#"{"action":"volume","level":"50"}"#),
             "volume 50"
         );
         // No operand → just the verb.
         assert_eq!(system_args_to_flat(r#"{"action":"mute"}"#), "mute");
-        // Empty value is treated as no operand.
+        // Empty operands are treated as absent.
         assert_eq!(
-            system_args_to_flat(r#"{"action":"lock","value":""}"#),
-            "lock"
+            system_args_to_flat(r#"{"action":"volume","level":""}"#),
+            "volume"
+        );
+        // The delay operand renders its "in" prefix; the cancel flag renders
+        // its literal.
+        assert_eq!(
+            system_args_to_flat(r#"{"action":"shutdown","delay":"30 minutes"}"#),
+            "shutdown in 30 minutes"
+        );
+        assert_eq!(
+            system_args_to_flat(r#"{"action":"shutdown","cancel":true}"#),
+            "shutdown cancel"
+        );
+        // Radio toggles render the exact simple-action names.
+        assert_eq!(
+            system_args_to_flat(r#"{"action":"wifi","state":"off"}"#),
+            "wifi off"
+        );
+        // A multi-word operand survives, with the bluetooth prefix literal.
+        assert_eq!(
+            system_args_to_flat(r#"{"action":"connect","device":"My Headphones"}"#),
+            "connect bluetooth My Headphones"
         );
         // A plain-string caller (human, legacy) passes straight through.
         assert_eq!(system_args_to_flat("volume 50"), "volume 50");
         assert_eq!(system_args_to_flat("shutdown"), "shutdown");
-        // A multi-word operand survives (bluetooth device name).
+        // Unknown-verb JSON falls back to the raw string (execute errors).
         assert_eq!(
-            system_args_to_flat(r#"{"action":"connect bluetooth","value":"My Headphones"}"#),
-            "connect bluetooth My Headphones"
+            system_args_to_flat(r#"{"action":"nope"}"#),
+            r#"{"action":"nope"}"#
         );
     }
 
+    /// Per-verb drift test: every flat rendering the grammar can produce must
+    /// be accepted by one of the three matchers `execute` dispatches through.
+    /// This is what pins the grammar to the parser.
     #[test]
-    fn system_schema_enum_matches_the_real_verbs() {
-        // The schema's action enum must be exactly SYSTEM_ACTION_VERBS, so the
-        // model is constrained to verbs the parser actually handles.
-        let schema = system_input_schema();
-        let en = schema["properties"]["action"]["enum"].as_array().unwrap();
-        assert_eq!(en.len(), SYSTEM_ACTION_VERBS.len());
-        for v in SYSTEM_ACTION_VERBS {
-            assert!(en.iter().any(|e| e == v), "enum missing {v}");
+    fn system_grammar_flat_renderings_are_accepted_by_the_parser() {
+        let flat = |json: &str| system_args_to_flat(json);
+
+        // No-operand verbs render to exact simple-action names.
+        for v in [
+            "shutdown",
+            "reboot",
+            "suspend",
+            "hibernate",
+            "lock",
+            "logout",
+            "mute",
+            "unmute",
+        ] {
+            let f = flat(&format!(r#"{{"action":"{v}"}}"#));
+            assert!(
+                simple_actions().iter().any(|a| a.name == f),
+                "no simple action for {f:?}"
+            );
+        }
+        // Radio toggles render to exact simple-action names for both states.
+        for v in ["wifi", "bluetooth"] {
+            for s in RADIO_STATES {
+                let f = flat(&format!(r#"{{"action":"{v}","state":"{s}"}}"#));
+                assert!(
+                    simple_actions().iter().any(|a| a.name == f),
+                    "no simple action for {f:?}"
+                );
+            }
+        }
+        // Parameterized verbs land in try_parameterized.
+        for json in [
+            r#"{"action":"volume","level":"50"}"#,
+            r#"{"action":"volume","level":"up"}"#,
+            r#"{"action":"brightness","level":"80"}"#,
+            r#"{"action":"brightness","level":"down"}"#,
+            r#"{"action":"shutdown","delay":"30 minutes"}"#,
+            r#"{"action":"shutdown","delay":"2 hours"}"#,
+            r#"{"action":"shutdown","cancel":true}"#,
+        ] {
+            let f = flat(json);
+            assert!(try_parameterized(&f).is_some(), "{f:?} not parameterized");
+        }
+        // Bluetooth device verbs land in try_bluetooth_connect.
+        for v in ["connect", "disconnect"] {
+            let f = flat(&format!(r#"{{"action":"{v}","device":"speaker"}}"#));
+            assert!(
+                try_bluetooth_connect(&f).is_some(),
+                "{f:?} not a bluetooth phrase"
+            );
+        }
+    }
+
+    /// Every centrally-classified destructive action must be a grammar verb
+    /// whose rendering the risk gate confirms — the grammar cannot drop or
+    /// rename a destructive verb without this failing.
+    #[test]
+    fn destructive_actions_are_grammar_verbs_and_confirm() {
+        let h = SystemCommand::new();
+        for name in DESTRUCTIVE_ACTIONS {
+            let verb = SYSTEM_GRAMMAR
+                .verb(name)
+                .unwrap_or_else(|| panic!("destructive action {name} missing from grammar"));
+            assert!(verb.mutates, "{name} must be declared mutating");
+            let json = format!(r#"{{"action":"{name}"}}"#);
+            assert_eq!(
+                h.assess_risk(&json, &Default::default()).level,
+                RiskLevel::Medium,
+                "{name} must confirm through the structured path too"
+            );
         }
     }
 

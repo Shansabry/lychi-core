@@ -8,6 +8,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
     RiskLevel,
@@ -122,6 +123,32 @@ fn normalize_weather_location(args: &str) -> &str {
     }
     t
 }
+
+/// `weather`'s argument surface: a single free-form action whose flat form IS
+/// the location. `location` is optional because empty args are a valid request
+/// (auto-detect via IP geolocation, consent-gated by `assess_risk` through the
+/// SAME normalizer `execute` uses). The JSON Schema derives from this; the
+/// drift test pins its renderings to [`normalize_weather_location`].
+const WEATHER_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Current weather plus a 3-day forecast for a place (met.no data, \
+               geocoded via OpenStreetMap). Needs network; responses are cached for \
+               about 10 minutes. Reads only — nothing stored.",
+        mutates: false,
+        operands: &[Operand {
+            name: "location",
+            desc: "The place to report on: a city or place name, optionally qualified \
+                   (\"tokyo\", \"Paris, France\", \"Nagercoil\"). Omit — or send a \
+                   here/now word like \"here\", \"now\", \"today\" — for the user's \
+                   own location via IP geolocation, which requires the user's consent \
+                   (the launcher asks).",
+            required: false,
+            kind: ArgKind::Text,
+            prefix: None,
+        }],
+    }],
+};
 
 // --- Structured output for frontend ---
 
@@ -429,6 +456,12 @@ impl ActionHandler for WeatherHandler {
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
     }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(WEATHER_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Utils
+    }
 
     fn default_risk(&self) -> RiskLevel {
         RiskLevel::Low
@@ -529,6 +562,15 @@ impl ActionHandler for Arc<WeatherHandler> {
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
     }
+    // Without these forwards, the Arc registration would silently fall back to
+    // the trait defaults (no grammar, Standalone) and weather would drop out
+    // of the quick_tools group — same manual-forwarding trap as assess_risk.
+    fn grammar(&self) -> Option<Grammar> {
+        self.as_ref().grammar()
+    }
+    fn tool_group(&self) -> ToolGroup {
+        self.as_ref().tool_group()
+    }
     fn default_risk(&self) -> RiskLevel {
         self.as_ref().default_risk()
     }
@@ -622,6 +664,7 @@ fn symbol_to_description(code: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use super::WEATHER_GRAMMAR;
     use super::normalize_weather_location;
 
     #[test]
@@ -652,5 +695,30 @@ mod tests {
         assert_eq!(normalize_weather_location("tokyo"), "tokyo");
         assert_eq!(normalize_weather_location("  Nagercoil "), "Nagercoil");
         assert_eq!(normalize_weather_location("new york"), "new york");
+    }
+
+    #[test]
+    fn weather_args_flatten_from_structured_json() {
+        // The grammar's flat renderings must be exactly what the normalizer
+        // (the parser `execute` AND `assess_risk` share) accepts.
+        let flat = WEATHER_GRAMMAR
+            .flatten_json(r#"{"location":"tokyo"}"#)
+            .unwrap();
+        assert_eq!(flat, "tokyo");
+        assert_eq!(normalize_weather_location(&flat), "tokyo");
+        // Absent/empty location → "" → the consent-gated auto-detect path.
+        let flat = WEATHER_GRAMMAR.flatten_json("{}").unwrap();
+        assert_eq!(normalize_weather_location(&flat), "");
+        // Flat/legacy callers pass through untouched (caller keeps raw).
+        assert_eq!(WEATHER_GRAMMAR.flatten_json("tokyo"), None);
+    }
+
+    #[test]
+    fn weather_schema_keeps_location_optional() {
+        // The grammar-derived schema must keep `location` optional — empty
+        // args are a valid (consent-gated) request.
+        let schema = WEATHER_GRAMMAR.handler_schema();
+        assert!(schema["properties"]["location"].is_object());
+        assert_eq!(schema["required"], serde_json::json!([]));
     }
 }

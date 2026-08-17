@@ -13,12 +13,47 @@ use reqwest::Client;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
 };
 use crate::error::LychiError;
 
 const API_URL: &str = "https://api.dictionaryapi.dev/api/v2/entries/en/";
+
+/// `define`'s argument surface: a single free-form action whose flat form IS
+/// the word. The JSON Schema and the structured→flat adapter both derive from
+/// this.
+const DEFINE_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Look up an English word in the dictionary and return its definition \
+               inline: phonetics plus the first few senses with part of speech and \
+               example sentences. Use for the meaning of a word or short phrase; \
+               for encyclopedic topics use the web search instead. Read-only: a \
+               keyless dictionary API is queried, nothing is stored or changed.",
+        mutates: false,
+        operands: &[Operand {
+            name: "word",
+            desc: "The word (or short hyphenated / two-word phrase) to define, e.g. \
+                   \"ephemeral\" or \"ad hoc\". Case-insensitive; send the base \
+                   word, not a whole sentence.",
+            required: true,
+            kind: ArgKind::Text,
+            prefix: None,
+        }],
+    }],
+};
+
+/// Normalize the tool's `args` to the flat word string the lookup reads. A
+/// constrained model sends the structured JSON (`{"word":"ephemeral"}`); a
+/// human or legacy/flat caller sends the word directly and passes through
+/// unchanged. Malformed JSON falls back to the raw string.
+fn define_args_to_flat(args: &str) -> String {
+    DEFINE_GRAMMAR
+        .flatten_json(args)
+        .unwrap_or_else(|| args.trim().to_string())
+}
 
 // ── API response shapes (only the fields we render) ─────────────────────
 
@@ -223,16 +258,25 @@ impl ActionHandler for DefineHandler {
     fn category(&self) -> CommandCategory {
         CommandCategory::Web
     }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(DEFINE_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Web
+    }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
-        if Self::normalize(args).is_none() {
+        // A constrained model sends `{"word":..}`; flatten it (a plain-string
+        // caller passes through) to the bare word.
+        let flat = define_args_to_flat(args);
+        if Self::normalize(&flat).is_none() {
             return Ok(ActionResult::err("Usage: define <word>".to_string()));
         }
-        match self.lookup(args).await? {
+        match self.lookup(&flat).await? {
             Some(entry) => Ok(ActionResult::ok(render(&entry), OutputType::Text)),
             None => Ok(ActionResult::err(format!(
                 "No definition found for \u{201c}{}\u{201d}",
-                args.trim()
+                flat.trim()
             ))),
         }
     }
@@ -277,6 +321,27 @@ impl ActionHandler for DefineHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn define_args_flatten_from_structured_json() {
+        // A constrained model sends the typed object; it flattens to the bare
+        // word the normalizer reads.
+        assert_eq!(define_args_to_flat(r#"{"word":"Ephemeral"}"#), "Ephemeral");
+        // A plain-string caller (human, legacy) passes straight through.
+        assert_eq!(define_args_to_flat("ephemeral"), "ephemeral");
+        // Malformed JSON falls back to the raw string.
+        assert_eq!(define_args_to_flat("{not json"), "{not json");
+    }
+
+    /// Drift guard: the grammar's flat rendering must be accepted by the
+    /// parser — normalize() (the gate `execute` and `lookup` share) treats the
+    /// flattened structured call exactly like the flat form. Network lookup
+    /// itself is not exercised here.
+    #[test]
+    fn structured_call_normalizes_like_the_flat_form() {
+        let flat = define_args_to_flat(r#"{"word":"  Ephemeral "}"#);
+        assert_eq!(DefineHandler::normalize(&flat), Some("ephemeral".into()));
+    }
 
     #[test]
     fn normalize_trims_and_lowercases() {

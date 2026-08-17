@@ -3,6 +3,7 @@ use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use std::sync::{Mutex, OnceLock};
 
+use crate::action_registry::grammar::{ArgKind, Grammar, Operand, ToolGroup, Verb};
 use crate::action_registry::handlers::clipboard::write_to_clipboard;
 use crate::action_registry::{
     ActionHandler, ActionResult, CommandCategory, CompletionItem, ExecContext, OutputType,
@@ -100,6 +101,32 @@ fn get_index() -> &'static Vec<UnicodeEntry> {
     INDEX.get_or_init(build_index)
 }
 
+/// `unicode`'s argument surface: a single free-form action whose flat form IS
+/// the search query. The JSON Schema derives from this; the drift test pins
+/// its rendering to the official-name lookup `execute` performs over the
+/// built index.
+const UNICODE_GRAMMAR: Grammar = Grammar {
+    verbs: &[Verb {
+        name: "",
+        desc: "Search Unicode characters by official name — arrows, box drawing, math \
+               operators, punctuation, currency, dingbats, Greek/Cyrillic letters — \
+               and copy the match to the clipboard with its codepoint. Fully local, \
+               read-only.",
+        mutates: false,
+        operands: &[Operand {
+            name: "query",
+            desc: "The character to find, by a fragment of its official Unicode name — \
+                   \"rightwards arrow\", \"em dash\", \"snowman\", \"bullet\". \
+                   Matching is a case-insensitive substring over names like \
+                   \"RIGHTWARDS ARROW\"; the first hit is copied. A literal non-ASCII \
+                   character is copied as-is.",
+            required: true,
+            kind: ArgKind::Text,
+            prefix: None,
+        }],
+    }],
+};
+
 pub struct UnicodeHandler;
 
 impl Default for UnicodeHandler {
@@ -140,6 +167,12 @@ impl ActionHandler for UnicodeHandler {
     }
     fn category(&self) -> CommandCategory {
         CommandCategory::Utilities
+    }
+    fn grammar(&self) -> Option<Grammar> {
+        Some(UNICODE_GRAMMAR)
+    }
+    fn tool_group(&self) -> ToolGroup {
+        ToolGroup::Utils
     }
 
     async fn execute(&self, _ctx: &ExecContext, args: &str) -> Result<ActionResult, LychiError> {
@@ -274,5 +307,24 @@ mod tests {
         let index = get_index();
         // Should have thousands of entries
         assert!(index.len() > 1000, "Index has {} entries", index.len());
+    }
+
+    #[test]
+    fn unicode_args_flatten_from_structured_json() {
+        // The grammar's flat rendering must be exactly what `execute`'s
+        // official-name lookup accepts.
+        let flat = UNICODE_GRAMMAR
+            .flatten_json(r#"{"query":"rightwards arrow"}"#)
+            .unwrap();
+        assert_eq!(flat, "rightwards arrow");
+        let lower = flat.to_lowercase();
+        assert!(
+            get_index()
+                .iter()
+                .any(|e| e.name.to_lowercase().contains(&lower)),
+            "lookup should find a match for {flat:?}"
+        );
+        // Flat/legacy callers pass through untouched (caller keeps raw).
+        assert_eq!(UNICODE_GRAMMAR.flatten_json("arrow"), None);
     }
 }
