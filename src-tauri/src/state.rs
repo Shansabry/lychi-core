@@ -552,7 +552,7 @@ impl AppState {
     /// handlers (quicklinks, script commands) stay in `new()`: their keywords
     /// come from user config, where a collision is diagnosed by the registry's
     /// warn log and the Settings UI, not treated as a bug in this list.
-    fn build_builtin_registry(
+    pub(crate) fn build_builtin_registry(
         db: &Arc<Database>,
         config: &Config,
         timer_state: &lychi_core::action_registry::handlers::timer::TimerState,

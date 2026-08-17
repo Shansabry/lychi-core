@@ -1,4 +1,6 @@
 mod commands;
+#[cfg(test)]
+mod evals;
 #[cfg(target_os = "linux")]
 mod hotkey_de;
 mod hotkey_portal;
