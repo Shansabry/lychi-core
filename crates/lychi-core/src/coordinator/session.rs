@@ -136,6 +136,70 @@ impl Session {
         self.messages
             .push(ChatMessage::tool_result(call_id, output, is_error));
     }
+
+    /// Compact old bulk once the conversation is heavy: stub tool RESULTS and
+    /// elide IMAGES outside the recent window. Returns how many messages were
+    /// edited (0 = under threshold, nothing touched).
+    ///
+    /// The whole history re-ships with EVERY model round-trip, and providers
+    /// have hard per-request budgets (Groq's free tier ≈ 8k tokens) — a long
+    /// conversation otherwise walks into a rejection with no way out. Two
+    /// rules keep the compaction honest:
+    /// - THRESHOLD-BATCHED, never incremental: each edit is a deliberate
+    ///   prompt-cache miss, so pruning fires rarely and does a batch at once
+    ///   (the one sanctioned violation of the append-only contract).
+    /// - The last [`Self::PRUNE_KEEP_RECENT`] messages are never touched — the
+    ///   model must keep verbatim sight of the work it is doing NOW.
+    ///
+    /// Old screenshots are the heaviest case by far (base64 re-sent every
+    /// turn), so image parts outside the window are dropped regardless of the
+    /// text threshold.
+    pub fn prune_old_bulk(&mut self) -> usize {
+        /// Serialized-content budget before TEXT tool results get stubbed
+        /// (~8k tokens' worth of bytes).
+        const PRUNE_THRESHOLD_BYTES: usize = 32 * 1024;
+        /// Tool results at or under this stay — stubbing a one-liner saves
+        /// nothing and costs cache.
+        const SMALL_RESULT_BYTES: usize = 240;
+        const PRUNE_KEEP_RECENT: usize = 10;
+
+        let len = self.messages.len();
+        let cutoff = len.saturating_sub(PRUNE_KEEP_RECENT);
+        let mut edited = 0usize;
+
+        // Images: elide outside the window unconditionally (they dwarf text).
+        // `set_text` deliberately PRESERVES image parts, so strip them first.
+        for m in &mut self.messages[..cutoff] {
+            if m.has_images() {
+                let kept = m.content_text();
+                m.content
+                    .retain(|p| !matches!(p, crate::providers::ContentPart::Image { .. }));
+                m.set_text(format!(
+                    "{kept}\n[image elided from history — it was analyzed above]"
+                ));
+                edited += 1;
+            }
+        }
+
+        let total: usize = self.messages.iter().map(|m| m.content_text().len()).sum();
+        if total <= PRUNE_THRESHOLD_BYTES {
+            return edited;
+        }
+
+        for m in &mut self.messages[..cutoff] {
+            if m.role == crate::providers::Role::Tool {
+                let text = m.content_text();
+                if text.len() > SMALL_RESULT_BYTES && !text.starts_with("[tool output elided") {
+                    m.set_text(format!(
+                        "[tool output elided from history — {} chars; re-run the tool if                          you need it again]",
+                        text.len()
+                    ));
+                    edited += 1;
+                }
+            }
+        }
+        edited
+    }
 }
 
 /// A tool call captured mid-loop because the Rules Engine flagged it destructive.
@@ -179,6 +243,81 @@ pub enum ApprovalDecision {
 mod tests {
     use super::*;
     use crate::providers::Role;
+
+    #[test]
+    fn prune_stubs_old_bulk_and_keeps_the_recent_window() {
+        let mut s = Session::new("sys", "start");
+        // 12 old fat tool results (~48KB) then a recent tail.
+        for i in 0..12 {
+            s.push_assistant(format!("calling {i}"), Vec::new());
+            s.push_tool_result(&format!("c{i}"), "x".repeat(4096), false);
+        }
+        for i in 0..5 {
+            s.push_user(format!("follow-up {i}"));
+            s.push_assistant(format!("answer {i}"), Vec::new());
+        }
+        let edited = s.prune_old_bulk();
+        assert!(edited > 0, "over threshold must prune");
+        // Old results are stubs; the newest messages are untouched.
+        let stubbed = s
+            .messages
+            .iter()
+            .filter(|m| m.content_text().starts_with("[tool output elided"))
+            .count();
+        assert!(stubbed >= 8, "old fat results stubbed: {stubbed}");
+        let tail = &s.messages[s.messages.len() - 10..];
+        assert!(
+            tail.iter()
+                .all(|m| !m.content_text().starts_with("[tool output elided")),
+            "recent window untouched"
+        );
+        // Idempotent: a second pass has nothing left to do (already stubbed,
+        // and now under threshold).
+        assert_eq!(s.prune_old_bulk(), 0);
+    }
+
+    #[test]
+    fn prune_leaves_light_conversations_alone() {
+        let mut s = Session::new("sys", "hi");
+        for i in 0..12 {
+            s.push_assistant(format!("t{i}"), Vec::new());
+            s.push_tool_result(&format!("c{i}"), "small".into(), false);
+        }
+        assert_eq!(s.prune_old_bulk(), 0);
+        assert!(
+            s.messages
+                .iter()
+                .all(|m| !m.content_text().contains("elided"))
+        );
+    }
+
+    #[test]
+    fn prune_elides_old_images_regardless_of_size() {
+        let mut s = Session::new("sys", "look at this");
+        s.push_user_with_images(
+            "[screenshot]",
+            vec![ImageSource {
+                media_type: "image/png".into(),
+                data: "aGVsbG8=".into(),
+            }],
+        );
+        // Push the image out of the recent window with small messages.
+        for i in 0..12 {
+            s.push_user(format!("small {i}"));
+        }
+        let edited = s.prune_old_bulk();
+        assert_eq!(edited, 1, "the old image message was edited");
+        assert!(
+            s.messages.iter().all(|m| !m.has_images()),
+            "no image bytes remain in history"
+        );
+        let elided = s
+            .messages
+            .iter()
+            .find(|m| m.content_text().contains("image elided"))
+            .expect("elision note present");
+        assert!(elided.content_text().contains("[screenshot]"), "text kept");
+    }
 
     #[test]
     fn display_split_is_stamped_on_the_last_user_turn_and_survives_a_roundtrip() {

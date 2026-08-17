@@ -304,6 +304,16 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
             }
             self.emit(AgentEvent::TurnStarted { step });
 
+            // Compact old bulk (stub big tool results, elide old screenshots)
+            // once the conversation is heavy — the whole history re-ships every
+            // round-trip, and budgeted providers reject an oversized request
+            // outright. Threshold-batched inside prune_old_bulk, so most turns
+            // this is a no-op.
+            let pruned = session.prune_old_bulk();
+            if pruned > 0 {
+                tracing::info!(pruned, "[agent] compacted old history bulk");
+            }
+
             // Send only the tools this conversation has plausibly needed:
             // re-selected from the CURRENT conversation each turn (a later step
             // reaches tools its own context now implies), but append-only across
