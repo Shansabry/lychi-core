@@ -29,6 +29,6 @@ pub use loop_::{
     AgentEvent, AgentEventStream, Coordinator, MaxSteps, Outcome, OutcomeHandle, StopCondition,
 };
 pub use manifest::{build_manifest, build_presets_note, splice_manifest, with_manifest};
-pub use relevance::select_tools;
+pub use relevance::{FIND_TOOL, find_tool_def, search_catalog, select_tools, select_tools_sticky};
 pub use session::{ApprovalDecision, ApprovalRequest, PendingApproval, Session};
 pub use tool_executor::{ResumeToken, ToolArtifact, ToolExecutor, ToolOutcome, ToolOutputChannel};

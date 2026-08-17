@@ -157,7 +157,18 @@ pub struct Coordinator<E: ToolExecutor + 'static> {
 }
 
 impl<E: ToolExecutor + 'static> Coordinator<E> {
-    pub fn new(provider: Arc<dyn AiProvider>, executor: Arc<E>, tools: Vec<ToolDef>) -> Self {
+    pub fn new(provider: Arc<dyn AiProvider>, executor: Arc<E>, mut tools: Vec<ToolDef>) -> Self {
+        // A tool-bearing agent always gets the discovery pseudo-tool: shortlist
+        // filtering is fail-safe only if the model can search the full catalog
+        // when nothing visible fits. Answered inline by the loop, never the
+        // executor. A tool-less chat gets no tools at all, discovery included.
+        if !tools.is_empty()
+            && !tools
+                .iter()
+                .any(|t| t.name == crate::coordinator::relevance::FIND_TOOL)
+        {
+            tools.push(crate::coordinator::relevance::find_tool_def());
+        }
         Self {
             provider,
             executor,
@@ -289,13 +300,19 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
             }
             self.emit(AgentEvent::TurnStarted { step });
 
-            // Send only the tools this query plausibly needs, re-selected from the
-            // CURRENT conversation each turn (a later step reaches tools its own
-            // context now implies). This cuts input tokens ~80% on a focused query
-            // and improves selection accuracy; it is fail-safe (core always present,
-            // full catalog on vague/broad queries) and the executor still runs any
-            // tool by name, so a filtered-out tool is never lost. See `relevance`.
-            let step_tools = crate::coordinator::select_tools(&session.messages, &self.tools);
+            // Send only the tools this conversation has plausibly needed:
+            // re-selected from the CURRENT conversation each turn (a later step
+            // reaches tools its own context now implies), but append-only across
+            // the conversation — once sent, a schema stays visible, so history
+            // never references a tool the model can no longer see and the
+            // request prefix only grows. Fail-safe (core + find_tool always
+            // present, full catalog on vague/broad queries), and the executor
+            // still runs any tool by name. See `relevance`.
+            let step_tools = crate::coordinator::select_tools_sticky(
+                &session.messages,
+                &self.tools,
+                &mut session.sent_tools,
+            );
 
             // Stream one model turn, forwarding prose + collecting tool calls.
             let turn = match self.consume_turn(&session.messages, &step_tools).await {
@@ -342,6 +359,23 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
             // held call is answered with a tool_result so the provider contract
             // holds (each tool_use id gets a result).
             let calls = self.filter_batch(&mut session, calls);
+
+            // Discovery calls are answered inline — find_tool is the
+            // coordinator's own pseudo-tool (the executor has never heard of
+            // it): search the FULL catalog, answer with the matches, and widen
+            // the session's sent set so the matched schemas are callable on the
+            // very next step.
+            let calls: Vec<ToolCall> = calls
+                .into_iter()
+                .filter_map(|call| {
+                    if call.name == crate::coordinator::relevance::FIND_TOOL {
+                        self.answer_find_tool(&mut session, call);
+                        None
+                    } else {
+                        Some(call)
+                    }
+                })
+                .collect();
 
             // Execute the batch IN FULL before suspending. The provider
             // contract is unforgiving here: every tool_use id in the assistant
@@ -781,6 +815,49 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
         kept
     }
 
+    /// Answer a `find_tool` call inline: rank the query against the FULL
+    /// catalog, reply with the matches, and add them to the session's sent set
+    /// so their schemas ride the next request. Accepts the schema'd JSON
+    /// (`{"query": …}`) or a bare string. A no-match answer says so explicitly
+    /// — silence would read as "the capability does not exist".
+    fn answer_find_tool(&self, session: &mut Session, call: ToolCall) {
+        self.emit(AgentEvent::ToolCallStarted {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            args: call.args.clone(),
+        });
+        let raw = call.args.trim();
+        let query = serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|v| v.get("query").and_then(|q| q.as_str()).map(String::from))
+            .unwrap_or_else(|| raw.to_string());
+
+        let matches = crate::coordinator::relevance::search_catalog(&query, &self.tools);
+        let output = if matches.is_empty() {
+            format!(
+                "No tools match \"{query}\". The capability may not exist; answer from \
+                 knowledge or tell the user it is not available."
+            )
+        } else {
+            let mut out = String::from("Matching tools (callable from your next step):\n");
+            for t in &matches {
+                out.push_str(&format!("- `{}` — {}\n", t.name, t.description));
+            }
+            out.trim_end().to_string()
+        };
+        for t in matches {
+            if !session.sent_tools.iter().any(|n| n == &t.name) {
+                session.sent_tools.push(t.name.clone());
+            }
+        }
+        session.push_tool_result(&call.id, output.clone(), false);
+        self.emit(AgentEvent::ToolCallCompleted {
+            call_id: call.id,
+            output,
+            artifact: None,
+        });
+    }
+
     /// Answer a call the batch filter dropped: emit its start/complete UI events
     /// and push a non-error tool_result carrying `note`, so the model sees why it
     /// was not run and the provider still gets a result for the tool_use id.
@@ -1086,6 +1163,72 @@ mod tests {
                 None
             }
         })
+    }
+
+    #[tokio::test]
+    async fn find_tool_answers_inline_and_widens_the_sent_set() {
+        // Turn 1: the model searches for a capability its shortlist lacked;
+        // turn 2: it answers. The executor must never see the pseudo-tool.
+        let provider = MockProvider::new(vec![
+            call_tool("c1", "find_tool", r#"{"query":"screenshot of my window"}"#),
+            answer("done"),
+        ]);
+        let exec = Arc::new(MockExecutor::new());
+        let tools = vec![
+            ToolDef {
+                name: "weather".into(),
+                description: "get weather".into(),
+                mutates: false,
+                input_schema: None,
+            },
+            ToolDef {
+                name: "screenshot".into(),
+                description: "capture the screen or a window".into(),
+                mutates: false,
+                input_schema: None,
+            },
+        ];
+        let coord = Coordinator::new(provider, exec.clone(), tools);
+        let (stream, handle) = coord.run(
+            Session::new("sys", "grab my screen"),
+            CancellationToken::new(),
+        );
+        let events = drain(stream).await;
+        let out = tool_completed_output(&events).expect("find_tool answered");
+        assert!(
+            out.contains("`screenshot`"),
+            "answers with the match: {out}"
+        );
+        assert_eq!(
+            *exec.execute_calls.lock().unwrap(),
+            0,
+            "the executor never sees find_tool"
+        );
+        match handle.wait().await {
+            Outcome::Done { session } => {
+                assert!(
+                    session.sent_tools.iter().any(|n| n == "screenshot"),
+                    "the found tool joins the sent set: {:?}",
+                    session.sent_tools
+                );
+                assert_eq!(result_ids(&session), vec!["c1".to_string()]);
+            }
+            _ => panic!("expected Done"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tool_bearing_coordinator_always_offers_find_tool() {
+        let provider = MockProvider::new(vec![answer("hi")]);
+        let exec = Arc::new(MockExecutor::new());
+        let coord = coordinator(provider, exec);
+        assert!(coord.tools.iter().any(|t| t.name == "find_tool"));
+
+        // A tool-less chat gets no discovery tool either.
+        let provider = MockProvider::new(vec![answer("hi")]);
+        let exec = Arc::new(MockExecutor::new());
+        let coord = Coordinator::new(provider, exec, Vec::new());
+        assert!(coord.tools.is_empty());
     }
 
     #[tokio::test]

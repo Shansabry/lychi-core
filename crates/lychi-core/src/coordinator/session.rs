@@ -24,6 +24,14 @@ pub struct Session {
     /// appended to `messages`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending: Vec<PendingApproval>,
+    /// Names of tools whose schemas have been sent to the model in THIS
+    /// conversation. Append-only: once a tool is sent it stays for every later
+    /// turn, so history never references a schema the model can no longer see
+    /// (which confuses models), and the request prefix only ever grows —
+    /// re-selection can add tools, never remove them. See
+    /// [`super::select_tools_sticky`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sent_tools: Vec<String>,
 }
 
 impl Session {
@@ -32,6 +40,7 @@ impl Session {
         Self {
             messages: vec![ChatMessage::system(system), ChatMessage::user(first_user)],
             pending: Vec::new(),
+            sent_tools: Vec::new(),
         }
     }
 
@@ -49,6 +58,7 @@ impl Session {
                 ChatMessage::user_with_images(first_user, images),
             ],
             pending: Vec::new(),
+            sent_tools: Vec::new(),
         }
     }
 
@@ -228,6 +238,7 @@ mod tests {
         let mut s = Session {
             messages: vec![ChatMessage::user("hi")],
             pending: Vec::new(),
+            sent_tools: Vec::new(),
         };
         s.set_system("sys");
         assert_eq!(s.messages[0].role, Role::System);

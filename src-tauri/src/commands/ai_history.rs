@@ -47,9 +47,22 @@ pub async fn load_conversation(
     let Some(conv) = AiHistoryStore::new().get(&id)? else {
         return Ok(None);
     };
+    // Re-derive the append-only sent-tools set from the stored history: every
+    // tool the transcript actually called must stay schema-visible when the
+    // conversation continues, or the model sees history referencing tools it
+    // cannot see (the confusion sticky selection exists to prevent).
+    let mut sent_tools: Vec<String> = Vec::new();
+    for m in &conv.messages {
+        for c in &m.tool_calls {
+            if !sent_tools.contains(&c.name) {
+                sent_tools.push(c.name.clone());
+            }
+        }
+    }
     let session = lychi_core::coordinator::Session {
         messages: conv.messages.clone(),
         pending: Vec::new(),
+        sent_tools,
     };
     *state.agent_session.write().await = Some(session);
     *state.agent_conversation_id.write().await = Some(id);

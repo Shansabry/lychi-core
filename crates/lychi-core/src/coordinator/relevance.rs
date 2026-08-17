@@ -37,7 +37,7 @@ const CONTEXT_LOOKBACK_MESSAGES: usize = 6;
 /// the ones a plan tends to need mid-way (open a file it found, run a follow-up).
 /// Matched against `ToolDef::name`. Keeps the agent capable no matter how the query
 /// is phrased, so filtering can never strand a common action.
-const CORE_TOOLS: &[&str] = &["run", "web", "calc", "url", "browse"];
+const CORE_TOOLS: &[&str] = &["run", "web", "calc", "url", "browse", FIND_TOOL];
 
 /// A query shorter than this is too ambiguous to rank safely → send everything.
 const MIN_QUERY_CHARS: usize = 8;
@@ -108,7 +108,14 @@ pub fn select_tools(messages: &[ChatMessage], catalog: &[ToolDef]) -> Vec<ToolDe
     }
 
     // Broad query (matched a large share) → filtering isn't earning its risk.
-    let non_core = catalog.len().saturating_sub(CORE_TOOLS.len()).max(1);
+    // Count the non-core tools actually present (not `len - CORE_TOOLS.len()`:
+    // the catalog need not contain every core name, and an absent core tool
+    // must not shrink the denominator).
+    let non_core = catalog
+        .iter()
+        .filter(|t| !CORE_TOOLS.contains(&t.name.as_str()))
+        .count()
+        .max(1);
     if (matched.len() as f32) / (non_core as f32) >= FULL_CATALOG_ABOVE_FRACTION {
         return catalog.to_vec();
     }
@@ -135,6 +142,110 @@ pub fn select_tools(messages: &[ChatMessage], catalog: &[ToolDef]) -> Vec<ToolDe
         return catalog.to_vec();
     }
     selected
+}
+
+/// Per-conversation sticky selection: [`select_tools`] proposes this step's
+/// shortlist, `sent` (the session's append-only record) absorbs any new names,
+/// and the returned set is every ever-sent tool in stable catalog order.
+///
+/// Append-only on purpose: a schema the model has seen must stay visible for
+/// the rest of the conversation — history referencing a vanished tool confuses
+/// models, and a prefix that only grows caches better than one that churns.
+/// The trade: a vague turn that pulls in the full catalog keeps it for the
+/// whole conversation. That is the safe direction to be wrong in.
+pub fn select_tools_sticky(
+    messages: &[ChatMessage],
+    catalog: &[ToolDef],
+    sent: &mut Vec<String>,
+) -> Vec<ToolDef> {
+    for t in select_tools(messages, catalog) {
+        if !sent.iter().any(|n| n == &t.name) {
+            sent.push(t.name);
+        }
+    }
+    catalog
+        .iter()
+        .filter(|t| sent.iter().any(|n| n == &t.name))
+        .cloned()
+        .collect()
+}
+
+/// The coordinator's built-in discovery pseudo-tool. Not a registry handler:
+/// the loop answers it inline (see the batch step in `loop_`), because its job
+/// is to search the FULL catalog and widen the session's sent set — state only
+/// the coordinator holds. This is the recovery path for a shortlist miss: the
+/// model notices a capability gap, searches by task words, and the matching
+/// schemas join the very next turn.
+pub const FIND_TOOL: &str = "find_tool";
+
+/// The `ToolDef` for [`FIND_TOOL`], sent with every shortlist (it is in
+/// [`CORE_TOOLS`], so filtering can never drop the recovery path itself).
+pub fn find_tool_def() -> ToolDef {
+    ToolDef {
+        name: FIND_TOOL.to_string(),
+        description: "Search this launcher's full tool catalog when no visible tool fits the \
+                      task. Returns matching tool names and descriptions; the matches become \
+                      callable on your next step. Use task words (e.g. \"compress files\", \
+                      \"wifi\"), not questions."
+            .to_string(),
+        mutates: false,
+        input_schema: Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string",
+                           "description": "Task words describing the needed capability." }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        })),
+    }
+}
+
+/// How many catalog matches a `find_tool` search returns.
+const FIND_TOOL_RESULTS: usize = 5;
+
+/// Rank `query` against the catalog (name + description, same scoring as
+/// [`select_tools`]) and return the best matches. Empty when nothing scores.
+pub fn search_catalog<'a>(query: &str, catalog: &'a [ToolDef]) -> Vec<&'a ToolDef> {
+    let atoms: Vec<Atom> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 3)
+        .map(|w| {
+            Atom::new(
+                w,
+                CaseMatching::Ignore,
+                Normalization::Smart,
+                AtomKind::Fuzzy,
+                false,
+            )
+        })
+        .collect();
+    if atoms.is_empty() {
+        return Vec::new();
+    }
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut buf = Vec::new();
+    let mut matched: Vec<(usize, u32)> = Vec::new();
+    for (i, t) in catalog.iter().enumerate() {
+        if t.name == FIND_TOOL {
+            continue; // never offer the search tool as its own answer
+        }
+        let hay = format!("{} {}", t.name, t.description);
+        let total: u32 = atoms
+            .iter()
+            .filter_map(|a| {
+                buf.clear();
+                let haystack = Utf32Str::new(&hay, &mut buf);
+                a.score(haystack, &mut matcher).map(u32::from)
+            })
+            .sum();
+        if total > 0 {
+            matched.push((i, total));
+        }
+    }
+    matched.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    matched.truncate(FIND_TOOL_RESULTS);
+    matched.into_iter().map(|(i, _)| &catalog[i]).collect()
 }
 
 /// Concatenate the last few user/assistant text turns into one ranking query.
@@ -218,6 +329,50 @@ mod tests {
         let small = vec![tool("run", "x"), tool("web", "y")];
         let msgs = vec![ChatMessage::user("take a screenshot please now")];
         assert_eq!(select_tools(&msgs, &small).len(), small.len());
+    }
+
+    #[test]
+    fn sticky_selection_only_grows() {
+        let mut sent = Vec::new();
+        let msgs1 = vec![ChatMessage::user("take a screenshot of my window")];
+        let first = select_tools_sticky(&msgs1, &catalog(), &mut sent);
+        assert!(first.iter().any(|t| t.name == "screenshot"));
+        let n_first = first.len();
+
+        // A later turn about something else: the screenshot schema must survive
+        // (history references it), and the new topic's tool joins.
+        let msgs2 = vec![
+            ChatMessage::user("take a screenshot of my window"),
+            ChatMessage::user("now control the media playback please"),
+        ];
+        let second = select_tools_sticky(&msgs2, &catalog(), &mut sent);
+        assert!(
+            second.iter().any(|t| t.name == "screenshot"),
+            "once sent, a tool stays: {:?}",
+            names(&second)
+        );
+        assert!(second.iter().any(|t| t.name == "media"));
+        assert!(second.len() >= n_first, "the sent set never shrinks");
+    }
+
+    #[test]
+    fn search_catalog_ranks_the_named_tool_first() {
+        let cat = catalog();
+        let hits = search_catalog("take a screenshot", &cat);
+        assert_eq!(hits.first().map(|t| t.name.as_str()), Some("screenshot"));
+    }
+
+    #[test]
+    fn search_catalog_empty_query_matches_nothing() {
+        assert!(search_catalog("", &catalog()).is_empty());
+    }
+
+    #[test]
+    fn find_tool_never_returns_itself() {
+        let mut cat = catalog();
+        cat.push(find_tool_def());
+        let hits = search_catalog("find a tool for this task", &cat);
+        assert!(hits.iter().all(|t| t.name != FIND_TOOL));
     }
 
     #[test]
