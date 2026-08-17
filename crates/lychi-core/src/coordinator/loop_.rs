@@ -354,6 +354,13 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
                 }
             };
             let (text, calls, truncated) = (turn.text, turn.tool_calls, turn.truncated);
+            // Repair recognizably-mangled tool names BEFORE the batch runs and
+            // BEFORE the assistant turn enters history — the stored call must
+            // teach the model the correct shape, not echo the mangling back.
+            let calls: Vec<ToolCall> = calls
+                .into_iter()
+                .map(|c| normalize_tool_call(c, &self.tools))
+                .collect();
 
             // A COMPLETELY empty turn (no prose, no calls, not a token-cap cut)
             // is a provider flake, not an answer — Groq has returned 0-token
@@ -948,6 +955,47 @@ struct TurnResult {
     truncated: bool,
 }
 
+/// Repair a tool call whose NAME the model mangled, when the intent is still
+/// recognizable. gpt-oss (via Groq, with server validation disabled) emits two
+/// known manglings: a namespaced `group.action` ("web_tools.fetch") and a
+/// leaked harmony marker ("web_tools<|channel|>commentary"). Both carry a real
+/// base tool; the dotted form also names the action, which folds into the JSON
+/// args. Anything unrecognizable passes through untouched — the executor's
+/// unknown-tool error is feedback the model can correct from, and inventing a
+/// call the model didn't make is worse than failing one it did.
+fn normalize_tool_call(mut call: ToolCall, tools: &[ToolDef]) -> ToolCall {
+    let known = |name: &str| tools.iter().any(|t| t.name == name);
+    if known(&call.name) {
+        return call;
+    }
+    // Cut trailing junk (the harmony marker starts at '<').
+    let cleaned: String = call
+        .name
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .collect();
+    let (base, action) = match cleaned.split_once('.') {
+        Some((b, a)) => (b.to_string(), Some(a.to_string())),
+        None => (cleaned, None),
+    };
+    if !known(&base) {
+        return call;
+    }
+    tracing::warn!(from = %call.name, to = %base, "[agent] normalized mangled tool name");
+    call.name = base;
+    if let Some(action) = action.filter(|a| !a.is_empty()) {
+        // Fold the dotted action into the JSON args the group dispatcher reads.
+        let mut map = serde_json::from_str::<serde_json::Value>(call.args.trim())
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        map.entry("action".to_string())
+            .or_insert(serde_json::Value::String(action));
+        call.args = serde_json::Value::Object(map).to_string();
+    }
+    call
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1323,6 +1371,56 @@ mod tests {
         let exec = Arc::new(MockExecutor::new());
         let coord = Coordinator::new(provider, exec, Vec::new());
         assert!(coord.tools.is_empty());
+    }
+
+    #[test]
+    fn mangled_tool_names_normalize_to_their_intent() {
+        let tools = vec![ToolDef {
+            name: "web_tools".into(),
+            description: "web".into(),
+            mutates: false,
+            mutating_actions: Vec::new(),
+            input_schema: None,
+        }];
+        let call = |name: &str, args: &str| ToolCall {
+            id: "c".into(),
+            name: name.into(),
+            args: args.into(),
+        };
+
+        // Dotted group.action → base tool, action folded into the args.
+        let n = normalize_tool_call(call("web_tools.fetch", r#"{"url":"https://x"}"#), &tools);
+        assert_eq!(n.name, "web_tools");
+        let v: serde_json::Value = serde_json::from_str(&n.args).unwrap();
+        assert_eq!(v["action"], "fetch");
+        assert_eq!(v["url"], "https://x");
+
+        // Harmony marker junk → base tool, args untouched.
+        let n = normalize_tool_call(
+            call(
+                "web_tools<|channel|>commentary",
+                r#"{"action":"search","query":"q"}"#,
+            ),
+            &tools,
+        );
+        assert_eq!(n.name, "web_tools");
+        assert_eq!(n.args, r#"{"action":"search","query":"q"}"#);
+
+        // An existing action never gets clobbered by the dotted one.
+        let n = normalize_tool_call(
+            call("web_tools.fetch", r#"{"action":"search","query":"q"}"#),
+            &tools,
+        );
+        let v: serde_json::Value = serde_json::from_str(&n.args).unwrap();
+        assert_eq!(v["action"], "search");
+
+        // Unrecognizable names pass through for the executor's error feedback.
+        let n = normalize_tool_call(call("mystery.thing", "{}"), &tools);
+        assert_eq!(n.name, "mystery.thing");
+
+        // A correct name is untouched (no re-serialization churn).
+        let n = normalize_tool_call(call("web_tools", "flat args"), &tools);
+        assert_eq!(n.args, "flat args");
     }
 
     #[tokio::test]

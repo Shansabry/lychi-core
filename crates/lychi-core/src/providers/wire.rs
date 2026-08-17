@@ -156,7 +156,18 @@ impl WireClient {
         let on_error = self.on_error.clone();
 
         // Build the wire body up-front (pure, no IO).
-        let body = build_body(dialect, &model, self.max_tokens, messages, tools);
+        let mut body = build_body(dialect, &model, self.max_tokens, messages, tools);
+        // GROQ QUIRK: gpt-oss models sometimes mangle a tool NAME
+        // ("web_tools.fetch", a leaked harmony channel marker), and Groq's
+        // server-side validator then kills the whole turn. Their documented
+        // escape hatch hands the call back to the client unvalidated — and the
+        // coordinator normalizes recognizable manglings back to the intended
+        // tool (see `coordinator::normalize_tool_call`), which turns a dead
+        // turn into a working call. Groq-only: OpenAI proper rejects unknown
+        // request fields.
+        if self.url.contains("api.groq.com") && !tools.is_empty() {
+            body["disable_tool_validation"] = json!(true);
+        }
         // Request-weight observability: reported input_tokens routinely exceeds
         // what the visible payload suggests (provider chat templates re-render
         // tool schemas verbosely), and diagnosing "why was this turn N tokens"
