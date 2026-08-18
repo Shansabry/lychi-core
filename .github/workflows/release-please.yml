@@ -1,14 +1,16 @@
 name: Release Please
 
-# Maintains a rolling release PR: version bump + changelog derived from the
-# conventional commits already enforced by commitlint. Merging that PR is the
-# release decision; the tag + GitHub release are still cut manually with
-# `gh release create vX.Y.Z` (which triggers release.yml).
+# The whole release ritual: merging the bot's release PR is the release.
+# The bot bumps every version file + changelog (from the conventional commits
+# commitlint enforces), then creates the tag and a DRAFT GitHub release; the
+# tag triggers release.yml, which attaches assets and publishes the draft
+# atomically (immutable releases only accept uploads while draft).
 #
-# Deliberately `skip-github-release: true`: a release created here with the
-# default GITHUB_TOKEN cannot trigger release.yml (GitHub suppresses workflow
-# cascades from GITHUB_TOKEN events). Flipping to fully automatic requires a
-# fine-grained PAT in secrets and removing that flag.
+# REQUIRES the RELEASE_PLEASE_TOKEN secret (fine-grained PAT, this repo,
+# Contents + Pull requests read/write): tags created with the default
+# GITHUB_TOKEN cannot trigger release.yml — GitHub suppresses workflow
+# cascades. Until the secret exists this falls back to GITHUB_TOKEN and the
+# tag must be re-pushed by hand to fire the build.
 on:
   push:
     branches: [main]
@@ -23,6 +25,6 @@ jobs:
     steps:
       - uses: googleapis/release-please-action@v4
         with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
-          skip-github-release: true
