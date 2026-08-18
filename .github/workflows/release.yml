@@ -156,6 +156,13 @@ jobs:
           cargo install cargo-about --locked --features cli
           cargo about generate about.hbs --features local-ai -o THIRD-PARTY-NOTICES.html
 
+      # The cache restores `target/` wholesale, including bundle outputs from
+      # earlier runs — v0.1.2 shipped a stale v0.1.0 AppImage because the sign
+      # and manifest steps globbed the OLD file. Purge before building so the
+      # bundle dir only ever holds this build's artifact.
+      - name: Clean stale bundle outputs
+        run: rm -rf target/release/bundle/appimage
+
       - name: Build AppImage
         run: pnpm exec tauri build --verbose --bundles appimage --features local-ai
 
@@ -178,6 +185,10 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           appimages=(target/release/bundle/appimage/*.AppImage)
+          if [ ${#appimages[@]} -ne 1 ]; then
+            echo "Expected exactly ONE AppImage, found ${#appimages[@]}: ${appimages[*]}" >&2
+            exit 1
+          fi
           pnpm tauri signer sign \
             --private-key "$TAURI_SIGNING_PRIVATE_KEY" \
             --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" \
@@ -217,8 +228,8 @@ jobs:
           # literal pattern.
           shopt -s nullglob
           appimages=(target/release/bundle/appimage/*.AppImage)
-          if [ ${#appimages[@]} -eq 0 ]; then
-            echo "No AppImage was produced" >&2
+          if [ ${#appimages[@]} -ne 1 ]; then
+            echo "Expected exactly ONE AppImage, found ${#appimages[@]}: ${appimages[*]}" >&2
             exit 1
           fi
           APPIMAGE="${appimages[0]}"
