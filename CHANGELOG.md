@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Pre-1.0, minor versions may contain breaking changes.
 
+## [0.2.1](https://github.com/Shansabry/lychi-core/compare/v0.2.0...v0.2.1) (2026-08-18)
+
+
+### Bug Fixes
+
+* **ai:** drop Anthropic strict mode when schemas exceed its budget ([#33](https://github.com/Shansabry/lychi-core/issues/33)) ([bbbb594](https://github.com/Shansabry/lychi-core/commit/bbbb59489e4a5b6c87d0d5a18311adcf5c4b8b32))
+* **ci:** create the release tag explicitly after release-please ([#31](https://github.com/Shansabry/lychi-core/issues/31)) ([3bc324a](https://github.com/Shansabry/lychi-core/commit/3bc324abf20449c1f7b7b48527052f20b028b0f9))
+* **ci:** include build and local-ai-check in the aggregate gate ([#34](https://github.com/Shansabry/lychi-core/issues/34)) ([68ac9cf](https://github.com/Shansabry/lychi-core/commit/68ac9cf6c3be5fa46d242456cd8144a4df2c7179))
+* **ci:** timeout budgets on every job ([#36](https://github.com/Shansabry/lychi-core/issues/36)) ([14daa99](https://github.com/Shansabry/lychi-core/commit/14daa99dd404b650c7af11288ec5aee5ba2d9f00))
+
 ## [0.2.0](https://github.com/Shansabry/lychi-core/compare/v0.1.4...v0.2.0) (2026-08-18)
 
 
