@@ -246,12 +246,39 @@ jobs:
 
       # Attaching the AppImage, its signature and the manifest to the tagged
       # release is what makes the updater endpoint resolve.
-      - name: Publish release assets
+      # Immutable releases only accept asset uploads while DRAFT — publishing
+      # first locks the release forever (v0.1.1 died this way). So the release
+      # is created/kept as a draft, assets land, and the step after flips it
+      # live in one atomic publish.
+      - name: Upload release assets (draft)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          draft: true
           files: |
             target/release/bundle/appimage/*.AppImage
             target/release/bundle/appimage/*.AppImage.sig
             latest.json
           fail_on_unmatched_files: false
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const tag = process.env.GITHUB_REF_NAME;
+            const { data: releases } = await github.rest.repos.listReleases({
+              ...context.repo, per_page: 100,
+            });
+            const draft = releases.find(r => r.tag_name === tag && r.draft);
+            if (!draft) {
+              core.setFailed(`No draft release found for ${tag}`);
+              return;
+            }
+            await github.rest.repos.updateRelease({
+              ...context.repo,
+              release_id: draft.id,
+              draft: false,
+              make_latest: 'true',
+            });
+            core.info(`Published ${tag} with ${draft.assets.length} assets`);
