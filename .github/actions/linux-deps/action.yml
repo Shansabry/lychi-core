@@ -1,0 +1,39 @@
+name: Linux system deps
+description: >
+  The one apt step shared by every compiling job. The package list used to be
+  copy-pasted across four jobs and drifted; this action is the single source
+  of truth for what a build host needs.
+inputs:
+  tauri:
+    description: Install the Tauri GTK/WebKit build stack (lychi-app). Core-only jobs set "false".
+    default: "true"
+  extra:
+    description: Space-separated extra packages for this job
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Install packages
+      shell: bash
+      env:
+        TAURI: ${{ inputs.tauri }}
+        EXTRA: ${{ inputs.extra }}
+      run: |
+        set -euo pipefail
+        packages=()
+        if [ "$TAURI" = "true" ]; then
+          # The -sys crates run pkg-config at build time, so even `cargo check`
+          # of lychi-app needs the full stack. Matches release.yml's proven set.
+          packages+=(
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev
+            libayatana-appindicator3-dev libgtk-layer-shell-dev
+            libssl-dev libdbus-1-dev pkg-config
+          )
+        fi
+        # Unquoted on purpose: a space-separated list that must word-split.
+        # shellcheck disable=SC2206
+        packages+=($EXTRA)
+        if [ ${#packages[@]} -eq 0 ]; then exit 0; fi
+        sudo apt-get update
+        # Retries: a mirror hiccup should cost seconds, not a hung job.
+        sudo apt-get install -y -o Acquire::Retries=3 "${packages[@]}"

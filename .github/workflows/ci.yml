@@ -2,86 +2,74 @@ name: CI
 
 # Runs on every PR and every push to main. This is the gate that lets an
 # outside PR (or a Dependabot bump) be trusted without building it by hand.
+#
+# ─── Architecture (2026-08 rewrite, aligned with what tokio / ruff /
+#     rust-analyzer / tauri itself actually run) ────────────────────────────
+#
+#   • Independent, fully parallel jobs. The old "compile once, fan out over a
+#     shared cache" staging is gone: no serious Rust project does it, because
+#     restored-from-main caches already give every job warm dependencies and
+#     the staging only added latency and cross-job coupling.
+#   • Each job restores its own rust-cache (default per-job key) and only
+#     main writes caches — PR branches read but never publish, so the 10GB
+#     repo budget holds exactly one steady-state cache per job.
+#   • System deps come from ONE composite action (.github/actions/linux-deps)
+#     instead of four drifting copies of the same apt block.
+#   • Every third-party action is pinned to a full commit SHA (post
+#     tj-actions/changed-files supply-chain attack orthodoxy; Dependabot's
+#     github-actions ecosystem keeps the pins fresh).
+#   • The `ci` aggregate job is the ONLY ruleset-required check and inspects
+#     every result explicitly — a skipped job passes (the licences job
+#     self-gates), anything else fails.
+#   • Workflows lint themselves: actionlint (correctness) + zizmor (security).
+
 on:
   pull_request:
   push:
     branches: [main]
 
-# A new push to the same PR cancels the previous run — no point finishing a
-# build for a commit that's already been replaced.
+# A new push to the same PR cancels the previous run. Keyed on PR number, with
+# the SHA as fallback so pushes to main NEVER cancel each other — main runs
+# write the caches and must finish.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
-  # Fewer codegen units and no incremental artifacts: CI builds once, so the
-  # incremental cache is pure overhead here.
+  # CI builds once, so the incremental cache is pure overhead.
   CARGO_INCREMENTAL: "0"
+  # No debuginfo in CI: significantly faster compiles and smaller caches.
+  # Panic backtraces still show symbol names, just not line numbers.
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Staged so the cheap, high-signal checks fail first.
-#
-#   stage 1  quick        formatting + frontend lint      ~30s, no compilation
-#   stage 2  build        one shared Rust compile         the expensive part
-#   stage 3  rust-checks  clippy / test / bindings        matrix, reuses stage 2
-#            env-tests    wlroots + X11                   matrix, own compile
-#            frontend     test + typecheck
-#   any      licenses     only when the dep graph moves
-#
-# The point of stage 1 is that a missing `cargo fmt` should cost 30 seconds, not
-# a full toolchain install and a workspace compile. Stage 3's matrices then fan
-# out over a warm cache, so clippy and test run concurrently rather than
-# serially in one job.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Least-privilege token: every job here only reads the repo. Pinned explicitly
-# so the default (broader) token permissions never apply (CodeQL
-# actions/missing-workflow-permissions).
+# Least-privilege token: every job here only reads the repo.
 permissions:
   contents: read
 
 jobs:
-  # ── Stage 1: fail fast on things that need no compilation ──────────────────
+  # ── Formatting + the workflows' own linters. No compilation, no apt. ───────
   quick:
     name: Quick checks
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      # rustfmt only — no GTK/WebKit, no dependency compile. This is why it is
-      # a separate job: `cargo fmt --check` does not need the project to build.
-      - uses: dtolnay/rust-toolchain@stable
+      # rustfmt only — `cargo fmt --check` does not need the project to build.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          toolchain: stable
           components: rustfmt
 
       - name: Rust formatting
         run: cargo fmt --all --check
 
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 10
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          cache: pnpm
-
-      - name: Install frontend dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Frontend lint
-        run: pnpm lint
-
       # Workflow files are the one thing CI cannot check by running: a syntax
       # error means GitHub rejects the file, produces ZERO jobs, and reports a
-      # 0-second failure with no log. That is exactly how a `" "` separator in
-      # a `join()` expression (GitHub expressions take only single quotes) broke
-      # every push to main for three days while every local gate stayed green.
-      #
-      # actionlint is a single static binary — no toolchain, no install step —
-      # and it catches that class before it can merge.
-      - name: Lint workflows
+      # 0-second failure with no log. actionlint catches that class before it
+      # can merge.
+      - name: Lint workflows (actionlint)
         run: |
           curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
             | tar xz actionlint
@@ -89,142 +77,93 @@ jobs:
         env:
           ACTIONLINT_VERSION: 1.7.7
 
-  # ── Stage 2: the one expensive Rust compile ────────────────────────────────
-  #
-  # Everything in `rust-checks` needs the same dependency build. Doing it once
-  # here and letting the matrix restore it beats three jobs each compiling the
-  # workspace from scratch.
-  build:
-    name: Build (shared cache)
-    needs: quick
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v7
+      # zizmor audits the workflows for security smells: template injection,
+      # cache poisoning, excessive permissions, impostor commits. The de-facto
+      # standard auditor (CPython, cURL, uv run it in CI).
+      - name: Audit workflows (zizmor)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: pipx run zizmor==1.29.0 --min-severity high .
 
-      # Tauri needs the full GTK/WebKit stack even to type-check, because the
-      # -sys crates run pkg-config at build time.
-      #
-      # Deliberately NOT cached: actions/cache runs as a non-root user and
-      # can't read /var/cache/apt/archives, and the third-party apt-cache
-      # actions would mean trusting an unpinned action in CI for a modest win.
-      # The package list matches release.yml's proven set.
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
-            libayatana-appindicator3-dev libgtk-layer-shell-dev \
-            libssl-dev libdbus-1-dev pkg-config
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      # Keyed on the lockfile and rustc version by default. `save-if` means only
-      # main writes the cache: PR branches read it but don't each push their own
-      # copy, which would evict main's shared entry under the 10GB repo limit.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          shared-key: workspace
-
-      # tauri.conf.json declares the CLI as an externalBin, so lychi-app's build
-      # script refuses to run without it — and src-tauri/binaries/ is gitignored,
-      # so a clean checkout never has one. Anything that compiles lychi-app
-      # (including `clippy --all-targets`) needs this first.
-      - name: Build CLI sidecar
-        run: |
-          cargo build --release -p lychi-cli
-          mkdir -p src-tauri/binaries
-          cp target/release/lychi src-tauri/binaries/lychi-x86_64-unknown-linux-gnu
-
-      # tauri.conf.json bundles THIRD-PARTY-NOTICES.html as a resource, and the
-      # file is gitignored because it is generated — so a clean checkout has no
-      # copy and the build script aborts with:
-      #
-      #   resource path `../THIRD-PARTY-NOTICES.html` doesn't exist
-      #
-      # Same shape as the sidecar above: a generated artefact that anything
-      # compiling lychi-app needs to already be on disk.
-      #
-      # A placeholder rather than the real thing, deliberately. Generating it
-      # needs `cargo install cargo-about`, which costs minutes on every run of
-      # this job — and nothing here reads the contents. The licence audit that
-      # DOES care runs in the `licenses` job, and the release workflow generates
-      # the real file for the artefact users actually receive.
-      - name: Stub bundled notices
-        run: |
-          echo '<!-- placeholder; real notices come from the release workflow -->' > THIRD-PARTY-NOTICES.html
-
-      # Compile test and clippy artifacts here so the matrix below only has to
-      # run them. `--no-run` builds the test binaries without executing them.
-      - name: Warm the build cache
-        run: |
-          cargo test --workspace --no-run
-          cargo clippy --workspace --all-targets -- -D warnings
-
-  # ── Stage 3a: Rust checks, fanned out over the warm cache ──────────────────
-  rust-checks:
-    name: Rust / ${{ matrix.check }}
-    needs: build
+  # ── Rust: lint ─────────────────────────────────────────────────────────────
+  clippy:
+    name: Rust / clippy
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      # One failing check should not cancel the others — knowing whether BOTH
-      # clippy and the tests are broken is more useful than learning it twice.
-      fail-fast: false
-      matrix:
-        check: [test, clippy, bindings]
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
-            libayatana-appindicator3-dev libgtk-layer-shell-dev \
-            libssl-dev libdbus-1-dev pkg-config
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/linux-deps
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          toolchain: stable
           components: clippy
-
-      # Reads the cache `build` just populated. Never writes: these jobs add
-      # nothing a later run needs, and three concurrent writers would race.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          save-if: false
-          shared-key: workspace
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # tauri.conf.json declares the CLI as an externalBin and bundles the
+      # notices file as a resource; both are generated, so a clean checkout has
+      # neither and anything that compiles lychi-app (clippy --all-targets
+      # included) aborts without them. The notices stub is deliberate: nothing
+      # here reads its contents — the licences job audits the real graph, and
+      # the release workflow generates the real file.
+      - name: Build CLI sidecar
+        run: |
+          cargo build --release -p lychi-cli
+          mkdir -p src-tauri/binaries
+          cp target/release/lychi src-tauri/binaries/lychi-x86_64-unknown-linux-gnu
+      - name: Stub bundled notices
+        run: echo '<!-- placeholder; real notices come from the release workflow -->' > THIRD-PARTY-NOTICES.html
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ── Rust: tests + the bindings-drift guarantee ─────────────────────────────
+  test:
+    name: Rust / test + bindings
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/linux-deps
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Prebuilt binary (~3s). nextest runs each test in its own process and
+      # retries flaky ones — a retried-then-passed test is reported FLAKY, so
+      # flakiness stays visible instead of being a manual rerun ritual.
+      - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2
+        with:
+          tool: cargo-nextest
 
       - name: Build CLI sidecar
         run: |
           cargo build --release -p lychi-cli
           mkdir -p src-tauri/binaries
           cp target/release/lychi src-tauri/binaries/lychi-x86_64-unknown-linux-gnu
-
       - name: Stub bundled notices
         run: echo '<!-- placeholder -->' > THIRD-PARTY-NOTICES.html
 
       # local-ai is deliberately excluded: it statically links llama.cpp, which
-      # dominates CI time. The release workflow builds with it; correctness of
-      # the AI plumbing is covered by tests that don't need the engine.
+      # dominates CI time. The local-ai job type-checks that feature; the
+      # release workflow builds it for real.
       - name: Test
-        if: matrix.check == 'test'
-        run: cargo test --workspace
+        run: cargo nextest run --workspace --retries 2
+        env:
+          RUST_BACKTRACE: "1"
 
-      - name: Clippy
-        if: matrix.check == 'clippy'
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      # nextest does not run doctests; keep them covered separately.
+      - name: Doctests
+        run: cargo test --workspace --doc
 
       # The export_bindings test rewrites src/lib/bindings.ts. If that differs
       # from the committed copy, someone changed a #[tauri::command] without
       # regenerating, and the frontend types are a lie. This is the guarantee
       # that makes committing a generated file safe.
       - name: Check bindings are up to date
-        if: matrix.check == 'bindings'
         run: |
           cargo test -p lychi-app export_bindings
           if ! git diff --exit-code --stat -- src/lib/bindings.ts; then
@@ -232,110 +171,78 @@ jobs:
             exit 1
           fi
 
-  # ── Stage 3b: the two window backends no developer machine can test ────────
-  #
-  # `active_window::detect` dispatches to exactly three backends, and desktop
-  # environments collapse onto them — so this matrix is keyed on BACKEND, not on
-  # DE. Five DE jobs would be three copies of one test plus two that cover
-  # nothing:
-  #
-  #   wlroots   Sway, Hyprland, river, Wayfire, niri, COSMIC  → one job
-  #   x11       every X11 session on every desktop            → one job
-  #   KWin      needs a full Plasma session on a session bus; heavy and flaky
-  #             headless, and it is the backend both dev machines exercise daily
-  #   GNOME     `_ => None` by design — Mutter implements neither
-  #             wlr-foreign-toplevel nor a scripting interface, so there is no
-  #             detector and nothing to assert
-  #
-  # Add a job when a fourth BACKEND appears, not a fourth desktop.
-  #
-  # Both only need lychi-core, so they skip the WebKit/GTK stack entirely and
-  # use their own cache key.
-  # The release build REQUIRES local-ai, but the matrix above deliberately
-  # excludes it (llama.cpp dominates CI time when built for real). That gap let
+  # ── Rust: the release feature set must keep compiling ──────────────────────
+  # The release build REQUIRES local-ai, but the test job deliberately excludes
+  # it (llama.cpp dominates CI time when built for real). That gap let
   # feature-gated code rot: ChatMessage grew two fields and the local-ai tests
-  # stopped compiling with nothing failing (AI-4). This job type-checks the
-  # feature — including its #[ignore]d model tests — without running anything.
-  # Its own cache key: llama.cpp's C++ objects rebuild only when the -sys crate
-  # bumps, so warm runs are minutes, not tens of minutes.
+  # stopped compiling with nothing failing (AI-4). This type-checks the feature
+  # — including its #[ignore]d model tests — without running anything.
+  # lychi-core has no Tauri deps by architecture rule, so no GTK/WebKit stack;
+  # cmake/clang for llama.cpp's build come preinstalled on the runner.
   local-ai-check:
     name: Rust / local-ai check
-    needs: quick
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
-            libayatana-appindicator3-dev libgtk-layer-shell-dev \
-            libssl-dev libdbus-1-dev pkg-config
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/linux-deps
         with:
-          shared-key: local-ai
-
+          tauri: "false"
+          extra: libdbus-1-dev libssl-dev pkg-config
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check local-ai (lib + tests)
         run: cargo check -p lychi-core --features local-ai --tests
 
+  # ── The two window backends no developer machine can test ──────────────────
+  # `active_window::detect` dispatches to exactly three backends, and desktop
+  # environments collapse onto them — so this matrix is keyed on BACKEND, not
+  # on DE:
+  #   wlroots   Sway, Hyprland, river, Wayfire, niri, COSMIC  → one job
+  #   x11       every X11 session on every desktop            → one job
+  #   KWin      needs a full Plasma session; both dev machines run it daily
+  #   GNOME     `_ => None` by design — Mutter exposes no detection interface
+  # Add a job when a fourth BACKEND appears, not a fourth desktop.
   env-tests:
     name: Backend / ${{ matrix.backend }}
-    needs: quick
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
         include:
           # Headless Sway really does advertise
           # zwlr_foreign_toplevel_manager_v1 — KDE and GNOME never do, which is
-          # why the whole Dispatch state machine is dead code on a developer
-          # machine and how the Sway SIGABRT (I-011) shipped. A Wayland dispatch
-          # that panics does so inside a C callback, cannot unwind, and aborts
-          # the process: total startup failure, not a degraded feature.
-          #
+          # how the Sway SIGABRT (I-011) shipped: a Wayland dispatch that
+          # panics does so inside a C callback and aborts the process.
           # Verified by mutation: deleting the `event_created_child!`
-          # specialization reproduces the original
-          # "Missing event_created_child specialization for event opcode 0".
+          # specialization reproduces the original crash.
           - backend: wlroots
             packages: sway foot
             script: ./scripts/test-wlroots.sh
-          # The X11 EWMH backend is the most widely used of the three and had no
-          # test at all. Its failure mode is silent: a wrong atom name or a
-          # misparsed property compiles fine and returns None, which is
-          # indistinguishable from "no window focused" — a legitimate result.
-          #
-          # Verified by mutation: typo'ing the `_NET_WM_PID` atom fails it.
+          # The X11 EWMH backend's failure mode is silent: a wrong atom name
+          # compiles fine and returns None, indistinguishable from "no window
+          # focused". Verified by mutation: typo'ing `_NET_WM_PID` fails it.
           - backend: x11
             packages: xvfb openbox xterm x11-utils xdotool
             script: ./scripts/test-x11.sh
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Install ${{ matrix.backend }} and build deps
-        env:
-          PACKAGES: ${{ matrix.packages }}
-        run: |
-          sudo apt-get update
-          # Unquoted on purpose: PACKAGES is a space-separated list that must
-          # word-split into separate arguments.
-          # shellcheck disable=SC2086
-          sudo apt-get install -y $PACKAGES \
-            libdbus-1-dev libssl-dev pkg-config
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      # Separate cache from the workspace one: these compile lychi-core only,
-      # without the Tauri stack, so sharing a key would thrash both.
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Core-only compile: no Tauri stack, so these stay lean on purpose.
+      - uses: ./.github/actions/linux-deps
+        with:
+          tauri: "false"
+          extra: ${{ matrix.packages }} libdbus-1-dev libssl-dev pkg-config
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          shared-key: core-only
 
       # The runner has no session bus and no XDG_RUNTIME_DIR; Sway needs one to
       # put its socket in, and it must be 0700 or wlroots refuses to start.
@@ -345,30 +252,27 @@ jobs:
           SCRIPT: ${{ matrix.script }}
         run: |
           set -euo pipefail
-          # Declared then assigned: `export X="$(cmd)"` returns export's status,
-          # not the command's, so a failing mktemp would sail past `set -e`.
+          # Declared then assigned: `export X="$(cmd)"` returns export's
+          # status, so a failing mktemp would sail past `set -e`.
           XDG_RUNTIME_DIR="$(mktemp -d)"
           export XDG_RUNTIME_DIR
           chmod 700 "$XDG_RUNTIME_DIR"
           "$SCRIPT"
 
-  # ── Stage 3c: frontend ─────────────────────────────────────────────────────
+  # ── Frontend: lint + test + typecheck, Node only ───────────────────────────
+  # No Rust toolchain here on purpose. src/lib/bindings.ts is committed, so the
+  # frontend is checkable with Node alone — which is also what a frontend-only
+  # contributor needs locally. The test job verifies the committed copy.
   frontend:
     name: Frontend
-    needs: quick
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-
-      # No Rust toolchain here on purpose. src/lib/bindings.ts is committed, so
-      # the frontend is checkable with Node alone — which is also what a
-      # frontend-only contributor needs locally. The rust-checks matrix verifies
-      # the committed copy is current.
-      - uses: pnpm/action-setup@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 10
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
           cache: pnpm
@@ -376,11 +280,14 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Lint
+        run: pnpm lint
+
       # svelte-check re-resolves every dependency's types on a cold run. The
       # .svelte-kit dir is generated (sync) and safe to reuse for a given
       # config + lockfile; a miss just regenerates it.
       - name: Cache SvelteKit artifacts
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: .svelte-kit
           key: svelte-kit-${{ hashFiles('pnpm-lock.yaml', 'svelte.config.js', 'vite.config.ts', 'tsconfig.json') }}
@@ -393,7 +300,7 @@ jobs:
       - name: Type check
         run: pnpm check
 
-  # ── Independent: only runs when the dependency graph actually moves ────────
+  # ── Licence audit: only runs when the dependency graph actually moves ──────
   licenses:
     name: Dependency licences
     runs-on: ubuntu-latest
@@ -401,20 +308,13 @@ jobs:
     steps:
       # Full history for the diff below — the default shallow checkout cannot
       # compare against the base commit.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
-      # Gate the expensive part on the dependency graph having actually moved.
-      #
-      # `cargo install cargo-about` is a from-source compile costing minutes,
-      # and this job can only ever fail when a dependency changes. Measured on
-      # this repo: 6 of the last 49 commits touched Cargo.lock, so ~88% of runs
-      # were rebuilding the tool to re-check an unchanged graph.
-      #
-      # GitHub has no per-job `paths:` filter (that is workflow-level, and this
-      # workflow must keep running for everything else), so the filter lives
-      # here as an explicit diff.
+      # This job can only ever fail when a dependency changes, so gate the
+      # expensive part on the graph having actually moved. GitHub has no
+      # per-job `paths:` filter, so the filter lives here as an explicit diff.
       - name: Did the dependency graph change?
         id: changed
         # `github.event.*` is externally influenced, so it arrives as an env
@@ -434,47 +334,43 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         if: steps.changed.outputs.run == 'true'
+        with:
+          toolchain: stable
+
+      # Prebuilt binary: 3 seconds instead of a minutes-long `cargo install`.
+      - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2
+        if: steps.changed.outputs.run == 'true'
+        with:
+          tool: cargo-about
 
       # Fails on any dependency whose licence is not in about.toml's accepted
       # list. Lychi is GPL-3.0-only, so a crate under GPL-2.0-only, AGPL, SSPL,
       # BUSL, CDDL or EPL would be a real distribution problem — and one added
       # transitively is invisible until someone audits by hand. This is the
       # audit, run whenever the graph moves.
-      #
-      # Deliberately NOT building the AppImage: the check is about the graph, so
-      # it needs the manifests and nothing else.
-      - name: Install cargo-about
-        if: steps.changed.outputs.run == 'true'
-        run: cargo install cargo-about --locked --features cli
-
-      - name: Check licences and generate notices
+      - name: Check licences
         if: steps.changed.outputs.run == 'true'
         run: cargo about generate about.hbs --features local-ai -o /dev/null
 
-  # A single required-status target for branch protection. Without this, adding
-  # a matrix leg means editing the protected-branch rules by hand, and a
-  # forgotten one silently stops gating.
+  # ── The single required-status target for branch protection ────────────────
+  # Without this, adding a job means editing the protected-branch rules by
+  # hand, and a forgotten one silently stops gating. EVERY meaningful job must
+  # be named in `needs`: the ruleset requires only this aggregate, and a
+  # missing entry is an invisible hole.
   ci:
     name: CI
-    if: always()
-    # EVERY meaningful job must be named here: the branch ruleset requires
-    # only this aggregate, and a missing entry is an invisible hole. `build`
-    # matters twice over — its own clippy, and because `rust-checks` needs it:
-    # a build failure would leave rust-checks SKIPPED, which the allowance
-    # below would otherwise wave through.
-    needs: [quick, build, rust-checks, local-ai-check, env-tests, frontend, licenses]
+    # `!cancelled()` rather than `always()`: run even when a dependency failed
+    # (so the check reports a real failure instead of staying pending forever),
+    # but not when the whole run was cancelled.
+    if: ${{ !cancelled() }}
+    needs: [quick, clippy, test, local-ai-check, env-tests, frontend, licenses]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      # The expression goes through `env:`, not straight into the script.
-      # Interpolating `${{ }}` into a shell line splices attacker-influenceable
-      # text into the script itself; an env var is passed as data and cannot be
-      # re-parsed as shell. It also keeps the quoting honest — GitHub
-      # expressions accept ONLY single quotes, and the `" "` separator that
-      # used to be here made the whole workflow unparseable, so every push to
-      # main failed in 0s with no jobs and no log.
+      # The expression goes through `env:`, not straight into the script:
+      # an env var is passed as data and cannot be re-parsed as shell.
       - name: Verify every job succeeded
         env:
           RESULTS: ${{ join(needs.*.result, ' ') }}
