@@ -1,0 +1,31 @@
+name: CI image
+
+# Builds the shared CI container (see .github/docker/ci.Dockerfile) and pushes
+# it to ghcr. Runs only when the Dockerfile changes, or on demand.
+on:
+  push:
+    branches: [main]
+    paths: [".github/docker/ci.Dockerfile", ".github/workflows/ci-image.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .github/docker
+          file: .github/docker/ci.Dockerfile
+          push: true
+          tags: ghcr.io/shansabry/lychi-ci:latest
