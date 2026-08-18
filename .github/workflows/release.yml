@@ -34,7 +34,27 @@ defaults:
     shell: bash
 
 jobs:
+  # A tag that disagrees with the built version would ship a binary whose
+  # About pill and updater manifest contradict the release page. Fail fast
+  # instead — the single version bump lives in the files, the tag must match.
+  version-guard:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match tauri.conf.json version
+        run: |
+          conf_version=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$conf_version" != "$tag_version" ]; then
+            echo "Tag v${tag_version} != tauri.conf.json version ${conf_version} — bump the files first" >&2
+            exit 1
+          fi
+
   linux:
+    needs: [version-guard]
+    # The guard is skipped on non-tag builds; needs+always lets this run then.
+    if: always() && (needs.version-guard.result == 'success' || needs.version-guard.result == 'skipped')
     runs-on: ubuntu-latest
     container: ubuntu:22.04
     env:
