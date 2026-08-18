@@ -120,10 +120,10 @@ describe("decideSubmit — actuating the backend decision", () => {
 	it("every NL decision — question or ambiguous — goes to the full agent", () => {
 		expect(
 			decideSubmit(ctx({ trimmed: "what is rust?", inputDecision: NL("what is rust?") })),
-		).toEqual({ kind: "agent", prompt: "what is rust?" });
+		).toEqual({ kind: "agent", prompt: "what is rust?", wantsSelection: false });
 		expect(
 			decideSubmit(ctx({ trimmed: "pasta recipe", inputDecision: NL("pasta recipe") })),
-		).toEqual({ kind: "agent", prompt: "pasta recipe" });
+		).toEqual({ kind: "agent", prompt: "pasta recipe", wantsSelection: false });
 	});
 
 	it("a preset decision renders through", () => {
@@ -221,7 +221,11 @@ describe("decideSubmit — selected completion actuation", () => {
 			completionIndex: 0,
 		});
 		// …but the explicit choice wins.
-		expect(decideSubmit(c)).toEqual({ kind: "agent", prompt: "can you define gallop" });
+		expect(decideSubmit(c)).toEqual({
+			kind: "agent",
+			prompt: "can you define gallop",
+			wantsSelection: false,
+		});
 	});
 
 	it("a selected 'Search web' row runs the web handler", () => {
@@ -243,7 +247,7 @@ describe("decideSubmit — selected completion actuation", () => {
 			completions: [comp({ label: "Ask AI: x", description: "x", kind: "ask-ai" })],
 			completionIndex: 0,
 		});
-		expect(decideSubmit(c)).toEqual({ kind: "agent", prompt: "x" });
+		expect(decideSubmit(c)).toEqual({ kind: "agent", prompt: "x", wantsSelection: false });
 	});
 
 	it("a selected correction WINS over the natural-language guard", () => {
@@ -378,7 +382,11 @@ describe("decideSubmit — a selected row's run is classified by the backend (du
 			inputDecision: NL("what is rust?", true),
 			runDecision: NL("what is rust?", true),
 		});
-		expect(decideSubmit(c)).toEqual({ kind: "agent", prompt: "what is rust?" });
+		expect(decideSubmit(c)).toEqual({
+			kind: "agent",
+			prompt: "what is rust?",
+			wantsSelection: false,
+		});
 	});
 
 	it("an NL question whose selected row echoes the query (run is NL) goes to the agent", () => {
@@ -394,7 +402,11 @@ describe("decideSubmit — a selected row's run is classified by the backend (du
 			inputDecision: NL("what is rust?", true),
 			runDecision: NL("what is rust?", true),
 		});
-		expect(decideSubmit(c)).toEqual({ kind: "agent", prompt: "what is rust?" });
+		expect(decideSubmit(c)).toEqual({
+			kind: "agent",
+			prompt: "what is rust?",
+			wantsSelection: false,
+		});
 	});
 
 	it("an ambiguous NL query (no runnable row selected) goes to the agent", () => {
@@ -404,7 +416,11 @@ describe("decideSubmit — a selected row's run is classified by the backend (du
 			trimmed: "pasta recipe",
 			inputDecision: NL("pasta recipe"),
 		});
-		expect(decideSubmit(c)).toEqual({ kind: "agent", prompt: "pasta recipe" });
+		expect(decideSubmit(c)).toEqual({
+			kind: "agent",
+			prompt: "pasta recipe",
+			wantsSelection: false,
+		});
 	});
 });
 

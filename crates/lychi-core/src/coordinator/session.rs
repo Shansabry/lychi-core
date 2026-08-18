@@ -328,6 +328,7 @@ mod tests {
             instruction: "Summarize the following: …".into(),
             label: "Selected text · 1.2k".into(),
             body: "<a very long blob>".into(),
+            preset_keyword: Some("summarize".into()),
         }));
 
         let user = &s.messages[1];

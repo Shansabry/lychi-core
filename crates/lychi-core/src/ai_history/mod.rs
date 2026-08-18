@@ -76,17 +76,17 @@ pub struct ConversationSummary {
 
 /// The AI-command label for a conversation, or `None` for an ordinary chat.
 ///
-/// A preset user turn is marked by its `display` split (a typed field, not a
-/// prose guess); its `instruction` is the command line the bubble shows
-/// ("Summarize the following…"). That is exactly the "which command" caption the
-/// recall list badges beside the answer-derived title.
+/// A preset user turn carries its keyword in `display.preset_keyword` — the
+/// typed, sender-recorded field. Shown verbatim as the recall pill; `None`
+/// (an ordinary chat) shows no pill. Never guessed from instruction prose.
 pub fn derive_preset_label(messages: &[ChatMessage]) -> Option<String> {
     use crate::providers::Role;
     messages
         .iter()
         .find(|m| m.role == Role::User)
         .and_then(|m| m.display.as_ref())
-        .map(|d| d.instruction.trim().to_string())
+        .and_then(|d| d.preset_keyword.clone())
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
@@ -104,7 +104,11 @@ pub fn derive_title(messages: &[ChatMessage]) -> String {
     use crate::providers::Role;
 
     let first_user = messages.iter().find(|m| m.role == Role::User);
-    let is_preset = first_user.is_some_and(|m| m.display.is_some());
+    let is_preset = first_user.is_some_and(|m| {
+        m.display
+            .as_ref()
+            .is_some_and(|d| d.preset_keyword.is_some())
+    });
 
     // A preset titles from the assistant's answer; a plain chat from the question.
     let source = if is_preset {
@@ -149,6 +153,7 @@ mod title_tests {
             instruction: instruction.to_string(),
             label: "Selected text · 756".to_string(),
             body: content.to_string(),
+            preset_keyword: Some("summarize".to_string()),
         });
         m
     }

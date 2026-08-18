@@ -749,7 +749,26 @@ async fn build_coordinator(
         app: app.clone(),
         vision_ok,
     });
-    Ok((Coordinator::new(provider, adapter, tools), manifest))
+    // Groq's free tier gates each request on an ESTIMATED prompt size —
+    // measured from its own rejections at ~body_bytes/2.5, with NO completion
+    // reservation included (subtracting max_tokens here once starved tool
+    // selection down to core-only and the model could not act at all). Budget
+    // the request in bytes with ~1k tokens of minute headroom; selection
+    // defers what will not fit. Other providers' ceilings are far above
+    // anything we assemble.
+    let request_byte_budget = {
+        let ai = state.config_snapshot(|c| c.ai.clone()).await;
+        let is_groq =
+            ai.provider.eq_ignore_ascii_case("groq") || ai.base_url.contains("api.groq.com");
+        is_groq.then(|| {
+            let tpm_tokens: usize = 8000;
+            (tpm_tokens - 1000) * 12 / 5 // ×2.4 bytes/token, margin under Groq's ~2.5
+        })
+    };
+    Ok((
+        Coordinator::new(provider, adapter, tools).with_request_byte_budget(request_byte_budget),
+        manifest,
+    ))
 }
 
 /// Drive a coordinator run/resume: forward every `AgentEvent` as
@@ -908,6 +927,10 @@ pub struct AgentChatStart {
     /// decider of that split. Never sent to a provider.
     #[serde(default)]
     pub display: Option<lychi_core::providers::MessageDisplay>,
+    /// The AI-command keyword that started this turn ("summarize"), for the
+    /// recall pill. `None` for ordinary chats.
+    #[serde(default)]
+    pub preset_keyword: Option<String>,
 }
 
 #[tauri::command]
@@ -925,6 +948,7 @@ pub async fn agent_chat_start(
         generation,
         images,
         display,
+        preset_keyword,
     } = params;
     // Entry marker for the AI path. Lengths and counts only — never prompt text,
     // which would put user content in the log file. Earns its place because
@@ -971,13 +995,17 @@ pub async fn agent_chat_start(
     let (user, display) = if with_tools {
         let ctx = state.executor.read().await.context.clone();
         let block = lychi_core::context::agent_context_block(ctx.as_ref());
-        let display = display.or_else(|| {
+        let mut display = display.or_else(|| {
             Some(lychi_core::providers::MessageDisplay {
                 instruction: user.clone(),
                 label: "Context".to_string(),
                 body: block.clone(),
+                preset_keyword: None,
             })
         });
+        if let Some(d) = display.as_mut() {
+            d.preset_keyword = preset_keyword.clone();
+        }
         (format!("{user}\n\n{block}"), display)
     } else {
         (user, display)

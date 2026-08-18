@@ -176,8 +176,15 @@ fn core_subset(catalog: &[ToolDef]) -> Vec<ToolDef> {
 /// and NEVER the whole thing on a vague query (that is exactly the request a
 /// token-budgeted provider rejects). The model recovers from any miss via
 /// `find_tool` (core) and the executor's run-any-tool-by-name fail-safe.
-pub fn select_tools(messages: &[ChatMessage], catalog: &[ToolDef]) -> Vec<ToolDef> {
-    if catalog.len() <= FULL_SEND_MAX_TOOLS && approx_payload_bytes(catalog) <= FULL_SEND_MAX_BYTES
+pub fn select_tools(
+    messages: &[ChatMessage],
+    catalog: &[ToolDef],
+    byte_budget: Option<usize>,
+) -> Vec<ToolDef> {
+    let within = |bytes: usize| byte_budget.is_none_or(|b| bytes <= b);
+    if catalog.len() <= FULL_SEND_MAX_TOOLS
+        && approx_payload_bytes(catalog) <= FULL_SEND_MAX_BYTES
+        && within(approx_payload_bytes(catalog))
     {
         return catalog.to_vec();
     }
@@ -205,7 +212,24 @@ pub fn select_tools(messages: &[ChatMessage], catalog: &[ToolDef]) -> Vec<ToolDe
 
     matched.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     matched.truncate(MAX_MATCHED_TOOLS);
-    let keep_matched: std::collections::HashSet<usize> = matched.iter().map(|(i, _)| *i).collect();
+
+    // Provider byte budget (the Tool Search Tool architecture's deferral):
+    // core is always sent, then matched groups best-first WHILE they fit.
+    // A shed group is DEFERRED, not gone — `find_tool` searches the full
+    // catalog and widens the sent set, so the model can still summon it.
+    let mut spent: usize = catalog
+        .iter()
+        .filter(|t| CORE_TOOLS.contains(&t.name.as_str()))
+        .map(approx_tool_bytes)
+        .sum();
+    let mut keep_matched: std::collections::HashSet<usize> = Default::default();
+    for (i, _) in &matched {
+        let cost = approx_tool_bytes(&catalog[*i]);
+        if within(spent + cost) {
+            spent += cost;
+            keep_matched.insert(*i);
+        }
+    }
 
     // Assemble in catalog order (stable): core tools + the matched ones.
     let selected: Vec<ToolDef> = catalog
@@ -240,8 +264,9 @@ pub fn select_tools_sticky(
     messages: &[ChatMessage],
     catalog: &[ToolDef],
     sent: &mut Vec<String>,
+    byte_budget: Option<usize>,
 ) -> Vec<ToolDef> {
-    for t in select_tools(messages, catalog) {
+    for t in select_tools(messages, catalog, byte_budget) {
         if !sent.iter().any(|n| n == &t.name) {
             sent.push(t.name);
         }
@@ -311,34 +336,47 @@ pub fn search_catalog<'a>(query: &str, catalog: &'a [ToolDef]) -> Vec<&'a ToolDe
 }
 
 /// Concatenate the last few user/assistant text turns into one ranking query.
+/// Approximate serialized size of one tool definition, for the byte budget.
+fn approx_tool_bytes(t: &ToolDef) -> usize {
+    serde_json::to_string(t).map(|j| j.len()).unwrap_or(0)
+}
+
 fn recent_context(messages: &[ChatMessage]) -> String {
     messages
         .iter()
         .rev()
         .filter(|m| matches!(m.role, Role::User | Role::Assistant))
         .take(CONTEXT_LOOKBACK_MESSAGES)
-        .map(|m| strip_context_blocks(&m.content_text()))
+        .map(|m| strip_material_blocks(&m.content_text()))
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-/// Remove injected `<context>…</context>` blocks before ranking. The ambient
-/// block rides INSIDE the user message, and its own words ("Working
-/// directory", "Project type", "Local time", "Package manager") lexically
-/// rank `files`/`quick_tools`/`system_control` on EVERY turn — selection must
-/// judge the user's words, not our telemetry. (Found via the wire log: a
-/// trivia question shipped 7 tools instead of core's 3.)
-fn strip_context_blocks(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("<context>") {
-        out.push_str(&rest[..start]);
-        match rest[start..].find("</context>") {
-            Some(end) => rest = &rest[start + end + "</context>".len()..],
-            None => return out, // unterminated block: drop the tail
+/// Remove injected `<context>…</context>` and `<pasted>…</pasted>` blocks
+/// before ranking. Both ride INSIDE the user message and both are material,
+/// not intent: the ambient block's words ("Working directory", "Local time")
+/// ranked `files`/`system_control` on every turn, and a pasted article's
+/// content words did the same ("close your eyes… the monitor" summoned
+/// `system_control` + `quick_tools`, 10.6KB of junk that blew Groq's TPM
+/// estimate). Selection must judge the user's INSTRUCTION, nothing else.
+pub(crate) fn strip_material_blocks(text: &str) -> String {
+    let mut out = text.to_string();
+    for (open, close) in [("<context>", "</context>"), ("<pasted>", "</pasted>")] {
+        let mut acc = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        while let Some(start) = rest.find(open) {
+            acc.push_str(&rest[..start]);
+            match rest[start..].find(close) {
+                Some(end) => rest = &rest[start + end + close.len()..],
+                None => {
+                    rest = ""; // unterminated block: drop the tail
+                    break;
+                }
+            }
         }
+        acc.push_str(rest);
+        out = acc;
     }
-    out.push_str(rest);
     out
 }
 
@@ -384,7 +422,7 @@ mod tests {
     fn a_small_catalog_is_sent_whole() {
         let small: Vec<ToolDef> = catalog().into_iter().take(FULL_SEND_MAX_TOOLS).collect();
         let msgs = vec![ChatMessage::user("take a screenshot of my window please")];
-        assert_eq!(select_tools(&msgs, &small).len(), small.len());
+        assert_eq!(select_tools(&msgs, &small, None).len(), small.len());
     }
 
     fn names(tools: &[ToolDef]) -> Vec<String> {
@@ -394,7 +432,7 @@ mod tests {
     #[test]
     fn a_specific_query_keeps_core_plus_the_matching_tool() {
         let msgs = vec![ChatMessage::user("take a screenshot of my window")];
-        let out = select_tools(&msgs, &catalog());
+        let out = select_tools(&msgs, &catalog(), None);
         let n = names(&out);
         assert!(
             n.contains(&"screenshot".to_string()),
@@ -413,7 +451,7 @@ mod tests {
         // exactly the request a token-budgeted provider rejects outright.
         // Core (with find_tool for recovery) is the safe floor now.
         let msgs = vec![ChatMessage::user("hi")];
-        let out = select_tools(&msgs, &catalog());
+        let out = select_tools(&msgs, &catalog(), None);
         let n = names(&out);
         assert!(out.len() < catalog().len(), "not the full catalog: {n:?}");
         assert!(n.contains(&"run".to_string()), "{n:?}");
@@ -422,7 +460,7 @@ mod tests {
     #[test]
     fn a_query_matching_nothing_still_has_core() {
         let msgs = vec![ChatMessage::user("xyzzy plugh flooble wugga")];
-        let n = names(&select_tools(&msgs, &catalog()));
+        let n = names(&select_tools(&msgs, &catalog(), None));
         assert!(n.contains(&"run".to_string()), "{n:?}");
         assert!(!n.contains(&"screenshot".to_string()));
     }
@@ -431,7 +469,7 @@ mod tests {
     fn a_small_catalog_is_never_filtered() {
         let small = vec![tool("run", "x"), tool("web", "y")];
         let msgs = vec![ChatMessage::user("take a screenshot please now")];
-        assert_eq!(select_tools(&msgs, &small).len(), small.len());
+        assert_eq!(select_tools(&msgs, &small, None).len(), small.len());
     }
 
     // ── Precision against the REAL group tools ───────────────────────────────
@@ -538,7 +576,7 @@ mod tests {
         // the score floor must hold this to the core set.
         let cat = heavy(production_like_catalog());
         let msgs = vec![ChatMessage::user("can you let me know what is a dolphin?")];
-        let n = names(&select_tools(&msgs, &cat));
+        let n = names(&select_tools(&msgs, &cat, None));
         assert_eq!(
             n,
             vec![
@@ -567,7 +605,7 @@ mod tests {
         ];
         for (query, expected) in cases {
             let msgs = vec![ChatMessage::user(*query)];
-            let n = names(&select_tools(&msgs, &cat));
+            let n = names(&select_tools(&msgs, &cat, None));
             assert!(
                 n.contains(&expected.to_string()),
                 "{query:?} should rank {expected}: got {n:?}"
@@ -592,7 +630,7 @@ mod tests {
              - Project type: Rust\n- Package manager: pnpm\n\
              - Docker: 2 running container(s)\n</context>",
         )];
-        let n = names(&select_tools(&msgs, &cat));
+        let n = names(&select_tools(&msgs, &cat, None));
         assert_eq!(
             n,
             vec![
@@ -619,7 +657,7 @@ mod tests {
     fn sticky_selection_only_grows() {
         let mut sent = Vec::new();
         let msgs1 = vec![ChatMessage::user("take a screenshot of my window")];
-        let first = select_tools_sticky(&msgs1, &catalog(), &mut sent);
+        let first = select_tools_sticky(&msgs1, &catalog(), &mut sent, None);
         assert!(first.iter().any(|t| t.name == "screenshot"));
         let n_first = first.len();
 
@@ -629,7 +667,7 @@ mod tests {
             ChatMessage::user("take a screenshot of my window"),
             ChatMessage::user("now control the media playback please"),
         ];
-        let second = select_tools_sticky(&msgs2, &catalog(), &mut sent);
+        let second = select_tools_sticky(&msgs2, &catalog(), &mut sent, None);
         assert!(
             second.iter().any(|t| t.name == "screenshot"),
             "once sent, a tool stays: {:?}",
@@ -665,7 +703,7 @@ mod tests {
             ChatMessage::user("what is 2+2"),
             ChatMessage::assistant("4. Want me to take a screenshot of the result?"),
         ];
-        let n = names(&select_tools(&msgs, &catalog()));
+        let n = names(&select_tools(&msgs, &catalog(), None));
         assert!(
             n.contains(&"screenshot".to_string()),
             "later turn steers: {n:?}"

@@ -799,6 +799,58 @@ mod tests {
     /// decentrally; this is the fence that keeps a new handler from silently
     /// stealing one.
     #[test]
+    fn tmp_probe_followup() {
+        let path = std::env::temp_dir().join(format!(
+            "lychi-probe3-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = lychi_core::db::open_database(&path).expect("temp db");
+        let config = Config::default();
+        let timer_state = lychi_core::action_registry::handlers::timer::new_timer_state();
+        #[cfg(feature = "mpris")]
+        let mpris = Arc::new(RwLock::new(None));
+        let registry = AppState::build_builtin_registry(
+            &db,
+            &config,
+            &timer_state,
+            #[cfg(feature = "mpris")]
+            &mpris,
+        );
+        let catalog: Vec<lychi_core::providers::ToolDef> = registry
+            .model_catalog()
+            .into_iter()
+            .map(|m| lychi_core::providers::ToolDef {
+                name: m.name,
+                description: m.description,
+                mutates: m.mutates,
+                mutating_actions: m.mutating_actions,
+                input_schema: m.input_schema,
+            })
+            .collect();
+        let article = "Microsoft Clarity flagged UX problems: the Looking for help nearby element on the Resources page should either function correctly or be restyled to appear non-clickable, and the Sobrynth logo on the sign-in page must link to the proper home landing page without using a simple reload. Internal staff sessions need to be identifiable using attributes like organization, role, or email domain and tagged so they can be filtered out or excluded from Clarity, ensuring no sensitive data is sent. All changes must be verified on desktop and mobile, meet the acceptance criteria, and be documented with filtering instructions.".repeat(3);
+        let msgs = vec![
+            lychi_core::providers::ChatMessage::system("You are the AI inside Lychi."),
+            lychi_core::providers::ChatMessage::user(format!(
+                "Summarize the following text in 2-3 concise sentences: {article}"
+            )),
+            lychi_core::providers::ChatMessage::assistant(
+                "Microsoft Clarity flagged UX problems: elements should function correctly, internal sessions must be tagged and filtered, and all changes verified on desktop and mobile.",
+            ),
+            lychi_core::providers::ChatMessage::user("add to notes"),
+        ];
+        for (label, budget) in [("no-budget", None), ("groq", Some(11000usize))] {
+            let picked = lychi_core::coordinator::select_tools(&msgs, &catalog, budget);
+            let names: Vec<&str> = picked.iter().map(|t| t.name.as_str()).collect();
+            eprintln!("PROBE [{label}] {} tools: {:?}", picked.len(), names);
+        }
+    }
+
+    #[test]
     fn builtin_trigger_prefixes_are_collision_free() {
         // Unique temp path per run: `open_test_database` is #[cfg(test)] of
         // lychi-core and invisible across crates.
@@ -1026,7 +1078,7 @@ mod tests {
         ];
         for (query, expected) in action_cases {
             let msgs = vec![lychi_core::providers::ChatMessage::user(*query)];
-            let picked = lychi_core::coordinator::select_tools(&msgs, &tool_defs);
+            let picked = lychi_core::coordinator::select_tools(&msgs, &tool_defs, None);
             let picked_names: Vec<&str> = picked.iter().map(|t| t.name.as_str()).collect();
             assert!(
                 picked_names.contains(expected),

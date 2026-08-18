@@ -92,18 +92,6 @@ function ago(ms: number): string {
 	const d = Math.floor(h / 24);
 	return `${d}d`;
 }
-
-// A compact tag for the AI-command pill. `preset_label` is the full instruction
-// ("Summarize the following text in 2-3 concise sentences:"); the pill shows the
-// first word or two, with the full text kept as the row's tooltip.
-function presetTag(label: string): string {
-	const words = label
-		.trim()
-		.replace(/[:.]+$/, "")
-		.split(/\s+/);
-	const tag = words.slice(0, 2).join(" ");
-	return tag.length > 18 ? `${words[0]}` : tag;
-}
 </script>
 
 <svelte:window onkeydown={onKeydown} />
@@ -140,7 +128,7 @@ function presetTag(label: string): string {
 					>
 						<span class="ch-title-row">
 							{#if c.preset_label}
-								<span class="ch-pill" title={c.preset_label}>{presetTag(c.preset_label)}</span>
+								<span class="ch-pill">{c.preset_label}</span>
 							{/if}
 							<span class="ch-title">{c.title}</span>
 						</span>
