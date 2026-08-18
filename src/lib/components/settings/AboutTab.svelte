@@ -1,6 +1,6 @@
 <script lang="ts">
 import type { UpdateStatus } from "$lib/ipc";
-import { checkForUpdate, installUpdate } from "$lib/ipc";
+import { checkForUpdate, installUpdate, openPath } from "$lib/ipc";
 import LychiIcon from "../LychiIcon.svelte";
 
 let { appVersion }: { appVersion: string } = $props();
@@ -76,9 +76,11 @@ async function runInstall() {
 		</div>
 		<div class="about-link-row">
 			<span class="about-link-label">Logs</span>
-			<span class="about-link-value about-link-stack">
-				<span>~/.local/share/lychi/logs</span>
-				<span class="about-link-note">kept 7 days · commands you type are not recorded</span>
+			<span class="about-link-stack">
+				<button class="about-update-btn" onclick={() => openPath("~/.local/share/lychi/logs")}>
+					Open folder
+				</button>
+				<span class="about-link-note">kept 7 days · typed commands never recorded</span>
 			</span>
 		</div>
 		<div class="about-link-row">
@@ -222,8 +224,6 @@ async function runInstall() {
 		border-radius: 4px;
 	}
 
-	/* A value with a secondary note stacks it on its own muted line instead of
-	   wrapping into the label (the old Logs row read as a collision). */
 	.about-link-stack {
 		display: flex;
 		flex-direction: column;
