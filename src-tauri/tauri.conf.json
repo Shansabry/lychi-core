@@ -45,6 +45,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": [
       "appimage",
       "deb",
@@ -100,7 +101,7 @@
       "Only the AppImage self-updates; deb/rpm/Flatpak are gated at runtime by lychi_core::install."
     ],
     "updater": {
-      "pubkey": "",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNCOEQ5RUQxQjlDMUU5QzgKUldUSTZjRzUwWjZOTzVCK3dIcjBERGhhWGdlTjV4R1c1Z1B1MlhMSXBVYW5YME1yc3NHaDZJYkkK",
       "endpoints": [
         "https://github.com/Shansabry/lychi-core/releases/latest/download/latest.json"
       ]

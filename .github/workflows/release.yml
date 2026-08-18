@@ -26,6 +26,13 @@ on:
 permissions:
   contents: write
 
+# The ubuntu:22.04 CONTAINER's default step shell is plain `sh`, which chokes
+# on bashisms (`set -o pipefail`, `shopt`) — v0.1.0's manifest step died on its
+# first line this way. Pin bash for every run step.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   linux:
     runs-on: ubuntu-latest
