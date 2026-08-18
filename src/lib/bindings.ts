@@ -2596,7 +2596,7 @@ export type RouteDecision =
  * answers and can act. (There was once a `confident` flag that sent vague
  * input to a quick-answer "fork card" first; that path was removed.)
  */
-{ kind: "nl"; prompt: string } | 
+{ kind: "nl"; prompt: string; wants_selection?: boolean } | 
 /**
  * An AI preset invocation. When `input` is empty the FE first tries the
  * PRIMARY selection (highlighted text) as `{input}`, and prompts inline

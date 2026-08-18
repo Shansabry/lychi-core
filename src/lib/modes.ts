@@ -184,8 +184,12 @@ export function tokenRange(
  * Expand the copied-text token back to its staged payload for submission. A
  * no-op when nothing is staged — a hand-typed `[copied text]` with no payload
  * behind it stays literal rather than expanding to stale state.
+ *
+ * The payload expands inside `<pasted>` tags: the model sees it labelled as
+ * user-provided MATERIAL, and tool selection strips it before ranking (like
+ * `<context>`) — a pasted article's words must never summon tool groups.
  */
 export function expandCopiedToken(value: string, payload: string | null): string {
 	if (payload === null) return value;
-	return value.replace(COPIED_TOKEN, payload);
+	return value.replace(COPIED_TOKEN, `<pasted>\n${payload}\n</pasted>`);
 }

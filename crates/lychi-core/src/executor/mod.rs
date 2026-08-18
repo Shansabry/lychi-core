@@ -1341,6 +1341,7 @@ impl Executor {
         if trimmed.is_empty() {
             return RouteDecision::Nl {
                 prompt: String::new(),
+                wants_selection: false,
             };
         }
 

@@ -143,7 +143,7 @@ describe("copied-text token", () => {
 
 	it("expands to the payload only when one is staged", () => {
 		expect(expandCopiedToken("summarize [copied text]", "long pasted body")).toBe(
-			"summarize long pasted body",
+			"summarize <pasted>\nlong pasted body\n</pasted>",
 		);
 		// Hand-typed token with nothing staged stays literal.
 		expect(expandCopiedToken("summarize [copied text]", null)).toBe("summarize [copied text]");

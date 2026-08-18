@@ -32,7 +32,15 @@ pub enum RouteDecision {
     /// question or an ambiguous phrase alike) goes straight to the agent, which
     /// answers and can act. (There was once a `confident` flag that sent vague
     /// input to a quick-answer "fork card" first; that path was removed.)
-    Nl { prompt: String },
+    Nl {
+        prompt: String,
+        /// The router demoted a preset CHAIN ("summarize and add it to
+        /// notes") here: material is expected but none is inline, so the
+        /// frontend should attach the PRIMARY selection as a `<pasted>` block
+        /// — the same identifier the copied-text token expands into.
+        #[serde(default)]
+        wants_selection: bool,
+    },
     /// An AI preset invocation. When `input` is empty the FE first tries the
     /// PRIMARY selection (highlighted text) as `{input}`, and prompts inline
     /// (re-filling `keyword `) when there is nothing to act on.
@@ -104,6 +112,7 @@ pub fn classify_string(
         // Nothing to classify — caller guards this, but be safe.
         return RouteDecision::Nl {
             prompt: String::new(),
+            wants_selection: false,
         };
     }
     let lower = trimmed.to_lowercase();
@@ -118,12 +127,32 @@ pub fn classify_string(
     }
 
     // AI preset invocation: `<keyword> <text>` (or a bare `<keyword>`).
+    //
+    // EXCEPT chained requests: a preset is a single tool-free text transform,
+    // so "summarize and add it to notes" must reach the AGENT (which can do
+    // both). The structural tell — with <pasted> material blocks removed — is
+    // the keyword followed IMMEDIATELY by a conjunction: there is no inline
+    // material, only further instructions. Material merely CONTAINING "and"
+    // ("summarize war and peace") still hits the preset.
     let first_word = lower.split_whitespace().next().unwrap_or(&lower);
     if let Some((template, _name)) = preset_for(first_word) {
         let rest = trimmed
             .split_once(char::is_whitespace)
             .map(|(_, r)| r.trim().to_string())
             .unwrap_or_default();
+        let rest_structural = crate::coordinator::strip_material_blocks(&rest);
+        let rest_structural = rest_structural.trim();
+        let chained = rest_structural
+            .strip_prefix("and")
+            .is_some_and(|t| t.is_empty() || t.starts_with(char::is_whitespace));
+        if chained && has_ai {
+            // Material is implied by the keyword but none is inline — the FE
+            // attaches the selection (the preset path's own fallback source).
+            return RouteDecision::Nl {
+                prompt: trimmed.to_string(),
+                wants_selection: true,
+            };
+        }
         // A preset is an explicit AI ask; when AI is off, warn + fall to web.
         if !has_ai {
             return RouteDecision::AiDisabled {
@@ -207,6 +236,7 @@ fn nl_or_disabled(prompt: &str, explicit: bool, has_ai: bool) -> RouteDecision {
     if has_ai {
         RouteDecision::Nl {
             prompt: prompt.to_string(),
+            wants_selection: false,
         }
     } else {
         RouteDecision::AiDisabled {
@@ -302,6 +332,7 @@ mod tests {
             classify_string("ask what is rust?", &r, no_presets, true),
             RouteDecision::Nl {
                 prompt: "what is rust?".into(),
+                wants_selection: false,
             }
         );
     }
@@ -350,7 +381,10 @@ mod tests {
         for q in ["what is rust?", "pastarecipe"] {
             assert_eq!(
                 classify_string(q, &r, no_presets, true),
-                RouteDecision::Nl { prompt: q.into() },
+                RouteDecision::Nl {
+                    prompt: q.into(),
+                    wants_selection: false,
+                },
                 "{q:?} should route to the agent",
             );
         }
@@ -451,5 +485,34 @@ mod tests {
         );
 
         index::rebuild_app_index();
+    }
+
+    #[test]
+    fn a_chained_preset_request_reaches_the_agent_not_the_preset() {
+        let r = test_registry();
+        let summarize = |w: &str| {
+            (w == "summarize").then(|| ("Summarize: {input}".to_string(), "Summarize".to_string()))
+        };
+        // Keyword followed immediately by a conjunction = a chain the tool-free
+        // preset cannot honor — the agent gets it.
+        match classify_string("summarize and add it to the notes", &r, summarize, true) {
+            RouteDecision::Nl { .. } => {}
+            other => panic!("expected Nl, got {other:?}"),
+        }
+        // Same with the pasted-material block between keyword and conjunction.
+        match classify_string(
+            "summarize <pasted>\nlong article body here\n</pasted> and add it to the notes",
+            &r,
+            summarize,
+            true,
+        ) {
+            RouteDecision::Nl { .. } => {}
+            other => panic!("expected Nl, got {other:?}"),
+        }
+        // Material merely CONTAINING "and" stays a preset.
+        match classify_string("summarize war and peace in two lines", &r, summarize, true) {
+            RouteDecision::Preset { keyword, .. } => assert_eq!(keyword, "summarize"),
+            other => panic!("expected Preset, got {other:?}"),
+        }
     }
 }

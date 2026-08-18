@@ -78,7 +78,6 @@ import { media } from "$lib/stores/media.svelte";
 import { ui } from "$lib/stores/ui.svelte";
 import {
 	decideSubmit,
-	presetDisplay,
 	type RouteDecision,
 	renderPreset,
 	type SubmitAction,
@@ -872,7 +871,7 @@ async function openConversation(id: string) {
 		// file chips, not re-rendered from history.
 		const text = contentText(m.content);
 		if (m.role === "user") {
-			// A folded turn carries its own display split (`presetDisplay` computed
+			// A folded turn carries its own display split (computed by the sender
 			// it when the message was SENT and it was persisted with the message),
 			// so recall replays that verdict rather than re-deriving the boundary
 			// from flat text — one decider, no drift. Unfolded turns render as-is.
@@ -1127,20 +1126,31 @@ async function actuate(action: SubmitAction): Promise<void> {
 			await runCommand(action.command, { runInline: action.runInline });
 			return;
 
-		case "agent":
+		case "agent": {
 			inputValue = "";
 			completions.items = [];
 			completions.index = -1;
 			lastResult = null; // AI answer takes over the result area
-			await chat.start(expandCopiedToken(action.prompt, submitPayload), /* fresh */ true);
+			let prompt = expandCopiedToken(action.prompt, submitPayload);
+			// A demoted preset chain ("summarize and add it to notes") implies
+			// material that is not inline: attach the PRIMARY selection inside
+			// the same <pasted> identifier the copied-text token expands into —
+			// the model treats it as material, the tool ranker ignores it.
+			if (action.wantsSelection && submitPayload === null) {
+				const sel = await readSelection().catch(() => null);
+				if (sel) prompt = `${prompt}\n\n<pasted>\n${sel}\n</pasted>`;
+			}
+			await chat.start(prompt, /* fresh */ true);
 			return;
+		}
 
 		case "preset": {
 			// An AI command (preset). If the user typed no text after the keyword,
 			// fall back to the PRIMARY selection (highlighted text in the focused
 			// window) — so `summarize` alone acts on what you've selected in a
-			// browser/editor. Runs tool-free (chat.startPreset) — a text transform
-			// needs no tools, and it is NOT the open-ended Ask AI chat.
+			// browser/editor. Runs through the ONE agent lane, tools included: a
+			// pure transform just answers, and a chained ask ("…and add it to
+			// notes") can act — no second engine, no routing dilemma.
 			let input = expandCopiedToken(action.input, submitPayload);
 			if (!input) {
 				const sel = await readSelection().catch(() => null);
@@ -1158,12 +1168,10 @@ async function actuate(action: SubmitAction): Promise<void> {
 			completions.items = [];
 			completions.index = -1;
 			lastResult = null; // AI answer takes over the result area
-			// Model gets the full rendered prompt; the bubble folds a big selection
-			// into a collapsed attachment chip instead of dumping it inline.
-			await chat.startPreset(
-				renderPreset(action.template, input),
-				presetDisplay(action.template, input),
-			);
+			// Material rides inside <pasted>: the model treats it as data, the
+			// tool ranker ignores it, and injection hygiene comes free.
+			const wrapped = input.includes("<pasted>") ? input : `<pasted>\n${input}\n</pasted>`;
+			await chat.start(renderPreset(action.template, wrapped), /* fresh */ true);
 			return;
 		}
 

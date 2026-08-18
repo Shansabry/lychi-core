@@ -85,52 +85,6 @@ export function renderPreset(template: string, input: string): string {
 }
 
 /**
- * A user message longer than this (chars) is folded into a collapsed attachment
- * chip in the chat bubble instead of shown inline. Keep in sync with the store's
- * intent; the store re-checks so callers can't accidentally inline a huge blob.
- */
-export const PRESET_ATTACH_THRESHOLD = 240;
-
-/**
- * Split a preset into what the CHAT BUBBLE shows: the instruction line (the
- * template minus the payload) and, when the payload is large, a collapsed
- * attachment chip. The MODEL still gets the full rendered prompt separately
- * (`renderPreset`) — this only shapes the on-screen bubble.
- *
- * - `Summarize the following: {input}` + big blob → instruction `Summarize the
- *   following:`, attachment `{label: "Selected text · 1.2k", body: blob}`.
- * - `translate {input} to spanish` + big blob → instruction `translate … to
- *   spanish`, attachment as above.
- * - Small input, or a template with no `{input}` → instruction is the rendered
- *   prompt, no attachment (behaves like before).
- */
-export function presetDisplay(
-	template: string,
-	input: string,
-): { instruction: string; attachment?: { label: string; body: string } } {
-	const payload = input.trim();
-	const large = payload.length >= PRESET_ATTACH_THRESHOLD;
-
-	if (!large || !template.includes("{input}")) {
-		// Nothing worth folding out — show the rendered prompt as-is.
-		return { instruction: renderPreset(template, input) };
-	}
-
-	// Replace the `{input}` slot with an ellipsis so the instruction reads
-	// naturally ("translate … to spanish", "Summarize the following: …").
-	const instruction = template.replaceAll("{input}", "…").replace(/\s+/g, " ").trim();
-	const label = `Selected text · ${formatCharCount(payload.length)}`;
-	return { instruction, attachment: { label, body: payload } };
-}
-
-/** Compact char count for the attachment chip: 812, 1.2k, 34k. */
-function formatCharCount(n: number): string {
-	if (n < 1000) return `${n}`;
-	if (n < 10_000) return `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k`;
-	return `${Math.round(n / 1000)}k`;
-}
-
-/**
  * The result of a submit decision — a tagged union. `handleSubmit` switches on
  * `kind` and does the (impure) work; everything routing-related is decided here.
  */
@@ -163,7 +117,7 @@ export type SubmitAction =
 	 * language query routes here — a clear question or an ambiguous phrase alike
 	 * (the quick-answer fork card was removed).
 	 */
-	| { kind: "agent"; prompt: string }
+	| { kind: "agent"; prompt: string; wantsSelection?: boolean }
 	/**
 	 * An AI preset invocation. `template` + the user's `input`; the dispatcher
 	 * renders it, and when `input` is empty it first tries the PRIMARY selection
@@ -195,7 +149,11 @@ function fromDecision(decision: RouteDecision): SubmitAction {
 		case "command":
 			return { kind: "command", command: decision.command };
 		case "nl":
-			return { kind: "agent", prompt: decision.prompt };
+			return {
+				kind: "agent",
+				prompt: decision.prompt,
+				wantsSelection: decision.wants_selection ?? false,
+			};
 		case "preset":
 			return {
 				kind: "preset",
@@ -238,7 +196,11 @@ export function decideSubmit(ctx: SubmitContext): SubmitAction {
 		// this?"). Send them to the full agent with a neutral instruction; the
 		// files themselves carry the question. Without a tray, still a no-op.
 		return ctx.hasAttachments
-			? { kind: "agent", prompt: "Look at the attached file(s) and describe what you see." }
+			? {
+					kind: "agent",
+					prompt: "Look at the attached file(s) and describe what you see.",
+					wantsSelection: false,
+				}
 			: { kind: "noop" };
 	}
 
@@ -314,8 +276,8 @@ function decideSelectedCompletion(ctx: SubmitContext, selected: RouterCompletion
 	// An AI command (preset) row: `run` is the template, `description` the typed
 	// argument (empty when only the keyword was entered — the actuator then reads
 	// the PRIMARY selection, and prompts inline if there is nothing to act on).
-	// A concrete AI action, not the open-ended agent — so it goes to `startPreset`
-	// (tool-free), never the Ask AI chat.
+	// A concrete AI action: the actuator renders the template over the
+	// <pasted>-wrapped material and starts the ONE agent lane.
 	if (selected.kind === "preset" && selected.run) {
 		return {
 			kind: "preset",
@@ -325,7 +287,7 @@ function decideSelectedCompletion(ctx: SubmitContext, selected: RouterCompletion
 		};
 	}
 	if (selected.kind === "ask-ai" && selected.description) {
-		return { kind: "agent", prompt: selected.description };
+		return { kind: "agent", prompt: selected.description, wantsSelection: false };
 	}
 	if (selected.kind === "search-web" && selected.description) {
 		return { kind: "command", command: `web ${selected.description}` };

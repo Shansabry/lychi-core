@@ -161,9 +161,18 @@ pub struct Coordinator<E: ToolExecutor + 'static> {
     /// re-selection and `is_mutating` always see every tool.
     tools: Vec<ToolDef>,
     stop: Arc<dyn StopCondition>,
+    /// Total request byte budget for tight providers (Groq free tier); the
+    /// per-step TOOLS budget is this minus the conversation's current bytes.
+    request_byte_budget: Option<usize>,
 }
 
 impl<E: ToolExecutor + 'static> Coordinator<E> {
+    /// Set the provider request byte budget (see `request_byte_budget`).
+    pub fn with_request_byte_budget(mut self, budget: Option<usize>) -> Self {
+        self.request_byte_budget = budget;
+        self
+    }
+
     pub fn new(provider: Arc<dyn AiProvider>, executor: Arc<E>, mut tools: Vec<ToolDef>) -> Self {
         // A tool-bearing agent always gets the discovery pseudo-tool: shortlist
         // filtering is fail-safe only if the model can search the full catalog
@@ -181,6 +190,7 @@ impl<E: ToolExecutor + 'static> Coordinator<E> {
             executor,
             tools,
             stop: Arc::new(MaxSteps(12)),
+            request_byte_budget: None,
         }
     }
 
@@ -233,6 +243,7 @@ impl<E: ToolExecutor + 'static> Coordinator<E> {
         let executor = self.executor.clone();
         let tools = self.tools.clone();
         let stop = self.stop.clone();
+        let request_byte_budget = self.request_byte_budget;
 
         tokio::spawn(async move {
             let ctx = LoopCtx {
@@ -242,6 +253,7 @@ impl<E: ToolExecutor + 'static> Coordinator<E> {
                 stop,
                 ev_tx,
                 cancel,
+                request_byte_budget,
             };
             let outcome = ctx.drive(session, decision).await;
             let _ = out_tx.send(outcome);
@@ -262,6 +274,7 @@ struct LoopCtx<E: ToolExecutor + 'static> {
     stop: Arc<dyn StopCondition>,
     ev_tx: mpsc::UnboundedSender<AgentEvent>,
     cancel: CancellationToken,
+    request_byte_budget: Option<usize>,
 }
 
 impl<E: ToolExecutor + 'static> LoopCtx<E> {
@@ -329,10 +342,26 @@ impl<E: ToolExecutor + 'static> LoopCtx<E> {
             // request prefix only grows. Fail-safe (core + find_tool always
             // present, full catalog on vague/broad queries), and the executor
             // still runs any tool by name. See `relevance`.
+            // The tools budget shrinks as the conversation grows: whatever the
+            // provider's request ceiling leaves after the messages themselves.
+            let tools_budget = self.request_byte_budget.map(|total| {
+                let msg_bytes: usize = session
+                    .messages
+                    .iter()
+                    .map(|m| m.content_text().len() + 300)
+                    .sum();
+                total.saturating_sub(msg_bytes)
+            });
             let step_tools = crate::coordinator::select_tools_sticky(
                 &session.messages,
                 &self.tools,
                 &mut session.sent_tools,
+                tools_budget,
+            );
+            tracing::debug!(
+                tools = step_tools.len(),
+                tools_budget = ?tools_budget,
+                "[agent] tool selection"
             );
 
             // Stream one model turn, forwarding prose + collecting tool calls.

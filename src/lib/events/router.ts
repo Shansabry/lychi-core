@@ -52,21 +52,11 @@ export const route = {
 	 * text (`lychi --ai [preset]`).
 	 *
 	 * The backend already read the selection and rendered the prompt, so this
-	 * just starts the turn. It goes through `startPreset`, which means the answer
-	 * lands in the SAME surface as every other AI answer — streaming, copy,
-	 * regenerate and follow-up all work with no extra code. The selection itself
-	 * folds into a collapsed chip rather than filling the bubble.
+	 * just starts the turn through the ONE agent lane, so the answer lands in
+	 * the SAME surface as every other AI answer — streaming, copy, regenerate
+	 * and follow-up all work with no extra code.
 	 */
 	aiOnSelection: (p: AiOnSelectionPayload): void => {
-		const label = p.note
-			? // Say when the text came from the clipboard instead of the live
-				// selection (GNOME Wayland can't share it) — a silent substitution
-				// would have the model answer about the wrong thing.
-				`Selected text · ${p.note}`
-			: "Selected text";
-		chat.startPreset(p.prompt, {
-			instruction: p.display,
-			attachment: { label, body: p.body },
-		});
+		void chat.start(p.prompt, /* fresh */ true);
 	},
 };

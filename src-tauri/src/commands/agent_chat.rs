@@ -749,7 +749,26 @@ async fn build_coordinator(
         app: app.clone(),
         vision_ok,
     });
-    Ok((Coordinator::new(provider, adapter, tools), manifest))
+    // Groq's free tier gates each request on an ESTIMATED prompt size —
+    // measured from its own rejections at ~body_bytes/2.5, with NO completion
+    // reservation included (subtracting max_tokens here once starved tool
+    // selection down to core-only and the model could not act at all). Budget
+    // the request in bytes with ~1k tokens of minute headroom; selection
+    // defers what will not fit. Other providers' ceilings are far above
+    // anything we assemble.
+    let request_byte_budget = {
+        let ai = state.config_snapshot(|c| c.ai.clone()).await;
+        let is_groq =
+            ai.provider.eq_ignore_ascii_case("groq") || ai.base_url.contains("api.groq.com");
+        is_groq.then(|| {
+            let tpm_tokens: usize = 8000;
+            (tpm_tokens - 1000) * 12 / 5 // ×2.4 bytes/token, margin under Groq's ~2.5
+        })
+    };
+    Ok((
+        Coordinator::new(provider, adapter, tools).with_request_byte_budget(request_byte_budget),
+        manifest,
+    ))
 }
 
 /// Drive a coordinator run/resume: forward every `AgentEvent` as
