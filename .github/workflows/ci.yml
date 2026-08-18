@@ -47,7 +47,7 @@ jobs:
     name: Quick checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # rustfmt only — no GTK/WebKit, no dependency compile. This is why it is
       # a separate job: `cargo fmt --check` does not need the project to build.
@@ -58,10 +58,10 @@ jobs:
       - name: Rust formatting
         run: cargo fmt --all --check
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
@@ -98,7 +98,7 @@ jobs:
     needs: quick
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Tauri needs the full GTK/WebKit stack even to type-check, because the
       # -sys crates run pkg-config at build time.
@@ -175,7 +175,7 @@ jobs:
       matrix:
         check: [test, clippy, bindings]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system dependencies
         run: |
@@ -260,7 +260,7 @@ jobs:
     needs: quick
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system dependencies
         run: |
@@ -310,7 +310,7 @@ jobs:
             packages: xvfb openbox xterm x11-utils xdotool
             script: ./scripts/test-x11.sh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install ${{ matrix.backend }} and build deps
         env:
@@ -353,16 +353,16 @@ jobs:
     needs: quick
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # No Rust toolchain here on purpose. src/lib/bindings.ts is committed, so
       # the frontend is checkable with Node alone — which is also what a
       # frontend-only contributor needs locally. The rust-checks matrix verifies
       # the committed copy is current.
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
@@ -374,7 +374,7 @@ jobs:
       # .svelte-kit dir is generated (sync) and safe to reuse for a given
       # config + lockfile; a miss just regenerates it.
       - name: Cache SvelteKit artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .svelte-kit
           key: svelte-kit-${{ hashFiles('pnpm-lock.yaml', 'svelte.config.js', 'vite.config.ts', 'tsconfig.json') }}
@@ -394,7 +394,7 @@ jobs:
     steps:
       # Full history for the diff below — the default shallow checkout cannot
       # compare against the base commit.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
