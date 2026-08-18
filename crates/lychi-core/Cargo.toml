@@ -63,7 +63,7 @@ quick-xml = "0.37"
 # the lean AppImage goal.
 pdf-extract = "0.12"
 sha2 = "0.10"
-md-5 = "0.10"
+md-5 = "0.11"
 hex = "0.4"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 getrandom = "0.4"
