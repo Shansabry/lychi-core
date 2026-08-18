@@ -43,6 +43,7 @@ jobs:
   version-guard:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
       - name: Tag must match tauri.conf.json version
@@ -59,6 +60,7 @@ jobs:
     # The guard is skipped on non-tag builds; needs+always lets this run then.
     if: always() && (needs.version-guard.result == 'success' || needs.version-guard.result == 'skipped')
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     container: ubuntu:22.04
     env:
       # linuxdeploy's embedded strip breaks on modern toolchains (.relr.dyn)
