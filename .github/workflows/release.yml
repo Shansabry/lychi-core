@@ -122,6 +122,8 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
+          # v7 auto-caches when package.json names a package manager — opt out.
+          package-manager-cache: false
 
       # Deliberately NO caches in this workflow — not cargo, not pnpm. A cache
       # saved on a tag ref is write-once garbage (1.2GB of dead weight per
