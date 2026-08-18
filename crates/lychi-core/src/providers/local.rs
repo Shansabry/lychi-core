@@ -259,18 +259,32 @@ fn generate_inner(
     // want for routing anyway — and avoids the empty-stack grammar assert that
     // temp/top-p/dist can trigger by pruning the grammar's allowed set. For free
     // text (ask), use temp+top-p sampling with a light repetition penalty.
+    // Seed from the clock: a FIXED seed made every generation deterministic,
+    // and a small model given a transcript containing its own last answer then
+    // echoed it byte-for-byte on every follow-up turn.
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(42);
     let mut sampler = if let Some(g) = grammar {
+        // Penalties sit between grammar and greedy: they only re-weight logits
+        // (never prune the grammar's allowed set), so the known empty-stack
+        // assert from temp/top-p/dist does not apply — and without them the
+        // grammar's free-text "answer" branch inherits pure-greedy echoing.
         LlamaSampler::chain_simple([
             LlamaSampler::grammar(&model.model, g, "root")
                 .map_err(|e| LychiError::Ai(format!("grammar: {e}")))?,
+            LlamaSampler::penalties(256, 1.15, 0.0, 0.0),
             LlamaSampler::greedy(),
         ])
     } else {
+        // Penalty window 256: wide enough to reach the PREVIOUS assistant turn
+        // in the flattened transcript, so repeating it is actually penalised.
         LlamaSampler::chain_simple([
-            LlamaSampler::penalties(64, 1.1, 0.0, 0.0),
-            LlamaSampler::temp(0.2),
+            LlamaSampler::penalties(256, 1.15, 0.0, 0.0),
+            LlamaSampler::temp(0.6),
             LlamaSampler::top_p(0.9, 1),
-            LlamaSampler::dist(42),
+            LlamaSampler::dist(seed),
         ])
     };
 
@@ -279,13 +293,12 @@ fn generate_inner(
     // can split a multi-byte codepoint, so decoding the running byte buffer
     // (lossily) each step is both correct and cheap for short outputs.
     let mut bytes: Vec<u8> = Vec::new();
-    let mut n_cur = batch.n_tokens();
     let mut decoded = 0usize;
     // How many chars of the decoded text we've already streamed to `on_delta`,
     // so each step emits only the newly-produced suffix.
     let mut emitted_chars = 0usize;
 
-    for _ in 0..max_tokens {
+    for n_cur in (batch.n_tokens()..).take(max_tokens as usize) {
         // Cancellation, checked BEFORE each token regardless of streaming. This is
         // the AI-5 fix: tool mode passes no `on_delta`, so without this the cancel
         // token was never consulted and an abandoned generation ran to the token
@@ -345,13 +358,12 @@ fn generate_inner(
         batch
             .add(token, n_cur, &[0], true)
             .map_err(|e| LychiError::Ai(format!("batch add: {e}")))?;
-        n_cur += 1;
         ctx.decode(&mut batch)
             .map_err(|e| LychiError::Ai(format!("decode: {e}")))?;
     }
 
     // Flush any final not-yet-emitted text.
-    if let Some(cb) = on_delta.as_deref_mut() {
+    if let Some(cb) = on_delta {
         let text = String::from_utf8_lossy(&bytes);
         if let Some(tail) = suffix_from_char(&text, emitted_chars) {
             cb(tail);
