@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Pre-1.0, minor versions may contain breaking changes.
 
+## [0.2.0](https://github.com/Shansabry/lychi-core/compare/v0.1.4...v0.2.0) (2026-08-18)
+
+
+### Features
+
+* **ai:** one agent lane — AI commands become prompt templates ([#29](https://github.com/Shansabry/lychi-core/issues/29)) ([8dbbb46](https://github.com/Shansabry/lychi-core/commit/8dbbb4650a5f2789579def8f9f1ce6bf31178b73))
+* **settings:** check-for-updates in About, click-consented ([#21](https://github.com/Shansabry/lychi-core/issues/21)) ([0faafd4](https://github.com/Shansabry/lychi-core/commit/0faafd4ef518e75abbe06c1ac5f13ef999712912))
+
 ## [Unreleased]
 
 ### Added
