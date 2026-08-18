@@ -438,9 +438,13 @@ jobs:
       #
       # Deliberately NOT building the AppImage: the check is about the graph, so
       # it needs the manifests and nothing else.
+      # Prebuilt binary (~3s) instead of `cargo install` compiling it from
+      # source (~2min) — same tool, pinned by the action to a released build.
       - name: Install cargo-about
         if: steps.changed.outputs.run == 'true'
-        run: cargo install cargo-about --locked --features cli
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
 
       - name: Check licences and generate notices
         if: steps.changed.outputs.run == 'true'
