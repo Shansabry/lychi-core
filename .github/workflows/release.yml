@@ -117,16 +117,10 @@ jobs:
           node-version: 24
           cache: pnpm
 
-      - name: Cache cargo + tauri bundler tools
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-            ~/.cache/tauri
-          key: linux-release-${{ hashFiles('Cargo.lock') }}
-
+      # Deliberately NO cache: a cache saved on a tag ref is write-once garbage
+      # (nothing else can restore it — 1.2GB of dead weight per release, and
+      # the mechanism behind the stale-AppImage incident). A release earns a
+      # clean, deterministic build; the few extra minutes are the point.
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
