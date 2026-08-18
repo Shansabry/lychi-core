@@ -1,0 +1,28 @@
+name: Release Please
+
+# Maintains a rolling release PR: version bump + changelog derived from the
+# conventional commits already enforced by commitlint. Merging that PR is the
+# release decision; the tag + GitHub release are still cut manually with
+# `gh release create vX.Y.Z` (which triggers release.yml).
+#
+# Deliberately `skip-github-release: true`: a release created here with the
+# default GITHUB_TOKEN cannot trigger release.yml (GitHub suppresses workflow
+# cascades from GITHUB_TOKEN events). Flipping to fully automatic requires a
+# fine-grained PAT in secrets and removing that flag.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-release: true
