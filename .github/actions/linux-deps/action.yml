@@ -34,6 +34,24 @@ runs:
         # shellcheck disable=SC2206
         packages+=($EXTRA)
         if [ ${#packages[@]} -eq 0 ]; then exit 0; fi
-        sudo apt-get update
-        # Retries: a mirror hiccup should cost seconds, not a hung job.
-        sudo apt-get install -y -o Acquire::Retries=3 "${packages[@]}"
+        # A mirror hiccup should cost seconds, not a hung job. Three layers:
+        # Acquire::http::Timeout makes apt abandon a STALLED connection
+        # (Acquire::Retries alone only re-requests after a FAILURE — a frozen
+        # TCP session never fails, which is how two jobs sat 10+ minutes on
+        # the azure mirror); `timeout` bounds each attempt outright; and the
+        # loop retries the whole sequence on fresh connections.
+        apt_opts=(
+          -o Acquire::Retries=3
+          -o Acquire::http::Timeout=30
+          -o Acquire::https::Timeout=30
+        )
+        for attempt in 1 2 3; do
+          if sudo timeout 120 apt-get update "${apt_opts[@]}" &&
+             sudo timeout 420 apt-get install -y "${apt_opts[@]}" "${packages[@]}"; then
+            exit 0
+          fi
+          echo "::warning::apt attempt ${attempt} failed; retrying"
+          sleep 15
+        done
+        echo "::error::apt failed after 3 attempts"
+        exit 1
