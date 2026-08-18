@@ -222,7 +222,11 @@ class ChatSession {
 	 * conversation; else the backend appends this as a follow-up. Progress arrives
 	 * via `lychi://agent-event` → `applyEvent`.
 	 */
-	start = async (prompt: string, fresh = true): Promise<void> => {
+	start = async (
+		prompt: string,
+		fresh = true,
+		presetKeyword: string | null = null,
+	): Promise<void> => {
 		const text = prompt.trim();
 		if (!text) return;
 		// Consume the staged attachments: doc/text files fold into the prompt as
@@ -264,6 +268,8 @@ class ChatSession {
 				/* withTools */ true,
 				gen,
 				sent.images,
+				/* display */ null,
+				presetKeyword,
 			);
 		} catch (e) {
 			this.#fail(gen, e);

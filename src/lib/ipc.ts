@@ -846,6 +846,7 @@ export async function agentChatStart(
 	generation: number,
 	images: string[] = [],
 	display: MessageDisplay | null = null,
+	presetKeyword: string | null = null,
 ): Promise<void> {
 	if (!isTauri()) return;
 	// The command now takes a named object (see AgentChatStart in the backend):
@@ -861,6 +862,7 @@ export async function agentChatStart(
 			generation,
 			images,
 			display,
+			presetKeyword,
 		}),
 	);
 }

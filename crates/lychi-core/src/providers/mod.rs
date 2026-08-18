@@ -122,6 +122,11 @@ pub struct MessageDisplay {
     pub label: String,
     /// The folded-out payload, revealed when the chip is expanded.
     pub body: String,
+    /// The AI-command keyword that started this turn ("summarize"), verbatim.
+    /// `None` for ordinary chats — recall shows a command pill only when set,
+    /// instead of guessing one from the instruction's first words.
+    #[serde(default)]
+    pub preset_keyword: Option<String>,
 }
 
 impl ChatMessage {

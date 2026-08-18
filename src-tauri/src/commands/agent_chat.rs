@@ -927,6 +927,10 @@ pub struct AgentChatStart {
     /// decider of that split. Never sent to a provider.
     #[serde(default)]
     pub display: Option<lychi_core::providers::MessageDisplay>,
+    /// The AI-command keyword that started this turn ("summarize"), for the
+    /// recall pill. `None` for ordinary chats.
+    #[serde(default)]
+    pub preset_keyword: Option<String>,
 }
 
 #[tauri::command]
@@ -944,6 +948,7 @@ pub async fn agent_chat_start(
         generation,
         images,
         display,
+        preset_keyword,
     } = params;
     // Entry marker for the AI path. Lengths and counts only — never prompt text,
     // which would put user content in the log file. Earns its place because
@@ -990,13 +995,17 @@ pub async fn agent_chat_start(
     let (user, display) = if with_tools {
         let ctx = state.executor.read().await.context.clone();
         let block = lychi_core::context::agent_context_block(ctx.as_ref());
-        let display = display.or_else(|| {
+        let mut display = display.or_else(|| {
             Some(lychi_core::providers::MessageDisplay {
                 instruction: user.clone(),
                 label: "Context".to_string(),
                 body: block.clone(),
+                preset_keyword: None,
             })
         });
+        if let Some(d) = display.as_mut() {
+            d.preset_keyword = preset_keyword.clone();
+        }
         (format!("{user}\n\n{block}"), display)
     } else {
         (user, display)

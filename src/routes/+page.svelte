@@ -1171,7 +1171,7 @@ async function actuate(action: SubmitAction): Promise<void> {
 			// Material rides inside <pasted>: the model treats it as data, the
 			// tool ranker ignores it, and injection hygiene comes free.
 			const wrapped = input.includes("<pasted>") ? input : `<pasted>\n${input}\n</pasted>`;
-			await chat.start(renderPreset(action.template, wrapped), /* fresh */ true);
+			await chat.start(renderPreset(action.template, wrapped), /* fresh */ true, action.keyword);
 			return;
 		}
 

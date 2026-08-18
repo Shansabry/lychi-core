@@ -1392,7 +1392,12 @@ generation: number; images?: string[];
  * RECALLED conversation renders identically, keeping the sender the only
  * decider of that split. Never sent to a provider.
  */
-display?: MessageDisplay | null }
+display?: MessageDisplay | null; 
+/**
+ * The AI-command keyword that started this turn ("summarize"), for the
+ * recall pill. `None` for ordinary chats.
+ */
+presetKeyword?: string | null }
 export type AiConfig = { 
 /**
  * AI mode: "disabled", "byo", "ollama", "local" (cloud is deferred to
@@ -2357,7 +2362,13 @@ label: string;
 /**
  * The folded-out payload, revealed when the chip is expanded.
  */
-body: string }
+body: string; 
+/**
+ * The AI-command keyword that started this turn ("summarize"), verbatim.
+ * `None` for ordinary chats — recall shows a command pill only when set,
+ * instead of guessing one from the instruction's first words.
+ */
+preset_keyword?: string | null }
 export type MountPoint = { path: string; label: string }
 /**
  * Network context snapshot.
