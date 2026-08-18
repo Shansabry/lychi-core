@@ -76,9 +76,10 @@ async function runInstall() {
 		</div>
 		<div class="about-link-row">
 			<span class="about-link-label">Logs</span>
-			<span class="about-link-value"
-				>~/.local/share/lychi/logs — kept 7 days; commands you type are not recorded</span
-			>
+			<span class="about-link-value about-link-stack">
+				<span>~/.local/share/lychi/logs</span>
+				<span class="about-link-note">kept 7 days · commands you type are not recorded</span>
+			</span>
 		</div>
 		<div class="about-link-row">
 			<span class="about-link-label">Features</span>
@@ -213,11 +214,26 @@ async function runInstall() {
 
 	.about-link-row {
 		display: flex;
-		align-items: center;
+		align-items: baseline;
 		justify-content: space-between;
+		gap: 12px;
 		padding: 5px 8px;
 		background: var(--bg-secondary);
 		border-radius: 4px;
+	}
+
+	/* A value with a secondary note stacks it on its own muted line instead of
+	   wrapping into the label (the old Logs row read as a collision). */
+	.about-link-stack {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-end;
+		gap: 1px;
+	}
+
+	.about-link-note {
+		font-size: 10px;
+		color: var(--fg-muted);
 	}
 
 	.about-link-label {
