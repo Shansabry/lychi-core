@@ -547,6 +547,24 @@ fn openai_content_parts(m: &ChatMessage) -> Vec<Value> {
 /// The JSON Schema for a tool's input: the handler's typed schema for a BOUNDED
 /// tool (`system`, …), else the uniform free-text `{ args: string }` every
 /// open-ended tool uses. Shared by both dialects so they can't diverge.
+/// Optional (non-required) properties in a tool schema — what Anthropic's
+/// strict grammar budget counts. Our schemas are flat, so a top-level walk is
+/// the whole story.
+fn count_optional_params(schema: &Value) -> usize {
+    let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return 0;
+    };
+    let required: std::collections::HashSet<&str> = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    props
+        .keys()
+        .filter(|k| !required.contains(k.as_str()))
+        .count()
+}
+
 fn tool_input_schema(t: &ToolDef) -> Value {
     t.input_schema.clone().unwrap_or_else(|| {
         json!({
@@ -575,6 +593,20 @@ fn tool_input_schema(t: &ToolDef) -> Value {
 /// filtered subset, and the "relevant now" hint that steers selection lives in the
 /// message stream, never in the tools array. Caching is GA (no beta header).
 pub(crate) fn anthropic_tools(tools: &[ToolDef]) -> Vec<Value> {
+    // Anthropic grammar-compiles `strict` tools with a hard budget on OPTIONAL
+    // parameters summed across the request's schemas; over it the API rejects
+    // the request outright ("Schemas contains too many optional parameters
+    // (28) … limit: 24"). Strict is a guarantee, not a requirement — Claude
+    // follows typed schemas reliably and the executor validates args anyway —
+    // so keep it while the request fits and drop it wholesale when it doesn't.
+    const STRICT_OPTIONAL_BUDGET: usize = 24;
+    let optional_params: usize = tools
+        .iter()
+        .filter_map(|t| t.input_schema.as_ref())
+        .map(count_optional_params)
+        .sum();
+    let strict_ok = optional_params <= STRICT_OPTIONAL_BUDGET;
+
     let last = tools.len().saturating_sub(1);
     tools
         .iter()
@@ -585,7 +617,7 @@ pub(crate) fn anthropic_tools(tools: &[ToolDef]) -> Vec<Value> {
                 "description": t.description,
                 "input_schema": tool_input_schema(t),
             });
-            if t.input_schema.is_some() {
+            if t.input_schema.is_some() && strict_ok {
                 tool["strict"] = json!(true);
             }
             // Mark the cache breakpoint on the final tool so the whole array is
@@ -1639,5 +1671,39 @@ mod tests {
         // OpenAI: plain system message.
         let o = build_body(Dialect::OpenAi, "gpt", 100, &msgs, &[]);
         assert_eq!(o["messages"][0]["content"], "stable persona");
+    }
+
+    #[test]
+    fn anthropic_strict_drops_when_optional_params_exceed_the_budget() {
+        // 5 schemas x 5 optionals = 25 > 24 → strict must be absent on ALL.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string"},
+                "a": {"type": "string"}, "b": {"type": "string"},
+                "c": {"type": "string"}, "d": {"type": "string"},
+                "e": {"type": "string"}
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        });
+        let big: Vec<ToolDef> = (0..5)
+            .map(|i| ToolDef {
+                name: format!("t{i}"),
+                description: "x".into(),
+                mutates: false,
+                mutating_actions: vec![],
+                input_schema: Some(schema.clone()),
+            })
+            .collect();
+        for tool in anthropic_tools(&big) {
+            assert!(tool.get("strict").is_none(), "over budget → no strict");
+        }
+        // A small set stays strict.
+        let small = vec![big[0].clone()];
+        assert_eq!(
+            anthropic_tools(&small)[0]["strict"],
+            serde_json::json!(true)
+        );
     }
 }
