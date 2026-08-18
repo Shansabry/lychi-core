@@ -91,6 +91,14 @@ cp -f "$GOOD_BINARY" "$APPDIR/usr/bin/lychi-app"
 patchelf --set-rpath '$ORIGIN/../lib' "$APPDIR/usr/bin/lychi-app"
 
 echo "==> Repacking the AppImage"
+# Preserve the bundler's own filename (Lychi_<version>_amd64.AppImage) — a
+# hardcoded name here shipped two releases labelled 0.1.0. Captured BEFORE the
+# rm, from the file the bundler just wrote.
+orig_name="$(basename "$(ls -1 "$BUNDLE_DIR"/*.AppImage | head -1)")"
+if [ -z "$orig_name" ]; then
+  echo "fix-appimage-codecs: no bundler AppImage found to take the name from" >&2
+  exit 1
+fi
 rm -f "$BUNDLE_DIR"/*.AppImage
 # The appimage plugin writes <Name>-<arch>.AppImage into the current directory.
 APPIMAGE_EXTRACT_AND_RUN=1 NO_STRIP=1 ARCH=x86_64 \
@@ -102,8 +110,8 @@ if [ -z "$packed" ]; then
   echo "fix-appimage-codecs: repack produced no AppImage" >&2
   exit 1
 fi
-mv -f "$packed" "$BUNDLE_DIR/Lychi_0.1.0_amd64.AppImage"
-chmod +x "$BUNDLE_DIR/Lychi_0.1.0_amd64.AppImage"
+mv -f "$packed" "$BUNDLE_DIR/$orig_name"
+chmod +x "$BUNDLE_DIR/$orig_name"
 
-echo "==> Done: $BUNDLE_DIR/Lychi_0.1.0_amd64.AppImage"
-ls -lh "$BUNDLE_DIR/Lychi_0.1.0_amd64.AppImage"
+echo "==> Done: $BUNDLE_DIR/$orig_name"
+ls -lh "$BUNDLE_DIR/$orig_name"
