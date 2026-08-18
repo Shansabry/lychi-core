@@ -452,7 +452,12 @@ jobs:
   ci:
     name: CI
     if: always()
-    needs: [quick, rust-checks, env-tests, frontend, licenses]
+    # EVERY meaningful job must be named here: the branch ruleset requires
+    # only this aggregate, and a missing entry is an invisible hole. `build`
+    # matters twice over — its own clippy, and because `rust-checks` needs it:
+    # a build failure would leave rust-checks SKIPPED, which the allowance
+    # below would otherwise wave through.
+    needs: [quick, build, rust-checks, local-ai-check, env-tests, frontend, licenses]
     runs-on: ubuntu-latest
     steps:
       # The expression goes through `env:`, not straight into the script.
