@@ -1,11 +1,61 @@
 <script lang="ts">
+import type { UpdateStatus } from "$lib/ipc";
+import { checkForUpdate, installUpdate, openPath } from "$lib/ipc";
 import LychiIcon from "../LychiIcon.svelte";
 
 let { appVersion }: { appVersion: string } = $props();
+
+// The update check is an EXPLICIT action — About never touches the network on
+// its own. The click is the consent; the result is shown beside the pill.
+let checking = $state(false);
+let installing = $state(false);
+let checked = $state<UpdateStatus | null>(null);
+
+async function runCheck() {
+	checking = true;
+	try {
+		checked = await checkForUpdate();
+	} catch (e) {
+		checked = null;
+	} finally {
+		checking = false;
+	}
+}
+
+async function runInstall() {
+	installing = true;
+	try {
+		// Backs up first, then installs and relaunches — this call only
+		// returns on failure.
+		await installUpdate();
+	} finally {
+		installing = false;
+	}
+}
 </script>
 
 <div class="about">
-	<span class="about-version-pill">v{appVersion}</span>
+	<div class="about-version-row">
+		<span class="about-version-pill">v{appVersion}</span>
+		{#if checked?.available_version}
+			<span class="about-update-found">v{checked.available_version} available</span>
+			{#if checked.can_self_update}
+				<button class="about-update-btn" onclick={runInstall} disabled={installing}>
+					{installing ? "Installing…" : "Install & restart"}
+				</button>
+			{:else}
+				<span class="about-update-hint">{checked.hint}</span>
+			{/if}
+		{:else if checked?.error}
+			<span class="about-update-hint">{checked.error}</span>
+		{:else if checked}
+			<span class="about-update-ok">up to date</span>
+		{:else}
+			<button class="about-update-btn" onclick={runCheck} disabled={checking}>
+				{checking ? "Checking…" : "Check for updates"}
+			</button>
+		{/if}
+	</div>
 	<div class="about-brand">
 		<div class="about-logo">
 			<LychiIcon size={56} />
@@ -26,9 +76,12 @@ let { appVersion }: { appVersion: string } = $props();
 		</div>
 		<div class="about-link-row">
 			<span class="about-link-label">Logs</span>
-			<span class="about-link-value"
-				>~/.local/share/lychi/logs — kept 7 days; commands you type are not recorded</span
-			>
+			<span class="about-link-stack">
+				<button class="about-update-btn" onclick={() => openPath("~/.local/share/lychi/logs")}>
+					Open folder
+				</button>
+				<span class="about-link-note">kept 7 days · typed commands never recorded</span>
+			</span>
 		</div>
 		<div class="about-link-row">
 			<span class="about-link-label">Features</span>
@@ -79,15 +132,51 @@ let { appVersion }: { appVersion: string } = $props();
 		padding: 12px 0;
 	}
 
-	.about-version-pill {
+	.about-version-row {
 		position: absolute;
 		top: 8px;
 		right: 8px;
+		display: flex;
+		align-items: center;
+		gap: 6px;
+	}
+
+	.about-version-pill {
 		font-size: 10px;
 		color: var(--fg-muted);
 		background: var(--border);
 		padding: 2px 8px;
 		border-radius: 10px;
+	}
+
+	.about-update-btn {
+		font-size: 10px;
+		color: var(--fg-muted);
+		background: transparent;
+		border: 1px solid var(--border);
+		padding: 2px 8px;
+		border-radius: 10px;
+		cursor: pointer;
+	}
+
+	.about-update-btn:hover {
+		color: var(--fg);
+	}
+
+	.about-update-ok {
+		font-size: 10px;
+		color: var(--success);
+	}
+
+	.about-update-found {
+		font-size: 10px;
+		color: var(--accent);
+	}
+
+	.about-update-hint {
+		font-size: 10px;
+		color: var(--fg-muted);
+		max-width: 220px;
 	}
 
 	.about-logo {
@@ -127,11 +216,24 @@ let { appVersion }: { appVersion: string } = $props();
 
 	.about-link-row {
 		display: flex;
-		align-items: center;
+		align-items: baseline;
 		justify-content: space-between;
+		gap: 12px;
 		padding: 5px 8px;
 		background: var(--bg-secondary);
 		border-radius: 4px;
+	}
+
+	.about-link-stack {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-end;
+		gap: 1px;
+	}
+
+	.about-link-note {
+		font-size: 10px;
+		color: var(--fg-muted);
 	}
 
 	.about-link-label {
