@@ -21,6 +21,18 @@ on:
   push:
     tags: ["v*"]
 
+# The release job must WRITE releases (create/attach assets); nothing here
+# needs more than that.
+permissions:
+  contents: write
+
+# The ubuntu:22.04 CONTAINER's default step shell is plain `sh`, which chokes
+# on bashisms (`set -o pipefail`, `shopt`) — v0.1.0's manifest step died on its
+# first line this way. Pin bash for every run step.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   linux:
     runs-on: ubuntu-latest
@@ -134,6 +146,20 @@ jobs:
       - name: Strip over-bundled codec libs from the AppImage
         run: bash scripts/fix-appimage-codecs.sh
 
+      # Sign AFTER the strip: the bundler's own signature (if any) covers the
+      # pre-strip bytes and would fail verification against what we actually
+      # ship. This signature is over the final artifact.
+      - name: Sign the final AppImage
+        if: startsWith(github.ref, 'refs/tags/v') && env.TAURI_SIGNING_PRIVATE_KEY != ''
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          appimages=(target/release/bundle/appimage/*.AppImage)
+          pnpm tauri signer sign \
+            --private-key "$TAURI_SIGNING_PRIVATE_KEY" \
+            --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" \
+            "${appimages[0]}"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
@@ -142,8 +168,8 @@ jobs:
           if-no-files-found: error
 
       # The updater reads `latest.json` from the release. It is generated from
-      # the signature the build just produced, so it can never claim a version
-      # or hash the artifact does not have.
+      # the signature over the FINAL (post-strip) artifact, so it can never
+      # claim a version or hash the artifact does not have.
       #
       # Skipped entirely when unsigned: publishing a manifest with no signature
       # would make every client fail verification, which is worse than having no
