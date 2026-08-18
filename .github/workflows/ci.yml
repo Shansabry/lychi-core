@@ -46,6 +46,7 @@ jobs:
   quick:
     name: Quick checks
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
 
@@ -97,6 +98,7 @@ jobs:
     name: Build (shared cache)
     needs: quick
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
 
@@ -168,6 +170,7 @@ jobs:
     name: Rust / ${{ matrix.check }}
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       # One failing check should not cancel the others — knowing whether BOTH
       # clippy and the tests are broken is more useful than learning it twice.
@@ -259,6 +262,7 @@ jobs:
     name: Rust / local-ai check
     needs: quick
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -283,6 +287,7 @@ jobs:
     name: Backend / ${{ matrix.backend }}
     needs: quick
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -352,6 +357,7 @@ jobs:
     name: Frontend
     needs: quick
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
 
@@ -391,6 +397,7 @@ jobs:
   licenses:
     name: Dependency licences
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       # Full history for the diff below — the default shallow checkout cannot
       # compare against the base commit.
@@ -459,6 +466,7 @@ jobs:
     # below would otherwise wave through.
     needs: [quick, build, rust-checks, local-ai-check, env-tests, frontend, licenses]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       # The expression goes through `env:`, not straight into the script.
       # Interpolating `${{ }}` into a shell line splices attacker-influenceable
