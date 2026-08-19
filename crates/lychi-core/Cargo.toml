@@ -43,7 +43,7 @@ notify = "8"
 meval = "0.2"
 arboard = "3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff"] }
-base64 = "0.22"
+base64 = "0.23"
 # File utilities (Phase 1): archives + magic-byte MIME sniffing. All pure-Rust
 # (no native libs) to keep the AppImage lean. zip >= 2.3.0 is required — earlier
 # versions have a symlink zip-slip (RUSTSEC GHSA-94vh-gphv-8pm8); we extract via
