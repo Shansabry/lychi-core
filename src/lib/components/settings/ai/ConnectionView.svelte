@@ -10,6 +10,7 @@ import {
 	savePrivacyConfig,
 	testAiConnection,
 } from "$lib/ipc";
+import { invalidateSettings } from "$lib/preloadCache";
 import Select from "../../Select.svelte";
 import type ApiKeyField from "./ApiKeyField.svelte";
 import ApiKeyFieldInput from "./ApiKeyField.svelte";
@@ -47,6 +48,7 @@ async function toggleWebAccess() {
 	privacyConfig.allow_web_access = !privacyConfig.allow_web_access;
 	try {
 		await savePrivacyConfig(privacyConfig);
+		invalidateSettings();
 	} catch (e) {
 		onsaveerror(String(e));
 	}
@@ -56,6 +58,7 @@ async function handleSearchProviderChange(val: string) {
 	aiConfig.web_search_provider = val;
 	try {
 		await saveAiConfig(aiConfig);
+		invalidateSettings();
 	} catch (e) {
 		onsaveerror(String(e));
 	}
@@ -65,6 +68,7 @@ async function handleSearxngUrlChange(e: Event) {
 	aiConfig.searxng_url = (e.target as HTMLInputElement).value.trim();
 	try {
 		await saveAiConfig(aiConfig);
+		invalidateSettings();
 	} catch (e2) {
 		onsaveerror(String(e2));
 	}
@@ -81,6 +85,7 @@ async function handleShellProfileChange(val: string) {
 	};
 	try {
 		await saveCommandsConfig(commandsConfig);
+		invalidateSettings();
 	} catch (err) {
 		console.error("[settings] Failed to save shell policy:", err);
 		onsaveerror(`Failed to save: ${err}`);
@@ -185,6 +190,11 @@ async function saveAi() {
 	onsaveerror("");
 	try {
 		await saveAiConfig(aiConfig);
+		// The settings preload cache still holds the config from panel-open;
+		// without this, the next panel mount restores the OLD mode on screen
+		// and a later whole-object save writes it back to disk (the "keeps
+		// switching back to Local AI" bug).
+		invalidateSettings();
 		await refreshHealth();
 	} catch (err) {
 		console.error("[settings] Failed to save AI config:", err);
@@ -200,6 +210,7 @@ export async function runConnectionTest() {
 	try {
 		// Persist first so the backend tests exactly what's on screen.
 		await saveAiConfig(aiConfig);
+		invalidateSettings();
 		testResult = await testAiConnection();
 		healthStatus = testResult.ok ? "healthy" : "error";
 	} catch (err) {
