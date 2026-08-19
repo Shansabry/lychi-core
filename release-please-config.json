@@ -16,7 +16,8 @@
           "jsonpath": "$.workspace.package.version"
         }
       ],
-      "draft": true
+      "draft": true,
+      "force-tag-creation": true
     }
   }
 }
