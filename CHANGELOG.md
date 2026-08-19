@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Pre-1.0, minor versions may contain breaking changes.
 
+## [0.2.2](https://github.com/Shansabry/lychi-core/compare/v0.2.1...v0.2.2) (2026-08-19)
+
+
+### Bug Fixes
+
+* **release:** let release-please create the draft tag itself ([#42](https://github.com/Shansabry/lychi-core/issues/42)) ([53264f6](https://github.com/Shansabry/lychi-core/commit/53264f691cd7adab8be8c2d00c81fb92094a370f))
+* **settings:** AI page saves now invalidate the settings preload cache ([#44](https://github.com/Shansabry/lychi-core/issues/44)) ([012e0a6](https://github.com/Shansabry/lychi-core/commit/012e0a68d2bda6dfb9de1fa82c922b85f1306af8))
+
 ## [0.2.1](https://github.com/Shansabry/lychi-core/compare/v0.2.0...v0.2.1) (2026-08-18)
 
 
