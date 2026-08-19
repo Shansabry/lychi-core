@@ -19,12 +19,7 @@ Built with **Tauri v2** (Rust) + **Svelte 5**, shipped as a single **AppImage**.
 
 ## 🎬 Demo
 
-<!-- DEMO VIDEO: after recording demo.mp4, edit this file in the GitHub WEB
-     editor and drag the file onto the line below — the generated
-     user-attachments URL renders an inline player (a committed .mp4 will not).
-     Then delete this comment. -->
-
-*Thirty seconds, no cuts — a chained request through the rules engine. Coming right up.*
+https://github.com/user-attachments/assets/88a08b40-f14b-4a3e-b6b4-c86a626e1638
 
 ---
 
