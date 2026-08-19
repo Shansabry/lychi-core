@@ -2,15 +2,24 @@ name: Release Please
 
 # The whole release ritual: merging the bot's release PR is the release.
 # The bot bumps every version file + changelog (from the conventional commits
-# commitlint enforces), then creates the tag and a DRAFT GitHub release; the
+# commitlint enforces), then creates a DRAFT GitHub release AND its tag; the
 # tag triggers release.yml, which attaches assets and publishes the draft
 # atomically (immutable releases only accept uploads while draft).
 #
+# `force-tag-creation` in release-please-config.json is load-bearing: GitHub
+# defers a draft release's tag until publish, and a tagless draft is
+# INVISIBLE to release-please's own boundary detection — the next release PR
+# then sweeps the entire commit history into its changelog (documented in
+# googleapis/release-please#1650; happened here as PR #41). Forcing the tag
+# at draft time keeps every later computation anchored. The action is the
+# ONLY tag writer — never create the release tag anywhere else.
+#
 # REQUIRES the RELEASE_PLEASE_TOKEN secret (fine-grained PAT, this repo,
-# Contents + Pull requests read/write): tags created with the default
-# GITHUB_TOKEN cannot trigger release.yml — GitHub suppresses workflow
-# cascades. Until the secret exists this falls back to GITHUB_TOKEN and the
-# tag must be re-pushed by hand to fire the build.
+# Contents + Pull requests read/write): the action tags with the token it is
+# given, and tags created with the default GITHUB_TOKEN cannot trigger
+# release.yml — GitHub suppresses workflow cascades. Until the secret exists
+# this falls back to GITHUB_TOKEN and the tag must be re-pushed by hand to
+# fire the build.
 on:
   push:
     branches: [main]
@@ -32,25 +41,8 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
-      # release-please defers the TAG of a draft release to publish time — but
-      # immutable releases only accept assets while DRAFT, so the tag (which
-      # triggers release.yml) is created here explicitly. The PAT matters: a
-      # GITHUB_TOKEN tag push would not fire the build workflow.
-      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+      - name: Report
         if: ${{ steps.rp.outputs.release_created }}
-        # Outputs arrive via env, not spliced into the script text — spliced
-        # `${{ }}` inside JS is the template-injection shape zizmor flags.
         env:
           TAG: ${{ steps.rp.outputs.tag_name }}
-          SHA: ${{ steps.rp.outputs.sha }}
-        with:
-          github-token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
-          script: |
-            const tag = process.env.TAG;
-            const sha = process.env.SHA;
-            try {
-              await github.rest.git.createRef({ ...context.repo, ref: `refs/tags/${tag}`, sha });
-              core.info(`Created ${tag} at ${sha} — release build will fire`);
-            } catch (e) {
-              if (e.status === 422) { core.info(`${tag} already exists`); } else { throw e; }
-            }
+        run: echo "Draft release + tag ${TAG} created — release build will fire"
