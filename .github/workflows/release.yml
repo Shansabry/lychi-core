@@ -95,7 +95,7 @@ jobs:
             libayatana-appindicator3-dev libgtk-layer-shell-dev \
             libssl-dev libdbus-1-dev xdg-utils desktop-file-utils \
             cmake clang libclang-dev \
-            xz-utils ca-certificates
+            xz-utils ca-certificates rpm
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -140,11 +140,10 @@ jobs:
           mkdir -p src-tauri/binaries
           cp target/release/lychi src-tauri/binaries/lychi-x86_64-unknown-linux-gnu
 
-      # AppImage only, deliberately. deb/rpm are not part of the distribution
-      # story yet (packaging is future work) and nobody has verified them, so
-      # building them bought three formats to test and one shared failure mode:
-      # any bundler erroring loses ALL artifacts, which is how an icon error in
-      # the deb path produced zero downloads including the AppImage.
+      # The AppImage builds FIRST and alone, deb/rpm in their own later step.
+      # The one time all formats shared a step, an icon error in the deb path
+      # produced zero downloads including the AppImage — the primary artifact
+      # must never depend on a secondary bundler succeeding.
       #
       # --features local-ai bakes the bundled llama.cpp CPU-inference engine
       # into the release (statically linked; runtime AI-mode switching is pure
@@ -165,7 +164,7 @@ jobs:
       # and manifest steps globbed the OLD file. Purge before building so the
       # bundle dir only ever holds this build's artifact.
       - name: Clean stale bundle outputs
-        run: rm -rf target/release/bundle/appimage
+        run: rm -rf target/release/bundle/appimage target/release/bundle/deb target/release/bundle/rpm
 
       - name: Build AppImage
         run: pnpm exec tauri build --verbose --bundles appimage --features local-ai
@@ -198,6 +197,36 @@ jobs:
             --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" \
             "${appimages[0]}"
 
+      # AFTER the AppImage chain is complete, so a deb/rpm bundler failure can
+      # never cost the primary artifact. The compile is warm — this re-runs
+      # only the frontend build and the two bundlers. Unlike the AppImage,
+      # deb/rpm declare their libraries as PACKAGE DEPENDENCIES (no bundled
+      # GStreamer stack), so the codec strip does not apply to them; and only
+      # the AppImage self-updates — deb/rpm installs defer to the package
+      # manager (gated at runtime by lychi_core::install), so no .sig and no
+      # updater manifest entry for these.
+      - name: Build deb and rpm packages
+        run: pnpm exec tauri build --bundles deb,rpm --features local-ai
+
+      # A format we ship is a format we verify: both files must exist, be
+      # readable by their native tools, and actually contain the binary.
+      - name: Verify deb and rpm packages
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(target/release/bundle/deb/*.deb)
+          rpms=(target/release/bundle/rpm/*.rpm)
+          if [ ${#debs[@]} -ne 1 ] || [ ${#rpms[@]} -ne 1 ]; then
+            echo "Expected exactly one .deb and one .rpm, found ${#debs[@]} / ${#rpms[@]}" >&2
+            exit 1
+          fi
+          dpkg-deb --info "${debs[0]}"
+          dpkg-deb --contents "${debs[0]}" | grep -q "usr/bin/lychi-app" \
+            || { echo "deb does not contain usr/bin/lychi-app" >&2; exit 1; }
+          rpm -qpi "${rpms[0]}"
+          rpm -qpl "${rpms[0]}" | grep -q "/usr/bin/lychi-app" \
+            || { echo "rpm does not contain /usr/bin/lychi-app" >&2; exit 1; }
+
       # Keyless provenance: a sigstore-signed, transparency-logged statement
       # that THIS AppImage came from THIS repo's release workflow at THIS
       # commit. Anyone can check it:
@@ -207,13 +236,19 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
-          subject-path: target/release/bundle/appimage/*.AppImage
+          subject-path: |
+            target/release/bundle/appimage/*.AppImage
+            target/release/bundle/deb/*.deb
+            target/release/bundle/rpm/*.rpm
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: lychi-appimage
-          path: target/release/bundle/appimage/*.AppImage
+          name: lychi-packages
+          path: |
+            target/release/bundle/appimage/*.AppImage
+            target/release/bundle/deb/*.deb
+            target/release/bundle/rpm/*.rpm
           if-no-files-found: error
 
       # The updater reads `latest.json` from the release. It is generated from
@@ -273,6 +308,8 @@ jobs:
           files: |
             target/release/bundle/appimage/*.AppImage
             target/release/bundle/appimage/*.AppImage.sig
+            target/release/bundle/deb/*.deb
+            target/release/bundle/rpm/*.rpm
             latest.json
           fail_on_unmatched_files: false
 
@@ -297,3 +334,60 @@ jobs:
               make_latest: 'true',
             });
             core.info(`Published ${tag} with ${draft.assets.length} assets`);
+
+  # Publishes/updates the lychi-appimage AUR package after the release goes
+  # live. Renders aur/PKGBUILD.template with the tag's version and the
+  # published AppImage's checksum, then pushes PKGBUILD + .SRCINFO to the AUR.
+  #
+  # Requires the AUR_SSH_PRIVATE_KEY secret (an SSH key registered on the
+  # Shansabry AUR account). Until it exists this job SKIPS with a notice
+  # rather than failing the release — AUR is downstream of the release, never
+  # a gate on it.
+  aur:
+    needs: [linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Secrets cannot appear in `if:` conditions, so the gate is a step
+      # output. Everything after keys off it.
+      - name: Is AUR publishing configured?
+        id: gate
+        env:
+          KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -n "$KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::AUR_SSH_PRIVATE_KEY is not set — skipping AUR publish."
+          fi
+
+      # The checksum comes from the PUBLISHED asset, not a local rebuild — the
+      # PKGBUILD must describe the exact bytes users download.
+      - name: Render PKGBUILD from the published release
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/Lychi_${version}_amd64.AppImage"
+          curl -fsSL -o /tmp/lychi.AppImage "$url"
+          sha="$(sha256sum /tmp/lychi.AppImage | cut -d' ' -f1)"
+          sed -e "s/@VERSION@/${version}/" -e "s/@SHA256@/${sha}/" \
+            aur/PKGBUILD.template > aur/PKGBUILD
+          grep -E "pkgver=|sha256sums=" aur/PKGBUILD
+
+      - name: Publish to the AUR
+        if: steps.gate.outputs.enabled == 'true'
+        uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
+        with:
+          pkgname: lychi-appimage
+          pkgbuild: aur/PKGBUILD
+          commit_username: Shansabry
+          commit_email: support@lychi.app
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: Update to ${{ github.ref_name }}
