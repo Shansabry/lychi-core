@@ -83,6 +83,29 @@ if [ "$kept" -eq 0 ]; then
   exit 1
 fi
 
+# IME fix (#48): linuxdeploy's GTK hook pins GTK to the BUNDLED input-method
+# cache via GTK_IM_MODULE_FILE — and the build container has no fcitx/ibus, so
+# that cache only lists GTK's stock modules. Result: the host's fcitx5/ibus
+# module can never load and CJK input is dead, with no user-side override
+# (the hook re-exports on every launch). We do not bundle libgtk — the HOST's
+# GTK runs — so the host's own module cache is the correct one. Drop the pin,
+# and GTK_EXE_PREFIX with it (its only effect here is re-deriving the same
+# bundled path as the fallback). GDK_PIXBUF_MODULE_FILE stays: pixbuf loaders
+# ARE deliberately bundled. The now-unreferenced stock immodules go too.
+echo "==> Un-pinning GTK input methods from the bundle (host fcitx/ibus must load)"
+HOOK="$APPDIR/apprun-hooks/linuxdeploy-plugin-gtk.sh"
+if [ ! -f "$HOOK" ]; then
+  echo "fix-appimage-codecs: expected GTK hook at $HOOK — did linuxdeploy change?" >&2
+  exit 1
+fi
+sed -i '/export GTK_IM_MODULE_FILE=/d; /export GTK_EXE_PREFIX=/d' "$HOOK"
+if grep -q "GTK_IM_MODULE_FILE\|GTK_EXE_PREFIX" "$HOOK"; then
+  echo "fix-appimage-codecs: IM-module pin survived the sed — hook format changed?" >&2
+  exit 1
+fi
+rm -rf "$APPDIR"/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules \
+       "$APPDIR"/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache
+
 echo "==> Restoring the un-patchelf'd application binary"
 # linuxdeploy patchelf-mangles the copied binary (changes size, can corrupt it).
 # Replace with the pristine release binary, then set ONLY the rpath needed to
