@@ -7,7 +7,7 @@
 **A local-first command launcher for Linux.**
 Spotlight/Raycast energy — keyboard-driven, privacy-first, AI optional.
 
-Open it with `Super+Space`, type what you want, hit Enter. That's it.
+Open it with `Ctrl+Space`, type what you want, hit Enter. That's it.
 
 `open firefox` · `web rust lang` · `run ls -la` · `calc 12% of 340` · `screenshot area` · `media pause all`
 
@@ -57,14 +57,14 @@ chmod +x ~/Applications/Lychi.AppImage
 ~/Applications/Lychi.AppImage
 ```
 
-First launch registers the **`Super+Space`** hotkey (your compositor may ask you to confirm) and drops a tray icon. Press the hotkey — the launcher appears.
+First launch registers the **`Ctrl+Space`** hotkey (your compositor may ask you to confirm) and drops a tray icon. Press the hotkey — the launcher appears.
 
 ### 4. Finish setup inside Lychi *(recommended)*
 
 Open Lychi → **Settings → Setup**. That page is your diagnostics + install helper:
 
 - **Install the `lychi` CLI** — one click creates a symlink on your `PATH` so `lychi --toggle`, `lychi --screenshot`, and `lychi --ai` work from anywhere and from desktop shortcuts. (It tracks the AppImage, so re-run it if you ever move or replace the file.)
-- **Hotkey status** — Setup tells you exactly which binding route worked (portal / DE settings / X11 grab) and flags it if `Super+Space` was already taken, so you know your hotkey is live.
+- **Hotkey status** — Setup tells you exactly which binding route worked (portal / DE settings / X11 grab) and flags it if `Ctrl+Space` was already taken, so you know your hotkey is live.
 - **Diagnostics** — a copy-paste report of your desktop, session type, and what Lychi can use on it. This is the single most useful thing to attach to a bug report.
 
 Nothing on this page is ever marked "done" permanently — replacing the AppImage dangles the CLI link, switching X11↔Wayland can break a working hotkey — so it re-checks every time and only offers a fix when one is actually needed.
@@ -143,7 +143,7 @@ All rebindable under `[keybindings]` in `config.toml`. Defaults:
 
 | Shortcut | Action |
 |----------|--------|
-| `Super+Space` | Show / hide the launcher |
+| `Ctrl+Space` | Show / hide the launcher |
 | `Ctrl+K` | Action panel for the selected result |
 | `Enter` | Submit |
 | `Escape` | Dismiss / close panel |
@@ -182,7 +182,7 @@ Lychi picks the best window strategy for your session automatically:
 
 On GNOME the window covers the monitor with a transparent surface and the launcher is centered by CSS — Mutter does not let applications position their own windows. True fullscreen is deliberately **not** requested there, because Mutter paints an opaque backdrop behind fullscreen windows.
 
-**Global hotkey:** Lychi registers `Super+Space` for you where it can, by three routes in order of preference:
+**Global hotkey:** Lychi registers `Ctrl+Space` for you where it can, by three routes in order of preference:
 
 | Session | How |
 |---------|-----|
