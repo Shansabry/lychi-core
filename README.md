@@ -195,7 +195,17 @@ Lychi picks the best window strategy for your session automatically:
 
 ### Input methods (CJK)
 
-Lychi uses your desktop's input method (fcitx5 / ibus) through the standard GTK mechanism — nothing is bundled, your host's modules load. If CJK input doesn't work: install your framework's GTK3 module (`fcitx5-gtk` / `ibus-gtk3`), make sure the daemon autostarts, and run `lychi doctor` — it checks the daemon, the environment, and the module cache, and names the missing piece. Lychi runs as an X11 (XWayland) window on purpose: configure fcitx5/ibus exactly as you would for X11 apps (`GTK_IM_MODULE=fcitx`, `XMODIFIERS=@im=fcitx`); that is currently the most reliable IME path on every desktop. (`GDK_BACKEND=wayland ~/Applications/Lychi.AppImage` opts into native Wayland if you want to experiment.)
+Lychi uses your desktop's input method (fcitx5 / ibus) through the standard GTK mechanism — nothing is bundled, your host's modules load, and Lychi itself needs **no settings**: once your desktop's input method works, it works in Lychi. Verified with fcitx5 + Pinyin: type `nihao` in the launcher, get the candidate window, commit 你好.
+
+**Enabling an input method is done in your desktop, not in Lychi:**
+
+- **GNOME**: Settings → Keyboard → **Input Sources** → `+` → your language (e.g. *Chinese (Intelligent Pinyin)*). GNOME runs ibus and wires the environment itself; `Super+Space` switches sources.
+- **KDE Plasma**: install `fcitx5`, your language addon (e.g. `fcitx5-chinese-addons`), and the settings module (`kcm-fcitx5` / `fcitx5-configtool`), then System Settings → **Input Method** → add your method, and log out/in once. `Ctrl+Space` toggles it — if you keep Lychi's default summon hotkey, pick a different chord for one of them.
+- The session environment (`GTK_IM_MODULE`, `XMODIFIERS`) is set automatically at login by your distro's tooling (`im-config` on Debian/Ubuntu, `imsettings` on Fedora) once the packages are installed.
+
+**If CJK input doesn't work in Lychi** but works elsewhere: install your framework's GTK3 module (`fcitx5-gtk` / `ibus-gtk3`) and run `lychi doctor` — it checks the daemon, the environment, and the GTK module cache, and names the missing piece in plain language.
+
+Two notes on how it looks and runs: the candidate window is drawn by the input method itself, so it follows *its* theme (`fcitx5-configtool` → Addons → Classic UI), not Lychi's. And Lychi runs as an X11 (XWayland) window on purpose — that is currently the most reliable IME path on every desktop; `GDK_BACKEND=wayland ~/Applications/Lychi.AppImage` opts into native Wayland if you want to experiment.
 
 On GNOME the window covers the monitor with a transparent surface and the launcher is centered by CSS — Mutter does not let applications position their own windows. True fullscreen is deliberately **not** requested there, because Mutter paints an opaque backdrop behind fullscreen windows.
 
