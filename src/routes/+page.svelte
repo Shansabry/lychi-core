@@ -597,11 +597,15 @@ onMount(() => {
 	// the launcher, but an unguarded `.then()` also leaves NO trace: the symptom
 	// is a launcher quietly missing a capability with a clean-looking log.
 	// `startup` keeps them independent and makes each failure a logged fact.
-	const startup = <T>(what: string, p: Promise<T>, apply: (v: T) => void) => {
+	// A function declaration, not an arrow: `<T>` in an arrow is ambiguous
+	// enough that the bumped Biome's lint-fix and formatter disagree about a
+	// trailing comma and undo each other. The declaration form parses
+	// unambiguously, so both leave it alone.
+	function startup<T>(what: string, p: Promise<T>, apply: (v: T) => void) {
 		p.then(apply).catch((err) => {
 			uiLog.error(`[startup] ${what} failed: ${err}`);
 		});
-	};
+	}
 
 	startup("window strategy", getActiveWindowStrategy(), (s) => {
 		windowStrategy = s;
