@@ -21,6 +21,36 @@ pub struct PortalStatus {
     pub present: bool,
 }
 
+/// The input-method landscape, as facts. CJK input lives or dies on these,
+/// and every failure mode looks identical from the launcher ("typing gives
+/// ascii") — only the combination of facts distinguishes "daemon not running"
+/// from "GTK module not installed" from "a stale AppImage hook is overriding
+/// the module path".
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ImeFacts {
+    /// GTK_IM_MODULE verbatim ("" = unset; unset is normal — GTK then asks
+    /// XSETTINGS or the immodules cache).
+    pub gtk_im_module: String,
+    /// XMODIFIERS verbatim (the XIM fallback route, e.g. "@im=fcitx").
+    pub xmodifiers: String,
+    /// GTK_IM_MODULE_FILE verbatim. Lychi's own AppImage must never set this:
+    /// it pins GTK to a bundled, IM-less module cache and silently kills CJK
+    /// input (issue #48). Set here = a stale hook or another AppImage leaked.
+    pub gtk_im_module_file: String,
+    /// GDK_BACKEND verbatim — Lychi defaults to x11 (XWayland), which is the
+    /// battle-tested IME path; a user override to wayland changes the story.
+    pub gdk_backend: String,
+    /// org.fcitx.Fcitx5 has a bus owner.
+    pub fcitx_daemon: bool,
+    /// org.freedesktop.IBus has a bus owner.
+    pub ibus_daemon: bool,
+    /// Whether the HOST GTK3 immodules cache lists an fcitx module.
+    /// None = no host cache was found to inspect.
+    pub host_cache_has_fcitx: Option<bool>,
+    /// Same, for ibus.
+    pub host_cache_has_ibus: Option<bool>,
+}
+
 /// Everything `doctor` knows, as data.
 ///
 /// Split out from the text so the Setup tab can consume the same conclusions the
@@ -41,8 +71,99 @@ pub struct DiagnosticReport {
     /// True when the portal frontend did not answer at all — which means "not
     /// started yet" as often as "missing", since it is D-Bus-activated.
     pub portals_unanswered: bool,
+    pub ime: ImeFacts,
     /// What the facts above cost the user, in plain sentences.
     pub consequences: Vec<String>,
+}
+
+/// Probe the input-method landscape. Two bus-daemon name lookups plus one
+/// file read — cheap, but still doctor-only, off any hot path.
+fn collect_ime() -> ImeFacts {
+    let env = |k: &str| std::env::var(k).unwrap_or_default();
+    // Distro layouts for the host GTK3 module cache: Debian/Ubuntu multiarch,
+    // Fedora lib64, Arch plain lib. First one that exists speaks for the host.
+    let cache = [
+        "/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache",
+        "/usr/lib64/gtk-3.0/3.0.0/immodules.cache",
+        "/usr/lib/gtk-3.0/3.0.0/immodules.cache",
+    ]
+    .iter()
+    .find_map(|p| std::fs::read_to_string(p).ok());
+
+    ImeFacts {
+        gtk_im_module: env("GTK_IM_MODULE"),
+        xmodifiers: env("XMODIFIERS"),
+        gtk_im_module_file: env("GTK_IM_MODULE_FILE"),
+        gdk_backend: env("GDK_BACKEND"),
+        fcitx_daemon: capabilities::dbus_name_present("org.fcitx.Fcitx5"),
+        ibus_daemon: capabilities::dbus_name_present("org.freedesktop.IBus"),
+        host_cache_has_fcitx: cache.as_deref().map(|c| c.contains("fcitx")),
+        host_cache_has_ibus: cache.as_deref().map(|c| c.contains("ibus")),
+    }
+}
+
+/// What the IME facts cost, said plainly. Pure over its input so every
+/// combination is testable, most of which this machine cannot produce.
+///
+/// Deliberately silent when no IME framework is present at all — most users
+/// have none, and doctor must not manufacture noise for them.
+fn ime_consequences(ime: &ImeFacts) -> Vec<String> {
+    let mut notes: Vec<String> = Vec::new();
+
+    if !ime.gtk_im_module_file.is_empty() {
+        notes.push(format!(
+            "GTK_IM_MODULE_FILE is set ({}) — something is pinning GTK to a \
+             fixed input-module cache. If that cache lacks your input method's \
+             module, CJK input dies silently. Lychi's own AppImage never sets \
+             this; unset it (a stale launcher script or another AppImage's \
+             hook is the usual source).",
+            ime.gtk_im_module_file
+        ));
+    }
+    if ime.fcitx_daemon && ime.host_cache_has_fcitx == Some(false) {
+        notes.push(
+            "fcitx5 is running but the host GTK3 module cache has no fcitx \
+             module — install your distro's fcitx5 GTK module (fcitx5-gtk / \
+             fcitx5-gtk3) or GTK apps, Lychi included, cannot reach it."
+                .into(),
+        );
+    }
+    if ime.ibus_daemon && ime.host_cache_has_ibus == Some(false) {
+        notes.push(
+            "ibus is running but the host GTK3 module cache has no ibus \
+             module — install ibus-gtk3 or GTK apps, Lychi included, cannot \
+             reach it."
+                .into(),
+        );
+    }
+    if ime.fcitx_daemon && !ime.ibus_daemon && ime.gtk_im_module == "ibus" {
+        notes.push(
+            "GTK_IM_MODULE=ibus but the running input daemon is fcitx5 — GTK \
+             apps will try to talk to a daemon that isn't there. Set \
+             GTK_IM_MODULE=fcitx (and XMODIFIERS=@im=fcitx) for this session."
+                .into(),
+        );
+    }
+    if ime.ibus_daemon && !ime.fcitx_daemon && ime.gtk_im_module.starts_with("fcitx") {
+        notes.push(
+            "GTK_IM_MODULE names fcitx but the running input daemon is ibus — \
+             GTK apps will try to talk to a daemon that isn't there. Set \
+             GTK_IM_MODULE=ibus for this session."
+                .into(),
+        );
+    }
+    if !ime.fcitx_daemon
+        && !ime.ibus_daemon
+        && (ime.gtk_im_module.starts_with("fcitx") || ime.gtk_im_module == "ibus")
+    {
+        notes.push(format!(
+            "GTK_IM_MODULE={} but no input-method daemon is on the bus — the \
+             module will connect to nothing and input stays plain. Start the \
+             daemon (or remove the variable if you no longer use an IME).",
+            ime.gtk_im_module
+        ));
+    }
+    notes
 }
 
 /// Probe the machine and decide what it means.
@@ -67,6 +188,8 @@ pub fn collect() -> DiagnosticReport {
     })
     .collect();
 
+    let ime = collect_ime();
+
     DiagnosticReport {
         version: env!("CARGO_PKG_VERSION"),
         raw_env: vec![
@@ -74,6 +197,10 @@ pub fn collect() -> DiagnosticReport {
             ("XDG_SESSION_DESKTOP", s.raw_session_desktop.clone()),
             ("XDG_SESSION_TYPE", s.raw_session_type.clone()),
             ("WAYLAND_DISPLAY", s.raw_wayland_display.clone()),
+            ("GDK_BACKEND", ime.gdk_backend.clone()),
+            ("GTK_IM_MODULE", ime.gtk_im_module.clone()),
+            ("XMODIFIERS", ime.xmodifiers.clone()),
+            ("GTK_IM_MODULE_FILE", ime.gtk_im_module_file.clone()),
         ],
         desktop_chain: s.desktops.iter().map(|d| format!("{d:?}")).collect(),
         session_type: match s.session_type {
@@ -84,7 +211,12 @@ pub fn collect() -> DiagnosticReport {
         kwin_scripting: caps.kwin_scripting,
         gnome_shell: caps.gnome_shell,
         portals_unanswered: caps.portals.is_empty(),
-        consequences: consequences(&caps, s.is_wayland(), s.primary().is_gnome_family()),
+        consequences: {
+            let mut all = consequences(&caps, s.is_wayland(), s.primary().is_gnome_family());
+            all.extend(ime_consequences(&ime));
+            all
+        },
+        ime,
     }
 }
 
@@ -195,6 +327,31 @@ pub fn render(r: &DiagnosticReport) -> String {
         "  {:<40}{}\n",
         "org.gnome.Shell",
         yes_no(r.gnome_shell)
+    ));
+    out.push_str(&format!(
+        "  {:<40}{}\n",
+        "org.fcitx.Fcitx5 (input method)",
+        yes_no(r.ime.fcitx_daemon)
+    ));
+    out.push_str(&format!(
+        "  {:<40}{}\n",
+        "org.freedesktop.IBus (input method)",
+        yes_no(r.ime.ibus_daemon)
+    ));
+    let cache_line = |v: Option<bool>| match v {
+        None => "no host cache found",
+        Some(true) => "yes",
+        Some(false) => "NO",
+    };
+    out.push_str(&format!(
+        "  {:<40}{}\n",
+        "host GTK cache: fcitx module",
+        cache_line(r.ime.host_cache_has_fcitx)
+    ));
+    out.push_str(&format!(
+        "  {:<40}{}\n",
+        "host GTK cache: ibus module",
+        cache_line(r.ime.host_cache_has_ibus)
     ));
     if r.portals_unanswered {
         out.push_str(
@@ -390,6 +547,7 @@ mod tests {
             kwin_scripting: true,
             gnome_shell: false,
             portals_unanswered: false,
+            ime: ImeFacts::default(),
             consequences: vec![],
         };
         let text = render(&r);
@@ -410,11 +568,124 @@ mod tests {
             kwin_scripting: false,
             gnome_shell: false,
             portals_unanswered: true,
+            ime: ImeFacts::default(),
             consequences: vec!["something".into()],
         };
         let text = render(&r);
         assert!(text.contains("(unset)"));
         assert!(text.contains("XDG_CURRENT_DESKTOP is unset"));
         assert!(text.contains("did not answer"));
+    }
+
+    #[test]
+    fn a_machine_without_any_ime_gets_no_ime_notes() {
+        // The overwhelmingly common case: no daemon, no env vars. Doctor must
+        // say nothing rather than teach users about a subsystem they lack.
+        assert!(ime_consequences(&ImeFacts::default()).is_empty());
+    }
+
+    #[test]
+    fn a_healthy_fcitx_setup_gets_no_notes() {
+        let ime = ImeFacts {
+            fcitx_daemon: true,
+            gtk_im_module: "fcitx".into(),
+            xmodifiers: "@im=fcitx".into(),
+            host_cache_has_fcitx: Some(true),
+            host_cache_has_ibus: Some(false),
+            ..Default::default()
+        };
+        assert!(ime_consequences(&ime).is_empty());
+    }
+
+    #[test]
+    fn fcitx_running_without_its_gtk_module_names_the_missing_package() {
+        // The classic "fcitx5 installed without fcitx5-gtk" failure: daemon
+        // alive, GTK structurally unable to reach it.
+        let ime = ImeFacts {
+            fcitx_daemon: true,
+            host_cache_has_fcitx: Some(false),
+            ..Default::default()
+        };
+        let notes = ime_consequences(&ime);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("fcitx5-gtk"), "{notes:?}");
+    }
+
+    #[test]
+    fn a_pinned_module_cache_is_flagged_loudly() {
+        // The issue-48 mechanism: GTK_IM_MODULE_FILE overrides everything and
+        // fails silently. It must be called out even when nothing else is wrong.
+        let ime = ImeFacts {
+            gtk_im_module_file: "/tmp/other.AppDir/immodules.cache".into(),
+            ..Default::default()
+        };
+        let notes = ime_consequences(&ime);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("GTK_IM_MODULE_FILE"), "{notes:?}");
+    }
+
+    #[test]
+    fn a_daemon_and_module_mismatch_is_called_out_both_ways() {
+        let fcitx_daemon_ibus_module = ImeFacts {
+            fcitx_daemon: true,
+            gtk_im_module: "ibus".into(),
+            host_cache_has_fcitx: Some(true),
+            host_cache_has_ibus: Some(true),
+            ..Default::default()
+        };
+        assert!(
+            ime_consequences(&fcitx_daemon_ibus_module)
+                .iter()
+                .any(|n| n.contains("running input daemon is fcitx5"))
+        );
+
+        let ibus_daemon_fcitx_module = ImeFacts {
+            ibus_daemon: true,
+            gtk_im_module: "fcitx".into(),
+            host_cache_has_fcitx: Some(true),
+            host_cache_has_ibus: Some(true),
+            ..Default::default()
+        };
+        assert!(
+            ime_consequences(&ibus_daemon_fcitx_module)
+                .iter()
+                .any(|n| n.contains("running input daemon is ibus"))
+        );
+    }
+
+    #[test]
+    fn a_module_configured_with_no_daemon_running_is_called_out() {
+        let ime = ImeFacts {
+            gtk_im_module: "fcitx".into(),
+            ..Default::default()
+        };
+        let notes = ime_consequences(&ime);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("no input-method daemon"), "{notes:?}");
+    }
+
+    #[test]
+    fn the_report_shows_the_ime_probe_lines() {
+        let r = DiagnosticReport {
+            version: "0.0.0",
+            raw_env: vec![],
+            desktop_chain: vec![],
+            session_type: "X11",
+            portals: vec![],
+            kwin_scripting: false,
+            gnome_shell: false,
+            portals_unanswered: false,
+            ime: ImeFacts {
+                fcitx_daemon: true,
+                host_cache_has_fcitx: Some(true),
+                host_cache_has_ibus: None,
+                ..Default::default()
+            },
+            consequences: vec![],
+        };
+        let text = render(&r);
+        assert!(text.contains("org.fcitx.Fcitx5"), "{text}");
+        assert!(text.contains("host GTK cache: fcitx module"), "{text}");
+        assert!(text.contains("no host cache found"), "{text}");
     }
 }
