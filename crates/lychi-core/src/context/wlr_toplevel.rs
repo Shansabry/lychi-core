@@ -153,8 +153,10 @@ mod imp {
                 Event::State { state: bytes } => {
                     // `state` is an array of little-endian u32 enum values.
                     entry.activated = bytes
-                        .chunks_exact(4)
-                        .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| u32::from_ne_bytes(*c))
                         .any(|v| v == STATE_ACTIVATED);
                 }
                 Event::Closed => entry.closed = true,
