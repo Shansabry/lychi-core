@@ -86,7 +86,7 @@ let generalConfig: GeneralConfig = $state({
 	font_family: "",
 	card_opacity: 1,
 	corner_radius: 12,
-	hotkey: "Super+Space",
+	hotkey: "Ctrl+Space",
 	window_x: null,
 	window_y: null,
 	monitor_mode: "cursor",

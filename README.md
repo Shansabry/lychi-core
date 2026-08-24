@@ -7,7 +7,7 @@
 **A local-first command launcher for Linux.**
 Spotlight/Raycast energy — keyboard-driven, privacy-first, AI optional.
 
-Open it with `Super+Space`, type what you want, hit Enter. That's it.
+Open it with `Ctrl+Space`, type what you want, hit Enter. That's it.
 
 `open firefox` · `web rust lang` · `run ls -la` · `calc 12% of 340` · `screenshot area` · `media pause all`
 
@@ -35,7 +35,20 @@ https://github.com/user-attachments/assets/88a08b40-f14b-4a3e-b6b4-c86a626e1638
 
 ## 📦 Install
 
-Lychi ships as a self-contained **AppImage** — no package manager, no root, no dependencies to chase.
+Lychi ships as a self-contained **AppImage** — no package manager, no root, and on most desktops nothing else to install.
+
+> **Requirements**: Lychi uses your system's WebKitGTK and GTK layer-shell — most desktops already have them, but minimal installs may need two packages:
+>
+> | Distro family | Command |
+> |---|---|
+> | Ubuntu / Debian / Mint | `sudo apt install libwebkit2gtk-4.1-0 libgtk-layer-shell0` |
+> | Fedora | `sudo dnf install webkit2gtk4.1 gtk-layer-shell` |
+> | Arch / Manjaro | `sudo pacman -S webkit2gtk-4.1 gtk-layer-shell` |
+> | openSUSE | `sudo zypper install libwebkit2gtk-4_1-0 libgtk-layer-shell0` |
+>
+> If the AppImage exits immediately with an `error while loading shared libraries` message, this is why — the message names the missing library.
+>
+> One optional extra: the **tray icon** needs an appindicator library (`libayatana-appindicator3-1` on Debian/Ubuntu, `libappindicator-gtk3` on Fedora). Without it Lychi runs fine — the tray icon just silently doesn't appear.
 
 ### 1. Get the AppImage
 
@@ -57,14 +70,14 @@ chmod +x ~/Applications/Lychi.AppImage
 ~/Applications/Lychi.AppImage
 ```
 
-First launch registers the **`Super+Space`** hotkey (your compositor may ask you to confirm) and drops a tray icon. Press the hotkey — the launcher appears.
+First launch registers the **`Ctrl+Space`** hotkey (your compositor may ask you to confirm) and drops a tray icon. Press the hotkey — the launcher appears.
 
 ### 4. Finish setup inside Lychi *(recommended)*
 
 Open Lychi → **Settings → Setup**. That page is your diagnostics + install helper:
 
 - **Install the `lychi` CLI** — one click creates a symlink on your `PATH` so `lychi --toggle`, `lychi --screenshot`, and `lychi --ai` work from anywhere and from desktop shortcuts. (It tracks the AppImage, so re-run it if you ever move or replace the file.)
-- **Hotkey status** — Setup tells you exactly which binding route worked (portal / DE settings / X11 grab) and flags it if `Super+Space` was already taken, so you know your hotkey is live.
+- **Hotkey status** — Setup tells you exactly which binding route worked (portal / DE settings / X11 grab) and flags it if `Ctrl+Space` was already taken, so you know your hotkey is live.
 - **Diagnostics** — a copy-paste report of your desktop, session type, and what Lychi can use on it. This is the single most useful thing to attach to a bug report.
 
 Nothing on this page is ever marked "done" permanently — replacing the AppImage dangles the CLI link, switching X11↔Wayland can break a working hotkey — so it re-checks every time and only offers a fix when one is actually needed.
@@ -143,7 +156,7 @@ All rebindable under `[keybindings]` in `config.toml`. Defaults:
 
 | Shortcut | Action |
 |----------|--------|
-| `Super+Space` | Show / hide the launcher |
+| `Ctrl+Space` | Show / hide the launcher |
 | `Ctrl+K` | Action panel for the selected result |
 | `Enter` | Submit |
 | `Escape` | Dismiss / close panel |
@@ -180,9 +193,23 @@ Lychi picks the best window strategy for your session automatically:
 | GNOME Wayland | monitor-covering transparent toplevel (Mutter has no layer-shell) |
 | X11 (KDE, XFCE, Cinnamon, MATE, …) | fullscreen overlay, or a compact opaque window when compositing is off |
 
+### Input methods (CJK)
+
+Lychi uses your desktop's input method (fcitx5 / ibus) through the standard GTK mechanism — nothing is bundled, your host's modules load, and Lychi itself needs **no settings**: once your desktop's input method works, it works in Lychi. Verified with fcitx5 + Pinyin: type `nihao` in the launcher, get the candidate window, commit 你好.
+
+**Enabling an input method is done in your desktop, not in Lychi:**
+
+- **GNOME**: Settings → Keyboard → **Input Sources** → `+` → your language (e.g. *Chinese (Intelligent Pinyin)*). GNOME runs ibus and wires the environment itself; `Super+Space` switches sources.
+- **KDE Plasma**: install `fcitx5`, your language addon (e.g. `fcitx5-chinese-addons`), and the settings module (`kcm-fcitx5` / `fcitx5-configtool`), then System Settings → **Input Method** → add your method, and log out/in once. `Ctrl+Space` toggles it — if you keep Lychi's default summon hotkey, pick a different chord for one of them.
+- The session environment (`GTK_IM_MODULE`, `XMODIFIERS`) is set automatically at login by your distro's tooling (`im-config` on Debian/Ubuntu, `imsettings` on Fedora) once the packages are installed.
+
+**If CJK input doesn't work in Lychi** but works elsewhere: install your framework's GTK3 module (`fcitx5-gtk` / `ibus-gtk3`) and run `lychi doctor` — it checks the daemon, the environment, and the GTK module cache, and names the missing piece in plain language.
+
+Two notes on how it looks and runs: the candidate window is drawn by the input method itself, so it follows *its* theme (`fcitx5-configtool` → Addons → Classic UI), not Lychi's. And Lychi runs as an X11 (XWayland) window on purpose — that is currently the most reliable IME path on every desktop; `GDK_BACKEND=wayland ~/Applications/Lychi.AppImage` opts into native Wayland if you want to experiment.
+
 On GNOME the window covers the monitor with a transparent surface and the launcher is centered by CSS — Mutter does not let applications position their own windows. True fullscreen is deliberately **not** requested there, because Mutter paints an opaque backdrop behind fullscreen windows.
 
-**Global hotkey:** Lychi registers `Super+Space` for you where it can, by three routes in order of preference:
+**Global hotkey:** Lychi registers `Ctrl+Space` for you where it can, by three routes in order of preference:
 
 | Session | How |
 |---------|-----|
