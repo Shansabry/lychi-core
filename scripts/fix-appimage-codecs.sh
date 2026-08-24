@@ -103,6 +103,21 @@ if grep -q "GTK_IM_MODULE_FILE\|GTK_EXE_PREFIX" "$HOOK"; then
   echo "fix-appimage-codecs: IM-module pin survived the sed — hook format changed?" >&2
   exit 1
 fi
+# The hook hard-pins GDK_BACKEND=x11 (Tauri's deliberate XWayland choice — and
+# for IME it is the RIGHT default: the X11 D-Bus module path is the most
+# battle-tested route, while text-input-v3 on layer-shell is the least). Make
+# it a default rather than an override, so `GDK_BACKEND=wayland ./Lychi...`
+# lets a user opt in without a rebuild. The hook must never set or clear
+# GTK_IM_MODULE / XMODIFIERS — those are the user's session's to decide.
+sed -i 's/^export GDK_BACKEND=x11.*/export GDK_BACKEND="${GDK_BACKEND:-x11}"/' "$HOOK"
+if ! grep -q 'GDK_BACKEND="\${GDK_BACKEND:-x11}"' "$HOOK"; then
+  echo "fix-appimage-codecs: GDK_BACKEND default rewrite missed — hook format changed?" >&2
+  exit 1
+fi
+if grep -qE "export (GTK_IM_MODULE|XMODIFIERS|QT_IM_MODULE)=" "$HOOK"; then
+  echo "fix-appimage-codecs: the hook now sets IM env vars it must inherit — refusing" >&2
+  exit 1
+fi
 rm -rf "$APPDIR"/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules \
        "$APPDIR"/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache
 

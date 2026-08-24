@@ -35,7 +35,20 @@ https://github.com/user-attachments/assets/88a08b40-f14b-4a3e-b6b4-c86a626e1638
 
 ## 📦 Install
 
-Lychi ships as a self-contained **AppImage** — no package manager, no root, no dependencies to chase.
+Lychi ships as a self-contained **AppImage** — no package manager, no root, and on most desktops nothing else to install.
+
+> **Requirements**: Lychi uses your system's WebKitGTK and GTK layer-shell — most desktops already have them, but minimal installs may need two packages:
+>
+> | Distro family | Command |
+> |---|---|
+> | Ubuntu / Debian / Mint | `sudo apt install libwebkit2gtk-4.1-0 libgtk-layer-shell0` |
+> | Fedora | `sudo dnf install webkit2gtk4.1 gtk-layer-shell` |
+> | Arch / Manjaro | `sudo pacman -S webkit2gtk-4.1 gtk-layer-shell` |
+> | openSUSE | `sudo zypper install libwebkit2gtk-4_1-0 libgtk-layer-shell0` |
+>
+> If the AppImage exits immediately with an `error while loading shared libraries` message, this is why — the message names the missing library.
+>
+> One optional extra: the **tray icon** needs an appindicator library (`libayatana-appindicator3-1` on Debian/Ubuntu, `libappindicator-gtk3` on Fedora). Without it Lychi runs fine — the tray icon just silently doesn't appear.
 
 ### 1. Get the AppImage
 
@@ -179,6 +192,10 @@ Lychi picks the best window strategy for your session automatically:
 | KDE Plasma Wayland | toplevel window (KWin layer-shell focus is unreliable) |
 | GNOME Wayland | monitor-covering transparent toplevel (Mutter has no layer-shell) |
 | X11 (KDE, XFCE, Cinnamon, MATE, …) | fullscreen overlay, or a compact opaque window when compositing is off |
+
+### Input methods (CJK)
+
+Lychi uses your desktop's input method (fcitx5 / ibus) through the standard GTK mechanism — nothing is bundled, your host's modules load. If CJK input doesn't work: install your framework's GTK3 module (`fcitx5-gtk` / `ibus-gtk3`), make sure the daemon autostarts, and run `lychi doctor` — it checks the daemon, the environment, and the module cache, and names the missing piece. Lychi runs as an X11 (XWayland) window on purpose: configure fcitx5/ibus exactly as you would for X11 apps (`GTK_IM_MODULE=fcitx`, `XMODIFIERS=@im=fcitx`); that is currently the most reliable IME path on every desktop. (`GDK_BACKEND=wayland ~/Applications/Lychi.AppImage` opts into native Wayland if you want to experiment.)
 
 On GNOME the window covers the monitor with a transparent surface and the launcher is centered by CSS — Mutter does not let applications position their own windows. True fullscreen is deliberately **not** requested there, because Mutter paints an opaque backdrop behind fullscreen windows.
 
