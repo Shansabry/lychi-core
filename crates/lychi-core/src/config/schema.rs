@@ -160,7 +160,7 @@ impl Default for GeneralConfig {
             card_opacity: default_card_opacity(),
             corner_radius: default_corner_radius(),
             card_blur: false,
-            hotkey: "Super+Space".to_string(),
+            hotkey: "Ctrl+Space".to_string(),
             window_x: None,
             window_y: None,
             monitor_mode: "cursor".to_string(),
