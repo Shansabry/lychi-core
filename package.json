@@ -29,11 +29,11 @@
     "hooks": "lefthook install"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.5.8",
+    "@biomejs/biome": "^2.5.10",
     "@commitlint/cli": "^21.2.2",
     "@commitlint/config-conventional": "^21.2.2",
     "@sveltejs/adapter-static": "^3",
-    "@sveltejs/kit": "^2.70.2",
+    "@sveltejs/kit": "^2.70.3",
     "@sveltejs/vite-plugin-svelte": "^7",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/cli": "^2.11.4",
@@ -46,12 +46,12 @@
     "svelte-check": "^4",
     "typescript": "^5",
     "vite": "^8",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.11"
   },
   "dependencies": {
     "@tauri-apps/plugin-updater": "^2.10.1",
     "ansi-to-html": "^0.7.2",
-    "dompurify": "^3.4.13",
+    "dompurify": "^3.4.14",
     "highlight.js": "^11.12.0",
     "lucide-svelte": "^1",
     "marked": "^18"
