@@ -6,6 +6,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Pre-1.0, minor versions may contain breaking changes.
 
+## [0.3.0](https://github.com/Shansabry/lychi-core/compare/v0.2.2...v0.3.0) (2026-08-31)
+
+
+### Features
+
+* default the hotkey to Ctrl+Space ([#53](https://github.com/Shansabry/lychi-core/issues/53)) ([31ad107](https://github.com/Shansabry/lychi-core/commit/31ad107c83ef969819671fad27d9c7f3a386c3f3))
+* **doctor:** diagnose the input-method stack; unpin GDK_BACKEND ([#55](https://github.com/Shansabry/lychi-core/issues/55)) ([97539bc](https://github.com/Shansabry/lychi-core/commit/97539bc28614dc1a10dcc7666defab892dfce184))
+* **release:** ship deb and rpm packages; automate the AUR ([#57](https://github.com/Shansabry/lychi-core/issues/57)) ([1e3134c](https://github.com/Shansabry/lychi-core/commit/1e3134c8fc1947910eebd165e72fc33190a3c6ed))
+
+
+### Bug Fixes
+
+* **appimage:** stop pinning GTK to the bundled input-method cache ([#50](https://github.com/Shansabry/lychi-core/issues/50)) ([d18848b](https://github.com/Shansabry/lychi-core/commit/d18848b8572bc0b94751f31abcc9b23ab1c2c222)), closes [#48](https://github.com/Shansabry/lychi-core/issues/48)
+* **core:** satisfy rust 1.98 clippy's chunks_exact_to_as_chunks ([#52](https://github.com/Shansabry/lychi-core/issues/52)) ([2212011](https://github.com/Shansabry/lychi-core/commit/22120117d80c6682262208b8dd07c22257ece4ee))
+
 ## [0.2.2](https://github.com/Shansabry/lychi-core/compare/v0.2.1...v0.2.2) (2026-08-19)
 
 
