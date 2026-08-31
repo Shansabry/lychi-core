@@ -221,10 +221,13 @@ jobs:
             exit 1
           fi
           dpkg-deb --info "${debs[0]}"
-          dpkg-deb --contents "${debs[0]}" | grep -q "usr/bin/lychi-app" \
+          # Full-read grep, no -q: under pipefail, `grep -q` exits at first
+          # match and the SIGPIPE it sends dpkg-deb fails the pipeline BECAUSE
+          # the check passed. Reading to EOF keeps success looking like success.
+          dpkg-deb --contents "${debs[0]}" | grep "usr/bin/lychi-app" >/dev/null \
             || { echo "deb does not contain usr/bin/lychi-app" >&2; exit 1; }
           rpm -qpi "${rpms[0]}"
-          rpm -qpl "${rpms[0]}" | grep -q "/usr/bin/lychi-app" \
+          rpm -qpl "${rpms[0]}" | grep "/usr/bin/lychi-app" >/dev/null \
             || { echo "rpm does not contain /usr/bin/lychi-app" >&2; exit 1; }
 
       # Keyless provenance: a sigstore-signed, transparency-logged statement
