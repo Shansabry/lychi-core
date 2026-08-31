@@ -1,0 +1,43 @@
+# Maintainer: Sab <support@lychi.app>
+#
+# Rendered by release.yml's `aur` job at release time: @VERSION@ and @SHA256@
+# are substituted from the tag and the published AppImage. Do not edit the
+# rendered copy on the AUR by hand — change this template instead.
+pkgname=lychi-appimage
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="Local-first, keyboard-driven command launcher for Linux with a consent-gated AI agent (AppImage)"
+arch=('x86_64')
+url="https://lychi.app"
+license=('GPL-3.0-only')
+depends=('fuse2')
+options=(!strip)
+_appimage="Lychi_${pkgver}_amd64.AppImage"
+source=("https://github.com/Shansabry/lychi-core/releases/download/v${pkgver}/${_appimage}")
+sha256sums=('@SHA256@')
+
+prepare() {
+    chmod +x "${_appimage}"
+    ./"${_appimage}" --appimage-extract usr/share/icons >/dev/null
+    ./"${_appimage}" --appimage-extract '*.desktop' >/dev/null
+}
+
+package() {
+    install -Dm755 "${_appimage}" "${pkgdir}/opt/${pkgname}/${_appimage}"
+    ln -s "/opt/${pkgname}/${_appimage}" "${pkgdir}/opt/${pkgname}/lychi"
+    install -dm755 "${pkgdir}/usr/bin"
+    ln -s "/opt/${pkgname}/${_appimage}" "${pkgdir}/usr/bin/lychi"
+
+    local desktop
+    desktop="$(find squashfs-root -maxdepth 1 -name '*.desktop' | head -1)"
+    if [ -n "$desktop" ]; then
+        sed -i "s|^Exec=.*|Exec=/usr/bin/lychi %U|" "$desktop"
+        install -Dm644 "$desktop" \
+            "${pkgdir}/usr/share/applications/lychi.desktop"
+    fi
+    if [ -d squashfs-root/usr/share/icons ]; then
+        cp -r squashfs-root/usr/share/icons "${pkgdir}/usr/share/"
+        find "${pkgdir}/usr/share/icons" -type f -exec chmod 644 {} +
+        find "${pkgdir}/usr/share/icons" -type d -exec chmod 755 {} +
+    fi
+}

@@ -60,3 +60,4 @@ npm-debug.log*
 # AppImage. Not committed: derived, 500KB+, and stale the moment a dependency
 # changes. Both the local build and CI regenerate it.
 THIRD-PARTY-NOTICES.html
+aur/PKGBUILD
