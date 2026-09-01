@@ -135,7 +135,7 @@ jobs:
       # Prebuilt binary (~3s). nextest runs each test in its own process and
       # retries flaky ones — a retried-then-passed test is reported FLAKY, so
       # flakiness stays visible instead of being a manual rerun ritual.
-      - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2
+      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2
         with:
           tool: cargo-nextest
 
@@ -340,7 +340,7 @@ jobs:
           toolchain: stable
 
       # Prebuilt binary: 3 seconds instead of a minutes-long `cargo install`.
-      - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2
+      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2
         if: steps.changed.outputs.run == 'true'
         with:
           tool: cargo-about
