@@ -62,7 +62,7 @@ quick-xml = "0.37"
 # never a crash. Chosen over pdf_oxide/ferrules/extractous (native/ML deps) for
 # the lean AppImage goal.
 pdf-extract = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 md-5 = "0.10"
 hex = "0.4"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
