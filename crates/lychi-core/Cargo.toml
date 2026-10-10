@@ -55,7 +55,7 @@ infer = "0.22"
 mime_guess = "2"
 # Doc text extraction (Phase 3): docx/odt/pptx/xlsx are ZIP+XML containers we read
 # with `zip` (already above) + a streaming XML pull-parser. Pure-Rust, no native libs.
-quick-xml = "0.37"
+quick-xml = "0.41"
 # PDF text extraction (Phase 3). Pure-Rust, MIT, no native libs (built on lopdf).
 # Known to PANIC on some malformed PDFs — we ALWAYS wrap it in `catch_unwind`
 # (see files/text_extract.rs `pdf_backend`), so a bad PDF degrades to an error,
