@@ -45,6 +45,7 @@
   },
   "bundle": {
     "active": true,
+    "category": "Utility",
     "targets": [
       "appimage",
       "deb",
