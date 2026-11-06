@@ -48,7 +48,7 @@ base64 = "0.22"
 # (no native libs) to keep the AppImage lean. zip >= 2.3.0 is required — earlier
 # versions have a symlink zip-slip (RUSTSEC GHSA-94vh-gphv-8pm8); we extract via
 # `enclosed_name()` + a canonicalize-under-dest guard regardless.
-zip = "8"
+zip = "9"
 tar = "0.4"
 flate2 = "1"
 infer = "0.22"
