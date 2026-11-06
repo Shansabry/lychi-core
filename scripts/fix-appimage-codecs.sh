@@ -128,6 +128,14 @@ echo "==> Restoring the un-patchelf'd application binary"
 cp -f "$GOOD_BINARY" "$APPDIR/usr/bin/lychi-app"
 patchelf --set-rpath '$ORIGIN/../lib' "$APPDIR/usr/bin/lychi-app"
 
+# Tauri caches its AppRun launcher as 0770 and linuxdeploy copies it in as
+# AppRun.wrapped with that mode. The image stores every file as root-owned, so
+# anything that honours permissions on the mount (`firejail --appimage`, a
+# kernel loop mount) gets "Permission denied" for a non-root user. A normal FUSE
+# launch hides this, so nothing else would ever catch it.
+echo "==> Making the AppDir readable and executable for everyone"
+chmod -R go-w,a+rX "$APPDIR"
+
 echo "==> Repacking the AppImage"
 # Preserve the bundler's own filename (Lychi_<version>_amd64.AppImage) — a
 # hardcoded name here shipped two releases labelled 0.1.0. Captured BEFORE the
@@ -150,6 +158,23 @@ if [ -z "$packed" ]; then
 fi
 mv -f "$packed" "$BUNDLE_DIR/$orig_name"
 chmod +x "$BUNDLE_DIR/$orig_name"
+
+# Check the artifact, not the AppDir: the modes that matter are the ones the
+# image stores. --appimage-extract is handled by the runtime, so the app never
+# starts. The fixed umask keeps the extraction itself from masking o+x. Regular
+# files only: extraction creates directories with its own modes, not stored ones.
+echo "==> Verifying file modes inside the packed AppImage"
+artifact="$(realpath "$BUNDLE_DIR/$orig_name")"
+verify_dir="$(mktemp -d)"
+trap 'rm -rf "$verify_dir"' EXIT
+(cd "$verify_dir" && umask 022 && "$artifact" --appimage-extract >/dev/null)
+unusable="$(find "$verify_dir/squashfs-root" -type f \
+  \( ! -perm -o+r -o \( -perm -u+x ! -perm -o+x \) \))"
+if [ -n "$unusable" ]; then
+  echo "fix-appimage-codecs: not readable/executable for everyone:" >&2
+  echo "$unusable" >&2
+  exit 1
+fi
 
 echo "==> Done: $BUNDLE_DIR/$orig_name"
 ls -lh "$BUNDLE_DIR/$orig_name"
