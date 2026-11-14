@@ -38,7 +38,7 @@ importers:
         version: 21.2.2
       '@sveltejs/adapter-static':
         specifier: ^3
-        version: 3.0.10(@sveltejs/kit@2.70.2(@sveltejs/vite-plugin-svelte@7.3.0(svelte@5.56.9)(vite@8.2.1(@types/node@26.2.0)(esbuild@0.27.3)(jiti@2.6.1)))(svelte@5.56.9)(typescript@5.9.3)(vite@8.2.1(@types/node@26.2.0)(esbuild@0.27.3)(jiti@2.6.1)))
+        version: 3.0.11(@sveltejs/kit@2.70.2(@sveltejs/vite-plugin-svelte@7.3.0(svelte@5.56.9)(vite@8.2.1(@types/node@26.2.0)(esbuild@0.27.3)(jiti@2.6.1)))(svelte@5.56.9)(typescript@5.9.3)(vite@8.2.1(@types/node@26.2.0)(esbuild@0.27.3)(jiti@2.6.1)))
       '@sveltejs/kit':
         specifier: ^2.70.2
         version: 2.70.2(@sveltejs/vite-plugin-svelte@7.3.0(svelte@5.56.9)(vite@8.2.1(@types/node@26.2.0)(esbuild@0.27.3)(jiti@2.6.1)))(svelte@5.56.9)(typescript@5.9.3)(vite@8.2.1(@types/node@26.2.0)(esbuild@0.27.3)(jiti@2.6.1))
@@ -590,8 +590,8 @@ packages:
     peerDependencies:
       acorn: ^8.9.0
 
-  '@sveltejs/adapter-static@3.0.10':
-    resolution: {integrity: sha512-7D9lYFWJmB7zxZyTE/qxjksvMqzMuYrrsyh1f4AlZqeZeACPRySjbC3aFiY55wb1tWUaKOQG9PVbm74JcN2Iew==}
+  '@sveltejs/adapter-static@3.0.11':
+    resolution: {integrity: sha512-DyX1bWx9uiPxzq7Mr+jnxqY+w3UhE3pYy5D1LcfdS++2KZTHSZBD60BoP44LjVgtGILfeOQCF8ESqzmLVrz4Ng==}
     peerDependencies:
       '@sveltejs/kit': ^2.0.0
 
@@ -1963,7 +1963,7 @@ snapshots:
     dependencies:
       acorn: 8.18.0
 
-  '@sveltejs/adapter-static@3.0.10(@sveltejs/kit@2.70.2(@sveltejs/vite-plugin-svelte@7.3.0(svelte@5.56.9)(vite@8.2.1(@types/node@26.2.0)(esbuild@0.27.3)(jiti@2.6.1)))(svelte@5.56.9)(typescript@5.9.3)(vite@8.2.1(@types/node@26.2.0)(esbuild@0.27.3)(jiti@2.6.1)))':
+  '@sveltejs/adapter-static@3.0.11(@sveltejs/kit@2.70.2(@sveltejs/vite-plugin-svelte@7.3.0(svelte@5.56.9)(vite@8.2.1(@types/node@26.2.0)(esbuild@0.27.3)(jiti@2.6.1)))(svelte@5.56.9)(typescript@5.9.3)(vite@8.2.1(@types/node@26.2.0)(esbuild@0.27.3)(jiti@2.6.1)))':
     dependencies:
       '@sveltejs/kit': 2.70.2(@sveltejs/vite-plugin-svelte@7.3.0(svelte@5.56.9)(vite@8.2.1(@types/node@26.2.0)(esbuild@0.27.3)(jiti@2.6.1)))(svelte@5.56.9)(typescript@5.9.3)(vite@8.2.1(@types/node@26.2.0)(esbuild@0.27.3)(jiti@2.6.1))
 
